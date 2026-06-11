@@ -110,16 +110,18 @@ fn classify_url(raw: &str) -> Network {
     Network::Unknown
 }
 
-/// Extract a network from an explicit `-u <x>`, `--url <x>`, or `--cluster <x>` flag.
+/// Extract a network from an explicit `-u <x>`, `--url <x>`, `--cluster <x>`, or Anchor's
+/// native `--provider.cluster <x>` flag.
 fn network_from_flags(command: &str) -> Option<Network> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let mut i = 0;
     while i < tokens.len() {
         let tok = tokens[i];
-        // --url=value / --cluster=value / -u=value forms.
+        // --url=value / --cluster=value / --provider.cluster=value / -u=value forms.
         if let Some(val) = tok
             .strip_prefix("--url=")
             .or_else(|| tok.strip_prefix("--cluster="))
+            .or_else(|| tok.strip_prefix("--provider.cluster="))
             .or_else(|| tok.strip_prefix("-u="))
         {
             let net = classify_url(val);
@@ -127,8 +129,10 @@ fn network_from_flags(command: &str) -> Option<Network> {
                 return Some(net);
             }
         }
-        // -u value / --url value / --cluster value forms.
-        if (tok == "-u" || tok == "--url" || tok == "--cluster") && i + 1 < tokens.len() {
+        // -u value / --url value / --cluster value / --provider.cluster value forms.
+        if (tok == "-u" || tok == "--url" || tok == "--cluster" || tok == "--provider.cluster")
+            && i + 1 < tokens.len()
+        {
             let net = classify_url(tokens[i + 1]);
             if net != Network::Unknown {
                 return Some(net);
@@ -313,6 +317,33 @@ mod tests {
             Some(Network::Localnet)
         );
         assert_eq!(network_from_flags("solana balance"), None);
+    }
+
+    #[test]
+    fn flags_provider_cluster_form() {
+        // Anchor's native --provider.cluster space form must be gated, not bypassed.
+        assert_eq!(
+            network_from_flags("anchor deploy --provider.cluster mainnet"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("anchor deploy --provider.cluster=mainnet-beta"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("anchor deploy --provider.cluster devnet"),
+            Some(Network::Devnet)
+        );
+        assert_eq!(
+            network_from_flags(
+                "anchor deploy --provider.cluster https://api.mainnet-beta.solana.com"
+            ),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("anchor deploy --provider.cluster=devnet"),
+            Some(Network::Devnet)
+        );
     }
 
     #[test]
