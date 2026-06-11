@@ -1,0 +1,6 @@
+# External Claude skill submodules
+.claude/skills/ext/
+CLAUDE.local.md
+
+# Secrets — never commit
+.env
