@@ -1,9 +1,14 @@
 [package]
-name = "ssai"
+name = "safe-solana-ai"
 version = "0.1.0"
 edition = "2021"
 description = "safe-solana-ai security engine — runtime firewall + supply-chain verifier for Solana AI dev"
 license = "MIT"
+repository = "https://github.com/solanabr/safe-solana-ai"
+homepage = "https://github.com/solanabr/safe-solana-ai"
+keywords = ["solana", "security", "claude-code", "firewall", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
 
 [[bin]]
 name = "ssai"

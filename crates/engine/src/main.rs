@@ -471,10 +471,25 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 /// `~/.claude/skills/`. Network + subprocess are acceptable here: `bootstrap` is a one-shot
 /// user-invoked command, not a gate hot path, so shelling out keeps the binary zero-new-dep.
 /// Never widens `~/.claude/settings.json`. A skill with a High finding is held unless `--yes`.
+///
+/// Offline affordances (default behavior unchanged):
+/// - `--from <dir-or-tarball>`: install from a local extracted directory or a local
+///   `.tar.gz`/`.tgz` instead of downloading over the network. A local directory skips both
+///   `curl` and `tar`; a local tarball skips only `curl`. This makes a fully hermetic,
+///   network-free install test possible.
+/// - `--home <dir>` (or the `SAFE_SOLANA_AI_HOME` env var): write installed skills under
+///   `<dir>/.claude/skills` instead of the real `~/.claude/skills`, so a sandboxed test
+///   never touches the user's home. `--from`/`--home` are independent and composable.
 fn cmd_bootstrap(rest: &[String]) -> ExitCode {
     const TARBALL_URL: &str = "https://www.solana.new/skills.tar.gz";
     let force = rest.iter().any(|a| a == "--yes" || a == "--force");
     let plugin_data = context::plugin_data_dir();
+
+    // Optional local source (`--from`) and test home override (`--home` / env).
+    let from = flag_value(rest, "--from");
+    let home_override = flag_value(rest, "--home")
+        .or_else(|| std::env::var("SAFE_SOLANA_AI_HOME").ok())
+        .filter(|s| !s.trim().is_empty());
 
     // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
     let stage = std::env::temp_dir().join(format!("ssai-bootstrap-{}", now_secs()));
@@ -485,56 +500,115 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
     let extract = stage.join("extract");
     let _ = std::fs::create_dir_all(&extract);
 
-    // 1. Download.
-    let curl = std::process::Command::new("curl")
-        .args(["-fsSL", TARBALL_URL, "-o", &tarball.display().to_string()])
-        .status();
-    match curl {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return bootstrap_err(&format!("curl failed with status {s}"));
+    // Resolve the staged `extract` dir holding skill subdirectories. Three sources:
+    //   (a) `--from <dir>`         → use the local directory directly (no curl, no tar).
+    //   (b) `--from <tarball>`     → extract the local tarball (no curl).
+    //   (c) no `--from`            → download the published tarball, then extract.
+    let extract_dir: PathBuf = match from.as_deref() {
+        Some(src) => {
+            let src_path = verify::expand_home(src);
+            if src_path.is_dir() {
+                src_path
+            } else if src_path.is_file() {
+                let tar = std::process::Command::new("tar")
+                    .args([
+                        "-xzf",
+                        &src_path.display().to_string(),
+                        "-C",
+                        &extract.display().to_string(),
+                    ])
+                    .status();
+                match tar {
+                    Ok(s) if s.success() => extract.clone(),
+                    Ok(s) => {
+                        let _ = std::fs::remove_dir_all(&stage);
+                        return bootstrap_err(&format!("tar failed with status {s}"));
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&stage);
+                        return bootstrap_err(&format!("could not run tar: {e}"));
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_dir_all(&stage);
+                return bootstrap_err(&format!("--from source not found: {src}"));
+            }
         }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return bootstrap_err(&format!("could not run curl: {e}"));
-        }
-    }
+        None => {
+            // 1. Download.
+            let curl = std::process::Command::new("curl")
+                .args(["-fsSL", TARBALL_URL, "-o", &tarball.display().to_string()])
+                .status();
+            match curl {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return bootstrap_err(&format!("curl failed with status {s}"));
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return bootstrap_err(&format!("could not run curl: {e}"));
+                }
+            }
 
-    // 2. Extract.
-    let tar = std::process::Command::new("tar")
-        .args([
-            "-xzf",
-            &tarball.display().to_string(),
-            "-C",
-            &extract.display().to_string(),
-        ])
-        .status();
-    match tar {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return bootstrap_err(&format!("tar failed with status {s}"));
+            // 2. Extract.
+            let tar = std::process::Command::new("tar")
+                .args([
+                    "-xzf",
+                    &tarball.display().to_string(),
+                    "-C",
+                    &extract.display().to_string(),
+                ])
+                .status();
+            match tar {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return bootstrap_err(&format!("tar failed with status {s}"));
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    return bootstrap_err(&format!("could not run tar: {e}"));
+                }
+            }
+            extract.clone()
         }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return bootstrap_err(&format!("could not run tar: {e}"));
-        }
-    }
+    };
 
     // 3. Verify + neutralize + install each extracted skill directory.
-    let install_root = verify::expand_home("~/.claude/skills");
+    //
+    // The install root honors `--home`/`SAFE_SOLANA_AI_HOME` (`<home>/.claude/skills`) so a
+    // sandboxed test never touches the real `~/.claude/skills`. Bootstrap intentionally never
+    // writes/widens `<home>/.claude/settings.json` (unlike solana-new's setup.sh).
+    let install_root = match &home_override {
+        Some(home) => PathBuf::from(home).join(".claude").join("skills"),
+        None => verify::expand_home("~/.claude/skills"),
+    };
     let _ = std::fs::create_dir_all(&install_root);
     let mut lock = verify::lockfile::load(&plugin_data);
 
     let mut installed: Vec<String> = Vec::new();
     let mut held: Vec<serde_json::Value> = Vec::new();
+    let mut flagged: Vec<serde_json::Value> = Vec::new();
 
-    for dir in skill_dirs_under(&extract) {
+    for dir in skill_dirs_under(&extract_dir) {
         let name = match dir.file_name().and_then(|n| n.to_str()) {
             Some(n) => n.to_string(),
             None => continue,
         };
+
+        // Scan the ORIGINAL (pre-neutralization) content first so the telemetry curl and
+        // any other danger are reported to the user. Then neutralize the telemetry preamble
+        // in SKILL.md before the installed copy is written.
+        let pre_report = verify::pipeline_dir(&dir, None);
+        for f in &pre_report.findings {
+            flagged.push(serde_json::json!({
+                "skill": name,
+                "severity": verify::severity_label(f.severity),
+                "kind": f.kind,
+                "detail": f.detail,
+            }));
+        }
 
         // Neutralize telemetry in SKILL.md before scanning/installing.
         let skill_md = dir.join("SKILL.md");
@@ -545,6 +619,8 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
             }
         }
 
+        // Re-scan the neutralized content: this is the verdict the install gate uses, so a
+        // skill whose ONLY danger was the (now-removed) telemetry preamble installs cleanly.
         let report = verify::pipeline_dir(&dir, None);
         let verdict = verify::verdict(&report);
 
@@ -576,13 +652,15 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
             continue;
         }
 
-        // Pin the installed content (TOFU).
+        // Pin the installed content (TOFU). The recorded source is the local `--from` path
+        // when bootstrapping offline, else the published tarball URL.
+        let pin_source = from.clone().unwrap_or_else(|| TARBALL_URL.to_string());
         let hash = verify::lockfile::hash_tree(&dest);
         lock.pin_skill(
             &name,
             verify::lockfile::SkillPin {
                 sha256: hash,
-                source: TARBALL_URL.to_string(),
+                source: pin_source,
                 verified_at: now_secs(),
                 scan: report
                     .max_severity()
@@ -609,6 +687,7 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
         "status": "done",
         "installed": installed,
         "held": held,
+        "flagged": flagged,
         "install_root": install_root.display().to_string(),
     }));
     ExitCode::SUCCESS
