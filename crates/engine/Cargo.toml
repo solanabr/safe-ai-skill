@@ -1,0 +1,34 @@
+[package]
+name = "ssai"
+version = "0.1.0"
+edition = "2021"
+description = "safe-solana-ai security engine — runtime firewall + supply-chain verifier for Solana AI dev"
+license = "MIT"
+
+[[bin]]
+name = "ssai"
+path = "src/main.rs"
+
+[lib]
+name = "ssai"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+glob = "0.3"
+walkdir = "2"
+bs58 = "0.5"
+# rustls TLS only (no native-tls/OpenSSL); default features dropped for a lean binary.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Ed25519 session keypairs (Phase 3). rand_core for keygen in round-2.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
