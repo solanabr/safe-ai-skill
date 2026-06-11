@@ -1,0 +1,118 @@
+# CI — safe-solana-ai
+#
+# Runs on every push and PR. Builds and tests the ssai engine crate
+# across all three shipping platforms, then verifies the committed
+# plugin binary checksum and shim syntax.
+#
+# NOTE: There is no workspace Cargo.toml at the repo root; the engine
+# crate lives at crates/engine/ and all cargo commands use
+# --manifest-path crates/engine/Cargo.toml explicitly.  Adding a
+# minimal workspace root was considered but the crate builds cleanly
+# without it, and adding one would require touching Cargo files that
+# are marked FROZEN by the round-2 contract in ARCHITECTURE.md.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  RUST_TOOLCHAIN: stable
+  MANIFEST: crates/engine/Cargo.toml
+
+jobs:
+  # ── lint (fmt + clippy) ───────────────────────────────────────────────────
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: macos-14          # arm64; representative for the fast lint job
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-lint-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path ${{ env.MANIFEST }} --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets -- -D warnings
+
+  # ── build + test matrix ──────────────────────────────────────────────────
+  build-test:
+    name: Build + test / ${{ matrix.name }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14          # GitHub-hosted M1/M2 runner (aarch64-apple-darwin)
+          - name: macos-x64
+            os: macos-13          # GitHub-hosted Intel runner (x86_64-apple-darwin)
+          - name: linux-x64
+            os: ubuntu-latest     # x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: cargo build --verbose
+        run: cargo build --manifest-path ${{ env.MANIFEST }} --verbose
+
+      - name: cargo test --verbose
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
+
+  # ── plugin binary checksum + shim syntax ─────────────────────────────────
+  verify-plugin-bin:
+    name: Verify committed plugin binaries
+    needs: lint
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify SHA256SUMS (committed binaries)
+        working-directory: plugins/safe-solana-ai/bin
+        run: |
+          # shasum -c uses the BSD shasum that ships with macOS; the format
+          # in SHA256SUMS is "<hash>  <filename>" (two spaces), which is
+          # standard shasum / sha256sum output.
+          shasum -a 256 -c SHA256SUMS
+
+      - name: Shim is executable
+        run: test -x plugins/safe-solana-ai/bin/ssai
+
+      - name: Shim passes sh -n (syntax check)
+        run: sh -n plugins/safe-solana-ai/bin/ssai
