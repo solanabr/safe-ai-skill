@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "safe-solana-ai",
+  "owner": {
+    "name": "Superteam Brazil"
+  },
+  "plugins": [
+    {
+      "name": "safe-solana-ai",
+      "source": "./plugins/safe-solana-ai",
+      "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions/deploys/secrets and verifies skills/MCPs."
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-bash", "if": "Bash(solana *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-bash", "if": "Bash(spl-token *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-bash", "if": "Bash(anchor *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-bash-secrets", "timeout": 10 }
+      ]},
+      { "matcher": "Read|Grep|Glob", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-read", "timeout": 10 }
+      ]},
+      { "matcher": "mcp__.*", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai gate-mcp", "timeout": 15 }
+      ]}
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash|Read|Grep", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai redact", "timeout": 10 }
+      ]}
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai prompt-guard", "timeout": 10 } ] }
+    ],
+    "SessionStart": [
+      { "matcher": "startup|resume", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/ssai verify session", "timeout": 60 }
+      ]}
+    ]
+  }
+}

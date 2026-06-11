@@ -1,0 +1,73 @@
+#!/bin/sh
+# safe-solana-ai platform-dispatch shim.
+#
+# Resolves the native `ssai` engine binary and execs it, forwarding all
+# arguments and stdin. Strategy:
+#   1. exec the prebuilt binary matching this platform (bin/ssai-<plat>), if present.
+#   2. else one-time `cargo build --release` of crates/engine into
+#      ${CLAUDE_PLUGIN_DATA}/bin/ssai, then exec it.
+#   3. else print an error and exit 2.
+#
+# CRITICAL: this shim NEVER exits 0 on failure. The engine gates security-
+# sensitive actions; failing open would silently bypass the firewall. If no
+# engine can be obtained, we exit non-zero so the gated action is blocked.
+
+set -eu
+
+SELF_DIR=$(dirname "$0")
+
+# Map uname output to our platform binary suffix.
+os=$(uname -s 2>/dev/null || echo unknown)
+arch=$(uname -m 2>/dev/null || echo unknown)
+
+plat=""
+case "$os" in
+  Darwin)
+    case "$arch" in
+      arm64|aarch64) plat="darwin-arm64" ;;
+      x86_64|amd64)  plat="darwin-x64" ;;
+    esac
+    ;;
+  Linux)
+    case "$arch" in
+      x86_64|amd64)  plat="linux-x64" ;;
+    esac
+    ;;
+esac
+
+# 1. Prebuilt platform binary shipped alongside this shim.
+if [ -n "$plat" ]; then
+  prebuilt="$SELF_DIR/ssai-$plat"
+  if [ -x "$prebuilt" ]; then
+    exec "$prebuilt" "$@"
+  fi
+fi
+
+# 2. Fallback: build from source once into the plugin data dir and cache it.
+data_dir="${CLAUDE_PLUGIN_DATA:-}"
+if [ -n "$data_dir" ]; then
+  built="$data_dir/bin/ssai"
+  if [ -x "$built" ]; then
+    exec "$built" "$@"
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    crate_dir="$SELF_DIR/../../../crates/engine"
+    if [ -d "$crate_dir" ]; then
+      mkdir -p "$data_dir/bin"
+      if cargo build --release --manifest-path "$crate_dir/Cargo.toml" >&2; then
+        compiled="$crate_dir/target/release/ssai"
+        if [ -x "$compiled" ]; then
+          cp "$compiled" "$built"
+          chmod +x "$built"
+          exec "$built" "$@"
+        fi
+      fi
+    fi
+  fi
+fi
+
+# 3. No engine could be obtained. Fail closed.
+echo "safe-solana-ai: no ssai engine binary available for platform '$os/$arch'" >&2
+echo "safe-solana-ai: install a prebuilt binary in plugins/safe-solana-ai/bin/ or install cargo to build from crates/engine; blocking gated action (exit 2)." >&2
+exit 2

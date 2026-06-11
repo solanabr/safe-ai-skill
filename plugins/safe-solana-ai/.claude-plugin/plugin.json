@@ -1,0 +1,19 @@
+{
+  "name": "safe-solana-ai",
+  "version": "0.1.0",
+  "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions/deploys/secrets and verifies skills/MCPs.",
+  "author": {
+    "name": "Superteam Brazil"
+  },
+  "license": "MIT",
+  "keywords": [
+    "solana",
+    "security",
+    "firewall",
+    "supply-chain",
+    "ai",
+    "claude-code",
+    "mcp"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

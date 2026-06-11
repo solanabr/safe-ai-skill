@@ -1,0 +1,37 @@
+version: 1
+network:
+  default: devnet
+  mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
+spend:
+  per_tx_sol_max: 1.0     # above → ask; above hard_max → deny
+  hard_tx_sol_max: 10.0
+  daily_sol_max: 5.0
+gates:                    # always ask regardless of caps
+  - mainnet_deploy
+  - program_upgrade
+  - set_authority         # solana program set-upgrade-authority, spl-token authorize
+  - account_close         # solana close, spl-token close
+mcp:
+  sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade"
+swap:
+  rugcheck: true                # GET rugcheck report before allowing swaps (Phase 2)
+  rugcheck_max_score: 40        # deny above
+  rugcheck_timeout_ms: 3000     # on timeout/API-down → ask (never hard-block on third-party uptime)
+  trusted_mints: [ "So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" ]
+secrets:
+  deny_read_globs:
+    - "**/*-keypair.json"
+    - "**/id.json"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/*.pem"
+    - "~/.config/solana/**"
+    - "~/.superstack/config.json"     # holds the plaintext Copilot JWT
+  allow_read_globs:
+    - "**/.env.example"
+redact: { enabled: true }
+audit:  { enabled: true }
+supply_chain:
+  verify_skills_dirs: [ "~/.claude/skills", ".claude/skills" ]
+  flag_unpinned_mcp: true           # @latest in .mcp.json
+  flag_telemetry_curl: true         # solana-new Convex preamble
