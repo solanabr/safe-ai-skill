@@ -1,7 +1,7 @@
 # Security Audit: sendaifun/solana-new (superstack / solana.new)
 
 **Audit date:** 2026-06-11
-**Auditor:** safe-solana-ai security research (defensive, read-only)
+**Auditor:** safe-ai-skill security research (defensive, read-only)
 **Target:** https://github.com/sendaifun/solana-new — the open-source platform behind
 `https://www.solana.new`, installed via `curl -fsSL https://www.solana.new/setup.sh | bash`
 **Scope:** install chain, telemetry/exfil, secrets handling, code-execution surfaces,
@@ -281,31 +281,31 @@ widened global permissions permanently.
 
 ---
 
-## safe-solana-ai Mitigations
+## safe-ai-skill Mitigations
 
-This section maps each finding to what safe-solana-ai (ssai) does — and does not — address.
+This section maps each finding to what safe-ai-skill (safe-ai-skill) does — and does not — address.
 
-| Finding | ssai Mitigation | Coverage |
+| Finding | safe-ai-skill Mitigation | Coverage |
 |---------|----------------|----------|
-| SS-01 Unsigned tarball | `~/.claude/skills/` is write-denied in ssai sandbox; session-start `verify` checks skill hash drift | Partial — catches post-install drift, not the initial install |
+| SS-01 Unsigned tarball | `~/.claude/skills/` is write-denied in safe-ai-skill sandbox; session-start `verify` checks skill hash drift | Partial — catches post-install drift, not the initial install |
 | SS-02 Attacker-mutable URL | `deny: Read(**/.superstack/config.json)` in `settings.json:246` blocks Read tool on config; but `Bash(cat *)` is allowed | Partial — blocks `Read` tool, does NOT block `Bash(cat ~/.superstack/config.json)` |
-| SS-03 Broad permission grant | ssai `settings.json` uses per-command `allow` patterns (`Bash(anchor *)`, etc.) plus a `deny` list; project-level settings override user-level for ssai sessions | Mitigated within ssai sessions — the global `~/.claude/settings.json` widening remains for non-ssai sessions |
+| SS-03 Broad permission grant | safe-ai-skill `settings.json` uses per-command `allow` patterns (`Bash(anchor *)`, etc.) plus a `deny` list; project-level settings override user-level for safe-ai-skill sessions | Mitigated within safe-ai-skill sessions — the global `~/.claude/settings.json` widening remains for non-safe-ai-skill sessions |
 | SS-04 Pre-consent telemetry | `deny: Read(**/.superstack/config.json)` would prevent preamble from reading convexUrl | Mitigated — if Read is denied, the `_CONVEX_URL` extraction fails, curl silently skips |
 | SS-05 World-readable JWT | `deny: Read(**/.superstack/config.json)` blocks Read tool; `gate-bash-secrets` hook (per SECURITY.md) blocks Bash reads | Mitigated at tool level; does not fix file permissions on disk |
-| SS-06 Default-on telemetry | No mitigation — this is an install-time issue before ssai is in place | Not mitigated — install happens before ssai loads |
+| SS-06 Default-on telemetry | No mitigation — this is an install-time issue before safe-ai-skill is in place | Not mitigated — install happens before safe-ai-skill loads |
 | SS-07 Stale Convex URL | If `Read` is denied for config.json, the URL cannot be read and curl silently skips | Mitigated indirectly |
-| SS-08 npm squatting | ssai does not install from npm; installs from git submodule | Not applicable to ssai install path |
-| SS-09 Community skill arbitrary URL | ssai's `claudeMdExcludes` and skill directory pinning limit which external skill directories load | Partial — ssai users who also run `npx skills add` can still install arbitrary skills |
-| SS-10 sh -c catalog commands | ssai hooks gate Bash commands; `deny` patterns block obviously destructive commands | Partial — generic shell injection in catalog commands not fully blocked |
-| SS-11 No release gate | Not addressable by ssai — upstream deployment issue | Not mitigated |
-| SS-12 Founder Pass GitHub API | No ssai mitigation needed; impact is low (only reads public data) | Not needed |
-| SS-13 Uninstall leaves permissions | ssai uses project-level `settings.json` that takes precedence; but `~/.claude/settings.json` remains | Partial — ssai project settings narrow permissions, but the user's global settings remain widened for other projects |
-| SS-14 Unpinned convex dep | ssai's `cargo audit` workflow does not cover npm deps of external tools | Not mitigated |
+| SS-08 npm squatting | safe-ai-skill does not install from npm; installs from git submodule | Not applicable to safe-ai-skill install path |
+| SS-09 Community skill arbitrary URL | safe-ai-skill's `claudeMdExcludes` and skill directory pinning limit which external skill directories load | Partial — safe-ai-skill users who also run `npx skills add` can still install arbitrary skills |
+| SS-10 sh -c catalog commands | safe-ai-skill hooks gate Bash commands; `deny` patterns block obviously destructive commands | Partial — generic shell injection in catalog commands not fully blocked |
+| SS-11 No release gate | Not addressable by safe-ai-skill — upstream deployment issue | Not mitigated |
+| SS-12 Founder Pass GitHub API | No safe-ai-skill mitigation needed; impact is low (only reads public data) | Not needed |
+| SS-13 Uninstall leaves permissions | safe-ai-skill uses project-level `settings.json` that takes precedence; but `~/.claude/settings.json` remains | Partial — safe-ai-skill project settings narrow permissions, but the user's global settings remain widened for other projects |
+| SS-14 Unpinned convex dep | safe-ai-skill's `cargo audit` workflow does not cover npm deps of external tools | Not mitigated |
 
-**Honest gaps.** Two findings are NOT blocked by ssai in its current form:
+**Honest gaps.** Two findings are NOT blocked by safe-ai-skill in its current form:
 
 1. **SS-01 at install time.** If the user runs `curl -fsSL https://www.solana.new/setup.sh | bash`
-   before setting up ssai, the skills are installed with no integrity check. ssai's verify
+   before setting up safe-ai-skill, the skills are installed with no integrity check. safe-ai-skill's verify
    hook catches hash drift on subsequent sessions, but not the initial compromise.
 
 2. **SS-02 via Bash.** `deny: Read(**/.superstack/config.json)` blocks the `Read` tool but does
@@ -320,7 +320,7 @@ This section maps each finding to what safe-solana-ai (ssai) does — and does n
 
 This audit was conducted as defensive research to understand the security posture of
 tooling used by members of the Solana developer community, specifically to inform the
-hardening approach of safe-solana-ai. All code was read-only (no vulnerability
+hardening approach of safe-ai-skill. All code was read-only (no vulnerability
 exploitation, no tampering).
 
 The sendaifun team has demonstrated genuine privacy-first intent: the Convex schema

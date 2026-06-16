@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-bash", "if": "Bash(solana *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-bash", "if": "Bash(spl-token *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-bash", "if": "Bash(anchor *)", "timeout": 20 },
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-bash-secrets", "timeout": 10 }
+      ]},
+      { "matcher": "Read|Grep|Glob", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-read", "timeout": 10 }
+      ]},
+      { "matcher": "mcp__.*", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-mcp", "timeout": 15 }
+      ]}
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash|Read|Grep", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill redact", "timeout": 10 }
+      ]}
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill prompt-guard", "timeout": 10 } ] }
+    ],
+    "SessionStart": [
+      { "matcher": "startup|resume", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill verify session", "timeout": 60 }
+      ]}
+    ]
+  }
+}

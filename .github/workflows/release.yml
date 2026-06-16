@@ -1,7 +1,7 @@
-# Release — safe-solana-ai
+# Release — safe-ai-skill
 #
 # Triggered by a "v*" tag push (e.g. v0.1.0) or workflow_dispatch.
-# Builds ssai for all four shipping targets, collects checksums,
+# Builds safe-ai-skill for all four shipping targets, collects checksums,
 # and uploads everything to the GitHub Release that the tag creates.
 #
 # Cross-compilation strategy
@@ -17,10 +17,10 @@
 #
 # Artifact naming
 # ─────────────────────────────────────────────────────────────────────────────
-# ssai-darwin-arm64   (aarch64-apple-darwin)
-# ssai-darwin-x64     (x86_64-apple-darwin)
-# ssai-linux-x64      (x86_64-unknown-linux-gnu)
-# ssai-linux-arm64    (aarch64-unknown-linux-gnu)
+# safe-ai-skill-darwin-arm64   (aarch64-apple-darwin)
+# safe-ai-skill-darwin-x64     (x86_64-apple-darwin)
+# safe-ai-skill-linux-x64      (x86_64-unknown-linux-gnu)
+# safe-ai-skill-linux-arm64    (aarch64-unknown-linux-gnu)
 #
 # Secrets required
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ on:
 env:
   RUST_TOOLCHAIN: stable
   MANIFEST: crates/engine/Cargo.toml
-  BIN_NAME: ssai
+  BIN_NAME: safe-ai-skill
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -62,22 +62,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - artifact_name: ssai-darwin-arm64
+          - artifact_name: safe-ai-skill-darwin-arm64
             os: macos-15
             target: aarch64-apple-darwin
             use_cross: false
 
-          - artifact_name: ssai-darwin-x64
+          - artifact_name: safe-ai-skill-darwin-x64
             os: macos-15
             target: x86_64-apple-darwin
             use_cross: false
 
-          - artifact_name: ssai-linux-x64
+          - artifact_name: safe-ai-skill-linux-x64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             use_cross: false
 
-          - artifact_name: ssai-linux-arm64
+          - artifact_name: safe-ai-skill-linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             use_cross: true    # cross handles the aarch64-linux sysroot
@@ -158,7 +158,7 @@ jobs:
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum ssai-darwin-arm64 ssai-darwin-x64 ssai-linux-x64 ssai-linux-arm64 \
+          sha256sum safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
             > SHA256SUMS
           cat SHA256SUMS
 
@@ -177,12 +177,12 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           gh release create "$TAG" \
-            --title "safe-solana-ai $TAG" \
+            --title "safe-ai-skill $TAG" \
             --generate-notes \
-            dist/ssai-darwin-arm64 \
-            dist/ssai-darwin-x64 \
-            dist/ssai-linux-x64 \
-            dist/ssai-linux-arm64 \
+            dist/safe-ai-skill-darwin-arm64 \
+            dist/safe-ai-skill-darwin-x64 \
+            dist/safe-ai-skill-linux-x64 \
+            dist/safe-ai-skill-linux-arm64 \
             dist/SHA256SUMS
 
       # Optionally update the committed plugin bin/ directory so the
@@ -191,6 +191,6 @@ jobs:
       - name: Reminder — update committed bin/ artifacts
         run: |
           echo "::notice::After verifying the release assets, copy the new"
-          echo "::notice::binaries into plugins/safe-solana-ai/bin/ and update"
+          echo "::notice::binaries into plugins/safe-ai-skill/bin/ and update"
           echo "::notice::SHA256SUMS, then commit.  The CI verify-plugin-bin"
           echo "::notice::job will confirm the checksums on the next push."

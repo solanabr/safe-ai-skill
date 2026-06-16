@@ -48,7 +48,7 @@ pub fn fetch(pkg: &str, version: &str) -> Option<String> {
         .post(OSV_URL)
         .timeout(std::time::Duration::from_secs(4))
         .set("Content-Type", "application/json")
-        .set("User-Agent", "safe-solana-ai")
+        .set("User-Agent", "safe-ai-skill")
         .send_string(&body)
         .ok()?;
     resp.into_string().ok()

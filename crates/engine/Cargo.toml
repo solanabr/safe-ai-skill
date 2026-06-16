@@ -1,21 +1,21 @@
 [package]
-name = "safe-solana-ai"
+name = "safe-ai-skill"
 version = "1.0.0"
 edition = "2021"
-description = "safe-solana-ai security engine — runtime firewall + supply-chain verifier for Solana AI dev"
+description = "safe-ai-skill security engine — runtime firewall + supply-chain verifier for Solana AI dev"
 license = "MIT"
-repository = "https://github.com/solanabr/safe-solana-ai"
-homepage = "https://github.com/solanabr/safe-solana-ai"
+repository = "https://github.com/solanabr/safe-ai-skill"
+homepage = "https://github.com/solanabr/safe-ai-skill"
 keywords = ["solana", "security", "claude-code", "firewall", "mcp"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
 
 [[bin]]
-name = "ssai"
+name = "safe-ai-skill"
 path = "src/main.rs"
 
 [lib]
-name = "ssai"
+name = "safe_ai_skill"
 path = "src/lib.rs"
 
 [dependencies]

@@ -204,7 +204,7 @@ mod tests {
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "ssai_spend_{}_{}_{}",
+            "safe_ai_skill_spend_{}_{}_{}",
             tag,
             std::process::id(),
             current_epoch_day()

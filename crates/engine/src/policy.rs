@@ -15,7 +15,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_yaml::Value as Yaml;
 
-/// Embedded default policy. Mirrors `plugins/safe-solana-ai/policy/default.policy.yaml`.
+/// Embedded default policy. Mirrors `plugins/safe-ai-skill/policy/default.policy.yaml`.
 pub const DEFAULT_POLICY_YAML: &str = r#"
 version: 1
 active_profile: strict
@@ -110,7 +110,7 @@ profiles:
 "#;
 
 /// Environment variable that overrides [`Policy::active_profile`].
-pub const PROFILE_ENV: &str = "SAFE_SOLANA_AI_PROFILE";
+pub const PROFILE_ENV: &str = "SAFE_AI_SKILL_PROFILE";
 
 fn default_version() -> u32 {
     1
@@ -244,7 +244,7 @@ pub struct SupplyChainPolicy {
 /// Opt-in skill-registry catalog gating.
 ///
 /// The catalog is the kit's `skill-registry.json` (every entry `default_installed:false`).
-/// ssai parses it to (a) audit installed-vs-registry and (b) force `ask`/`deny` on entries
+/// safe-ai-skill parses it to (a) audit installed-vs-registry and (b) force `ask`/`deny` on entries
 /// matching a [`HighRiskClass`] (e.g. `phantom-mcp` wallet signing, `x402-proxy-mcp` BIP-39
 /// key custody, `curl … | bash` installer scripts).
 #[derive(Debug, Clone, Deserialize)]
@@ -500,7 +500,7 @@ impl Policy {
     /// Load the effective base policy for a project.
     ///
     /// Order: parse `${CLAUDE_PLUGIN_ROOT}/policy/default.policy.yaml` if present, else the
-    /// embedded [`DEFAULT_POLICY_YAML`]; then deep-merge `<cwd>/.safe-solana-ai/policy.yaml`
+    /// embedded [`DEFAULT_POLICY_YAML`]; then deep-merge `<cwd>/.safe-ai-skill/policy.yaml`
     /// over it. Any unrecoverable parse error → [`Policy::fail_closed`] (every soft gate
     /// becomes `ask`). The `active_profile` is then overridden by the [`PROFILE_ENV`] env var
     /// if set.
@@ -514,7 +514,7 @@ impl Policy {
             Err(_) => return Policy::fail_closed(),
         };
 
-        let override_path = cwd.join(".safe-solana-ai").join("policy.yaml");
+        let override_path = cwd.join(".safe-ai-skill").join("policy.yaml");
         if let Ok(text) = std::fs::read_to_string(&override_path) {
             if let Ok(overlay) = serde_yaml::from_str::<Yaml>(&text) {
                 base = merge_yaml(base, overlay);
@@ -651,10 +651,10 @@ mod tests {
 
     /// Parse the on-disk plugin policy YAML, asserting it exists and is well-formed.
     fn ondisk_policy() -> Policy {
-        // The on-disk file lives at <repo>/plugins/safe-solana-ai/policy/default.policy.yaml,
+        // The on-disk file lives at <repo>/plugins/safe-ai-skill/policy/default.policy.yaml,
         // i.e. three levels up from this crate's manifest dir (crates/engine).
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../plugins/safe-solana-ai/policy/default.policy.yaml");
+            .join("../../plugins/safe-ai-skill/policy/default.policy.yaml");
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("on-disk policy missing at {}: {e}", path.display()));
         serde_yaml::from_str(&text).expect("on-disk policy must parse")
@@ -828,8 +828,8 @@ mod tests {
 
     #[test]
     fn load_merges_project_override() {
-        let dir = std::env::temp_dir().join(format!("ssai_pol_{}", std::process::id()));
-        let cfg = dir.join(".safe-solana-ai");
+        let dir = std::env::temp_dir().join(format!("safe_ai_skill_pol_{}", std::process::id()));
+        let cfg = dir.join(".safe-ai-skill");
         fs::create_dir_all(&cfg).unwrap();
         fs::write(cfg.join("policy.yaml"), "spend:\n  per_tx_sol_max: 0.1\n").unwrap();
         let p = Policy::load(&dir);

@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn append_writes_jsonl_line() {
-        let dir = std::env::temp_dir().join(format!("ssai_audit_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("safe_ai_skill_audit_{}", std::process::id()));
         let entry = AuditEntry::new("sess", "Bash", "transfer", "ask", "over cap", "deadbeef");
         append(&entry, &dir).unwrap();
         let body = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();

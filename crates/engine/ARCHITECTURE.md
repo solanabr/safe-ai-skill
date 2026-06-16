@@ -1,6 +1,6 @@
-# ssai engine — architecture & round-2 contract
+# safe-ai-skill engine — architecture & round-2 contract
 
-`ssai` is the Rust security engine behind the **safe-solana-ai** Claude Code plugin. It is
+`safe-ai-skill` is the Rust security engine behind the **safe-ai-skill** Claude Code plugin. It is
 a single binary (hot path: gates fire on every Bash/Read/MCP call) plus a thin library so
 tests and the binary share one module tree.
 
@@ -116,7 +116,7 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 
 ---
 
-## State files (under `${CLAUDE_PLUGIN_DATA}`, fallback `~/.safe-solana-ai`)
+## State files (under `${CLAUDE_PLUGIN_DATA}`, fallback `~/.safe-ai-skill`)
 
 | File | Producer | Purpose |
 |---|---|---|
@@ -175,7 +175,7 @@ pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) 
 ### `policy`
 ```rust
 pub const DEFAULT_POLICY_YAML: &str;     // embedded default (literal; crate is standalone)
-pub const PROFILE_ENV: &str;             // "SAFE_SOLANA_AI_PROFILE"
+pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE"
 
 pub struct Policy {
     pub version: u32, pub active_profile: String,
@@ -235,7 +235,7 @@ override* is ignored (base default still applies).
 flags are consumed by gates / `relax`. Hard guards are never relaxed.
 
 **On-disk ⇄ embedded equivalence (FROZEN invariant).** The on-disk
-`plugins/safe-solana-ai/policy/default.policy.yaml` is now the **full schema** (incl.
+`plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
 `active_profile`, `hard_guards`, `profiles`, `catalog`, and the new `supply_chain` fields) and
 MUST parse to the same `Policy` as the embedded `DEFAULT_POLICY_YAML` const. The
 `policy::tests::ondisk_policy_equivalent_to_embedded` test enforces this field-by-field — edit
@@ -263,7 +263,7 @@ pub struct Context { pub network: Network, pub plugin_data: PathBuf, pub project
 impl Context { pub fn build(command: &str, cwd: &Path) -> Context; }
 
 pub fn resolve_network(command: &str, cwd: &Path) -> Network;  // flag>env>Anchor.toml>cached solana config
-pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA} | ~/.safe-solana-ai
+pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA} | ~/.safe-ai-skill
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
 Fully implemented (not a stub). Never panics; `Unknown` on failure.
@@ -380,7 +380,7 @@ pub fn registry::Registry::high_risk(entry: &RegistryEntry, policy: &Policy) -> 
 ```
 The on-disk catalog shape is `{ version, updated, entries: [ … ] }`; each entry carries
 `id`/`name`/`type`/`domain`/`description`/`source`/`install`/`license`/`maintainer`/`signal`/
-`default_installed`/`safety`/`tags`. `RegistryEntry` keeps the subset ssai gates on (JSON
+`default_installed`/`safety`/`tags`. `RegistryEntry` keeps the subset safe-ai-skill gates on (JSON
 `name`→`title`, `type`→`category`); unknown fields are tolerated. `high_risk` classifies an
 entry against `policy.catalog.high_risk_classes` (id match or case-insensitive keyword match
 against safety/description/tags) and returns the matching class `kind`. `risk_class` is `None`
@@ -410,7 +410,7 @@ Unknown subcommand → `emit_pretooluse(Allow)`.
 source only — there is no hardcoded download URL (`solana.new/skills.tar.gz` + the
 `curl … | tar` network path are gone). `--from <dir|tarball>` verifies + neutralizes +
 installs each skill dir (a local tarball is extracted via `tar`); `--home <dir>` /
-`SAFE_SOLANA_AI_HOME` redirects the install root to `<dir>/.claude/skills` (sandboxable). With
+`SAFE_AI_SKILL_HOME` redirects the install root to `<dir>/.claude/skills` (sandboxable). With
 **no `--from`**, `install` runs **verify-in-place** over the current project's `.claude/skills`
 (scan + telemetry-neutralize + TOFU-pin, no copy) — the post-`install.sh` audit path. Never
 widens `settings.json`; a High finding holds the skill unless `--yes`.

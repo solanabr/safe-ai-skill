@@ -1,5 +1,5 @@
 {
-  "name": "safe-solana-ai",
+  "name": "safe-ai-skill",
   "version": "0.1.0",
   "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions, deploys, and secrets; verifies skills and MCPs.",
   "keywords": [
@@ -11,19 +11,18 @@
     "supply-chain",
     "ai"
   ],
-  "homepage": "https://github.com/solanabr/safe-solana-ai#readme",
+  "homepage": "https://github.com/solanabr/safe-ai-skill#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/solanabr/safe-solana-ai.git"
+    "url": "https://github.com/solanabr/safe-ai-skill.git"
   },
   "bugs": {
-    "url": "https://github.com/solanabr/safe-solana-ai/issues"
+    "url": "https://github.com/solanabr/safe-ai-skill/issues"
   },
   "license": "MIT",
   "author": "Superteam Brazil",
   "bin": {
-    "safe-solana-ai": "bin/cli.js",
-    "ssai": "bin/cli.js"
+    "safe-ai-skill": "bin/cli.js"
   },
   "files": [
     "bin/",

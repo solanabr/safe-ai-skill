@@ -1,5 +1,5 @@
 {
-  "name": "safe-solana-ai",
+  "name": "safe-ai-skill",
   "version": "1.0.0",
   "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions/deploys/secrets and verifies skills/MCPs.",
   "author": {

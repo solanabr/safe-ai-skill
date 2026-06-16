@@ -270,7 +270,7 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "ssai_grants_{}_{}_{}",
+            "safe_ai_skill_grants_{}_{}_{}",
             tag,
             std::process::id(),
             now_secs()

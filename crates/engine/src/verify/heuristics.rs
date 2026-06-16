@@ -488,7 +488,7 @@ mod tests {
 
     fn tempdir(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "ssai-heur-{tag}-{}-{}",
+            "safe-ai-skill-heur-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,4 +1,4 @@
-//! MCP gate end-to-end decisions for the `ssai` binary (hermetic, std-only).
+//! MCP gate end-to-end decisions for the `safe-ai-skill` binary (hermetic, std-only).
 //!
 //! Drives `gate-mcp` with PreToolUse MCP hook payloads and asserts the emitted
 //! `permissionDecision`. Covers the solana-ai-kit MCP surface:
@@ -8,7 +8,7 @@
 //!   - the hook gates regardless of `enableAllProjectMcpServers` pre-approval — a PreToolUse
 //!     `ask`/`deny` fires before (and survives) the permission check, so MCP pre-approval in the
 //!     kit's settings cannot bypass `gate-mcp`. We assert the engine decision directly (the
-//!     pre-approval lives in the host's settings, not in any ssai input the gate reads).
+//!     pre-approval lives in the host's settings, not in any safe-ai-skill input the gate reads).
 //!
 //! Fully hermetic: isolated `CLAUDE_PLUGIN_DATA` + `HOME` temp dirs, no network.
 

@@ -1,4 +1,4 @@
-//! End-to-end hook decision tests for the `ssai` binary (hermetic, std-only).
+//! End-to-end hook decision tests for the `safe-ai-skill` binary (hermetic, std-only).
 //!
 //! Each test spawns the real built binary, pipes a Claude Code hook JSON to stdin, captures
 //! stdout, and asserts the emitted decision JSON. Every run is sandboxed via an isolated

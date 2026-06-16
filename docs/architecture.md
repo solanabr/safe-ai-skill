@@ -2,9 +2,9 @@
 
 ## Engine
 
-The core of safe-solana-ai is `ssai`, a single static Rust binary. The user-facing CLI command `safe-solana-ai` is the same binary (symlink or alias); `ssai` is the terse name used on the hot path.
+The core of safe-ai-skill is `safe-ai-skill`, a single static Rust binary. The user-facing CLI command `safe-ai-skill` is the same binary (symlink or alias); `safe-ai-skill` is the terse name used on the hot path.
 
-**Why Rust.** PreToolUse fires on every Bash, Read, Grep, Glob, and MCP tool call — hundreds of invocations per session. Rust runs the gate logic in ~2–5ms; a Node.js spawn costs ~40–80ms. More importantly, a gate that requires a runtime (Node, Python) fails open if that runtime is absent. `ssai` has no runtime dependency. The binary is auditable as a single artifact. The CLI contract — stdin JSON in, stdout JSON out — is language-agnostic, so the language choice does not ripple into hook wiring or tooling.
+**Why Rust.** PreToolUse fires on every Bash, Read, Grep, Glob, and MCP tool call — hundreds of invocations per session. Rust runs the gate logic in ~2–5ms; a Node.js spawn costs ~40–80ms. More importantly, a gate that requires a runtime (Node, Python) fails open if that runtime is absent. `safe-ai-skill` has no runtime dependency. The binary is auditable as a single artifact. The CLI contract — stdin JSON in, stdout JSON out — is language-agnostic, so the language choice does not ripple into hook wiring or tooling.
 
 **Crate dependencies** are intentionally minimal: `serde`/`serde_json`, `serde_yaml`, `sha2`, `ureq`, `glob`. No tokio. All I/O is synchronous; the 10–60s hook timeouts are more than sufficient.
 
@@ -37,24 +37,24 @@ The core of safe-solana-ai is `ssai`, a single static Rust binary. The user-faci
 
 ## Binary distribution
 
-Prebuilt binaries are committed at `plugins/safe-solana-ai/bin/`:
+Prebuilt binaries are committed at `plugins/safe-ai-skill/bin/`:
 
 ```
 bin/
-├── ssai                  # shell shim — platform selector
-├── ssai-darwin-arm64
-├── ssai-darwin-x64
-├── ssai-linux-x64
+├── safe-ai-skill                  # shell shim — platform selector
+├── safe-ai-skill-darwin-arm64
+├── safe-ai-skill-darwin-x64
+├── safe-ai-skill-linux-x64
 └── SHA256SUMS
 ```
 
-The `ssai` shim selects the matching platform binary and execs it. If no match is found it performs a one-time `cargo build --release` into `${CLAUDE_PLUGIN_DATA}/bin` and records the path. CI rebuilds all three binaries and regenerates `SHA256SUMS` on every release tag.
+The `safe-ai-skill` shim selects the matching platform binary and execs it. If no match is found it performs a one-time `cargo build --release` into `${CLAUDE_PLUGIN_DATA}/bin` and records the path. CI rebuilds all three binaries and regenerates `SHA256SUMS` on every release tag.
 
-**Never fails open.** If no prebuilt binary matches and `cargo` is unavailable, the shim exits with code 2. Claude Code interprets a non-zero exit from a PreToolUse hook as a block on the gated action. There is no code path that allows a gated action to proceed when `ssai` cannot run.
+**Never fails open.** If no prebuilt binary matches and `cargo` is unavailable, the shim exits with code 2. Claude Code interprets a non-zero exit from a PreToolUse hook as a block on the gated action. There is no code path that allows a gated action to proceed when `safe-ai-skill` cannot run.
 
 ## Hook wiring
 
-Hooks are declared in `plugins/safe-solana-ai/hooks/hooks.json` and wired by Claude Code when the plugin is enabled. All hooks invoke `ssai` subcommands via `${CLAUDE_PLUGIN_ROOT}/bin/ssai`.
+Hooks are declared in `plugins/safe-ai-skill/hooks/hooks.json` and wired by Claude Code when the plugin is enabled. All hooks invoke `safe-ai-skill` subcommands via `${CLAUDE_PLUGIN_ROOT}/bin/safe-ai-skill`.
 
 ### PreToolUse
 
@@ -122,26 +122,26 @@ Runs the supply-chain audit on every session start and resume. Scans `~/.claude/
 2. `additionalContext` is injected into the session with a warning listing what was quarantined and why.
 3. `reloadSkills: true` is emitted so Claude Code reloads the (now reduced) skill set.
 4. The session starts normally with the quarantined content absent.
-5. The user can inspect with `safe-solana-ai status` and restore with `ssai verify approve <name>`.
+5. The user can inspect with `safe-ai-skill status` and restore with `safe-ai-skill verify approve <name>`.
 
 ## Per-`ext`-submodule verification
 
-solana-ai-kit installs 18 third-party `ext/` submodules into `.claude/skills/ext/`. Each submodule is its own supply-chain unit — different origin, different maintainer, different risk profile. ssai treats them individually, not as a single blob.
+solana-ai-kit installs 18 third-party `ext/` submodules into `.claude/skills/ext/`. Each submodule is its own supply-chain unit — different origin, different maintainer, different risk profile. safe-ai-skill treats them individually, not as a single blob.
 
 **First-seen (TOFU) pin.** On first `verify session`, `verify/mod.rs` walks `.claude/skills/ext/` and reads the git submodule SHA for each entry (`git rev-parse HEAD` inside the submodule directory, or from `.gitmodules`). That SHA is recorded in `lockfile.json` as the canonical pin for that submodule.
 
 **Drift detection.** On subsequent sessions, the current git SHA is compared to the pinned SHA. Any difference is drift. Drift triggers:
 - The submodule is moved to quarantine before skills load.
 - The drift is shown as a diff in `additionalContext`.
-- `ssai verify approve <name>` re-pins after the user reviews the diff.
+- `safe-ai-skill verify approve <name>` re-pins after the user reviews the diff.
 
 **Per-submodule heuristics.** `heuristics.rs` runs the same static scan on each submodule's content: telemetry curl patterns, `curl|bash` installer patterns, keypair references, prompt injection markers. The `ext/solana-new` submodule is treated the same as any other — its telemetry preamble is flagged and neutralized generically; there is no special-casing.
 
-**`resync.sh` integration.** When solana-ai-kit's `resync.sh` updates submodules (pulling new commits), ssai detects the SHA changes on the next `SessionStart` and quarantines the updated submodules until the user reviews and re-pins. This prevents silent code updates from taking effect without user awareness.
+**`resync.sh` integration.** When solana-ai-kit's `resync.sh` updates submodules (pulling new commits), safe-ai-skill detects the SHA changes on the next `SessionStart` and quarantines the updated submodules until the user reviews and re-pins. This prevents silent code updates from taking effect without user awareness.
 
 ## Catalog awareness and registry gating
 
-solana-ai-kit ships a `skill-registry.json` with 39 opt-in entries (`default_installed: false`). ssai's `registry.rs` parses this catalog and classifies each entry by risk class.
+solana-ai-kit ships a `skill-registry.json` with 39 opt-in entries (`default_installed: false`). safe-ai-skill's `registry.rs` parses this catalog and classifies each entry by risk class.
 
 **Risk classes:**
 
@@ -152,9 +152,9 @@ solana-ai-kit ships a `skill-registry.json` with 39 opt-in entries (`default_ins
 | `installer_script` | `ghostsecurity` (installs via `curl\|bash`) | `ask` — shows installer content before execution |
 | `standard` | All other entries | Standard verification pipeline |
 
-**`ssai registry list`** shows all 39 entries with their risk class, install status, and policy gate. **`ssai registry verify`** audits installed entries against the registry — checking that installed content matches the pinned catalog version and that no high-risk entries were installed without approval.
+**`safe-ai-skill registry list`** shows all 39 entries with their risk class, install status, and policy gate. **`safe-ai-skill registry verify`** audits installed entries against the registry — checking that installed content matches the pinned catalog version and that no high-risk entries were installed without approval.
 
-**`ssai add skill <name>`** resolves a catalog entry name, checks its risk class against policy, runs the full verification pipeline, and installs on approval. High-risk entries show a risk summary and require explicit confirmation even if the general policy permits `standard` installs.
+**`safe-ai-skill add skill <name>`** resolves a catalog entry name, checks its risk class against policy, runs the full verification pipeline, and installs on approval. High-risk entries show a risk summary and require explicit confirmation even if the general policy permits `standard` installs.
 
 ## `curl|bash` install-script gate
 
@@ -164,19 +164,19 @@ This gate fires unconditionally (no `if` filter) — it is part of `gate-bash-se
 
 ## Verified hook semantics
 
-Three properties of the Claude Code hook system (verified against official 2026-06 docs, v2.1.139+) that are load-bearing for safe-solana-ai's guarantees:
+Three properties of the Claude Code hook system (verified against official 2026-06 docs, v2.1.139+) that are load-bearing for safe-ai-skill's guarantees:
 
 **`deny` survives `bypassPermissions`.** A `permissionDecision: "deny"` response from a PreToolUse hook blocks the action even when the session is running with `bypassPermissions` (yolo mode). The hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) use this and cannot be overridden by any profile, grant, or session flag.
 
-**`deny` survives `enableAllProjectMcpServers: true`.** solana-ai-kit enables all project MCPs in its `settings.json`. ssai's `gate-mcp` hook fires via PreToolUse, which runs before the MCP permission check. MCP pre-approval does not bypass `gate-mcp`. This is a verified property of the hook execution order.
+**`deny` survives `enableAllProjectMcpServers: true`.** solana-ai-kit enables all project MCPs in its `settings.json`. safe-ai-skill's `gate-mcp` hook fires via PreToolUse, which runs before the MCP permission check. MCP pre-approval does not bypass `gate-mcp`. This is a verified property of the hook execution order.
 
-**No TTY in hook context.** Hooks do not have a TTY attached. The prior approach of using `read -r` inside a hook for interactive confirmation is silently broken — it exits immediately, failing open. `ask` (`permissionDecision: "ask"`) is the correct mechanism. This is why ssai supersedes the kit's broken mainnet gate without requiring any change to the kit's settings.
+**No TTY in hook context.** Hooks do not have a TTY attached. The prior approach of using `read -r` inside a hook for interactive confirmation is silently broken — it exits immediately, failing open. `ask` (`permissionDecision: "ask"`) is the correct mechanism. This is why safe-ai-skill supersedes the kit's broken mainnet gate without requiring any change to the kit's settings.
 
-**Hooks run in parallel; most-restrictive-wins.** When multiple hook entries match the same tool call, all run concurrently. The most restrictive response wins: `deny` > `ask` > `allow`. ssai composes safely with any existing project or user hooks — including the kit's own hook entries.
+**Hooks run in parallel; most-restrictive-wins.** When multiple hook entries match the same tool call, all run concurrently. The most restrictive response wins: `deny` > `ask` > `allow`. safe-ai-skill composes safely with any existing project or user hooks — including the kit's own hook entries.
 
 ## Policy DSL
 
-The default policy ships at `plugins/safe-solana-ai/policy/default.policy.yaml`. Projects override it by placing a file at `<project>/.safe-solana-ai/policy.yaml`, which is deep-merged over the defaults.
+The default policy ships at `plugins/safe-ai-skill/policy/default.policy.yaml`. Projects override it by placing a file at `<project>/.safe-ai-skill/policy.yaml`, which is deep-merged over the defaults.
 
 **Top-level keys:**
 
@@ -211,7 +211,7 @@ The default policy ships at `plugins/safe-solana-ai/policy/default.policy.yaml`.
 
 ## Profiles and time-boxed grants
 
-**Profiles** are named presets that adjust the policy's soft thresholds before gate evaluation. The active profile is set via `ssai mode <profile>` and applied in `policy.effective()`.
+**Profiles** are named presets that adjust the policy's soft thresholds before gate evaluation. The active profile is set via `safe-ai-skill mode <profile>` and applied in `policy.effective()`.
 
 | Profile | Behavior |
 |---------|----------|
@@ -220,7 +220,7 @@ The default policy ships at `plugins/safe-solana-ai/policy/default.policy.yaml`.
 | `paranoid` | Lowers spend caps; all transfers require `ask`; `exec_install_scripts: deny`; `installer_script` catalog class denied. |
 | `off` | Disables soft gates entirely. Hard guards remain and cannot be disabled. |
 
-**Time-boxed grants** allow specific soft-gate relaxations for a bounded scope and duration, applied in `relax::apply` after `policy.effective()`. Grants are created with `ssai allow` and revoked with `ssai revoke`.
+**Time-boxed grants** allow specific soft-gate relaxations for a bounded scope and duration, applied in `relax::apply` after `policy.effective()`. Grants are created with `safe-ai-skill allow` and revoked with `safe-ai-skill revoke`.
 
 Hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are not affected by profiles or grants. The engine enforces this unconditionally.
 
@@ -252,7 +252,7 @@ ${CLAUDE_PLUGIN_DATA}/
 ├── audit.jsonl          # append-only gate decision log (one JSON object per line)
 ├── lockfile.json        # TOFU pins: skill dir sha256 trees + ext/ submodule git SHAs + MCP pkg@version+shasum
 ├── spend.json           # daily SOL spend ledger; resets at UTC midnight
-├── grants.json          # active time-boxed grant records (written by ssai allow)
+├── grants.json          # active time-boxed grant records (written by safe-ai-skill allow)
 ├── session/             # ephemeral keypair files; mode 0600
 │   └── <id>.json
 └── quarantine/          # drifted or unverified skill dirs and ext/ submodules moved here at SessionStart

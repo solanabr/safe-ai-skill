@@ -83,7 +83,7 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "ssai_relax_{}_{}_{}",
+            "safe_ai_skill_relax_{}_{}_{}",
             tag,
             std::process::id(),
             secs

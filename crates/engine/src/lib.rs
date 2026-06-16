@@ -1,8 +1,8 @@
-//! safe-solana-ai engine (`ssai`) library root.
+//! safe-ai-skill engine (`safe-ai-skill`) library root.
 //!
-//! This crate is the security engine behind the safe-solana-ai Claude Code plugin. It is
+//! This crate is the security engine behind the safe-ai-skill Claude Code plugin. It is
 //! built as both a library (so tests and the binary share one module tree) and a binary
-//! (`ssai`) whose `main.rs` is a thin dispatcher over these modules.
+//! (`safe-ai-skill`) whose `main.rs` is a thin dispatcher over these modules.
 //!
 //! # Module map
 //! - Foundation (FROZEN — owned by the foundation pass): [`io`], [`policy`], [`context`],

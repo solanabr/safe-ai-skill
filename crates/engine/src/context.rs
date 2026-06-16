@@ -41,7 +41,7 @@ impl Network {
 pub struct Context {
     /// Resolved network for the action.
     pub network: Network,
-    /// `${CLAUDE_PLUGIN_DATA}` (or `~/.safe-solana-ai`) — where state lives.
+    /// `${CLAUDE_PLUGIN_DATA}` (or `~/.safe-ai-skill`) — where state lives.
     pub plugin_data: PathBuf,
     /// Project root for the session.
     pub project_dir: PathBuf,
@@ -236,7 +236,7 @@ fn solana_config_rpc_url() -> Option<String> {
     None
 }
 
-/// `${CLAUDE_PLUGIN_DATA}` if set, else `~/.safe-solana-ai`, else `./.safe-solana-ai`.
+/// `${CLAUDE_PLUGIN_DATA}` if set, else `~/.safe-ai-skill`, else `./.safe-ai-skill`.
 pub fn plugin_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CLAUDE_PLUGIN_DATA") {
         if !dir.is_empty() {
@@ -245,10 +245,10 @@ pub fn plugin_data_dir() -> PathBuf {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            return PathBuf::from(home).join(".safe-solana-ai");
+            return PathBuf::from(home).join(".safe-ai-skill");
         }
     }
-    PathBuf::from(".safe-solana-ai")
+    PathBuf::from(".safe-ai-skill")
 }
 
 /// Project root for a session. Currently the cwd itself (reserved for a future git-root walk).
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn anchor_toml_provider_cluster() {
-        let dir = std::env::temp_dir().join(format!("ssai_anchor_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("safe_ai_skill_anchor_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("Anchor.toml"),
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn precedence_flag_beats_anchor_toml() {
-        let dir = std::env::temp_dir().join(format!("ssai_prec_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("safe_ai_skill_prec_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("Anchor.toml"),
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn unknown_on_garbage() {
-        let dir = std::env::temp_dir().join(format!("ssai_unk_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("safe_ai_skill_unk_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         // No flags, no Anchor.toml; solana config may or may not exist — accept either a
         // real network or Unknown, but the call must not panic.
@@ -391,8 +391,8 @@ mod tests {
     fn plugin_data_dir_honors_env() {
         // Save/restore to avoid cross-test interference.
         let prev = std::env::var("CLAUDE_PLUGIN_DATA").ok();
-        std::env::set_var("CLAUDE_PLUGIN_DATA", "/tmp/ssai-data");
-        assert_eq!(plugin_data_dir(), PathBuf::from("/tmp/ssai-data"));
+        std::env::set_var("CLAUDE_PLUGIN_DATA", "/tmp/safe-ai-skill-data");
+        assert_eq!(plugin_data_dir(), PathBuf::from("/tmp/safe-ai-skill-data"));
         match prev {
             Some(v) => std::env::set_var("CLAUDE_PLUGIN_DATA", v),
             None => std::env::remove_var("CLAUDE_PLUGIN_DATA"),

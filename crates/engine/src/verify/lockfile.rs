@@ -341,7 +341,7 @@ mod tests {
 
     fn tempdir(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "ssai-lockfile-{tag}-{}-{}",
+            "safe-ai-skill-lockfile-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn hash_tree_missing_is_empty() {
-        assert_eq!(hash_tree(Path::new("/nonexistent/ssai/xyz")), "");
+        assert_eq!(hash_tree(Path::new("/nonexistent/safe-ai-skill/xyz")), "");
     }
 
     #[test]

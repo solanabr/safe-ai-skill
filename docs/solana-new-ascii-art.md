@@ -263,17 +263,17 @@ Captured here as the textual branding:
 
 ## Wiring into solana-claude
 
-Where this art could be reused in this repo (`safe-solana-ai` / solana-claude):
+Where this art could be reused in this repo (`safe-ai-skill` / solana-claude):
 
 1. **`SessionStart` hook banner in `.claude/settings.json`** — currently prints a
    plain `🤖 Solana Claude Config is ON` line. Replace it with a real wordmark.
    Two good options:
    - Reuse the cyan/bold `superstack`-style FIGlet approach but with our own text
-     (e.g. a "SOLANA CLAUDE" or "SSAI" FIGlet), so the look matches the
+     (e.g. a "SOLANA CLAUDE" or "SAFE-AI-SKILL" FIGlet), so the look matches the
      solana-new family.
    - Or drop in piece #5 (the SendAI/Solana block-logo) as a compact splash.
 
-2. **A `ssai` / CLI startup banner** — if/when a launcher script exists, mirror
+2. **A `safe-ai-skill` / CLI startup banner** — if/when a launcher script exists, mirror
    `renderBanner()`: print the wordmark with the purple→pink gradient
    (`GRADIENT_STOPS` from `cli/colors.ts`) and a dim one-line tagline, honoring
    `NO_COLOR`.
@@ -293,7 +293,7 @@ printf '\n  \033[1;36m ___      _                  ___ _              _\033[0m\n
 printf '  \033[1;36m/ __| ___| |__ _ _ _  __ _   / __| |__ _ _  _ __| |___\033[0m\n'
 printf '  \033[1;36m\\__ \\/ _ \\ / _` | ` \\/ _` | | (__| / _` | || / _` / -_)\033[0m\n'
 printf '  \033[1;36m|___/\\___/_\\__,_|_||_\\__,_|  \\___|_\\__,_|\\_,_\\__,_\\___|\033[0m\n'
-printf '  \033[2mSafe Solana AI — config is ON\033[0m\n\n'
+printf '  \033[2mSafe AI Skill — config is ON\033[0m\n\n'
 ```
 
 If you prefer to keep it minimal and just reuse the exact solana-new `superstack`

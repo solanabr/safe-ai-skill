@@ -331,7 +331,7 @@ pub fn github_resolve_sha(owner: &str, repo: &str, reference: &str) -> Option<St
     let resp = ureq::agent()
         .get(&url)
         .timeout(std::time::Duration::from_secs(4))
-        .set("User-Agent", "safe-solana-ai")
+        .set("User-Agent", "safe-ai-skill")
         .set("Accept", "application/vnd.github.sha")
         .call()
         .ok()?;
@@ -358,7 +358,7 @@ pub fn npm_fetch(name: &str, version: &str) -> Option<String> {
     let resp = ureq::agent()
         .get(&url)
         .timeout(std::time::Duration::from_secs(4))
-        .set("User-Agent", "safe-solana-ai")
+        .set("User-Agent", "safe-ai-skill")
         .call()
         .ok()?;
     let body = resp.into_string().ok()?;

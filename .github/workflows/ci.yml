@@ -1,6 +1,6 @@
-# CI — safe-solana-ai
+# CI — safe-ai-skill
 #
-# Runs on every push and PR. Builds and tests the ssai engine crate
+# Runs on every push and PR. Builds and tests the safe-ai-skill engine crate
 # across all three shipping platforms, then verifies the committed
 # plugin binary checksum and shim syntax.
 #
@@ -103,14 +103,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Verify SHA256SUMS (committed binaries)
-        working-directory: plugins/safe-solana-ai/bin
+        working-directory: plugins/safe-ai-skill/bin
         run: |
           # sha256sum ships with GNU coreutils on ubuntu-latest; the format
           # in SHA256SUMS is "<hash>  <filename>" (two spaces), standard output.
           sha256sum -c SHA256SUMS
 
       - name: Shim is executable
-        run: test -x plugins/safe-solana-ai/bin/ssai
+        run: test -x plugins/safe-ai-skill/bin/safe-ai-skill
 
       - name: Shim passes sh -n (syntax check)
-        run: sh -n plugins/safe-solana-ai/bin/ssai
+        run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill

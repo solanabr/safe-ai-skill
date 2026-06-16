@@ -1,7 +1,7 @@
 //! Opt-in skill-registry catalog parsing and high-risk classification.
 //!
 //! The kit ships `.claude/skills/skill-registry.json`: an opt-in catalog whose entries are
-//! all `default_installed:false`. ssai parses it to (a) audit installed-vs-registry and
+//! all `default_installed:false`. safe-ai-skill parses it to (a) audit installed-vs-registry and
 //! (b) force `ask`/`deny` on entries matching a [`crate::policy::HighRiskClass`] (e.g.
 //! `phantom-mcp` wallet signing, `x402-proxy-mcp` BIP-39 key custody, `curl … | bash`
 //! installer scripts).
@@ -12,7 +12,7 @@
 //! registry shape is `{ "version": …, "updated": …, "entries": [ … ] }` where each entry
 //! carries `id`, `name`, `type`, `domain`, `description`, `source`, `install`, `license`,
 //! `maintainer`, `signal`, `default_installed`, `safety`, `tags`. The fields kept on
-//! [`RegistryEntry`] are the subset ssai gates on; unknown fields are tolerated.
+//! [`RegistryEntry`] are the subset safe-ai-skill gates on; unknown fields are tolerated.
 
 use std::path::Path;
 
@@ -21,9 +21,9 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::policy::{HighRiskClass, Policy};
 
-/// One catalog entry, projected to the fields ssai gates on.
+/// One catalog entry, projected to the fields safe-ai-skill gates on.
 ///
-/// `risk_class` is NOT a field of the on-disk JSON — it is the class ssai *derives* by
+/// `risk_class` is NOT a field of the on-disk JSON — it is the class safe-ai-skill *derives* by
 /// classifying the entry against [`crate::policy::CatalogPolicy::high_risk_classes`] (see
 /// [`Registry::high_risk`]). It is `None` until classified.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -67,7 +67,7 @@ pub struct Registry {
 
 /// Raw on-disk catalog entry, deserialized straight from JSON before projection.
 ///
-/// The public [`RegistryEntry`] keeps only the subset ssai gates on. This private mirror
+/// The public [`RegistryEntry`] keeps only the subset safe-ai-skill gates on. This private mirror
 /// captures the on-disk field names (`name`, `type`) so they can be mapped onto the
 /// public struct (`title`, `category`). Unknown fields are silently dropped.
 #[derive(Debug, Default, Deserialize)]
@@ -158,7 +158,7 @@ impl RegistryEntry {
     /// Whether the entry is opt-in (i.e. NOT installed by the kit by default).
     ///
     /// The opt-in catalog is entirely `default_installed:false`, so this is `true` for every
-    /// genuine catalog entry; it lets `ssai add`/`registry verify` distinguish deliberate
+    /// genuine catalog entry; it lets `safe-ai-skill add`/`registry verify` distinguish deliberate
     /// installs from defaults without re-reading the raw `default_installed` flag.
     pub fn is_opt_in(&self) -> bool {
         !self.default_installed
@@ -379,14 +379,14 @@ mod tests {
 
     #[test]
     fn load_missing_file_is_empty_catalog() {
-        let path = Path::new("/nonexistent/safe-solana-ai/skill-registry.json");
+        let path = Path::new("/nonexistent/safe-ai-skill/skill-registry.json");
         let registry = Registry::load(path).unwrap();
         assert!(registry.entries.is_empty());
     }
 
     #[test]
     fn load_reads_and_parses_a_real_file() {
-        let dir = std::env::temp_dir().join("ssai_registry_load_test");
+        let dir = std::env::temp_dir().join("safe_ai_skill_registry_load_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("skill-registry.json");
         std::fs::write(&path, FIXTURE).unwrap();

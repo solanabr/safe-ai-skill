@@ -1,7 +1,7 @@
-//! Shared helpers for the `ssai` integration test suites.
+//! Shared helpers for the `safe-ai-skill` integration test suites.
 //!
 //! Every helper here is std-only (no dev-deps). The built binary path is provided by Cargo
-//! through `env!("CARGO_BIN_EXE_ssai")`, so the suites drive the real binary end-to-end:
+//! through `env!("CARGO_BIN_EXE_safe-ai-skill")`, so the suites drive the real binary end-to-end:
 //! write a hook JSON to stdin, capture stdout, parse the emitted decision.
 //!
 //! Each integration test binary (`gates`, `bootstrap_sandbox`, `verify_drift`) includes this
@@ -15,9 +15,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Absolute path to the built `ssai` binary (Cargo-provided).
+/// Absolute path to the built `safe-ai-skill` binary (Cargo-provided).
 pub fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_ssai")
+    env!("CARGO_BIN_EXE_safe-ai-skill")
 }
 
 /// Monotonic-ish unique suffix for sandbox dir names (pid + counter + time).
@@ -39,7 +39,7 @@ pub struct TempDir {
 impl TempDir {
     /// Create a fresh, empty temp dir tagged with `tag`.
     pub fn new(tag: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("ssai-it-{tag}-{}", unique()));
+        let path = std::env::temp_dir().join(format!("safe-ai-skill-it-{tag}-{}", unique()));
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir { path }
     }
@@ -80,11 +80,11 @@ impl Run {
     }
 }
 
-/// Builder for a sandboxed `ssai` invocation.
+/// Builder for a sandboxed `safe-ai-skill` invocation.
 ///
 /// Always sets `CLAUDE_PLUGIN_DATA` to an isolated dir so audit/spend/grants/lockfile writes
-/// never touch the real plugin-data dir. Optionally overrides `HOME` and `SAFE_SOLANA_AI_HOME`
-/// and clears `SAFE_SOLANA_AI_PROFILE`/`ANCHOR_PROVIDER_URL`/`CLAUDE_PLUGIN_DATA` inheritance
+/// never touch the real plugin-data dir. Optionally overrides `HOME` and `SAFE_AI_SKILL_HOME`
+/// and clears `SAFE_AI_SKILL_PROFILE`/`ANCHOR_PROVIDER_URL`/`CLAUDE_PLUGIN_DATA` inheritance
 /// to keep the run hermetic.
 pub struct Invocation<'a> {
     args: Vec<String>,
@@ -151,9 +151,9 @@ impl<'a> Invocation<'a> {
         cmd.stderr(Stdio::piped());
 
         // Hermetic env: clear inherited knobs that could perturb a decision.
-        cmd.env_remove("SAFE_SOLANA_AI_PROFILE");
+        cmd.env_remove("SAFE_AI_SKILL_PROFILE");
         cmd.env_remove("ANCHOR_PROVIDER_URL");
-        cmd.env_remove("SAFE_SOLANA_AI_HOME");
+        cmd.env_remove("SAFE_AI_SKILL_HOME");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);
@@ -165,7 +165,7 @@ impl<'a> Invocation<'a> {
             cmd.env(k, v);
         }
 
-        let mut child = cmd.spawn().expect("spawn ssai");
+        let mut child = cmd.spawn().expect("spawn safe-ai-skill");
         if let Some(body) = &self.stdin {
             child
                 .stdin
@@ -174,7 +174,7 @@ impl<'a> Invocation<'a> {
                 .write_all(body.as_bytes())
                 .expect("write stdin");
         }
-        let out = child.wait_with_output().expect("wait ssai");
+        let out = child.wait_with_output().expect("wait safe-ai-skill");
         Run {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),

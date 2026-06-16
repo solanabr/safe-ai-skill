@@ -1,6 +1,6 @@
 # solana-old: Preservation Spec for solanabr/solana-claude Engineering Content
 
-**Purpose of this document**: A structured inventory of the high-engineering-depth material in `solanabr/solana-claude-config` (the `.claude/` tree in this repo) that is absent from `sendaifun/solana-new` (the "superstack"). When the migration off solana-claude completes, nothing in this document should be silently lost — each item is assigned a disposition: bundle into safe-solana-ai, contribute upstream to solana-new, or keep as an optional add-on.
+**Purpose of this document**: A structured inventory of the high-engineering-depth material in `solanabr/solana-claude-config` (the `.claude/` tree in this repo) that is absent from `sendaifun/solana-new` (the "superstack"). When the migration off solana-claude completes, nothing in this document should be silently lost — each item is assigned a disposition: bundle into safe-ai-skill, contribute upstream to solana-new, or keep as an optional add-on.
 
 ---
 
@@ -132,7 +132,7 @@ Coverage: ~70 security rules derived from real protocol audits:
 - Admin key: two-step rotation, timelock recommendations
 - BPF limits: 4096-byte stack frame DoS, `Box<>` mitigation
 
-This skill pairs naturally with safe-solana-ai's security mandate. It is a prerequisite check before the audit command runs.
+This skill pairs naturally with safe-ai-skill's security mandate. It is a prerequisite check before the audit command runs.
 
 #### trailofbits/ (ext/trailofbits/)
 
@@ -150,7 +150,7 @@ Lean support library: `QEDGen/Solana/Account.lean`, `Token.lean` (conservation a
 
 The `qedgen` binary is a Rust CLI with `generate`, `fill-sorry`, `spec`, `consolidate`, `setup` subcommands. First Mathlib build: 15-45 minutes. Requires `MISTRAL_API_KEY`.
 
-This is the most specialized item in the entire inventory. It is directly aligned with safe-solana-ai's security goals (mathematical guarantees about program properties) and has no equivalent anywhere in the ecosystem.
+This is the most specialized item in the entire inventory. It is directly aligned with safe-ai-skill's security goals (mathematical guarantees about program properties) and has no equivalent anywhere in the ecosystem.
 
 ---
 
@@ -168,7 +168,7 @@ This workflow is encoded in CLAUDE.md and enforced by the agent team through the
 
 `/deploy` requires explicit user confirmation for mainnet. The `CLAUDE.md` directive "NEVER deploy to mainnet without explicit user confirmation" is referenced by all build-focused agents. `/setup-ci-cd` bakes this gate into CI.
 
-The migration plan (`plans/`) identifies that the current settings.json mainnet gate using `when.command_matches` is non-functional (not a real Claude Code feature). The real gate is the `/deploy` command's interactive prompt plus safe-solana-ai's runtime firewall (Phase 1 of the plan).
+The migration plan (`plans/`) identifies that the current settings.json mainnet gate using `when.command_matches` is non-functional (not a real Claude Code feature). The real gate is the `/deploy` command's interactive prompt plus safe-ai-skill's runtime firewall (Phase 1 of the plan).
 
 #### Agent team patterns
 
@@ -178,13 +178,13 @@ The migration plan (`plans/`) identifies that the current settings.json mainnet 
 
 Three scripts: `update.sh` (in-place update from `solanabr/solana-claude-config` upstream, backs up CLAUDE.md, shows diff, dry-run support), `resync.sh` (pulls submodule updates), `_env_merge.sh` (merges .env changes without overwriting secrets).
 
-After migration to safe-solana-ai as the primary config, `update.sh` and `resync.sh` target the wrong upstream and become dead. The update mechanism should be replaced by safe-solana-ai's own versioning.
+After migration to safe-ai-skill as the primary config, `update.sh` and `resync.sh` target the wrong upstream and become dead. The update mechanism should be replaced by safe-ai-skill's own versioning.
 
 #### settings.json permissions allowlist
 
 The current settings.json contains a comprehensive pre-approved command allowlist (anchor, cargo, solana, spl-token, npm/yarn/pnpm/bun, git, gh, docker, unity, etc.) that was assembled over time. This is independent of the runtime firewall — it is the baseline that avoids per-command prompts during development.
 
-The plan notes the allowlist is currently too permissive in places (wide-open `Read(*)`, `Bash(cat *)`) and needs narrowing — but the structure and breadth are valuable and should be carried into safe-solana-ai's policy layer.
+The plan notes the allowlist is currently too permissive in places (wide-open `Read(*)`, `Bash(cat *)`) and needs narrowing — but the structure and breadth are valuable and should be carried into safe-ai-skill's policy layer.
 
 ---
 
@@ -192,40 +192,40 @@ The plan notes the allowlist is currently too permissive in places (wide-open `R
 
 | Item | Disposition | Priority |
 |---|---|---|
-| **anchor-engineer agent** | Bundle into safe-solana-ai | Must-keep |
-| **pinocchio-engineer agent** | Bundle into safe-solana-ai | Must-keep |
-| **solana-qa-engineer agent** | Bundle into safe-solana-ai | Must-keep |
-| **solana-architect agent** | Bundle into safe-solana-ai | Must-keep |
-| **defi-engineer agent** | Bundle into safe-solana-ai | Must-keep |
-| **token-engineer agent** | Bundle into safe-solana-ai | Must-keep |
-| **anchor.md rules** | Bundle into safe-solana-ai | Must-keep |
-| **rust.md rules** | Bundle into safe-solana-ai | Must-keep |
-| **pinocchio.md rules** | Bundle into safe-solana-ai | Must-keep |
-| **typescript.md rules** | Bundle into safe-solana-ai | Must-keep |
-| **safe-solana-builder skill** | Bundle into safe-solana-ai | Must-keep |
+| **anchor-engineer agent** | Bundle into safe-ai-skill | Must-keep |
+| **pinocchio-engineer agent** | Bundle into safe-ai-skill | Must-keep |
+| **solana-qa-engineer agent** | Bundle into safe-ai-skill | Must-keep |
+| **solana-architect agent** | Bundle into safe-ai-skill | Must-keep |
+| **defi-engineer agent** | Bundle into safe-ai-skill | Must-keep |
+| **token-engineer agent** | Bundle into safe-ai-skill | Must-keep |
+| **anchor.md rules** | Bundle into safe-ai-skill | Must-keep |
+| **rust.md rules** | Bundle into safe-ai-skill | Must-keep |
+| **pinocchio.md rules** | Bundle into safe-ai-skill | Must-keep |
+| **typescript.md rules** | Bundle into safe-ai-skill | Must-keep |
+| **safe-solana-builder skill** | Bundle into safe-ai-skill | Must-keep |
 | **qedgen skill** | Keep as optional add-on (requires MISTRAL_API_KEY + 15-45 min Mathlib setup) | Must-keep (opt-in) |
-| **trailofbits scanner** | Bundle into safe-solana-ai | Must-keep |
-| **/audit-solana command** | Bundle into safe-solana-ai | Must-keep |
-| **/profile-cu command** | Bundle into safe-solana-ai | Must-keep |
-| **/benchmark command** | Bundle into safe-solana-ai | Must-keep |
-| **/diff-review command** | Bundle into safe-solana-ai | Must-keep |
-| **/test-rust command** | Bundle into safe-solana-ai | Must-keep |
-| **/test-ts command** | Bundle into safe-solana-ai | Must-keep |
-| **/generate-idl-client command** | Bundle into safe-solana-ai | Must-keep |
-| **/setup-ci-cd command** | Bundle into safe-solana-ai | Must-keep |
-| **/migrate-web3 command** | Bundle into safe-solana-ai | Must-keep |
-| **Mandatory build workflow** | Bundle into safe-solana-ai (CLAUDE.md) | Must-keep |
-| **Agent team patterns** | Bundle into safe-solana-ai (CLAUDE.md + settings) | Must-keep |
-| **dotnet.md rules** | Bundle into safe-solana-ai | Nice-to-have |
-| **rust-backend-engineer agent** | Bundle into safe-solana-ai | Nice-to-have |
-| **solana-frontend-engineer agent** | Bundle into safe-solana-ai | Nice-to-have |
-| **devops-engineer agent** | Bundle into safe-solana-ai | Nice-to-have |
+| **trailofbits scanner** | Bundle into safe-ai-skill | Must-keep |
+| **/audit-solana command** | Bundle into safe-ai-skill | Must-keep |
+| **/profile-cu command** | Bundle into safe-ai-skill | Must-keep |
+| **/benchmark command** | Bundle into safe-ai-skill | Must-keep |
+| **/diff-review command** | Bundle into safe-ai-skill | Must-keep |
+| **/test-rust command** | Bundle into safe-ai-skill | Must-keep |
+| **/test-ts command** | Bundle into safe-ai-skill | Must-keep |
+| **/generate-idl-client command** | Bundle into safe-ai-skill | Must-keep |
+| **/setup-ci-cd command** | Bundle into safe-ai-skill | Must-keep |
+| **/migrate-web3 command** | Bundle into safe-ai-skill | Must-keep |
+| **Mandatory build workflow** | Bundle into safe-ai-skill (CLAUDE.md) | Must-keep |
+| **Agent team patterns** | Bundle into safe-ai-skill (CLAUDE.md + settings) | Must-keep |
+| **dotnet.md rules** | Bundle into safe-ai-skill | Nice-to-have |
+| **rust-backend-engineer agent** | Bundle into safe-ai-skill | Nice-to-have |
+| **solana-frontend-engineer agent** | Bundle into safe-ai-skill | Nice-to-have |
+| **devops-engineer agent** | Bundle into safe-ai-skill | Nice-to-have |
 | **game-architect + unity-engineer agents** | Keep as optional add-on (game projects only) | Nice-to-have |
 | **mobile-engineer agent** | Contribute to solana-new build-mobile | Nice-to-have |
 | **/deploy command** | Merge improvements into solana-new deploy-to-mainnet | Nice-to-have |
 | **/build-program command** | Contribute to solana-new scaffold-project | Nice-to-have |
-| **/test-dotnet command** | Bundle into safe-solana-ai (Unity projects) | Nice-to-have |
-| **settings.json allowlist** | Carry into safe-solana-ai policy layer (with narrowing) | Must-keep (reworked) |
+| **/test-dotnet command** | Bundle into safe-ai-skill (Unity projects) | Nice-to-have |
+| **settings.json allowlist** | Carry into safe-ai-skill policy layer (with narrowing) | Must-keep (reworked) |
 | **solana-guide agent** | Contribute to solana-new solana-beginner | Drop / contribute |
 | **solana-researcher agent** | Drop (covered by solana-new colosseum-copilot + competitive-landscape) | Drop |
 | **tech-docs-writer agent** | Drop or keep as optional | Low |
@@ -233,7 +233,7 @@ The plan notes the allowlist is currently too permissive in places (wide-open `R
 | **plan-feature command** | Contribute to solana-new (if absent there) | Low |
 | **quick-commit, cleanup, explain-code** | Drop (general-purpose, not Solana-specific) | Drop |
 | **write-docs command** | Keep as optional | Low |
-| **setup-mcp command** | Merge into safe-solana-ai bootstrap flow | Low |
+| **setup-mcp command** | Merge into safe-ai-skill bootstrap flow | Low |
 
 ---
 
@@ -245,13 +245,13 @@ The user runs three things simultaneously:
 
 1. **solana-new** (superstack) — installed at `~/.claude/skills/` via `curl solana.new/setup.sh | bash`. Provides idea-to-launch flow: scaffold, build-defi, launch-token, deploy-to-mainnet, submit-to-hackathon, etc.
 
-2. **safe-solana-ai** — installed as a Claude Code plugin (`claude plugin install safe-solana-ai@safe-solana-ai`). Provides: runtime firewall (gates deploys, transfers, keypair reads, telemetry curl), supply-chain verification of whatever solana-new installs, and — after this migration — all the engineering-depth content from solana-claude.
+2. **safe-ai-skill** — installed as a Claude Code plugin (`claude plugin install safe-ai-skill@safe-ai-skill`). Provides: runtime firewall (gates deploys, transfers, keypair reads, telemetry curl), supply-chain verification of whatever solana-new installs, and — after this migration — all the engineering-depth content from solana-claude.
 
-3. **solana-claude-config** — this repo's `.claude/` subtree — is decommissioned or frozen. Its engineering content lives inside safe-solana-ai.
+3. **solana-claude-config** — this repo's `.claude/` subtree — is decommissioned or frozen. Its engineering content lives inside safe-ai-skill.
 
-### What safe-solana-ai gains from this migration
+### What safe-ai-skill gains from this migration
 
-The engineering-depth content (agents, commands, rules, security skills) moves from the `.claude/` project-local config into the safe-solana-ai plugin. This means:
+The engineering-depth content (agents, commands, rules, security skills) moves from the `.claude/` project-local config into the safe-ai-skill plugin. This means:
 
 - The 15 specialized agents are available in any project that has the plugin installed, not just this repo.
 - The 5 rules files are injected globally, not just in this working directory.
@@ -267,7 +267,7 @@ The engineering-depth content (agents, commands, rules, security skills) moves f
 
 ### What solana-new users get without any extra action
 
-With safe-solana-ai installed, a user who runs the solana-new installer and then opens any Solana project gets:
+With safe-ai-skill installed, a user who runs the solana-new installer and then opens any Solana project gets:
 - Engineering agents available in every session (no per-project setup)
 - Security rules injected automatically
 - Runtime firewall active on every solana/anchor/spl-token command
@@ -287,4 +287,4 @@ The solana-new skills continue to work exactly as before; the engineering layer 
 
 ---
 
-*Last updated: 2026-06-11. Source inventory from solanabr/solana-claude-config v1.3.0 at `/Users/azrael/Developer/GigaClaude/safe-solana-ai/.claude/`.*
+*Last updated: 2026-06-11. Source inventory from solanabr/solana-claude-config v1.3.0 at `/Users/azrael/Developer/GigaClaude/safe-ai-skill/.claude/`.*

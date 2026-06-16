@@ -1,4 +1,4 @@
-//! `ssai` binary — subcommand dispatch.
+//! `safe-ai-skill` binary — subcommand dispatch.
 //!
 //! This binary owns ALL stdin parsing, policy loading, context building, audit appends and
 //! stdout emission so the feature modules stay pure and unit-testable. A gate returns a
@@ -12,12 +12,12 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ssai::audit::{self, AuditEntry};
-use ssai::context::{self, Context};
-use ssai::gate::{GateMeta, Scope};
-use ssai::io::{self, Decision, HookInput};
-use ssai::policy::Policy;
-use ssai::{grants, mode, promptguard, redact, registry, relax, session, verify};
+use safe_ai_skill::audit::{self, AuditEntry};
+use safe_ai_skill::context::{self, Context};
+use safe_ai_skill::gate::{GateMeta, Scope};
+use safe_ai_skill::io::{self, Decision, HookInput};
+use safe_ai_skill::policy::Policy;
+use safe_ai_skill::{grants, mode, promptguard, redact, registry, relax, session, verify};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -59,13 +59,13 @@ fn read_input() -> (String, HookInput) {
 
 /// Load the policy for `cwd` and resolve it to its EFFECTIVE form (profile overlay applied).
 ///
-/// The active profile is resolved with this precedence: the `SAFE_SOLANA_AI_PROFILE` env var
+/// The active profile is resolved with this precedence: the `SAFE_AI_SKILL_PROFILE` env var
 /// (applied inside [`Policy::load`]) wins; otherwise the persistent runtime override written
-/// by `ssai mode <profile>` (`mode.json`) is consulted. This is what makes `ssai mode
+/// by `safe-ai-skill mode <profile>` (`mode.json`) is consulted. This is what makes `safe-ai-skill mode
 /// autopilot` actually take effect for every subsequent gate.
 fn load_effective_policy(cwd: &Path, plugin_data: &Path) -> Policy {
     let mut base = Policy::load(cwd);
-    let env_set = std::env::var(ssai::policy::PROFILE_ENV)
+    let env_set = std::env::var(safe_ai_skill::policy::PROFILE_ENV)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false);
     if !env_set {
@@ -105,7 +105,7 @@ fn finish_pretooluse(
     // they still count against the daily ledger here so the daily cap stays authoritative.
     if matches!(decision, Decision::Allow) && meta.scope == Scope::Transfer {
         if let Some(amount) = meta.amount_sol {
-            ssai::spend::commit(plugin_data, amount);
+            safe_ai_skill::spend::commit(plugin_data, amount);
         }
     }
 
@@ -137,7 +137,7 @@ fn now_secs() -> u64 {
 fn audit_event(plugin_data: &Path, classification: &str, decision: &str, reason: &str) {
     let entry = AuditEntry::new(
         String::new(),
-        "ssai".to_string(),
+        "safe-ai-skill".to_string(),
         classification.to_string(),
         decision.to_string(),
         reason.to_string(),
@@ -176,7 +176,7 @@ fn cmd_gate_bash() -> ExitCode {
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
     let ctx = Context::build(command, &cwd);
-    let (decision, meta) = ssai::gates::bash::decide(command, &ctx, &effective);
+    let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
 }
 
@@ -186,7 +186,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
-    let decision = ssai::gates::secrets::decide(command, &effective);
+    let decision = safe_ai_skill::gates::secrets::decide(command, &effective);
     // Secret reads are always a hard guard.
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
@@ -198,7 +198,7 @@ fn cmd_gate_read() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let path = input.read_path().unwrap_or("");
-    let decision = ssai::gates::read::decide(path, &effective);
+    let decision = safe_ai_skill::gates::read::decide(path, &effective);
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
 }
@@ -211,7 +211,7 @@ fn cmd_gate_mcp() -> ExitCode {
     let tool = input.tool_name.clone().unwrap_or_default();
     let payload = input.mcp_payload();
     let ctx = Context::build("", &cwd);
-    let (decision, meta) = ssai::gates::mcp::decide(&tool, payload, &ctx, &effective);
+    let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
 }
 
@@ -585,7 +585,7 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 /// - no `--from`: operate on the current project's `.claude/skills` (verify-in-place) — no
 ///   download, no copy; each immediate skill subdirectory is scanned and pinned (TOFU) in
 ///   place. This is the post-`install.sh` audit path for the kit's project layout.
-/// - `--home <dir>` (or the `SAFE_SOLANA_AI_HOME` env var): write installed skills under
+/// - `--home <dir>` (or the `SAFE_AI_SKILL_HOME` env var): write installed skills under
 ///   `<dir>/.claude/skills` instead of the real `~/.claude/skills`, so a sandboxed test never
 ///   touches the user's home. `--from`/`--home` are independent and composable. Ignored in the
 ///   verify-in-place (no `--from`) mode, which never copies.
@@ -598,7 +598,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     // Optional local source (`--from`) and test home override (`--home` / env).
     let from = flag_value(rest, "--from");
     let home_override = flag_value(rest, "--home")
-        .or_else(|| std::env::var("SAFE_SOLANA_AI_HOME").ok())
+        .or_else(|| std::env::var("SAFE_AI_SKILL_HOME").ok())
         .filter(|s| !s.trim().is_empty());
 
     // No `--from`: verify the current project's `.claude/skills` in place (no download/copy).
@@ -607,7 +607,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     }
 
     // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
-    let stage = std::env::temp_dir().join(format!("ssai-install-{}", now_secs()));
+    let stage = std::env::temp_dir().join(format!("safe-ai-skill-install-{}", now_secs()));
     if let Err(e) = std::fs::create_dir_all(&stage) {
         return install_err(&format!("could not create staging dir: {e}"));
     }
@@ -650,7 +650,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
 
     // Verify + neutralize + install each skill directory.
     //
-    // The install root honors `--home`/`SAFE_SOLANA_AI_HOME` (`<home>/.claude/skills`) so a
+    // The install root honors `--home`/`SAFE_AI_SKILL_HOME` (`<home>/.claude/skills`) so a
     // sandboxed test never touches the real `~/.claude/skills`. `install` intentionally never
     // writes/widens `<home>/.claude/settings.json` (unlike solana-new's setup.sh).
     let install_root = match &home_override {
@@ -1155,7 +1155,7 @@ fn cmd_status() -> ExitCode {
         .collect();
 
     // Today's spend against the effective caps.
-    let ledger = ssai::spend::SpendLedger::load(&plugin_data);
+    let ledger = safe_ai_skill::spend::SpendLedger::load(&plugin_data);
     let spend_view = serde_json::json!({
         "today_sol": ledger.total_sol,
         "per_tx_sol_max": effective.spend.per_tx_sol_max,

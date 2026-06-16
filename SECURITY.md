@@ -8,7 +8,7 @@
 
 **Prompt content.** `prompt-guard` (UserPromptSubmit hook) blocks prompts that contain raw private keys or seed phrases before they reach the model.
 
-**Supply chain.** Every session start runs `verify session` over the installed skills directories, each of the 18 `ext/` git submodules independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; ssai does not treat it as an error because solana-ai-kit keeps MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is quarantined before skills are loaded.
+**Supply chain.** Every session start runs `verify session` over the installed skills directories, each of the 18 `ext/` git submodules independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; safe-ai-skill does not treat it as an error because solana-ai-kit keeps MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is quarantined before skills are loaded.
 
 **Install-script execution.** Runtime `curl|bash`, `wget|bash`, and `curl|sh` patterns are intercepted by `gate-bash-secrets` (unconditional, microsecond matching) before the pipe executes. The default policy is `exec_install_scripts: ask` — the user sees the URL and script preview before approval.
 
@@ -25,21 +25,21 @@ solana-ai-kit ships 18 third-party `ext/` git submodules: third-party security t
 - Dependency changes in a submodule's npm/Cargo manifests that introduce CVEs.
 - Compromised upstream repository — a submodule commit SHA can change on any `git submodule update`.
 
-**ssai's response:** each submodule is walked by `ext_verify.rs` at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the submodule is quarantined and the diff is surfaced in `additionalContext`. The user must explicitly re-pin with `ssai verify approve <name>` after reviewing the diff.
+**safe-ai-skill's response:** each submodule is walked by `ext_verify.rs` at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the submodule is quarantined and the diff is surfaced in `additionalContext`. The user must explicitly re-pin with `safe-ai-skill verify approve <name>` after reviewing the diff.
 
-**`ext/solana-new` specifically:** this submodule carries the 14 findings documented in `docs/solana-new-security.md` (3 Critical, 4 High, 4 Medium, 3 Low) — including the attacker-mutable Convex telemetry endpoint, the unsigned tarball installer, and the global Bash/Read permission grant pattern. ssai treats it identically to every other `ext/` submodule: the telemetry preamble is flagged and neutralized generically by `heuristics.rs`; there is no special-casing for `ext/solana-new`.
+**`ext/solana-new` specifically:** this submodule carries the 14 findings documented in `docs/solana-new-security.md` (3 Critical, 4 High, 4 Medium, 3 Low) — including the attacker-mutable Convex telemetry endpoint, the unsigned tarball installer, and the global Bash/Read permission grant pattern. safe-ai-skill treats it identically to every other `ext/` submodule: the telemetry preamble is flagged and neutralized generically by `heuristics.rs`; there is no special-casing for `ext/solana-new`.
 
 ### `@latest` MCP posture
 
-solana-ai-kit configures all 7 MCP servers with `@latest` versions in `.mcp.json`. ssai flags these as INFORMATIONAL (LOW) — not as errors — because this is a deliberate posture choice by the kit maintainers, not an oversight. The risk is concrete: an `@latest` entry silently pulls whatever is newest on each install, creating a rug-pull vector where a compromised new release is auto-applied.
+solana-ai-kit configures all 7 MCP servers with `@latest` versions in `.mcp.json`. safe-ai-skill flags these as INFORMATIONAL (LOW) — not as errors — because this is a deliberate posture choice by the kit maintainers, not an oversight. The risk is concrete: an `@latest` entry silently pulls whatever is newest on each install, creating a rug-pull vector where a compromised new release is auto-applied.
 
-ssai's response: flag at session start and at `install` time. Offer `ssai pin-mcps` as an opt-in rewrite to exact versions — never silent auto-rewrite. The user decides when to pin.
+safe-ai-skill's response: flag at session start and at `install` time. Offer `safe-ai-skill pin-mcps` as an opt-in rewrite to exact versions — never silent auto-rewrite. The user decides when to pin.
 
-**What ssai does NOT do:** ssai does not gate MCP calls solely on the basis of `@latest` pinning. The runtime `gate-mcp` hook gates by tool name and payload. An `@latest` entry that calls a safe read-only tool is allowed; an entry that calls a sensitive tool is gated regardless of whether it is pinned.
+**What safe-ai-skill does NOT do:** safe-ai-skill does not gate MCP calls solely on the basis of `@latest` pinning. The runtime `gate-mcp` hook gates by tool name and payload. An `@latest` entry that calls a safe read-only tool is allowed; an entry that calls a sensitive tool is gated regardless of whether it is pinned.
 
 ### High-risk catalog classes
 
-solana-ai-kit's `skill-registry.json` includes entries classified by ssai as high risk:
+solana-ai-kit's `skill-registry.json` includes entries classified by safe-ai-skill as high risk:
 
 | Class | Representative entries | Risk |
 |-------|----------------------|------|
@@ -47,15 +47,15 @@ solana-ai-kit's `skill-registry.json` includes entries classified by ssai as hig
 | `key_custody` | `x402-proxy-mcp` | Holds BIP-39 mnemonic or derived keys for x402 payment channel operations. Key material is exposed to the MCP process boundary. |
 | `installer_script` | `ghostsecurity`, others with `curl\|bash` setup | The `setup_command` or installer invokes a network fetch piped to a shell. The fetched content is not verifiable at catalog-entry-audit time; it can change between audit and execution. |
 
-Entries in `wallet_signing` and `key_custody` are denied by default policy (configurable in `.safe-solana-ai/policy.yaml`). Entries in `installer_script` trigger the `exec_install_scripts` policy gate. At runtime, tools from approved `wallet_signing` entries are gated by `gate-mcp` with a risk-class header in the approval prompt — the user is reminded of the class on every invocation.
+Entries in `wallet_signing` and `key_custody` are denied by default policy (configurable in `.safe-ai-skill/policy.yaml`). Entries in `installer_script` trigger the `exec_install_scripts` policy gate. At runtime, tools from approved `wallet_signing` entries are gated by `gate-mcp` with a risk-class header in the approval prompt — the user is reminded of the class on every invocation.
 
 ### TOCTOU and simulation spoofing
 
-A transaction can pass simulation while the on-chain execution differs (e.g., due to account state changes between simulation and confirmation, or a maliciously constructed instruction sequence that looks benign in simulation). safe-solana-ai gates the *execution command* — the `anchor deploy`, `solana transfer`, or MCP call — not the simulation. This does not fully mitigate sophisticated TOCTOU attacks but ensures that at minimum the execution requires user awareness and approval for high-risk actions, regardless of simulation results.
+A transaction can pass simulation while the on-chain execution differs (e.g., due to account state changes between simulation and confirmation, or a maliciously constructed instruction sequence that looks benign in simulation). safe-ai-skill gates the *execution command* — the `anchor deploy`, `solana transfer`, or MCP call — not the simulation. This does not fully mitigate sophisticated TOCTOU attacks but ensures that at minimum the execution requires user awareness and approval for high-risk actions, regardless of simulation results.
 
 ### Over-permissioned agents
 
-solana-ai-kit sets `enableAllProjectMcpServers: true`, which pre-approves all project MCP tools. safe-solana-ai's `deny` decisions from PreToolUse hooks hold even when `enableAllProjectMcpServers: true` is set — this is a verified property of the Claude Code hook execution order: PreToolUse runs before the permission check, and `permissionDecision: "deny"` is not overridable by project settings. The hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are enforced unconditionally.
+solana-ai-kit sets `enableAllProjectMcpServers: true`, which pre-approves all project MCP tools. safe-ai-skill's `deny` decisions from PreToolUse hooks hold even when `enableAllProjectMcpServers: true` is set — this is a verified property of the Claude Code hook execution order: PreToolUse runs before the permission check, and `permissionDecision: "deny"` is not overridable by project settings. The hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are enforced unconditionally.
 
 ### Secret exfiltration
 
@@ -72,7 +72,7 @@ Users occasionally paste private key material, seed phrases, or other sensitive 
 
 ### MCP CVEs
 
-MCP package vulnerabilities are a concrete, documented risk. ssai addresses this in two ways: `safe-solana-ai add mcp` and `install` query osv.dev for every resolved `pkg@version` before installation; and `safe-solana-ai verify` re-checks pinned versions on demand. The osv.dev API requires no authentication.
+MCP package vulnerabilities are a concrete, documented risk. safe-ai-skill addresses this in two ways: `safe-ai-skill add mcp` and `install` query osv.dev for every resolved `pkg@version` before installation; and `safe-ai-skill verify` re-checks pinned versions on demand. The osv.dev API requires no authentication.
 
 ### Tool poisoning and prompt injection
 
@@ -82,7 +82,7 @@ Malicious skills can embed instructions targeting the language model in SKILL.md
 
 **Hard guards are unconditional.** The four hard guards — `mainnet_deploy`, `set_authority`, `account_close`, `secret_read` — are enforced by the engine binary regardless of the active profile, any time-boxed grant, or any project policy override. There is no flag or configuration that relaxes them in v1.
 
-**Never fails open.** If the `ssai` binary cannot be obtained (no matching prebuilt, no `cargo`), the `bin/ssai` shim exits with code 2, which Claude Code interprets as a block on the gated action.
+**Never fails open.** If the `safe-ai-skill` binary cannot be obtained (no matching prebuilt, no `cargo`), the `bin/safe-ai-skill` shim exits with code 2, which Claude Code interprets as a block on the gated action.
 
 **Fail-closed policy.** If `policy.yaml` cannot be parsed, `policy.rs` falls back to treating all gated actions as `ask`. The session is not left without gates because of a config file error.
 
@@ -98,7 +98,7 @@ Malicious skills can embed instructions targeting the language model in SKILL.md
 
 Lighthouse is a Solana program (`L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95`, deployed mainnet and devnet) that allows embedding verifiable assertions as instructions in a transaction. The assertion is checked on-chain at execution time, not in simulation.
 
-Retrofitting Lighthouse assertions onto a transaction already built by `solana-cli` or `anchor deploy` requires re-signing the transaction. safe-solana-ai gates commands at the CLI/MCP layer, after the transaction has been constructed and before it is submitted. Inserting Lighthouse assertions at this stage without owning the tx-construction path is not possible.
+Retrofitting Lighthouse assertions onto a transaction already built by `solana-cli` or `anchor deploy` requires re-signing the transaction. safe-ai-skill gates commands at the CLI/MCP layer, after the transaction has been constructed and before it is submitted. Inserting Lighthouse assertions at this stage without owning the tx-construction path is not possible.
 
 This is deferred to a future "guarded signer" component: an MCP tool that exposes `signAndSend`, holds session-key access, and can simulate, append Lighthouse assertions, and sign in a single controlled step before submission.
 
@@ -106,13 +106,13 @@ This is deferred to a future "guarded signer" component: an MCP tool that expose
 
 Turnkey is a SaaS wallet-as-a-service product evaluated and skipped for v1. The free tier is 25 total signatures (not per day); beyond that, $0.10 per signature. Phase 3 session keypairs achieve the same spend-cap-by-construction guarantee with zero external dependencies.
 
-### `ssai doctor` (dual-install detection)
+### `safe-ai-skill doctor` (dual-install detection)
 
-When ssai is installed as both a Claude Code plugin and as part of a full solana-ai-kit config-repo install, both `SessionStart` hooks fire. `ssai doctor` — detecting coexistence, reporting which gates are active vs. superseded, and diagnosing `settings.json` overlap — is a P2 item deferred to a future release.
+When safe-ai-skill is installed as both a Claude Code plugin and as part of a full solana-ai-kit config-repo install, both `SessionStart` hooks fire. `safe-ai-skill doctor` — detecting coexistence, reporting which gates are active vs. superseded, and diagnosing `settings.json` overlap — is a P2 item deferred to a future release.
 
 ## Vulnerability reporting
 
-To report a security vulnerability in safe-solana-ai, send email to **security@superteam.com.br** with subject line `[safe-solana-ai] vulnerability report`.
+To report a security vulnerability in safe-ai-skill, send email to **security@superteam.com.br** with subject line `[safe-ai-skill] vulnerability report`.
 
 Include in your report:
 

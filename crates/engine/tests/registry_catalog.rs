@@ -1,4 +1,4 @@
-//! Catalog (`skill-registry.json`) gating — end-to-end against the built `ssai` binary.
+//! Catalog (`skill-registry.json`) gating — end-to-end against the built `safe-ai-skill` binary.
 //!
 //! Lays out a fixture project whose `.claude/skills/skill-registry.json` is a real subset of
 //! solana-ai-kit's opt-in catalog (`phantom-mcp`, `x402-proxy-mcp`, plus two ordinary clean

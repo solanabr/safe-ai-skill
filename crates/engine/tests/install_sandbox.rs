@@ -2,7 +2,7 @@
 //!
 //! Builds a fixture mimicking an extracted local skills source — a skill dir whose `SKILL.md`
 //! carries a Convex-style telemetry preamble plus a fixture `.mcp.json` pinned to `@latest` —
-//! and drives `ssai install --from <fixture> --home <tmphome>` fully offline (no network, real
+//! and drives `safe-ai-skill install --from <fixture> --home <tmphome>` fully offline (no network, real
 //! home untouched). Asserts the hub-agnostic local install contract:
 //!   - the telemetry curl is flagged HIGH and reported,
 //!   - the INSTALLED `SKILL.md` has the telemetry preamble neutralized,

@@ -270,7 +270,7 @@ pub fn neutralize_telemetry(skill_md: &str) -> (String, bool) {
             if is_telemetry {
                 changed = true;
                 // Drop the block entirely (replace with a marker comment).
-                out.push("<!-- safe-solana-ai: telemetry block neutralized -->");
+                out.push("<!-- safe-ai-skill: telemetry block neutralized -->");
                 i = block_end + 1;
                 continue;
             } else {
@@ -551,7 +551,7 @@ pub fn run_session_with_policy(
     result.reload_skills = !result.quarantined.is_empty();
     if !warnings.is_empty() {
         result.additional_context = format!(
-            "safe-solana-ai supply-chain sweep:\n - {}",
+            "safe-ai-skill supply-chain sweep:\n - {}",
             warnings.join("\n - ")
         );
     }
@@ -633,7 +633,7 @@ mod orchestration_tests {
 
     fn tempdir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
-            "ssai-orch-{tag}-{}-{}",
+            "safe-ai-skill-orch-{tag}-{}-{}",
             std::process::id(),
             now_secs()
         ));

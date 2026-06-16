@@ -1,11 +1,11 @@
 #!/bin/sh
-# safe-solana-ai platform-dispatch shim.
+# safe-ai-skill platform-dispatch shim.
 #
-# Resolves the native `ssai` engine binary and execs it, forwarding all
+# Resolves the native `safe-ai-skill` engine binary and execs it, forwarding all
 # arguments and stdin. Strategy:
-#   1. exec the prebuilt binary matching this platform (bin/ssai-<plat>), if present.
+#   1. exec the prebuilt binary matching this platform (bin/safe-ai-skill-<plat>), if present.
 #   2. else one-time `cargo build --release` of crates/engine into
-#      ${CLAUDE_PLUGIN_DATA}/bin/ssai, then exec it.
+#      ${CLAUDE_PLUGIN_DATA}/bin/safe-ai-skill, then exec it.
 #   3. else print an error and exit 2.
 #
 # CRITICAL: this shim NEVER exits 0 on failure. The engine gates security-
@@ -37,7 +37,7 @@ esac
 
 # 1. Prebuilt platform binary shipped alongside this shim.
 if [ -n "$plat" ]; then
-  prebuilt="$SELF_DIR/ssai-$plat"
+  prebuilt="$SELF_DIR/safe-ai-skill-$plat"
   if [ -x "$prebuilt" ]; then
     exec "$prebuilt" "$@"
   fi
@@ -46,7 +46,7 @@ fi
 # 2. Fallback: build from source once into the plugin data dir and cache it.
 data_dir="${CLAUDE_PLUGIN_DATA:-}"
 if [ -n "$data_dir" ]; then
-  built="$data_dir/bin/ssai"
+  built="$data_dir/bin/safe-ai-skill"
   if [ -x "$built" ]; then
     exec "$built" "$@"
   fi
@@ -56,7 +56,7 @@ if [ -n "$data_dir" ]; then
     if [ -d "$crate_dir" ]; then
       mkdir -p "$data_dir/bin"
       if cargo build --release --manifest-path "$crate_dir/Cargo.toml" >&2; then
-        compiled="$crate_dir/target/release/ssai"
+        compiled="$crate_dir/target/release/safe-ai-skill"
         if [ -x "$compiled" ]; then
           cp "$compiled" "$built"
           chmod +x "$built"
@@ -68,6 +68,6 @@ if [ -n "$data_dir" ]; then
 fi
 
 # 3. No engine could be obtained. Fail closed.
-echo "safe-solana-ai: no ssai engine binary available for platform '$os/$arch'" >&2
-echo "safe-solana-ai: install a prebuilt binary in plugins/safe-solana-ai/bin/ or install cargo to build from crates/engine; blocking gated action (exit 2)." >&2
+echo "safe-ai-skill: no safe-ai-skill engine binary available for platform '$os/$arch'" >&2
+echo "safe-ai-skill: install a prebuilt binary in plugins/safe-ai-skill/bin/ or install cargo to build from crates/engine; blocking gated action (exit 2)." >&2
 exit 2

@@ -1,9 +1,9 @@
-# safe-solana-ai default policy — the FULL schema (kept equivalent to the embedded
+# safe-ai-skill default policy — the FULL schema (kept equivalent to the embedded
 # DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project may deep-merge an override
-# at <cwd>/.safe-solana-ai/policy.yaml; every field below has a serde default so a partial
+# at <cwd>/.safe-ai-skill/policy.yaml; every field below has a serde default so a partial
 # override still parses.
 version: 1
-active_profile: strict    # strict | autopilot | paranoid | off (env SAFE_SOLANA_AI_PROFILE wins)
+active_profile: strict    # strict | autopilot | paranoid | off (env SAFE_AI_SKILL_PROFILE wins)
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
@@ -43,7 +43,7 @@ secrets:
 redact: { enabled: true }
 audit:  { enabled: true }
 catalog:
-  # opt-in skill-registry catalog (every entry default_installed:false); ssai forces ask/deny
+  # opt-in skill-registry catalog (every entry default_installed:false); safe-ai-skill forces ask/deny
   # on entries matching a high-risk class by id or by keyword in safety/description/tag text.
   registry_path: ".claude/skills/skill-registry.json"
   high_risk_classes:

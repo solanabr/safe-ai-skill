@@ -448,7 +448,8 @@ mod tests {
 
     /// A context with a fixed network and an isolated, per-test plugin-data dir.
     fn ctx_with(network: Network, tag: &str) -> Context {
-        let dir = std::env::temp_dir().join(format!("ssai_bash_{}_{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("safe_ai_skill_bash_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         Context {
             network,

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// postinstall.js — safe-solana-ai npm wrapper
+// postinstall.js — safe-ai-skill npm wrapper
 //
-// Downloads the ssai binary for the current platform from the GitHub Release
+// Downloads the safe-ai-skill binary for the current platform from the GitHub Release
 // that matches this package version, verifies its SHA-256 against the
 // published SHA256SUMS file, marks it executable, and writes a thin
 // bin/cli.js launcher stub if one is not already present.
@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // • Zero runtime npm dependencies. Uses Node's built-in https and fs modules
 //   (Node 18+ has global fetch; we use https for reliability in older CI).
-// • The binary is placed at <package-root>/bin/ssai-<plat> and the launcher
+// • The binary is placed at <package-root>/bin/safe-ai-skill-<plat> and the launcher
 //   at bin/cli.js discovers it via __dirname at exec time.
 // • We FAIL LOUDLY on any download or checksum error. This is a security
 //   tool; a broken silent install is worse than a loud failing install.
@@ -18,7 +18,7 @@
 // Alternative approach (NOT used here)
 // ─────────────────────────────────────────────────────────────────────────────
 // The "optionalDependencies" pattern publishes per-platform sub-packages
-// (e.g. safe-solana-ai-darwin-arm64) containing the prebuilt binary; npm
+// (e.g. safe-ai-skill-darwin-arm64) containing the prebuilt binary; npm
 // installs only the matching one based on os/cpu fields in package.json.
 // Pros: works offline after install, no postinstall script required.
 // Cons: requires publishing N+1 packages per release, each with the binary
@@ -37,7 +37,7 @@ const { execFileSync } = require("child_process");
 // ── constants ─────────────────────────────────────────────────────────────
 
 const PKG_VERSION = require("../package.json").version;
-const GITHUB_REPO = "solanabr/safe-solana-ai";
+const GITHUB_REPO = "solanabr/safe-ai-skill";
 const RELEASE_TAG = `v${PKG_VERSION}`;
 const RELEASE_BASE = `https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}`;
 
@@ -122,20 +122,20 @@ async function main() {
   const plat = detectPlatform();
   if (!plat) {
     console.error(
-      `safe-solana-ai: unsupported platform ${process.platform}/${process.arch}.\n` +
-      `Install cargo and run: cargo install safe-solana-ai`
+      `safe-ai-skill: unsupported platform ${process.platform}/${process.arch}.\n` +
+      `Install cargo and run: cargo install safe-ai-skill`
     );
     process.exit(1);
   }
 
-  const binaryName = `ssai-${plat}`;
+  const binaryName = `safe-ai-skill-${plat}`;
   const binaryPath = path.join(BIN_DIR, binaryName);
   const binaryUrl  = `${RELEASE_BASE}/${binaryName}`;
   const sumsUrl    = `${RELEASE_BASE}/SHA256SUMS`;
 
   // Skip download if binary already present (e.g. re-running npm install in CI).
   if (!fs.existsSync(binaryPath)) {
-    console.log(`safe-solana-ai: downloading ${binaryName} from GitHub Release ${RELEASE_TAG}…`);
+    console.log(`safe-ai-skill: downloading ${binaryName} from GitHub Release ${RELEASE_TAG}…`);
 
     let binaryBuf;
     let sumsBuf;
@@ -144,14 +144,14 @@ async function main() {
       [binaryBuf, sumsBuf] = await Promise.all([download(binaryUrl), download(sumsUrl)]);
     } catch (err) {
       console.error(
-        `\nsafe-solana-ai: INSTALL FAILED — could not download release assets.\n` +
+        `\nsafe-ai-skill: INSTALL FAILED — could not download release assets.\n` +
         `  URL: ${binaryUrl}\n` +
         `  Error: ${err.message}\n\n` +
         `Troubleshooting:\n` +
         `  • Check your internet connection.\n` +
         `  • Verify that release ${RELEASE_TAG} exists at\n` +
         `    https://github.com/${GITHUB_REPO}/releases\n` +
-        `  • As a fallback, install via cargo: cargo install safe-solana-ai\n`
+        `  • As a fallback, install via cargo: cargo install safe-ai-skill\n`
       );
       process.exit(1);
     }
@@ -161,7 +161,7 @@ async function main() {
     const expectedHex = parseSumsFile(sumsText).get(binaryName);
     if (!expectedHex) {
       console.error(
-        `safe-solana-ai: INSTALL FAILED — ${binaryName} not found in SHA256SUMS.\n` +
+        `safe-ai-skill: INSTALL FAILED — ${binaryName} not found in SHA256SUMS.\n` +
         `SHA256SUMS content:\n${sumsText}`
       );
       process.exit(1);
@@ -170,12 +170,12 @@ async function main() {
     const actualHex = sha256hex(binaryBuf);
     if (actualHex !== expectedHex) {
       console.error(
-        `safe-solana-ai: INSTALL FAILED — checksum mismatch for ${binaryName}.\n` +
+        `safe-ai-skill: INSTALL FAILED — checksum mismatch for ${binaryName}.\n` +
         `  Expected: ${expectedHex}\n` +
         `  Got:      ${actualHex}\n\n` +
         `The downloaded binary did not match the published checksum. This may\n` +
         `indicate a network issue, a tampered artifact, or an out-of-date release.\n` +
-        `Do NOT use this binary. Re-run the install or use: cargo install safe-solana-ai`
+        `Do NOT use this binary. Re-run the install or use: cargo install safe-ai-skill`
       );
       process.exit(1);
     }
@@ -185,7 +185,7 @@ async function main() {
     fs.writeFileSync(binaryPath, binaryBuf, { mode: 0o755 });
     fs.writeFileSync(CHECKSUMS_FILE, sumsText, "utf8");
 
-    console.log(`safe-solana-ai: installed ${binaryName} (checksum verified).`);
+    console.log(`safe-ai-skill: installed ${binaryName} (checksum verified).`);
   } else {
     // Binary already present; re-verify the stored checksum.
     if (fs.existsSync(CHECKSUMS_FILE)) {
@@ -195,7 +195,7 @@ async function main() {
         const actualHex = sha256hex(fs.readFileSync(binaryPath));
         if (actualHex !== expectedHex) {
           console.error(
-            `safe-solana-ai: INTEGRITY ERROR — cached ${binaryName} checksum mismatch.\n` +
+            `safe-ai-skill: INTEGRITY ERROR — cached ${binaryName} checksum mismatch.\n` +
             `  Expected: ${expectedHex}\n` +
             `  Got:      ${actualHex}\n` +
             `Deleting corrupted binary; re-run npm install to re-download.`
@@ -205,7 +205,7 @@ async function main() {
         }
       }
     }
-    console.log(`safe-solana-ai: ${binaryName} already present.`);
+    console.log(`safe-ai-skill: ${binaryName} already present.`);
   }
 
   // Ensure executable bit (in case fs lost it on Windows-style FS).
@@ -217,6 +217,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`safe-solana-ai: unexpected install error: ${err.message}`);
+  console.error(`safe-ai-skill: unexpected install error: ${err.message}`);
   process.exit(1);
 });
