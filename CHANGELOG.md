@@ -2,8 +2,6 @@
 
 All notable changes are documented in this file. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-> **Note:** This project was renamed to `safe-ai-skill` (formerly `safe-solana-ai`; CLI/crate formerly `ssai`) before its first public release. All names below use the current `safe-ai-skill` naming.
-
 ---
 
 ## [1.0.0] — 2026-06-16
