@@ -91,6 +91,7 @@ pub struct Invocation<'a> {
     stdin: Option<String>,
     plugin_data: Option<&'a Path>,
     home: Option<&'a Path>,
+    cwd: Option<&'a Path>,
     extra_env: Vec<(String, String)>,
 }
 
@@ -102,6 +103,7 @@ impl<'a> Invocation<'a> {
             stdin: None,
             plugin_data: None,
             home: None,
+            cwd: None,
             extra_env: Vec::new(),
         }
     }
@@ -124,6 +126,13 @@ impl<'a> Invocation<'a> {
         self
     }
 
+    /// Set the process working directory (so `current_dir()`-relative resolution — the
+    /// catalog `registry_path` and the `add` registry lookup — points at a fixture project).
+    pub fn cwd(mut self, dir: &'a Path) -> Self {
+        self.cwd = Some(dir);
+        self
+    }
+
     /// Set an extra env var.
     pub fn env(mut self, key: &str, val: &str) -> Self {
         self.extra_env.push((key.to_string(), val.to_string()));
@@ -134,6 +143,9 @@ impl<'a> Invocation<'a> {
     pub fn run(self) -> Run {
         let mut cmd = Command::new(bin());
         cmd.args(&self.args);
+        if let Some(dir) = self.cwd {
+            cmd.current_dir(dir);
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

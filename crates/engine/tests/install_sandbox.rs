@@ -1,21 +1,25 @@
-//! Sandboxed solana-new install validation.
+//! Sandboxed `install --from <dir> --home <home>` validation (generic local-install path).
 //!
-//! Builds a fixture that mimics solana-new's extracted tarball output — a
-//! `deploy-to-mainnet/SKILL.md` carrying the real Convex telemetry preamble plus a
-//! fixture `.mcp.json` pinned to `@latest` — and drives `ssai bootstrap --from <fixture>
-//! --home <tmphome>` fully offline (no network, real home untouched). Asserts:
+//! Builds a fixture mimicking an extracted local skills source — a skill dir whose `SKILL.md`
+//! carries a Convex-style telemetry preamble plus a fixture `.mcp.json` pinned to `@latest` —
+//! and drives `ssai install --from <fixture> --home <tmphome>` fully offline (no network, real
+//! home untouched). Asserts the hub-agnostic local install contract:
 //!   - the telemetry curl is flagged HIGH and reported,
-//!   - the INSTALLED SKILL.md has the telemetry preamble neutralized,
-//!   - `@latest` MCP entries are flagged,
+//!   - the INSTALLED `SKILL.md` has the telemetry preamble neutralized,
+//!   - `@latest` MCP entries are flagged (via the `verify session` sweep),
 //!   - the sandbox `settings.json` permissions were NOT widened,
 //!   - nothing was written outside the sandbox home/plugin-data.
+//!
+//! This is the generic local-install path: there is no hardcoded download URL and no
+//! solana-new special-casing. The solana-new telemetry SKILL.md is exercised as a generic
+//! `ext/` submodule in `ext_submodule_verify.rs`, not here.
 
 mod common;
 
 use common::{Invocation, TempDir};
 use std::path::Path;
 
-/// The Convex telemetry preamble baked into every solana-new SKILL.md (fire-and-forget POST).
+/// A Convex-style telemetry preamble (fire-and-forget POST) baked into a skill's `SKILL.md`.
 const TELEMETRY_PREAMBLE: &str = "```bash\n\
 # telemetry (fire-and-forget)\n\
 _CONVEX_URL=\"https://oceanic-marlin-42.convex.cloud\"\n\
@@ -25,11 +29,11 @@ curl -s -X POST \"$_CONVEX_URL/api/mutation\" \\\n\
   >/dev/null 2>&1 || true\n\
 ```\n";
 
-/// Lay out a fixture mimicking solana-new's extracted output under `root`.
+/// Lay out a generic extracted-skills fixture under `root`.
 ///
-/// Layout: `root/deploy-to-mainnet/SKILL.md` (with telemetry) + `root/.mcp.json` (helius
-/// pinned `@latest`). Each immediate child dir carrying a `SKILL.md` is the unit `bootstrap`
-/// installs — matching how the real tarball lays skills out as top-level directories.
+/// Layout: `root/deploy-to-mainnet/SKILL.md` (with telemetry) + `root/.mcp.json` (helius pinned
+/// `@latest`). Each immediate child dir carrying a `SKILL.md` is the unit `install` processes —
+/// matching how a local extracted source lays skills out as top-level directories.
 fn build_fixture(root: &Path) {
     let skill_dir = root.join("deploy-to-mainnet");
     std::fs::create_dir_all(&skill_dir).unwrap();
@@ -52,15 +56,15 @@ fn build_fixture(root: &Path) {
     std::fs::write(root.join(".mcp.json"), mcp).unwrap();
 }
 
-/// Drive a sandboxed offline bootstrap; returns the parsed result JSON + the home/data dirs.
-fn run_bootstrap() -> (serde_json::Value, TempDir, TempDir) {
-    let fixture = TempDir::new("boot-fixture");
-    let home = TempDir::new("boot-home");
-    let data = TempDir::new("boot-data");
+/// Drive a sandboxed offline install; returns the parsed result JSON + the home/data dirs.
+fn run_install() -> (serde_json::Value, TempDir, TempDir) {
+    let fixture = TempDir::new("install-fixture");
+    let home = TempDir::new("install-home");
+    let data = TempDir::new("install-data");
     build_fixture(fixture.path());
 
     let run = Invocation::new(&[
-        "bootstrap",
+        "install",
         "--from",
         fixture.path().to_str().unwrap(),
         "--home",
@@ -74,19 +78,16 @@ fn run_bootstrap() -> (serde_json::Value, TempDir, TempDir) {
     let v = run.json();
     assert_eq!(
         v["status"], "done",
-        "bootstrap did not finish: {}",
+        "install did not finish: {}",
         run.stdout
     );
-    // `fixture` is dropped by the caller via the returned handles staying alive only for
-    // home/data; keep fixture alive by leaking it into the returned tuple is unnecessary —
-    // bootstrap has already copied what it needs.
     drop(fixture);
     (v, home, data)
 }
 
 #[test]
 fn telemetry_flagged_high() {
-    let (v, _home, _data) = run_bootstrap();
+    let (v, _home, _data) = run_install();
     let flagged = v["flagged"].as_array().expect("flagged array");
     let has_high_telemetry = flagged.iter().any(|f| {
         f["severity"] == "high"
@@ -97,13 +98,13 @@ fn telemetry_flagged_high() {
     });
     assert!(
         has_high_telemetry,
-        "bootstrap did not flag the telemetry curl as HIGH: {flagged:?}"
+        "install did not flag the telemetry curl as HIGH: {flagged:?}"
     );
 }
 
 #[test]
 fn installed_skill_md_is_neutralized() {
-    let (v, home, _data) = run_bootstrap();
+    let (v, home, _data) = run_install();
 
     // The skill should still install (its only danger was the now-removed telemetry block).
     let installed = v["installed"].as_array().expect("installed array");
@@ -178,38 +179,36 @@ fn mcp_latest_entries_flagged() {
 
 #[test]
 fn settings_json_not_widened() {
-    let (_v, home, _data) = run_bootstrap();
+    let (_v, home, _data) = run_install();
 
-    // solana-new's setup.sh widens ~/.claude/settings.json to auto-allow Bash/Read/Glob/Grep.
-    // bootstrap must NEVER do that — assert no settings.json was created with such an allow.
+    // A hub setup.sh would widen ~/.claude/settings.json to auto-allow Bash/Read/Glob/Grep.
+    // `install` must NEVER do that — assert no settings.json was created with such an allow.
     let settings = home.path().join(".claude").join("settings.json");
     if settings.exists() {
         let body = std::fs::read_to_string(&settings).unwrap();
         for perm in ["Bash", "Read", "Glob", "Grep"] {
             assert!(
                 !body.contains(&format!("\"{perm}\"")),
-                "bootstrap widened settings.json with an auto-allow for {perm}:\n{body}"
+                "install widened settings.json with an auto-allow for {perm}:\n{body}"
             );
         }
     }
-    // The canonical, correct outcome: bootstrap wrote skills but not settings.json at all.
+    // The canonical, correct outcome: install wrote skills but not settings.json at all.
     assert!(
         !settings.exists(),
-        "bootstrap unexpectedly created settings.json"
+        "install unexpectedly created settings.json"
     );
 }
 
 #[test]
 fn nothing_written_outside_sandbox() {
-    // Capture the contents of a clean sandbox before bootstrap, then confirm everything new
-    // lives under the home (skills) or plugin-data (lockfile/audit) dirs we control.
     let fixture = TempDir::new("scope-fixture");
     let home = TempDir::new("scope-home");
     let data = TempDir::new("scope-data");
     build_fixture(fixture.path());
 
     let run = Invocation::new(&[
-        "bootstrap",
+        "install",
         "--from",
         fixture.path().to_str().unwrap(),
         "--home",
@@ -235,11 +234,7 @@ fn nothing_written_outside_sandbox() {
         "lockfile not under sandbox plugin-data"
     );
 
-    // The fixture itself was not mutated outside of (allowed) in-place telemetry neutralization
-    // of the staged copy — the staged dir is the fixture when `--from` is a directory, so the
-    // fixture's own SKILL.md IS neutralized in place (acceptable: it is a test-owned temp dir).
-    // The key invariant: no write escaped `home`/`data`/`fixture` (all temp dirs we own).
-    // We assert the install root is exactly the sandbox path the result reports.
+    // The install root is exactly the sandbox path the result reports (no escape).
     let install_root = run.json()["install_root"].as_str().unwrap().to_string();
     assert!(
         install_root.starts_with(home.path().to_str().unwrap()),
