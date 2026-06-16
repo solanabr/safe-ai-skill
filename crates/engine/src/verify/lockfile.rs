@@ -46,6 +46,27 @@ pub struct McpPin {
     pub scan: String,
 }
 
+/// A pinned `ext/<name>` git submodule entry.
+///
+/// Unlike [`SkillPin`] (which pins a content tree hash), a submodule is pinned at its
+/// checked-out commit SHA when available, so a `resync.sh`-driven submodule bump surfaces as
+/// drift. When the directory is not a git checkout, [`pin_ext`](Lockfile::pin_ext) falls back to
+/// the [`hash_tree`] content hash and records `kind = "hash"`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtPin {
+    /// Pinned identity: a 40-char git commit SHA, or a content tree hash on the fallback path.
+    pub sha: String,
+    /// Identity kind: `"git"` (commit SHA) or `"hash"` (content tree hash fallback).
+    #[serde(default)]
+    pub kind: String,
+    /// Unix seconds when the entry was first verified / pinned.
+    #[serde(default)]
+    pub verified_at: u64,
+    /// Highest severity observed at pin time (`"low"`/`"medium"`/`"high"`/`""`).
+    #[serde(default)]
+    pub scan: String,
+}
+
 /// The TOFU lockfile contents.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Lockfile {
@@ -55,6 +76,9 @@ pub struct Lockfile {
     /// Pinned MCP servers, keyed by server name.
     #[serde(default)]
     pub mcps: BTreeMap<String, McpPin>,
+    /// Pinned `ext/<name>` git submodules, keyed by submodule name.
+    #[serde(default)]
+    pub ext: BTreeMap<String, ExtPin>,
 }
 
 /// Result of comparing a current hash against the lockfile.
@@ -91,6 +115,23 @@ impl Lockfile {
     /// Record (or overwrite) an MCP pin.
     pub fn pin_mcp(&mut self, name: impl Into<String>, pin: McpPin) {
         self.mcps.insert(name.into(), pin);
+    }
+
+    /// Classify an `ext/<name>` submodule against its current `identity` (git SHA or hash).
+    ///
+    /// Identity comparison is exact: a submodule whose pinned SHA differs from the current SHA
+    /// (e.g. after `resync.sh` advances the submodule) is [`DriftStatus::Drifted`].
+    pub fn ext_drift(&self, name: &str, identity: &str) -> DriftStatus {
+        match self.ext.get(name) {
+            None => DriftStatus::Unpinned,
+            Some(pin) if pin.sha == identity => DriftStatus::Clean,
+            Some(_) => DriftStatus::Drifted,
+        }
+    }
+
+    /// Record (or overwrite) an `ext/<name>` submodule pin — trust-on-first-use.
+    pub fn pin_ext(&mut self, name: impl Into<String>, pin: ExtPin) {
+        self.ext.insert(name.into(), pin);
     }
 }
 
@@ -172,6 +213,125 @@ pub fn hash_tree(path: &Path) -> String {
 pub fn detect_drift(lockfile: &Lockfile, name: &str, dir: &Path) -> DriftStatus {
     let current = hash_tree(dir);
     lockfile.skill_drift(name, &current)
+}
+
+/// The resolved identity of an `ext/<name>` submodule working directory.
+///
+/// `kind` is `"git"` when [`resolve_git_sha`] succeeded (`sha` is a 40-char commit hash), or
+/// `"hash"` when the directory is not a git checkout and we fell back to [`hash_tree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtIdentity {
+    /// Pinned identity string (git commit SHA or content tree hash).
+    pub sha: String,
+    /// `"git"` or `"hash"`.
+    pub kind: &'static str,
+}
+
+/// Resolve the identity of a submodule working directory: its checked-out commit SHA, else a
+/// content tree hash.
+///
+/// A git submodule's working dir contains a `.git` **file** (not a dir) of the form
+/// `gitdir: <relative-or-absolute path to the real gitdir>`. We follow that to read `HEAD` and
+/// resolve it to a commit SHA. A regular `.git` directory is also handled. When `dir` is not a
+/// git checkout (no resolvable SHA), we fall back to [`hash_tree`] so drift detection still
+/// works on plain directories.
+pub fn resolve_ext_identity(dir: &Path) -> ExtIdentity {
+    if let Some(sha) = resolve_git_sha(dir) {
+        return ExtIdentity { sha, kind: "git" };
+    }
+    ExtIdentity {
+        sha: hash_tree(dir),
+        kind: "hash",
+    }
+}
+
+/// Resolve a git checkout's `HEAD` commit SHA from its working directory `dir`.
+///
+/// Handles both a `.git` directory (top-level repo) and a `.git` file pointing at a real gitdir
+/// (the submodule case: `gitdir: ../../../.git/modules/<path>`). Returns `None` when `dir` is
+/// not a git checkout or `HEAD` cannot be resolved to a 40-hex commit SHA.
+pub fn resolve_git_sha(dir: &Path) -> Option<String> {
+    let dot_git = dir.join(".git");
+    let git_dir = resolve_git_dir(&dot_git, dir)?;
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+
+    // Detached HEAD (the common submodule case): HEAD holds the commit SHA directly.
+    if let Some(sha) = valid_sha(head) {
+        return Some(sha);
+    }
+
+    // Symbolic ref: `ref: refs/heads/<branch>` → resolve to a loose or packed ref.
+    let target = head.strip_prefix("ref:")?.trim();
+    if let Ok(loose) = std::fs::read_to_string(git_dir.join(target)) {
+        if let Some(sha) = valid_sha(loose.trim()) {
+            return Some(sha);
+        }
+    }
+    resolve_packed_ref(&git_dir, target)
+}
+
+/// Resolve the real gitdir from a `.git` path that may be a dir or a `gitdir:` pointer file.
+fn resolve_git_dir(dot_git: &Path, work_dir: &Path) -> Option<std::path::PathBuf> {
+    if dot_git.is_dir() {
+        return Some(dot_git.to_path_buf());
+    }
+    if dot_git.is_file() {
+        let body = std::fs::read_to_string(dot_git).ok()?;
+        let rel = body.trim().strip_prefix("gitdir:")?.trim();
+        let candidate = Path::new(rel);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            work_dir.join(candidate)
+        };
+        // Normalize away `..` segments so the path is canonical-ish without touching the fs.
+        return Some(normalize_path(&resolved));
+    }
+    None
+}
+
+/// Resolve a ref via the gitdir's `packed-refs`, if present.
+fn resolve_packed_ref(git_dir: &Path, target: &str) -> Option<String> {
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs")).ok()?;
+    for line in packed.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        if let Some((sha, name)) = line.split_once(' ') {
+            if name == target {
+                return valid_sha(sha);
+            }
+        }
+    }
+    None
+}
+
+/// Return the lowercased SHA if `s` is a 40-char lowercase-hex git object id, else `None`.
+fn valid_sha(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(s.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Lexically normalize a path, collapsing `.` and `..` segments (no filesystem access).
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -296,6 +456,162 @@ mod tests {
         let loaded = load(&data);
         assert!(loaded.skills.is_empty());
         assert!(loaded.mcps.is_empty());
+        assert!(loaded.ext.is_empty());
+        fs::remove_dir_all(&data).ok();
+    }
+
+    /// Simulate a submodule working dir: a `.git` FILE pointing at a real gitdir holding a
+    /// detached `HEAD` (the typical checked-out-submodule shape).
+    fn fake_submodule(work: &Path, gitdir: &Path, sha: &str) {
+        fs::create_dir_all(work).unwrap();
+        fs::create_dir_all(gitdir).unwrap();
+        fs::write(gitdir.join("HEAD"), format!("{sha}\n")).unwrap();
+        // `.git` is a FILE: `gitdir: <path>` (use an absolute path so the test is location-free).
+        fs::write(
+            work.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_git_sha_from_submodule_file_detached_head() {
+        let base = tempdir("subgit");
+        let work = base.join("ext/jupiter");
+        let gitdir = base.join(".git/modules/ext/jupiter");
+        let sha = "a".repeat(40);
+        fake_submodule(&work, &gitdir, &sha);
+
+        let id = resolve_ext_identity(&work);
+        assert_eq!(id.kind, "git");
+        assert_eq!(id.sha, sha);
+        assert_eq!(resolve_git_sha(&work), Some(sha));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_git_sha_symbolic_ref_via_loose_and_packed() {
+        let base = tempdir("subref");
+        let work = base.join("ext/helius");
+        let gitdir = base.join("gd");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(work.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let sha = "b".repeat(40);
+        // Loose ref first.
+        fs::create_dir_all(gitdir.join("refs/heads")).unwrap();
+        fs::write(gitdir.join("refs/heads/main"), format!("{sha}\n")).unwrap();
+        assert_eq!(resolve_git_sha(&work), Some(sha.clone()));
+
+        // Now drop the loose ref and resolve via packed-refs.
+        fs::remove_file(gitdir.join("refs/heads/main")).unwrap();
+        let packed = format!("# pack-refs with: peeled\n{sha} refs/heads/main\n");
+        fs::write(gitdir.join("packed-refs"), packed).unwrap();
+        assert_eq!(resolve_git_sha(&work), Some(sha));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_falls_back_to_hash_tree_when_not_git() {
+        let base = tempdir("nogit");
+        let work = base.join("ext/plain");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("SKILL.md"), b"# plain submodule").unwrap();
+
+        let id = resolve_ext_identity(&work);
+        assert_eq!(id.kind, "hash");
+        assert_eq!(id.sha, hash_tree(&work));
+        assert!(resolve_git_sha(&work).is_none());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ext_pin_drift_lifecycle_git() {
+        let base = tempdir("extdrift");
+        let work = base.join("ext/trailofbits");
+        let gitdir = base.join(".git/modules/ext/trailofbits");
+        let sha1 = "c".repeat(40);
+        fake_submodule(&work, &gitdir, &sha1);
+
+        let mut lock = Lockfile::default();
+        let id1 = resolve_ext_identity(&work);
+        assert_eq!(
+            lock.ext_drift("trailofbits", &id1.sha),
+            DriftStatus::Unpinned
+        );
+
+        lock.pin_ext(
+            "trailofbits",
+            ExtPin {
+                sha: id1.sha.clone(),
+                kind: id1.kind.into(),
+                verified_at: 1,
+                scan: String::new(),
+            },
+        );
+        assert_eq!(lock.ext_drift("trailofbits", &id1.sha), DriftStatus::Clean);
+
+        // resync.sh bumps the submodule → HEAD advances → drift.
+        let sha2 = "d".repeat(40);
+        fs::write(gitdir.join("HEAD"), format!("{sha2}\n")).unwrap();
+        let id2 = resolve_ext_identity(&work);
+        assert_eq!(id2.sha, sha2);
+        assert_eq!(
+            lock.ext_drift("trailofbits", &id2.sha),
+            DriftStatus::Drifted
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ext_pin_drift_lifecycle_hash_fallback() {
+        let base = tempdir("exthash");
+        let work = base.join("ext/sendai");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("SKILL.md"), b"# original").unwrap();
+
+        let mut lock = Lockfile::default();
+        let id = resolve_ext_identity(&work);
+        assert_eq!(id.kind, "hash");
+        lock.pin_ext(
+            "sendai",
+            ExtPin {
+                sha: id.sha.clone(),
+                kind: id.kind.into(),
+                verified_at: 1,
+                scan: String::new(),
+            },
+        );
+        assert_eq!(lock.ext_drift("sendai", &id.sha), DriftStatus::Clean);
+
+        // Content change → hash changes → drift.
+        fs::write(work.join("SKILL.md"), b"# tampered").unwrap();
+        let id2 = resolve_ext_identity(&work);
+        assert_eq!(lock.ext_drift("sendai", &id2.sha), DriftStatus::Drifted);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn ext_pins_survive_save_load_roundtrip() {
+        let data = tempdir("extroundtrip");
+        let mut lock = Lockfile::default();
+        lock.pin_ext(
+            "jupiter",
+            ExtPin {
+                sha: "e".repeat(40),
+                kind: "git".into(),
+                verified_at: 9,
+                scan: "low".into(),
+            },
+        );
+        save(&data, &lock).unwrap();
+        let loaded = load(&data);
+        let pin = loaded.ext.get("jupiter").unwrap();
+        assert_eq!(pin.sha, "e".repeat(40));
+        assert_eq!(pin.kind, "git");
+        assert_eq!(pin.verified_at, 9);
         fs::remove_dir_all(&data).ok();
     }
 }

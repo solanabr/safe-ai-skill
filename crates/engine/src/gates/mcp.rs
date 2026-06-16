@@ -29,6 +29,20 @@ pub fn decide(
     _ctx: &Context,
     policy: &Policy,
 ) -> (Decision, GateMeta) {
+    // High-risk MCP class gating runs first: a known-dangerous server/tool (wallet
+    // signing, key custody, …) is gated even when its verb is absent from the
+    // sensitive-name pattern (e.g. `signTransaction` — "sign" *is* in the pattern, but
+    // `signMessage` and key-custody surfaces may not be). This is the kit's most
+    // dangerous MCP surface, so it cannot fall through the fast path.
+    if let Some((kind, decision_word)) = high_risk_class(tool_name, policy) {
+        let reason = high_risk_reason(kind, short_name(tool_name));
+        let decision = match decision_word {
+            "deny" => Decision::Deny { reason },
+            _ => Decision::Ask { reason },
+        };
+        return (decision, GateMeta::new(Scope::Other, false));
+    }
+
     let name_sensitive = name_matches_sensitive(tool_name, &policy.mcp.sensitive_name_pattern);
     let signal = payload.and_then(payload_signal);
 
@@ -64,6 +78,15 @@ pub fn decide(
                     None => String::new(),
                 }
             )
+        }
+        // Staking / delegation moves value out of liquid control even without a
+        // destination address. `Scope` has no `Stake` variant, so it stays `Scope::Other`
+        // (already set by `classify_scope`) but carries a stake-specific reason.
+        _ if is_staking(tool_name) => {
+            let amt_str = amount
+                .map(|a| format!("{a} SOL"))
+                .unwrap_or_else(|| "unspecified amount".to_string());
+            format!("MCP staking/delegation: {short_tool} ({amt_str})")
         }
         _ => {
             let dest_str = dest
@@ -168,6 +191,89 @@ fn classify_scope(tool_name: &str) -> Scope {
     } else {
         Scope::Other
     }
+}
+
+/// Whether the tool name indicates a staking / delegation action (no destination, but
+/// still value-moving). Used only to phrase the reason; the scope stays `Scope::Other`.
+fn is_staking(tool_name: &str) -> bool {
+    let n = tool_name.to_ascii_lowercase();
+    n.contains("stake") || n.contains("delegate")
+}
+
+/// Classify an MCP tool against `policy.catalog.high_risk_classes`.
+///
+/// Matches the MCP server segment (`mcp__<server>__…`) and the short tool name against
+/// each class's `ids` (exact / stem match, e.g. server `phantom` ⇒ id `phantom-mcp`) and
+/// `keywords` (case-insensitive substring over the server + tool text). The first class
+/// that matches wins; returns its `kind` and forced `decision` (`"ask"` / `"deny"`).
+///
+/// Pure and allocation-light: this runs on every MCP call, so it scans lowercased copies
+/// of the two name segments only — no I/O, no registry load.
+fn high_risk_class<'p>(tool_name: &str, policy: &'p Policy) -> Option<(&'p str, &'p str)> {
+    let server = server_segment(tool_name).to_ascii_lowercase();
+    let short = short_name(tool_name).to_ascii_lowercase();
+
+    for class in &policy.catalog.high_risk_classes {
+        // The installer-script class targets bash `curl | bash` text, not MCP tools — it
+        // is enforced by the secrets gate. Skip it here to avoid spurious `wget`/`| sh`
+        // keyword hits on unrelated tool names.
+        if class.kind == "installer_script" {
+            continue;
+        }
+
+        let id_hit = class
+            .ids
+            .iter()
+            .any(|id| id_matches_segment(id, &server, &short));
+        let kw_hit = class.keywords.iter().any(|kw| {
+            let k = kw.to_ascii_lowercase();
+            !k.is_empty() && (server.contains(&k) || short.contains(&k))
+        });
+
+        if id_hit || kw_hit {
+            return Some((class.kind.as_str(), class.decision.as_str()));
+        }
+    }
+    None
+}
+
+/// Whether a catalog id (e.g. `phantom-mcp`) matches the server or short-name segment.
+///
+/// Compares against the id's stem (everything before the first `-`, so `phantom-mcp` ⇒
+/// `phantom`) as well as the full id, in both directions of containment — the server
+/// segment of `mcp__phantom__signTransaction` is `phantom`, which the registry id
+/// `phantom-mcp` would otherwise never equal.
+fn id_matches_segment(id: &str, server: &str, short: &str) -> bool {
+    let id_l = id.to_ascii_lowercase();
+    if id_l.is_empty() {
+        return false;
+    }
+    let stem = id_l.split('-').next().unwrap_or(&id_l);
+    server == id_l
+        || short == id_l
+        || (!stem.is_empty() && (server == stem || server.contains(stem) || short.contains(stem)))
+}
+
+/// A class-specific, non-echoing reason for a high-risk MCP gate.
+fn high_risk_reason(kind: &str, short_tool: &str) -> String {
+    match kind {
+        "wallet_signing" => format!(
+            "High-risk MCP: wallet signing tool `{short_tool}` can sign/submit arbitrary transactions — approve to proceed"
+        ),
+        "key_custody" => format!(
+            "High-risk MCP: key-custody tool `{short_tool}` can access/derive private keys — approve to proceed"
+        ),
+        other => format!(
+            "High-risk MCP ({other}): `{short_tool}` is a known dangerous surface — approve to proceed"
+        ),
+    }
+}
+
+/// The `<server>` segment of an MCP tool name (`mcp__phantom__signTransaction` →
+/// `phantom`). Falls back to the whole name when the `mcp__<server>__` shape is absent.
+fn server_segment(tool_name: &str) -> &str {
+    let rest = tool_name.strip_prefix("mcp__").unwrap_or(tool_name);
+    rest.split("__").next().unwrap_or(rest)
 }
 
 /// The final `__`-delimited segment of an MCP tool name (`mcp__helius__transferSol` →
@@ -277,5 +383,126 @@ mod tests {
             &Policy::default(),
         );
         assert!(matches!(d, Decision::Ask { .. }));
+    }
+
+    #[test]
+    fn helius_write_send_sol_asks_transfer() {
+        let payload = json!({
+            "destination": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+            "lamports": 1_000_000_000u64
+        });
+        let (d, m) = decide(
+            "mcp__helius__heliusWrite.sendSol",
+            Some(&payload),
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Transfer);
+        assert_eq!(m.amount_sol, Some(1.0));
+    }
+
+    #[test]
+    fn helius_write_send_token_asks_transfer() {
+        let (d, m) = decide(
+            "mcp__helius__heliusWrite.sendToken",
+            None,
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Transfer);
+    }
+
+    #[test]
+    fn helius_write_stake_asks() {
+        let (d, m) = decide(
+            "mcp__helius__heliusWrite.stake",
+            None,
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Other);
+        assert!(d.reason().contains("staking"), "reason: {}", d.reason());
+    }
+
+    #[test]
+    fn helius_write_delegate_asks() {
+        let (d, m) = decide(
+            "mcp__helius__heliusWrite.delegate",
+            None,
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Other);
+    }
+
+    #[test]
+    fn dot_suffixed_send_substring_matches() {
+        // Confirms the dot-suffixed short name still substring-matches the `send` verb.
+        assert!(name_matches_sensitive(
+            "mcp__helius__heliusWrite.sendSol",
+            &Policy::default().mcp.sensitive_name_pattern
+        ));
+    }
+
+    #[test]
+    fn phantom_sign_transaction_high_risk_asks() {
+        // "sign" IS in the pattern, but this must be gated as a high-risk wallet-signing
+        // class (server `phantom` ⇒ id `phantom-mcp`), not a plain sensitive-name match.
+        let (d, m) = decide(
+            "mcp__phantom__signTransaction",
+            None,
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Other);
+        assert!(
+            d.reason().contains("wallet signing"),
+            "reason: {}",
+            d.reason()
+        );
+    }
+
+    #[test]
+    fn phantom_sign_message_high_risk_asks() {
+        // `signMessage` does NOT contain "signing" — only the id (server) match catches it.
+        let (d, _) = decide(
+            "mcp__phantom__signMessage",
+            None,
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn x402_key_custody_high_risk_asks() {
+        let (d, m) = decide("mcp__x402__createWallet", None, &ctx(), &Policy::default());
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Other);
+        assert!(d.reason().contains("key-custody"), "reason: {}", d.reason());
+    }
+
+    #[test]
+    fn high_risk_deny_when_policy_says_deny() {
+        let mut p = Policy::default();
+        for c in &mut p.catalog.high_risk_classes {
+            if c.kind == "wallet_signing" {
+                c.decision = "deny".into();
+            }
+        }
+        let (d, _) = decide("mcp__phantom__signTransaction", None, &ctx(), &p);
+        assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn benign_helius_read_not_high_risk() {
+        // helius must NOT be misclassified as a high-risk server.
+        let (d, _) = decide("mcp__helius__getBalance", None, &ctx(), &Policy::default());
+        assert_eq!(d, Decision::Defer);
     }
 }

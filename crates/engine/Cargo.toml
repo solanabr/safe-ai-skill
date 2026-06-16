@@ -1,6 +1,6 @@
 [package]
 name = "safe-solana-ai"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "safe-solana-ai security engine — runtime firewall + supply-chain verifier for Solana AI dev"
 license = "MIT"

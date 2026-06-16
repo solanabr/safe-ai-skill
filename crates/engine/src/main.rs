@@ -17,7 +17,7 @@ use ssai::context::{self, Context};
 use ssai::gate::{GateMeta, Scope};
 use ssai::io::{self, Decision, HookInput};
 use ssai::policy::Policy;
-use ssai::{grants, mode, promptguard, redact, relax, session, verify};
+use ssai::{grants, mode, promptguard, redact, registry, relax, session, verify};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -33,7 +33,8 @@ fn main() -> ExitCode {
         "prompt-guard" => cmd_prompt_guard(),
         "verify" => cmd_verify(rest),
         "add" => cmd_add(rest),
-        "bootstrap" => cmd_bootstrap(rest),
+        "install" => cmd_install(rest),
+        "registry" => cmd_registry(rest),
         "session" => cmd_session(rest),
         "allow" => cmd_allow(rest),
         "mode" => cmd_mode(rest),
@@ -388,6 +389,44 @@ fn cmd_add(rest: &[String]) -> ExitCode {
 
     let plugin_data = context::plugin_data_dir();
 
+    // Catalog high-risk gate (runs BEFORE the verify/install pipeline). If the target resolves
+    // to a known high-risk registry entry (`phantom-mcp` wallet signing, `x402-proxy-mcp` key
+    // custody, …), force the class decision (`ask`/`deny`) and refuse to emit the install
+    // command — the verify pipeline never even runs. A `deny` blocks outright; an `ask` holds
+    // unless `--yes`.
+    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(&plugin_data, source) {
+        let blocked = decision == "deny" || (decision == "ask" && !force);
+        if blocked {
+            audit_event(
+                &plugin_data,
+                "add_high_risk_gate",
+                decision,
+                &format!("id={entry_id} class={risk_class} source={source}"),
+            );
+            print_json(&serde_json::json!({
+                "command": "add",
+                "kind": kind,
+                "source": source,
+                "verdict": "high_risk",
+                "status": if decision == "deny" { "high_risk_deny" } else { "high_risk_ask" },
+                "risk_class": risk_class,
+                "decision": decision,
+                "entry_id": entry_id,
+                "reason": high_risk_add_reason(risk_class, &entry_id),
+                "proceed": false,
+                "run": serde_json::Value::Null,
+            }));
+            return ExitCode::SUCCESS;
+        }
+        // `ask` + `--yes`: the user explicitly confirmed; record it and fall through to verify.
+        audit_event(
+            &plugin_data,
+            "add_high_risk_confirm",
+            "ask",
+            &format!("id={entry_id} class={risk_class} source={source} confirmed=true"),
+        );
+    }
+
     // mcp → npm package provenance (+ osv); skill/repo → directory/source heuristics.
     let report = match kind {
         "mcp" => verify::pipeline_npm(source, online),
@@ -453,6 +492,75 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Resolve an `add <source>` target against the project catalog and classify it.
+///
+/// Loads the project `skill-registry.json` (path from `policy.catalog.registry_path`) and tries
+/// to match `source` to a [`registry::RegistryEntry`] — first by exact `id`, then by exact
+/// `source` URL. If the matched entry is high-risk (per [`registry::Registry::high_risk`]),
+/// returns `(entry_id, class_kind, forced_decision)` where `forced_decision` is `ask`/`deny`
+/// from [`registry::Registry::decision_for_kind`]. Returns `None` when there is no catalog, no
+/// matching entry, or the entry is not high-risk — in which case `add` proceeds to its normal
+/// verify pipeline. Never panics; a missing/unparseable catalog yields `None`.
+fn resolve_high_risk_target(
+    plugin_data: &Path,
+    source: &str,
+) -> Option<(String, &'static str, &'static str)> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let policy = load_effective_policy(&cwd, plugin_data);
+    let reg_path = cwd.join(&policy.catalog.registry_path);
+    let reg = registry::Registry::load(&reg_path).ok()?;
+
+    let entry = reg
+        .entry_by_id(source)
+        .or_else(|| reg.entries.iter().find(|e| e.source == source))?;
+
+    let kind = registry::Registry::high_risk(entry, &policy)?;
+    let decision = registry::Registry::decision_for_kind(&policy, &kind).unwrap_or("ask");
+    // Intern the dynamic strings to &'static via a small known set so the caller can pass them
+    // into JSON without lifetime juggling.
+    Some((
+        entry.id.clone(),
+        intern_class(&kind),
+        intern_decision(decision),
+    ))
+}
+
+/// Map a class kind string to a stable `&'static str` (falls back to a generic label).
+fn intern_class(kind: &str) -> &'static str {
+    match kind {
+        "wallet_signing" => "wallet_signing",
+        "key_custody" => "key_custody",
+        "installer_script" => "installer_script",
+        _ => "high_risk",
+    }
+}
+
+/// Map a forced-decision string to a stable `&'static str` (`deny` only when explicit).
+fn intern_decision(decision: &str) -> &'static str {
+    match decision {
+        "deny" => "deny",
+        _ => "ask",
+    }
+}
+
+/// A human-readable reason for a high-risk `add` gate.
+fn high_risk_add_reason(kind: &str, entry_id: &str) -> String {
+    match kind {
+        "wallet_signing" => format!(
+            "`{entry_id}` is a high-risk wallet-signing catalog entry (can sign/submit transactions) — re-run with --yes to confirm"
+        ),
+        "key_custody" => format!(
+            "`{entry_id}` is a high-risk key-custody catalog entry (holds/derives private keys) — re-run with --yes to confirm"
+        ),
+        "installer_script" => format!(
+            "`{entry_id}` runs a download-and-execute installer (`curl … | bash`) — re-run with --yes to confirm"
+        ),
+        other => format!(
+            "`{entry_id}` is a high-risk catalog entry ({other}) — re-run with --yes to confirm"
+        ),
+    }
+}
+
 /// The underlying installer command `add` emits on a pass (the user runs it to install).
 fn underlying_install_cmd(kind: &str, source: &str) -> String {
     match kind {
@@ -463,25 +571,27 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
     }
 }
 
-/// `bootstrap` — the solana.new secure skills installer.
+/// `install` — hub-agnostic secure skills installer / in-place verifier.
 ///
-/// Downloads the published skills tarball (via `curl`), extracts it (via `tar`) into a temp
-/// dir, runs the intrinsic verification pipeline over each extracted skill, neutralizes any
-/// telemetry preamble in its `SKILL.md`, and installs ONLY the skills that pass into
-/// `~/.claude/skills/`. Network + subprocess are acceptable here: `bootstrap` is a one-shot
-/// user-invoked command, not a gate hot path, so shelling out keeps the binary zero-new-dep.
-/// Never widens `~/.claude/settings.json`. A skill with a High finding is held unless `--yes`.
+/// Runs the intrinsic verification pipeline over each skill directory in a LOCAL source,
+/// neutralizes any telemetry preamble in its `SKILL.md`, and installs ONLY the skills that
+/// pass. There is NO hardcoded download URL: the solana-new `skills.tar.gz` tarball path is
+/// retired (decision 2026-06-16). The source is always local.
 ///
-/// Offline affordances (default behavior unchanged):
 /// - `--from <dir-or-tarball>`: install from a local extracted directory or a local
-///   `.tar.gz`/`.tgz` instead of downloading over the network. A local directory skips both
-///   `curl` and `tar`; a local tarball skips only `curl`. This makes a fully hermetic,
-///   network-free install test possible.
+///   `.tar.gz`/`.tgz`. A local directory is used directly; a local tarball is extracted via
+///   `tar` (subprocess is acceptable here — `install` is a one-shot user-invoked command, not
+///   a gate hot path, so shelling out keeps the binary zero-new-dep).
+/// - no `--from`: operate on the current project's `.claude/skills` (verify-in-place) — no
+///   download, no copy; each immediate skill subdirectory is scanned and pinned (TOFU) in
+///   place. This is the post-`install.sh` audit path for the kit's project layout.
 /// - `--home <dir>` (or the `SAFE_SOLANA_AI_HOME` env var): write installed skills under
-///   `<dir>/.claude/skills` instead of the real `~/.claude/skills`, so a sandboxed test
-///   never touches the user's home. `--from`/`--home` are independent and composable.
-fn cmd_bootstrap(rest: &[String]) -> ExitCode {
-    const TARBALL_URL: &str = "https://www.solana.new/skills.tar.gz";
+///   `<dir>/.claude/skills` instead of the real `~/.claude/skills`, so a sandboxed test never
+///   touches the user's home. `--from`/`--home` are independent and composable. Ignored in the
+///   verify-in-place (no `--from`) mode, which never copies.
+///
+/// Never widens `settings.json`. A skill with a High finding is held unless `--yes`.
+fn cmd_install(rest: &[String]) -> ExitCode {
     let force = rest.iter().any(|a| a == "--yes" || a == "--force");
     let plugin_data = context::plugin_data_dir();
 
@@ -491,94 +601,57 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
         .or_else(|| std::env::var("SAFE_SOLANA_AI_HOME").ok())
         .filter(|s| !s.trim().is_empty());
 
-    // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
-    let stage = std::env::temp_dir().join(format!("ssai-bootstrap-{}", now_secs()));
-    if let Err(e) = std::fs::create_dir_all(&stage) {
-        return bootstrap_err(&format!("could not create staging dir: {e}"));
+    // No `--from`: verify the current project's `.claude/skills` in place (no download/copy).
+    if from.is_none() {
+        return install_verify_in_place(&plugin_data, force);
     }
-    let tarball = stage.join("skills.tar.gz");
+
+    // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
+    let stage = std::env::temp_dir().join(format!("ssai-install-{}", now_secs()));
+    if let Err(e) = std::fs::create_dir_all(&stage) {
+        return install_err(&format!("could not create staging dir: {e}"));
+    }
     let extract = stage.join("extract");
     let _ = std::fs::create_dir_all(&extract);
 
-    // Resolve the staged `extract` dir holding skill subdirectories. Three sources:
-    //   (a) `--from <dir>`         → use the local directory directly (no curl, no tar).
-    //   (b) `--from <tarball>`     → extract the local tarball (no curl).
-    //   (c) no `--from`            → download the published tarball, then extract.
-    let extract_dir: PathBuf = match from.as_deref() {
-        Some(src) => {
-            let src_path = verify::expand_home(src);
-            if src_path.is_dir() {
-                src_path
-            } else if src_path.is_file() {
-                let tar = std::process::Command::new("tar")
-                    .args([
-                        "-xzf",
-                        &src_path.display().to_string(),
-                        "-C",
-                        &extract.display().to_string(),
-                    ])
-                    .status();
-                match tar {
-                    Ok(s) if s.success() => extract.clone(),
-                    Ok(s) => {
-                        let _ = std::fs::remove_dir_all(&stage);
-                        return bootstrap_err(&format!("tar failed with status {s}"));
-                    }
-                    Err(e) => {
-                        let _ = std::fs::remove_dir_all(&stage);
-                        return bootstrap_err(&format!("could not run tar: {e}"));
-                    }
-                }
-            } else {
-                let _ = std::fs::remove_dir_all(&stage);
-                return bootstrap_err(&format!("--from source not found: {src}"));
-            }
-        }
-        None => {
-            // 1. Download.
-            let curl = std::process::Command::new("curl")
-                .args(["-fsSL", TARBALL_URL, "-o", &tarball.display().to_string()])
-                .status();
-            match curl {
-                Ok(s) if s.success() => {}
-                Ok(s) => {
-                    let _ = std::fs::remove_dir_all(&stage);
-                    return bootstrap_err(&format!("curl failed with status {s}"));
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&stage);
-                    return bootstrap_err(&format!("could not run curl: {e}"));
-                }
-            }
-
-            // 2. Extract.
+    // Resolve the source dir holding skill subdirectories from a LOCAL source only:
+    //   (a) `--from <dir>`     → use the local directory directly (no tar).
+    //   (b) `--from <tarball>` → extract the local tarball.
+    let extract_dir: PathBuf = {
+        let src = from.as_deref().unwrap_or_default();
+        let src_path = verify::expand_home(src);
+        if src_path.is_dir() {
+            src_path
+        } else if src_path.is_file() {
             let tar = std::process::Command::new("tar")
                 .args([
                     "-xzf",
-                    &tarball.display().to_string(),
+                    &src_path.display().to_string(),
                     "-C",
                     &extract.display().to_string(),
                 ])
                 .status();
             match tar {
-                Ok(s) if s.success() => {}
+                Ok(s) if s.success() => extract.clone(),
                 Ok(s) => {
                     let _ = std::fs::remove_dir_all(&stage);
-                    return bootstrap_err(&format!("tar failed with status {s}"));
+                    return install_err(&format!("tar failed with status {s}"));
                 }
                 Err(e) => {
                     let _ = std::fs::remove_dir_all(&stage);
-                    return bootstrap_err(&format!("could not run tar: {e}"));
+                    return install_err(&format!("could not run tar: {e}"));
                 }
             }
-            extract.clone()
+        } else {
+            let _ = std::fs::remove_dir_all(&stage);
+            return install_err(&format!("--from source not found: {src}"));
         }
     };
 
-    // 3. Verify + neutralize + install each extracted skill directory.
+    // Verify + neutralize + install each skill directory.
     //
     // The install root honors `--home`/`SAFE_SOLANA_AI_HOME` (`<home>/.claude/skills`) so a
-    // sandboxed test never touches the real `~/.claude/skills`. Bootstrap intentionally never
+    // sandboxed test never touches the real `~/.claude/skills`. `install` intentionally never
     // writes/widens `<home>/.claude/settings.json` (unlike solana-new's setup.sh).
     let install_root = match &home_override {
         Some(home) => PathBuf::from(home).join(".claude").join("skills"),
@@ -652,9 +725,8 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
             continue;
         }
 
-        // Pin the installed content (TOFU). The recorded source is the local `--from` path
-        // when bootstrapping offline, else the published tarball URL.
-        let pin_source = from.clone().unwrap_or_else(|| TARBALL_URL.to_string());
+        // Pin the installed content (TOFU). The recorded source is the local `--from` path.
+        let pin_source = from.clone().unwrap_or_default();
         let hash = verify::lockfile::hash_tree(&dest);
         lock.pin_skill(
             &name,
@@ -677,13 +749,13 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
 
     audit_event(
         &plugin_data,
-        "bootstrap",
-        "bootstrap",
+        "install",
+        "install",
         &format!("installed={} held={}", installed.len(), held.len()),
     );
 
     print_json(&serde_json::json!({
-        "command": "bootstrap",
+        "command": "install",
         "status": "done",
         "installed": installed,
         "held": held,
@@ -693,12 +765,187 @@ fn cmd_bootstrap(rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Emit a bootstrap error result line.
-fn bootstrap_err(msg: &str) -> ExitCode {
+/// Emit an install error result line.
+fn install_err(msg: &str) -> ExitCode {
     print_json(&serde_json::json!({
-        "command": "bootstrap",
+        "command": "install",
         "status": "error",
         "error": msg,
+    }));
+    ExitCode::SUCCESS
+}
+
+/// `install` with no `--from`: verify the current project's `.claude/skills` in place.
+///
+/// No download, no copy: each immediate skill subdirectory under `<cwd>/.claude/skills` is
+/// scanned (and its telemetry preamble neutralized in place), then pinned (TOFU) in the
+/// lockfile. A High finding holds the skill (reported, not installed) unless `--yes`. This is
+/// the post-`install.sh` audit path for the kit's project layout.
+fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let skills_root = cwd.join(".claude").join("skills");
+    if !skills_root.is_dir() {
+        return install_err(&format!(
+            "no --from and no project skills dir at {}",
+            skills_root.display()
+        ));
+    }
+
+    let mut lock = verify::lockfile::load(plugin_data);
+    let mut verified: Vec<String> = Vec::new();
+    let mut held: Vec<serde_json::Value> = Vec::new();
+    let mut flagged: Vec<serde_json::Value> = Vec::new();
+
+    for dir in skill_dirs_under(&skills_root) {
+        let name = match dir.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let pre_report = verify::pipeline_dir(&dir, None);
+        for f in &pre_report.findings {
+            flagged.push(serde_json::json!({
+                "skill": name,
+                "severity": verify::severity_label(f.severity),
+                "kind": f.kind,
+                "detail": f.detail,
+            }));
+        }
+
+        let skill_md = dir.join("SKILL.md");
+        if let Ok(body) = std::fs::read_to_string(&skill_md) {
+            let (cleaned, changed) = verify::neutralize_telemetry(&body);
+            if changed {
+                let _ = std::fs::write(&skill_md, cleaned);
+            }
+        }
+
+        let report = verify::pipeline_dir(&dir, None);
+        let verdict = verify::verdict(&report);
+        let proceed = match verdict {
+            verify::Verdict::Pass => true,
+            verify::Verdict::Warn => force,
+            verify::Verdict::Block => false,
+        };
+        if !proceed {
+            held.push(serde_json::json!({
+                "skill": name,
+                "verdict": verdict.label(),
+                "findings": report.findings.len(),
+            }));
+            continue;
+        }
+
+        let hash = verify::lockfile::hash_tree(&dir);
+        lock.pin_skill(
+            &name,
+            verify::lockfile::SkillPin {
+                sha256: hash,
+                source: skills_root.display().to_string(),
+                verified_at: now_secs(),
+                scan: report
+                    .max_severity()
+                    .map(verify::severity_label)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        );
+        verified.push(name);
+    }
+
+    let _ = verify::lockfile::save(plugin_data, &lock);
+    audit_event(
+        plugin_data,
+        "install",
+        "verify_in_place",
+        &format!("verified={} held={}", verified.len(), held.len()),
+    );
+
+    print_json(&serde_json::json!({
+        "command": "install",
+        "status": "done",
+        "mode": "verify_in_place",
+        "verified": verified,
+        "held": held,
+        "flagged": flagged,
+        "skills_root": skills_root.display().to_string(),
+    }));
+    ExitCode::SUCCESS
+}
+
+/// `registry verify|list` — opt-in catalog audit / listing.
+///
+/// Loads the project `.claude/skills/skill-registry.json` (path from
+/// `policy.catalog.registry_path`) via [`registry::Registry::load`] and either:
+/// - `list`: prints every entry with its opt-in status and derived `risk_class`; or
+/// - `verify`: additionally resolves each high-risk entry to its forced class decision
+///   (`ask`/`deny`) via [`registry::Registry::decision_for_kind`] and writes one audit entry
+///   per high-risk entry so the catalog's dangerous opt-ins (`phantom-mcp`, `x402-proxy-mcp`,
+///   …) leave a loud record.
+///
+/// A missing registry file degrades to an empty catalog (count 0), so both actions are safe to
+/// run on a project that has not opted into the catalog.
+fn cmd_registry(rest: &[String]) -> ExitCode {
+    let action = rest.first().map(String::as_str).unwrap_or("list");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let plugin_data = context::plugin_data_dir();
+    let policy = load_effective_policy(&cwd, &plugin_data);
+    let reg_path = cwd.join(&policy.catalog.registry_path);
+
+    if action != "verify" && action != "list" {
+        print_json(&serde_json::json!({
+            "command": "registry",
+            "status": "error",
+            "error": "usage: registry verify|list",
+        }));
+        return ExitCode::SUCCESS;
+    }
+
+    let reg = registry::Registry::load(&reg_path).unwrap_or_default();
+    let auditing = action == "verify";
+    let mut high_risk_count = 0usize;
+    let entries: Vec<serde_json::Value> = reg
+        .entries
+        .iter()
+        .map(|e| {
+            let risk = registry::Registry::high_risk(e, &policy);
+            // `verify` surfaces the forced class decision (ask/deny) and audits the entry.
+            let decision = risk
+                .as_deref()
+                .and_then(|kind| registry::Registry::decision_for_kind(&policy, kind));
+            if auditing && risk.is_some() {
+                high_risk_count += 1;
+                audit_event(
+                    &plugin_data,
+                    "registry_high_risk",
+                    decision.unwrap_or("ask"),
+                    &format!(
+                        "id={} class={} opt_in={}",
+                        e.id,
+                        risk.as_deref().unwrap_or(""),
+                        e.is_opt_in()
+                    ),
+                );
+            }
+            serde_json::json!({
+                "id": e.id,
+                "title": e.title,
+                "category": e.category,
+                "opt_in": e.is_opt_in(),
+                "default_installed": e.default_installed,
+                "risk_class": risk,
+                "decision": decision,
+            })
+        })
+        .collect();
+
+    print_json(&serde_json::json!({
+        "command": "registry",
+        "action": action,
+        "registry_path": reg_path.display().to_string(),
+        "count": entries.len(),
+        "high_risk": high_risk_count,
+        "entries": entries,
     }));
     ExitCode::SUCCESS
 }
