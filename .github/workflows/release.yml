@@ -51,6 +51,7 @@ env:
   RUST_TOOLCHAIN: stable
   MANIFEST: crates/engine/Cargo.toml
   BIN_NAME: ssai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ── per-platform native builds ────────────────────────────────────────────
