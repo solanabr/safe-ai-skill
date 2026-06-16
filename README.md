@@ -1,6 +1,5 @@
 <p align="center">
-  <strong>safe-ai-skill</strong><br>
-  <em>Hooks-based firewall and supply-chain verifier for Claude Code skills, MCPs, and agents</em>
+  <img src="assets/banner.png" alt="Safe AI Skill — security firewall and supply-chain verifier for Claude Code skills and MCPs" width="100%" />
 </p>
 
 <p align="center">
