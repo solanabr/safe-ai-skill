@@ -24,7 +24,7 @@ Both `safe-ai-skill` and `safe-ai-skill` are registered as bin aliases.
 
 ```bash
 # Gate installs before they run
-safe-ai-skill add skill <name|url>    # any GitHub skill URL or solana-new catalog entry
+safe-ai-skill add skill <name|url>    # any GitHub skill URL or catalog entry
 safe-ai-skill add mcp <id|pkg|url>    # any MCP; pins exact version before writing .mcp.json
 safe-ai-skill add repo <url>          # any clonable repo; pins to commit SHA
 
@@ -34,8 +34,8 @@ safe-ai-skill verify
 # Show status: pins, quarantine list, active profile, live grants, recent decisions
 safe-ai-skill status
 
-# Secure drop-in for: curl solana.new/setup.sh | bash
-safe-ai-skill bootstrap
+# Hub-agnostic secure install: verify, diff, and approve before writing
+safe-ai-skill install --from <url|ref>
 ```
 
 ## Claude Code plugin
@@ -69,6 +69,5 @@ cargo install safe-ai-skill
 ## Further reading
 
 - [GitHub repository](https://github.com/solanabr/safe-ai-skill)
-- [Architecture](https://github.com/solanabr/safe-ai-skill/blob/main/docs/architecture.md)
-- [Usage reference](https://github.com/solanabr/safe-ai-skill/blob/main/docs/usage.md)
+- [README](https://github.com/solanabr/safe-ai-skill/blob/main/README.md)
 - [Security policy](https://github.com/solanabr/safe-ai-skill/blob/main/SECURITY.md)

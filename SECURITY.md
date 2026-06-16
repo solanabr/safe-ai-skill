@@ -16,7 +16,7 @@
 
 ### `ext/` submodule supply chain
 
-solana-ai-kit ships 18 third-party `ext/` git submodules: third-party security tools, DeFi protocol SDKs, NFT tooling, and infrastructure integrations (including `ext/solana-new`, `ext/ghostsecurity`, `ext/trailofbits`, `ext/jupiter`, `ext/metaplex`, `ext/helius`, `ext/sendai`, `ext/vercel`, and others). Each is an independent supply-chain unit with a different origin, maintainer, and risk profile.
+solana-ai-kit ships 18 third-party `ext/` git submodules: third-party security tools, DeFi protocol SDKs, NFT tooling, and infrastructure integrations (including `ext/ghostsecurity`, `ext/trailofbits`, `ext/jupiter`, `ext/metaplex`, `ext/helius`, `ext/sendai`, `ext/vercel`, and others). Each is an independent supply-chain unit with a different origin, maintainer, and risk profile.
 
 **What can go wrong per submodule:**
 - Telemetry preambles in SKILL.md files that POST skill-invocation metadata to third-party endpoints.
@@ -27,7 +27,7 @@ solana-ai-kit ships 18 third-party `ext/` git submodules: third-party security t
 
 **safe-ai-skill's response:** each submodule is walked by `ext_verify.rs` at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the submodule is quarantined and the diff is surfaced in `additionalContext`. The user must explicitly re-pin with `safe-ai-skill verify approve <name>` after reviewing the diff.
 
-**`ext/solana-new` specifically:** this submodule carries the 14 findings documented in `docs/solana-new-security.md` (3 Critical, 4 High, 4 Medium, 3 Low) — including the attacker-mutable Convex telemetry endpoint, the unsigned tarball installer, and the global Bash/Read permission grant pattern. safe-ai-skill treats it identically to every other `ext/` submodule: the telemetry preamble is flagged and neutralized generically by `heuristics.rs`; there is no special-casing for `ext/solana-new`.
+**No special-casing:** some submodules carry known supply-chain risks — attacker-mutable telemetry endpoints, unsigned tarball installers, and global Bash/Read permission grant patterns. safe-ai-skill treats every `ext/` submodule identically: telemetry preambles and installer patterns are flagged and neutralized generically by `heuristics.rs`; no submodule is special-cased.
 
 ### `@latest` MCP posture
 
