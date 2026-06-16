@@ -6,22 +6,132 @@ The `safe-solana-ai` CLI and its `ssai` alias are the same binary. `ssai` is use
 
 ---
 
+### `safe-solana-ai install`
+
+Download and verified-install `solanabr/solana-ai-kit` into the project `.claude/` directory. This is the secure drop-in for `curl https://aikit.superteam.codes | bash`.
+
+```bash
+# Install solana-ai-kit from the default source
+safe-solana-ai install
+
+# Install from a specific source URL or GitHub ref
+safe-solana-ai install --from https://github.com/solanabr/solana-ai-kit@a3c3d23
+
+# Override the install destination (default: ./.claude)
+safe-solana-ai install --home ~/.claude
+```
+
+**What install does, in order:**
+
+1. Downloads the hub source (clone or tarball, depending on `--from`).
+2. Runs `heuristics.rs` on every SKILL.md and catalog entry.
+3. Walks all `ext/` submodules individually; pins each to its current git SHA in `lockfile.json`.
+4. Parses `skill-registry.json` and flags any high-risk catalog entries.
+5. Flags all `@latest` MCP entries in `.mcp.json` as INFORMATIONAL (LOW) — does not auto-rewrite.
+6. Shows a diff of all flagged content.
+7. Prompts for approval before writing anything to disk.
+8. Does not auto-widen `~/.claude/settings.json` permissions.
+
+```
+# Example output
+Fetching solanabr/solana-ai-kit@a3c3d23...
+Scanning 15 agents... OK
+Scanning 18 ext/ submodules...
+  INFO  ext/solana-new:          git SHA a1b2c3d — telemetry preamble detected (neutralized)
+  WARN  ext/ghostsecurity:       curl|bash installer in SKILL.md — HIGH
+  OK    ext/jupiter:             pinned 4f9e2a1
+  OK    ext/metaplex:            pinned 8c3b5d2
+  [14 more OK]
+Scanning skill-registry.json (39 entries)...
+  HIGH  phantom-mcp:             class=wallet_signing — policy requires approval
+  HIGH  x402-proxy-mcp:          class=key_custody — policy requires approval
+  INFO  ghostsecurity:           class=installer_script — will gate at exec_install_scripts policy
+Scanning .mcp.json (7 MCPs)...
+  INFO  helius-mcp:              @latest (informational — use 'ssai pin-mcps' to pin)
+  INFO  solana-dev:              @latest
+  [5 more @latest]
+Proceed with install? [y/N]
+```
+
+---
+
+### `safe-solana-ai registry list`
+
+List all entries in `skill-registry.json` with their risk classification and install status.
+
+```bash
+safe-solana-ai registry list
+
+# Output:
+# NAME                  CLASS             DEFAULT    INSTALLED  GATE
+# anchor-specialist     standard          false      yes        standard
+# phantom-mcp           wallet_signing    false      no         DENY (policy)
+# x402-proxy-mcp        key_custody       false      no         DENY (policy)
+# ghostsecurity         installer_script  false      no         ASK (exec_install_scripts)
+# jupiter               standard          false      yes        standard
+# [35 more entries]
+```
+
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--class <class>` | Filter by risk class (`standard`, `wallet_signing`, `key_custody`, `installer_script`) |
+| `--installed` | Show only installed entries |
+| `--high-risk` | Show only `wallet_signing` and `key_custody` entries |
+
+---
+
+### `safe-solana-ai registry verify`
+
+Audit all installed registry entries against the pinned catalog state. Reports drift, missing pins, and entries installed outside the registry pipeline.
+
+```bash
+safe-solana-ai registry verify
+
+# Output:
+# Registry entries installed (6):
+#   OK    anchor-specialist  git SHA 4f9e2a1 matches lockfile
+#   OK    jupiter            git SHA 8c3b5d2 matches lockfile
+#   WARN  colosseum-copilot  git SHA changed: 8c3b5d2 → c1d2e3f (quarantine? y/N)
+# Entries installed outside registry (1):
+#   WARN  custom-skill       not in registry; no catalog risk classification
+```
+
+---
+
 ### `safe-solana-ai add skill <name|url>`
 
 Fetch a skill and run the intrinsic verification pipeline before installing it.
 
-`<name>` resolves against the solana-new catalog (`~/.superstack/` if present). `<url>` accepts any GitHub URL or `github:<owner>/<repo>` shorthand. Moving refs (`main`, `HEAD`, branch names) are resolved to a commit SHA before fetch; the SHA is what gets pinned.
+`<name>` resolves against the installed `skill-registry.json`. `<url>` accepts any GitHub URL or `github:<owner>/<repo>` shorthand. Moving refs (`main`, `HEAD`, branch names) are resolved to a commit SHA before fetch; the SHA is what gets pinned.
 
-**Pipeline steps:** static heuristics scan → provenance pin to commit SHA → osv.dev CVE check for any npm deps declared in the skill → TOFU lockfile entry. On high-severity heuristic match or known CVE, the install is refused and the reason is printed. On medium findings, a diff is shown and approval is requested. On clean, the skill is installed and pinned.
+**High-risk entry gating.** If `<name>` resolves to a `wallet_signing` or `key_custody` catalog entry, ssai shows a risk summary and requires explicit confirmation — regardless of the general policy setting — before proceeding:
+
+```
+safe-solana-ai add skill phantom-mcp
+
+# Output:
+# RISK: phantom-mcp is class=wallet_signing
+# This skill requests signing permissions over arbitrary transactions via Phantom wallet.
+# Approving allows the agent to initiate wallet signing requests without further confirmation.
+# Policy: DENY (catalog.high_risk_classes includes wallet_signing)
+# To allow, update .safe-solana-ai/policy.yaml:
+#   catalog:
+#     high_risk_classes: []   # or remove wallet_signing from the list
+# Install refused.
+```
+
+**Pipeline steps:** static heuristics scan → risk-class check → provenance pin to commit SHA → osv.dev CVE check → TOFU lockfile entry. On high-severity match or known CVE, install is refused. On medium findings, a diff is shown and approval is requested. On clean, the skill is installed and pinned.
 
 ```bash
-# Install from solana-new catalog by name
-safe-solana-ai add skill scaffold-project
+# Install from the registry by name
+safe-solana-ai add skill anchor-specialist
 
 # Install from an arbitrary GitHub URL
 safe-solana-ai add skill https://github.com/example/my-solana-skill
 
-# Install from a specific commit (already immutable — no resolution needed)
+# Install from a specific commit (already immutable)
 safe-solana-ai add skill github:example/my-solana-skill@abc1234
 ```
 
@@ -31,18 +141,31 @@ safe-solana-ai add skill github:example/my-solana-skill@abc1234
 
 Resolve an MCP package to an exact version, verify it, pin it, and write the entry to `.mcp.json`.
 
-`<id>` resolves against the solana-new MCP catalog. `<pkg>` is an npm package name (optionally `@version`). `<url>` accepts a GitHub URL. Packages specified as `@latest` or without a version are resolved to the current latest version at fetch time; the pinned exact version is written to `.mcp.json`, not `@latest`.
+`<id>` resolves against the installed `skill-registry.json` MCP catalog. `<pkg>` is an npm package name (optionally `@version`). Packages specified as `@latest` or without a version are resolved to the current latest version at fetch time; the pinned exact version is written to `.mcp.json`, not `@latest`.
 
-**Pipeline steps:** resolve to `pkg@x.y.z` + record `dist.shasum`/integrity → flag if package is very new, very low-download, or typosquat-similar to a popular name → osv.dev CVE check for `pkg@x.y.z` → TOFU lockfile entry with shasum. The `setup_command` from the catalog entry is inspected by `heuristics.rs` before execution.
+`@latest` entries already in `.mcp.json` (from a kit install) are **not** auto-rewritten. ssai flags them as INFORMATIONAL and offers `ssai pin-mcps` as an opt-in rewrite.
+
+**High-risk MCP gating.** If `<id>` resolves to a `wallet_signing` or `key_custody` catalog entry, the same risk-summary gate applies as for `add skill`:
+
+```
+safe-solana-ai add mcp x402-proxy-mcp
+
+# Output:
+# RISK: x402-proxy-mcp is class=key_custody
+# This MCP holds BIP-39 key custody for x402 payment channel operations.
+# Approving grants the MCP access to derive and store payment keys.
+# Policy: DENY (catalog.high_risk_classes includes key_custody)
+# Install refused.
+```
 
 ```bash
-# Install by solana-new catalog ID
+# Install by registry ID (verifies and pins to exact version)
 safe-solana-ai add mcp helius
 
 # Install by npm package name (resolves to exact version)
 safe-solana-ai add mcp @modelcontextprotocol/server-filesystem
 
-# Install a specific version (skips resolution, still verified)
+# Install a specific version (still fully verified)
 safe-solana-ai add mcp @modelcontextprotocol/server-filesystem@1.2.3
 ```
 
@@ -52,7 +175,7 @@ safe-solana-ai add mcp @modelcontextprotocol/server-filesystem@1.2.3
 
 Clone a repository, pin it to a commit SHA, and record it in the lockfile.
 
-Moving refs are rejected with an error — you must supply either a full commit SHA in the URL fragment or use `@<sha>` syntax. This enforces that the content you verified is the content that runs.
+Moving refs are rejected — you must supply either a full commit SHA in the URL fragment or use `@<sha>` syntax.
 
 ```bash
 # Rejected — moving ref
@@ -67,46 +190,27 @@ safe-solana-ai add repo https://github.com/example/tools#a3f9c12de4b5f6789012345
 
 ---
 
-### `safe-solana-ai bootstrap`
-
-The secure drop-in for `curl solana.new/setup.sh | bash`.
-
-Downloads solana-new's skills tarball and the three catalog JSONs (`solana-skills.json`, `solana-mcps.json`, `clonable-repos.json`). Runs the full verification pipeline on every SKILL.md and every `setup_command`/`clone_command` entry. Neutralizes the telemetry preamble in each SKILL.md (sets `telemetryTier=off`, removes or no-ops the Convex `curl` call). Pins every MCP to an exact version. Shows a diff of flagged content for approval before writing anything to disk. Does not auto-widen `~/.claude/settings.json` permissions.
-
-```bash
-safe-solana-ai bootstrap
-
-# Output:
-# Fetching solana-new tarball...
-# Scanning 80 skills... 3 flagged
-#   WARN scaffold-project: telemetry preamble (neutralized)
-#   WARN colosseum-copilot: reads ~/.superstack/config.json (JWT present)
-#   HIGH custom-skill: base58 key in SKILL.md preamble (install refused)
-# Scanning 41 MCPs...
-#   WARN helius: pinned @latest -> 3.2.1
-#   WARN solana-dev: pinned @latest -> 1.0.4
-# Proceed with install? [y/N]
-```
-
----
-
 ### `safe-solana-ai verify`
 
 On-demand audit of everything already installed.
 
-Re-hashes all pinned skill directories against `lockfile.json`. Re-checks all pinned MCP entries for CVEs (re-querying osv.dev for any that have not been checked within the last 24 hours). Flags any `@latest` MCP entries in `.mcp.json` that were not installed via `safe-solana-ai add`. Reports findings without modifying anything; use `ssai verify approve <name>` to re-pin after reviewing a change.
+Re-hashes all pinned skill directories against `lockfile.json`. Re-checks all pinned `ext/` submodule git SHAs against their current state. Re-checks all pinned MCP entries for CVEs (re-querying osv.dev for any not checked within the last 24 hours). Flags any `@latest` MCP entries in `.mcp.json` that were not installed via `safe-solana-ai add`. Reports findings without modifying anything.
 
 ```bash
 safe-solana-ai verify
 
 # Output:
-# Skills:
-#   OK   scaffold-project  (sha256 matches)
-#   WARN anchor-specialist (drift detected — hash changed since last pin)
-#   OK   colosseum-copilot
+# ext/ submodules (18):
+#   OK   ext/jupiter            git SHA 4f9e2a1 matches lockfile
+#   OK   ext/metaplex           git SHA 8c3b5d2 matches lockfile
+#   WARN ext/solana-new         git SHA changed: a1b2c3d → d4e5f6g
+#   [15 more OK]
+# Skills (3 installed outside ext/):
+#   OK   anchor-specialist  (sha256 matches)
+#   WARN custom-skill       (drift — hash changed since last pin)
 # MCPs:
-#   OK   @helius-labs/helius-mcp@3.2.1
-#   WARN @modelcontextprotocol/server-filesystem (unpinned @latest)
+#   INFO @helius-labs/helius-mcp  @latest (informational; use 'ssai pin-mcps' to pin)
+#   OK   @modelcontextprotocol/server-filesystem@1.2.3
 # Run 'ssai verify approve <name>' to re-pin after review.
 ```
 
@@ -124,30 +228,32 @@ safe-solana-ai status
 # Active grants: none
 # Spend today: 0.3 SOL / 5.0 SOL daily cap
 #
-# Pinned skills (12):    all OK
-# Pinned MCPs (6):       all OK
-# Quarantined (0):       none
+# ext/ submodules (18):  17 OK, 1 quarantined
+# Pinned skills (3):     all OK
+# Pinned MCPs (7):       7 @latest (informational)
+# Quarantined (1):       ext/solana-new (SHA drift)
 #
 # Recent decisions (last 10):
 #   allow  gate-bash    solana transfer ABC... 0.1  devnet
 #   ask    gate-bash    anchor deploy          mainnet
 #   deny   gate-read    ~/.config/solana/id.json
+#   ask    gate-mcp     mcp__helius__heliusWrite.sendSol
 ```
 
 ---
 
 ### `ssai mode <profile>`
 
-Set the active policy profile. The profile adjusts soft-gate thresholds in `policy.effective()` before gate evaluation. Persists across sessions.
+Set the active policy profile. Persists across sessions.
 
 | Profile | Effect |
 |---------|--------|
-| `strict` | Default. All gates active at policy values. |
+| `strict` | Default. All gates active at policy values. `exec_install_scripts: ask`. |
 | `autopilot` | Raises spend caps; devnet routine operations become `allow`. Hard guards unchanged. |
-| `paranoid` | Lowers spend caps; all transfers require `ask` regardless of amount. |
+| `paranoid` | Lowers spend caps; all transfers require `ask`; `exec_install_scripts: deny`; `installer_script` catalog class denied. |
 | `off` | Disables all soft gates. Hard guards unchanged and cannot be disabled. |
 
-Hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are not modified by any profile. The engine enforces this unconditionally.
+Hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are not modified by any profile.
 
 ```bash
 ssai mode autopilot   # raise caps for a high-frequency devnet session
@@ -159,7 +265,7 @@ ssai mode off         # disable soft gates (hard guards remain)
 
 ### `ssai allow`
 
-Create a time-boxed grant that relaxes one or more soft gates for a specific scope and duration. Grants are applied in `relax::apply` after `policy.effective()`. Hard guards are not relaxable by any grant.
+Create a time-boxed grant that relaxes one or more soft gates for a specific scope and duration. Hard guards are not relaxable by any grant.
 
 **Flags:**
 
@@ -206,11 +312,9 @@ ssai revoke --all
 
 ### `ssai session init --cap <SOL>`
 
-Generate an ephemeral Ed25519 keypair, fund it from the master wallet with a SOL cap, and export it for the current session (Phase 3).
+Generate an ephemeral Ed25519 keypair, fund it from the master wallet with a SOL cap, and export it for the current session.
 
-The funding transaction itself is routed through the Phase 1 gate — it requires approval as a mainnet transfer. The keypair is written mode 0600 to `${CLAUDE_PLUGIN_DATA}/session/<id>.json`. The path is exported via `$CLAUDE_ENV_FILE` so skills that reference `$SOLANA_KEYPAIR` or the default Solana CLI config pick it up automatically. The master key remains read-denied throughout.
-
-The session keypair caps agent spending by construction: an agent can spend at most what is in the session keypair's balance. Any over-cap attempts are blocked by the Phase 1 transfer gate on the session balance, not by policy alone.
+The funding transaction is routed through the Phase 1 gate — it requires approval as a mainnet transfer. The keypair is written mode 0600 to `${CLAUDE_PLUGIN_DATA}/session/<id>.json`. The path is exported via `$CLAUDE_ENV_FILE` so skills that reference `$SOLANA_KEYPAIR` pick it up automatically. The master key remains read-denied throughout.
 
 ```bash
 ssai session init --cap 0.5
@@ -226,7 +330,7 @@ ssai session init --cap 0.5
 
 ### `ssai session status`
 
-Show the current session keypair ID, current balance, and remaining cap.
+Show the current session keypair ID, balance, and remaining cap.
 
 ```bash
 ssai session status
@@ -243,13 +347,16 @@ ssai session status
 
 ### `ssai verify approve <name>`
 
-Restore a quarantined skill or re-pin a skill whose content has drifted. After restoring, the new content hash is recorded in the lockfile.
+Restore a quarantined skill or `ext/` submodule, or re-pin content whose hash drifted. After restoring, the new content hash or git SHA is recorded in the lockfile.
 
 ```bash
 # List what is quarantined
 ssai verify approve
 
-# Restore and re-pin a specific skill
+# Restore and re-pin a specific ext/ submodule after reviewing the diff
+ssai verify approve ext/solana-new
+
+# Restore a skill dir
 ssai verify approve anchor-specialist
 ```
 
@@ -257,22 +364,21 @@ ssai verify approve anchor-specialist
 
 ## Policy override
 
-Place a file at `<project>/.safe-solana-ai/policy.yaml` to override the defaults for that project. The file is deep-merged over the defaults: only keys present in the override file take effect; all other defaults remain. Array values in override files replace (not extend) the corresponding default arrays.
+Place a file at `<project>/.safe-solana-ai/policy.yaml` to override the defaults for that project. The file is deep-merged over the defaults: only keys present in the override file take effect. Array values replace (not extend) the corresponding default arrays.
 
 ```yaml
 # <project>/.safe-solana-ai/policy.yaml
-# Only the keys you specify here override the defaults.
 
 version: 1
 
-# Raise spend caps for a trading bot that moves larger amounts on devnet
+# Raise spend caps for a trading bot on devnet
 spend:
   per_tx_sol_max: 5.0       # default: 1.0
   hard_tx_sol_max: 50.0     # default: 10.0
   daily_sol_max: 20.0       # default: 5.0
 
-# Add project-specific secret paths to the deny list.
-# This REPLACES the default deny_read_globs array — include any defaults you want to keep.
+# Add project-specific secret paths.
+# This REPLACES the default deny_read_globs array.
 secrets:
   deny_read_globs:
     - "**/*-keypair.json"
@@ -281,9 +387,23 @@ secrets:
     - "**/.env.*"
     - "**/*.pem"
     - "~/.config/solana/**"
-    - "~/.superstack/config.json"
-    - "**/secrets/**"         # project-specific addition
-    - "**/.api-keys"          # project-specific addition
+    - "**/secrets/**"
+    - "**/.api-keys"
+
+# Allow install-script execution in this project (not recommended globally)
+exec_install_scripts: ask   # default: ask; options: allow | ask | deny
+
+# Catalog risk class gates for this project
+catalog:
+  # Remove key_custody from the denied set to allow x402-proxy-mcp (use carefully)
+  high_risk_classes:
+    - wallet_signing
+  denied_classes: []
+
+# Per-ext-submodule supply chain settings
+ext:
+  pin_on_first_seen: true
+  quarantine_on_drift: true
 
 # Disable rugcheck for this project (using only curated, known-good mints)
 swap:
@@ -294,16 +414,18 @@ supply_chain:
   verify_skills_dirs:
     - "~/.claude/skills"
     - ".claude/skills"
-    - "./project-skills"    # project-local skills directory
+    - "./project-skills"
 ```
 
-**What cannot be overridden.** The hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are enforced by the engine and are not present in the policy DSL. They cannot be removed, relaxed by a profile, or overridden by a project policy file. There is no `--danger` flag in v1 that affects them.
+**What cannot be overridden.** The hard guards (`mainnet_deploy`, `set_authority`, `account_close`, `secret_read`) are enforced by the engine and are not present in the policy DSL. There is no `--danger` flag in v1 that affects them.
 
-**Fail-closed.** If `policy.yaml` has a parse error, the engine falls back to treating all gated actions as `ask`. The session continues with a warning; it is never left unprotected because of a config file error.
+**Fail-closed.** If `policy.yaml` has a parse error, the engine falls back to treating all gated actions as `ask`. The session is never left unprotected because of a config error.
+
+---
 
 ## Gate behavior: what you will see
 
-These are the literal interactions a user will encounter for the most common gated actions.
+These are the literal interactions a user encounters for the most common gated actions.
 
 ---
 
@@ -311,15 +433,13 @@ These are the literal interactions a user will encounter for the most common gat
 
 Triggered by `anchor deploy`, `solana program deploy`, `solana program upgrade`, or any equivalent with a mainnet RPC URL resolved by `context.rs`.
 
-Claude Code surfaces an `ask` prompt:
-
 ```
 safe-solana-ai: MAINNET DEPLOY — approve to proceed?
 Command: anchor deploy --provider.cluster mainnet-beta
 Program: target/deploy/my_program.so
 ```
 
-Approving allows the command to run. Denying blocks it. The decision is recorded in `audit.jsonl`. This replaces the defunct `read -r` gate that was in the prior hook configuration and never fired due to the no-TTY constraint.
+This replaces the kit's broken `read -r` gate, which exits immediately in hook context (no TTY) and always fails open.
 
 ---
 
@@ -336,9 +456,57 @@ Daily spent: 0.3 SOL / 5.0 SOL cap
 
 ---
 
+**Value-moving MCP call**
+
+Triggered by `mcp__helius__heliusWrite.sendSol`, `mcp__helius__heliusWrite.stakeSOL`, or any tool name matching `send|stake|delegate|mint|bridge|lend|borrow`.
+
+```
+safe-solana-ai: MCP value-moving call — approve?
+Tool: mcp__helius__heliusWrite.sendSol
+Payload: { "to": "9WzDXwBb...", "amount": 1.0 }
+Network: mainnet-beta
+```
+
+---
+
+**High-risk catalog entry execution**
+
+Triggered when the agent invokes a tool from a `wallet_signing` MCP entry that was approved at install time but gated at runtime.
+
+```
+safe-solana-ai: HIGH-RISK MCP — wallet_signing class. Approve?
+Tool: mcp__phantom__signTransaction
+Entry: phantom-mcp (class=wallet_signing, approved at install)
+This action requests Phantom wallet to sign a transaction.
+```
+
+---
+
+**`curl|bash` install script**
+
+Triggered by `curl https://example.com/install.sh | bash` or equivalent (caught by `gate-bash-secrets`, unconditional).
+
+```
+safe-solana-ai: Install script detected — approve execution?
+Pattern: curl ... | bash
+URL: https://example.com/install.sh
+Policy: exec_install_scripts=ask
+(First 20 lines of script shown)
+```
+
+With `exec_install_scripts: deny`:
+
+```
+safe-solana-ai: Install script execution denied
+Pattern: curl ... | bash
+Policy: exec_install_scripts=deny
+```
+
+---
+
 **Keypair or secret file read**
 
-Triggered by `Read ~/.config/solana/id.json`, `Read .env`, `cat ~/.config/solana/id.json` (caught by `gate-bash-secrets`), or any path matching `secrets.deny_read_globs`.
+Triggered by `Read ~/.config/solana/id.json`, `Read .env`, or any path matching `secrets.deny_read_globs`.
 
 ```
 safe-solana-ai: Read denied
@@ -346,7 +514,7 @@ Path: ~/.config/solana/id.json
 Reason: matches secret glob ~/.config/solana/**
 ```
 
-This is a `deny`, not an `ask`. It is a hard guard. It holds even with `bypassPermissions` active. There is no approval path.
+This is a hard guard — `deny`, not `ask`. It holds with `bypassPermissions` active. There is no approval path.
 
 ---
 
@@ -360,7 +528,7 @@ Mint: Hf...xQ (score 87/100)
 Risks: ["Mutable metadata", "No liquidity", "Creator holds 94%"]
 ```
 
-If the rugcheck API is unavailable or times out (default 3000ms):
+On rugcheck timeout:
 
 ```
 safe-solana-ai: Rugcheck unavailable — approve swap manually?
@@ -368,21 +536,19 @@ Mint: Hf...xQ
 Rugcheck: timed out after 3000ms
 ```
 
-Timeout always produces `ask`, never `deny` (to avoid blocking the session on third-party uptime) and never `allow` (to avoid silent bypass of risk checks).
+Timeout always produces `ask`, never `deny` and never `allow`.
 
 ---
 
-**solana-new telemetry curl**
+**Telemetry preamble blocked**
 
-Triggered when a skill's Bash call matches the Convex exfiltration pattern: `curl -s -X POST <convex-url>/api/mutation ...`.
+Triggered when a skill's Bash call matches the Convex exfiltration pattern or any config-driven telemetry endpoint pattern (caught by `gate-bash-secrets`).
 
 ```
 safe-solana-ai: Outbound POST denied
 Command: curl -s -X POST https://...convex.cloud/api/mutation ...
 Reason: matches telemetry/exfiltration endpoint pattern (gate-bash-secrets)
 ```
-
-This is caught by `gate-bash-secrets` (unconditional, no `if` required) before the curl executes. The solana-new skill's telemetry preamble fires this pattern on every skill invocation.
 
 ---
 
@@ -391,17 +557,19 @@ This is caught by `gate-bash-secrets` (unconditional, no `if` required) before t
 When `verify session` quarantines content, Claude Code's `additionalContext` mechanism injects a warning at the top of the session:
 
 ```
-[safe-solana-ai] Supply-chain warning — 1 skill quarantined:
-  anchor-specialist: content hash changed since last pin
-  Last pinned: 2026-06-08T14:23:11Z
-  Quarantine path: ${CLAUDE_PLUGIN_DATA}/quarantine/anchor-specialist/
+[safe-solana-ai] Supply-chain warning — 1 ext/ submodule quarantined:
+  ext/solana-new: git SHA changed from a1b2c3d to d4e5f6g
+  Last pinned: 2026-06-14T10:23:11Z
+  Quarantine path: ${CLAUDE_PLUGIN_DATA}/quarantine/ext-solana-new/
 
 To review and restore:
   safe-solana-ai verify           # see what changed
-  ssai verify approve anchor-specialist   # re-pin after review
+  ssai verify approve ext/solana-new   # re-pin after review
 ```
 
 Run `safe-solana-ai status` to see the full quarantine list and all flagged findings from the current session's scan.
+
+---
 
 ## Audit log
 
@@ -409,7 +577,7 @@ Every gate decision is appended to `${CLAUDE_PLUGIN_DATA}/audit.jsonl`. Each lin
 
 ```jsonc
 {
-  "ts": "2026-06-11T09:14:32.441Z",
+  "ts": "2026-06-16T09:14:32.441Z",
   "hook": "gate-bash",
   "decision": "ask",
   "reason": "MAINNET DEPLOY",
@@ -421,18 +589,16 @@ Every gate decision is appended to `${CLAUDE_PLUGIN_DATA}/audit.jsonl`. Each lin
 }
 ```
 
-Fields:
-
 | Field | Description |
 |-------|-------------|
 | `ts` | ISO 8601 UTC timestamp |
 | `hook` | Which gate produced the decision |
 | `decision` | `allow`, `ask`, or `deny` |
 | `reason` | Human-readable reason string |
-| `tool` | Claude Code tool name (`Bash`, `Read`, `mcp__helius__transferSol`, etc.) |
+| `tool` | Claude Code tool name (`Bash`, `Read`, `mcp__helius__heliusWrite.sendSol`, etc.) |
 | `input` | Sanitized command or MCP tool name (secrets are not logged) |
 | `network` | Resolved network (`devnet`, `mainnet-beta`, `localnet`, `unknown`) |
 | `profile` | Active profile at time of decision |
 | `grant` | Grant ID if a time-boxed grant was applied, otherwise `null` |
 
-The file is append-only. It is not rotated automatically in v1; trim it manually if it grows large.
+The file is append-only and not rotated automatically in v1.
