@@ -167,12 +167,18 @@ impl<'a> Invocation<'a> {
 
         let mut child = cmd.spawn().expect("spawn safe-ai-skill");
         if let Some(body) = &self.stdin {
-            child
+            // The child may finish and close stdin before we drain the whole body;
+            // a resulting BrokenPipe is benign (it already read what it needed).
+            match child
                 .stdin
                 .take()
                 .expect("stdin pipe")
                 .write_all(body.as_bytes())
-                .expect("write stdin");
+            {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(e) => panic!("write stdin: {e}"),
+            }
         }
         let out = child.wait_with_output().expect("wait safe-ai-skill");
         Run {
