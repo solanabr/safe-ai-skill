@@ -1,4 +1,9 @@
+# safe-solana-ai default policy — the FULL schema (kept equivalent to the embedded
+# DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project may deep-merge an override
+# at <cwd>/.safe-solana-ai/policy.yaml; every field below has a serde default so a partial
+# override still parses.
 version: 1
+active_profile: strict    # strict | autopilot | paranoid | off (env SAFE_SOLANA_AI_PROFILE wins)
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
@@ -11,8 +16,14 @@ gates:                    # always ask regardless of caps
   - program_upgrade
   - set_authority         # solana program set-upgrade-authority, spl-token authorize
   - account_close         # solana close, spl-token close
+hard_guards:              # scopes NO profile or grant may ever relax
+  - mainnet_deploy
+  - set_authority
+  - account_close
+  - secret_read
 mcp:
-  sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade"
+  # value-moving verbs matched in MCP tool names (expanded for heliusWrite staking + future tools)
+  sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
 swap:
   rugcheck: true                # GET rugcheck report before allowing swaps (Phase 2)
   rugcheck_max_score: 40        # deny above
@@ -31,7 +42,37 @@ secrets:
     - "**/.env.example"
 redact: { enabled: true }
 audit:  { enabled: true }
+catalog:
+  # opt-in skill-registry catalog (every entry default_installed:false); ssai forces ask/deny
+  # on entries matching a high-risk class by id or by keyword in safety/description/tag text.
+  registry_path: ".claude/skills/skill-registry.json"
+  high_risk_classes:
+    - kind: wallet_signing            # phantom-mcp: can sign/submit transactions
+      decision: ask
+      keywords: [ "wallet signing", "sign/submit", "signing" ]
+      ids: [ "phantom-mcp" ]
+    - kind: key_custody               # x402-proxy-mcp: BIP-39 key custody for agent payments
+      decision: ask
+      keywords: [ "key custody", "key-custody", "bip-39", "bip39" ]
+      ids: [ "x402-proxy-mcp" ]
+    - kind: installer_script          # ghostsecurity & friends: curl | bash installers
+      decision: ask
+      keywords: [ "curl | bash", "curl|bash", "| sh", "wget" ]
+      ids: []
 supply_chain:
   verify_skills_dirs: [ "~/.claude/skills", ".claude/skills" ]
-  flag_unpinned_mcp: true           # @latest in .mcp.json
-  flag_telemetry_curl: true         # solana-new Convex preamble
+  flag_unpinned_mcp: true           # @latest in .mcp.json — INFORMATIONAL/LOW (MCPs kept @latest), not blocking
+  flag_telemetry_curl: true         # solana-new Convex preamble (generic telemetry detector)
+  verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
+  ext_dir: ".claude/skills/ext"
+  exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny
+profiles:
+  strict: {}
+  autopilot:
+    relax_transfer: true
+    relax_swap: true
+    per_tx_sol_max: 2.0
+  paranoid:
+    ask_all: true
+  off:
+    disabled: true
