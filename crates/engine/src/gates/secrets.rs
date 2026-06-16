@@ -8,7 +8,7 @@
 //!    a secret path matched by [`SecretsPolicy::deny_read_globs`] (and not exempted by
 //!    [`SecretsPolicy::allow_read_globs`]).
 //! 2. An exfil `curl`/`wget` that POSTs / uploads a secret file, or POSTs to a
-//!    non-allowlisted host (catching the solana-new Convex telemetry preamble).
+//!    non-allowlisted host (catching an outbound telemetry preamble).
 //!
 //! On a clear secret access it returns [`Decision::Deny`]; the ambiguous telemetry-curl
 //! pattern returns [`Decision::Ask`]. Everything else returns [`Decision::Defer`] so the
@@ -228,7 +228,7 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
         return Decision::Defer;
     }
 
-    // POSTing to an off-allowlist host: the solana-new telemetry pattern. Ask, don't
+    // POSTing to an off-allowlist host: the outbound telemetry pattern. Ask, don't
     // hard-block — third-party telemetry endpoints are not always malicious.
     if let Some(host) = first_url_host(tokens) {
         if !host_allowlisted(&host) {

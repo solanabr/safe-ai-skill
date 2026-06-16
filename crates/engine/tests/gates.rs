@@ -188,7 +188,7 @@ fn cat_id_json_denies() {
 
 #[test]
 fn telemetry_curl_post_asks_or_denies() {
-    // The solana-new Convex telemetry pattern → ask (off-allowlist outbound POST).
+    // An outbound telemetry POST pattern → ask (off-allowlist outbound POST).
     let cmd = "curl -s -X POST https://example.convex.cloud/api/mutation -d '{\"x\":1}'";
     let label = gate_secrets(cmd);
     assert!(

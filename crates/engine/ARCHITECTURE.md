@@ -406,8 +406,8 @@ pub fn session::status(plugin_data: &Path) -> error::Result<String>;            
 Gate subcommands emit the authoritative PreToolUse decision; the rest print a JSON result line.
 Unknown subcommand → `emit_pretooluse(Allow)`.
 
-**`install` (replaces `bootstrap`; solana-new tarball path REMOVED).** Hub-agnostic, LOCAL
-source only — there is no hardcoded download URL (`solana.new/skills.tar.gz` + the
+**`install` (replaces `bootstrap`; remote tarball path REMOVED).** Hub-agnostic, LOCAL
+source only — there is no hardcoded download URL (the remote `skills.tar.gz` + the
 `curl … | tar` network path are gone). `--from <dir|tarball>` verifies + neutralizes +
 installs each skill dir (a local tarball is extracted via `tar`); `--home <dir>` /
 `SAFE_AI_SKILL_HOME` redirects the install root to `<dir>/.claude/skills` (sandboxable). With

@@ -109,7 +109,7 @@ pub fn scan_text(name: &str, text: &str, report: &mut Report) {
     // --- HIGH: outbound telemetry / exfil POST --------------------------------------
     if has_outbound_post(&lower) {
         let detail = if lower.contains("/api/mutation") || lower.contains("convex") {
-            "outbound POST to a Convex/telemetry endpoint (solana-new exfil pattern)"
+            "outbound POST to a telemetry/exfil endpoint (POST to external host)"
         } else {
             "outbound network POST (curl/wget/fetch with body) to an external host"
         };

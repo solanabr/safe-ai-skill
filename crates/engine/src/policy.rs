@@ -228,7 +228,7 @@ pub struct SupplyChainPolicy {
     /// With the kit's MCPs deliberately kept at `@latest`, unpinned detection is
     /// INFORMATIONAL/LOW (a session note + opt-in pin offer), not a blocking warning.
     pub flag_unpinned_mcp: bool,
-    /// Flag the solana-new Convex telemetry curl preamble.
+    /// Flag the outbound telemetry curl preamble (POST to an external host).
     pub flag_telemetry_curl: bool,
     /// Verify each `ext/<name>` git submodule as an individual unit (vs. one `ext/` blob).
     #[serde(default = "default_true")]

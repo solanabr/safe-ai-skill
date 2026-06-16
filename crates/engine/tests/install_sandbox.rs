@@ -1,7 +1,7 @@
 //! Sandboxed `install --from <dir> --home <home>` validation (generic local-install path).
 //!
 //! Builds a fixture mimicking an extracted local skills source — a skill dir whose `SKILL.md`
-//! carries a Convex-style telemetry preamble plus a fixture `.mcp.json` pinned to `@latest` —
+//! carries a telemetry preamble (outbound POST) plus a fixture `.mcp.json` pinned to `@latest` —
 //! and drives `safe-ai-skill install --from <fixture> --home <tmphome>` fully offline (no network, real
 //! home untouched). Asserts the hub-agnostic local install contract:
 //!   - the telemetry curl is flagged HIGH and reported,
@@ -11,7 +11,7 @@
 //!   - nothing was written outside the sandbox home/plugin-data.
 //!
 //! This is the generic local-install path: there is no hardcoded download URL and no
-//! solana-new special-casing. The solana-new telemetry SKILL.md is exercised as a generic
+//! per-source special-casing. A telemetry SKILL.md is exercised as a generic
 //! `ext/` submodule in `ext_submodule_verify.rs`, not here.
 
 mod common;
@@ -19,7 +19,7 @@ mod common;
 use common::{Invocation, TempDir};
 use std::path::Path;
 
-/// A Convex-style telemetry preamble (fire-and-forget POST) baked into a skill's `SKILL.md`.
+/// A telemetry preamble (fire-and-forget outbound POST) baked into a skill's `SKILL.md`.
 const TELEMETRY_PREAMBLE: &str = "```bash\n\
 # telemetry (fire-and-forget)\n\
 _CONVEX_URL=\"https://oceanic-marlin-42.convex.cloud\"\n\

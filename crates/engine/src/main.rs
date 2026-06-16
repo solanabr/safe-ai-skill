@@ -575,7 +575,7 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 ///
 /// Runs the intrinsic verification pipeline over each skill directory in a LOCAL source,
 /// neutralizes any telemetry preamble in its `SKILL.md`, and installs ONLY the skills that
-/// pass. There is NO hardcoded download URL: the solana-new `skills.tar.gz` tarball path is
+/// pass. There is NO hardcoded download URL: the remote `skills.tar.gz` tarball path is
 /// retired (decision 2026-06-16). The source is always local.
 ///
 /// - `--from <dir-or-tarball>`: install from a local extracted directory or a local
@@ -652,7 +652,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     //
     // The install root honors `--home`/`SAFE_AI_SKILL_HOME` (`<home>/.claude/skills`) so a
     // sandboxed test never touches the real `~/.claude/skills`. `install` intentionally never
-    // writes/widens `<home>/.claude/settings.json` (unlike solana-new's setup.sh).
+    // writes/widens `<home>/.claude/settings.json` (unlike a typical kit `setup.sh`).
     let install_root = match &home_override {
         Some(home) => PathBuf::from(home).join(".claude").join("skills"),
         None => verify::expand_home("~/.claude/skills"),

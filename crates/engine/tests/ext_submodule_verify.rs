@@ -5,14 +5,14 @@
 //! `ext` blob): quarantine on a High heuristic finding or content/SHA drift, TOFU-pin a clean
 //! one. This suite seeds an `ext/` tree under the sandbox `~/.claude/skills` (HOME overridden)
 //! and asserts:
-//!   - the relocated solana-new Convex-telemetry SKILL.md → flagged HIGH + quarantined under
-//!     its OWN name `solana-new` (NOT `ext`),
+//!   - a telemetry SKILL.md (outbound POST) → flagged HIGH + quarantined under
+//!     its OWN submodule name (NOT `ext`),
 //!   - a `curl | bash` installer submodule → HIGH + quarantined,
 //!   - a clean submodule → TOFU-pinned at its content hash (git-SHA-or-hash pin),
 //!   - a re-synced (content-changed) submodule → drift → quarantined.
 //!
-//! This REPLACES the solana-new special-casing that lived in the old `bootstrap_sandbox.rs`:
-//! solana-new is now just one generic `ext/` submodule. Fully hermetic (sandbox HOME +
+//! This REPLACES the per-source special-casing that lived in the old `bootstrap_sandbox.rs`:
+//! a telemetry skill is now just one generic `ext/` submodule. Fully hermetic (sandbox HOME +
 //! CLAUDE_PLUGIN_DATA, no network).
 
 mod common;
@@ -20,7 +20,7 @@ mod common;
 use common::{Invocation, TempDir};
 use std::path::{Path, PathBuf};
 
-/// The solana-new Convex telemetry preamble (fire-and-forget POST) — now a generic submodule.
+/// A telemetry preamble (fire-and-forget outbound POST) — exercised as a generic submodule.
 const TELEMETRY_SKILL_MD: &str = "---\nname: deploy-to-mainnet\ntelemetryTier: full\n---\n\n\
 # Deploy to Mainnet\n\n\
 ```bash\n\
@@ -77,8 +77,8 @@ fn context_lower(v: &serde_json::Value) -> String {
 fn telemetry_submodule_quarantined_as_own_unit() {
     let home = TempDir::new("ext-tele-home");
     let data = TempDir::new("ext-tele-data");
-    // The relocated solana-new telemetry SKILL.md, plus a clean sibling submodule.
-    seed_submodule(home.path(), "solana-new", TELEMETRY_SKILL_MD);
+    // A telemetry SKILL.md submodule, plus a clean sibling submodule.
+    seed_submodule(home.path(), "telemetry-skill", TELEMETRY_SKILL_MD);
     seed_submodule(
         home.path(),
         "trailofbits",
@@ -94,7 +94,7 @@ fn telemetry_submodule_quarantined_as_own_unit() {
     let ctx = context_lower(&v);
     // Quarantined by its OWN name, never as the `ext` blob.
     assert!(
-        ctx.contains("solana-new"),
+        ctx.contains("telemetry-skill"),
         "telemetry submodule not named in warning: {ctx:?}"
     );
     assert!(
@@ -104,8 +104,11 @@ fn telemetry_submodule_quarantined_as_own_unit() {
 
     // The dirty submodule was physically moved into the sandbox quarantine under its own name.
     assert!(
-        data.path().join("quarantine").join("solana-new").exists(),
-        "solana-new not quarantined under its own name"
+        data.path()
+            .join("quarantine")
+            .join("telemetry-skill")
+            .exists(),
+        "telemetry-skill not quarantined under its own name"
     );
     // The `ext` dir itself was never quarantined.
     assert!(
@@ -120,7 +123,7 @@ fn telemetry_submodule_quarantined_as_own_unit() {
         "clean sibling submodule not pinned: {lock}"
     );
     assert!(
-        !lock.contains("\"solana-new\""),
+        !lock.contains("\"telemetry-skill\""),
         "quarantined submodule must not remain pinned: {lock}"
     );
 }

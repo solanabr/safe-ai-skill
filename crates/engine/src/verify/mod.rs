@@ -150,7 +150,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Discover each `ext/<name>` git submodule directory under a skills root.
 ///
 /// The kit lays third-party code out as 18 git submodules under `.claude/skills/ext/`
-/// (trailofbits, ghostsecurity, solana-new, …). [`run_session`] currently treats `ext/` as a
+/// (trailofbits, ghostsecurity, …). [`run_session`] currently treats `ext/` as a
 /// single child unit; per the round-2 contract these should each be verified/pinned as their
 /// OWN unit (pin/drift on the submodule git SHA). This is the discovery primitive Round-2
 /// Agent B iterates over.
@@ -238,9 +238,9 @@ pub fn eval_skill(
     }
 }
 
-/// Neutralize the solana-new telemetry preamble in a `SKILL.md` body (pure).
+/// Neutralize an outbound telemetry preamble in a `SKILL.md` body (pure).
 ///
-/// Strips fenced bash blocks that perform an outbound telemetry POST (the Convex
+/// Strips fenced bash blocks that perform an outbound telemetry POST (the
 /// `curl -s -X POST <url>/api/mutation` pattern) and flips a `telemetryTier`/`telemetry`
 /// front-matter toggle to `off`. Returns the cleaned text and whether anything changed.
 pub fn neutralize_telemetry(skill_md: &str) -> (String, bool) {
@@ -858,8 +858,8 @@ mod orchestration_tests {
         // A telemetry SKILL.md inside ext/<name> → HIGH.
         seed_ext_submodule(
             &root,
-            "solana-new",
-            "# solana-new\n```bash\ncurl -s -X POST \"$U/api/mutation\" -d '{}'\n```",
+            "telemetry-skill",
+            "# telemetry-skill\n```bash\ncurl -s -X POST \"$U/api/mutation\" -d '{}'\n```",
         );
         // A clean sibling submodule.
         seed_ext_submodule(&root, "trailofbits", "# trailofbits\nStatic analysis docs.");
@@ -868,14 +868,14 @@ mod orchestration_tests {
         let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
 
         // The dirty submodule is quarantined by its OWN name, not as `ext`.
-        assert!(result.quarantined.contains(&"solana-new".to_string()));
+        assert!(result.quarantined.contains(&"telemetry-skill".to_string()));
         assert!(!result.quarantined.contains(&"ext".to_string()));
         assert!(result.pinned.contains(&"trailofbits".to_string()));
-        assert!(data.join("quarantine/solana-new").exists());
+        assert!(data.join("quarantine/telemetry-skill").exists());
         // The clean submodule was pinned in the ext section of the lockfile.
         let lock = lockfile::load(&data);
         assert!(lock.ext.contains_key("trailofbits"));
-        assert!(!lock.ext.contains_key("solana-new"));
+        assert!(!lock.ext.contains_key("telemetry-skill"));
         // `ext` was never treated as a single skill.
         assert!(!lock.skills.contains_key("ext"));
         fs::remove_dir_all(&data).ok();
