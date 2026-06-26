@@ -18,6 +18,10 @@ At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before 
 
 ## Install
 
+safe-ai-skill has two layers. The **plugin** is the always-on runtime firewall (SessionStart verifier + PreToolUse gates). The **CLI** is the `safe-ai-skill` binary that powers the Tier 1/2 commands (`registry`, `add skill`, `add mcp`, `install`, `verify`, `status`). Most users want the plugin; install the CLI too if you want to gate skill/MCP installs before they run.
+
+### Plugin (runtime firewall)
+
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill
 claude plugin install safe-ai-skill@safe-ai-skill
@@ -25,9 +29,36 @@ claude plugin install safe-ai-skill@safe-ai-skill
 
 Every Claude Code session is protected automatically from that point. No per-project configuration required.
 
-**Contributors:** cloning this repo gives immediate protection — the plugin is already enabled in `.claude/settings.json`.
-
 **Dev install:** `claude plugin marketplace add .` from the repo root, then `claude plugin install safe-ai-skill@safe-ai-skill`.
+
+### CLI (`safe-ai-skill` command)
+
+The plugin runs the firewall; the Tier 1/2 commands need the `safe-ai-skill` binary on your `PATH`. Pick one:
+
+**npm**
+
+```bash
+npm install -g safe-ai-skill          # installs the CLI globally
+npx safe-ai-skill add skill <name|url>  # or run without installing
+```
+
+`safe-ai-skill add skill <name|url>` is the headline command — it runs the full verification pipeline on the fetched content before any install touches your machine (see [Usage tiers](#usage-tiers)).
+
+**Standalone script** (no npm or cargo)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
+```
+
+Downloads the prebuilt binary for your platform and verifies its SHA-256 against the release's published `SHA256SUMS` before installing — checksum-pinned, not an opaque pipe. Set `SAFE_AI_SKILL_BIN_DIR` to override the install location (default `~/.local/bin`).
+
+**cargo** (any platform with a Rust toolchain)
+
+```bash
+cargo install safe-ai-skill
+```
+
+The npm and standalone paths download the binary matching their release tag and abort on any checksum mismatch.
 
 ## What it protects
 

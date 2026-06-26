@@ -185,12 +185,76 @@ jobs:
             dist/safe-ai-skill-linux-arm64 \
             dist/SHA256SUMS
 
-      # Optionally update the committed plugin bin/ directory so the
-      # post-release state is self-consistent.  This is a non-blocking step;
-      # it opens a PR or prints a reminder rather than committing directly.
-      - name: Reminder — update committed bin/ artifacts
+  # ── vendor the released binaries back into plugins/safe-ai-skill/bin/ (PR) ──
+  # The committed plugin binaries are what the Claude marketplace install ships;
+  # after each release we refresh all four + the SHA256SUMS so the repo state is
+  # self-consistent and CI's verify-plugin-bin stays green. Opens a PR (does NOT
+  # push to main) so a human reviews the binary update before it lands.
+  #
+  # NOTE: a PR opened with the default GITHUB_TOKEN will NOT trigger CI. To have
+  # CI (verify-plugin-bin) run on the vendor PR automatically, add a repo secret
+  # RELEASE_PAT (a fine-grained PAT with contents+pull_requests write); the job
+  # falls back to GITHUB_TOKEN when it is absent.
+  vendor-binaries:
+    name: Vendor binaries into plugin (PR)
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the vendor branch
+      pull-requests: write    # open the PR
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Download built binaries (from this run)
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Stage binaries + regenerate SHA256SUMS
         run: |
-          echo "::notice::After verifying the release assets, copy the new"
-          echo "::notice::binaries into plugins/safe-ai-skill/bin/ and update"
-          echo "::notice::SHA256SUMS, then commit.  The CI verify-plugin-bin"
-          echo "::notice::job will confirm the checksums on the next push."
+          set -euo pipefail
+          find dist/ -mindepth 2 -type f -exec mv {} dist/ \; || true
+          bindir=plugins/safe-ai-skill/bin
+          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            install -m 0755 "dist/safe-ai-skill-$p" "$bindir/safe-ai-skill-$p"
+          done
+          # SHA256SUMS covers the shim + all four binaries (what verify-plugin-bin checks).
+          ( cd "$bindir" && sha256sum \
+              safe-ai-skill \
+              safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 \
+              safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
+              > SHA256SUMS && sha256sum -c SHA256SUMS )
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR with refreshed binaries
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          BRANCH="release/vendor-${TAG}-binaries"
+          if git diff --quiet -- plugins/safe-ai-skill/bin; then
+            echo "::notice::Committed binaries already match the release; nothing to vendor."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add plugins/safe-ai-skill/bin
+          git commit -m "release: vendor ${TAG} platform binaries"
+          git push -f origin "$BRANCH"
+          BODY="Automated: refreshes plugins/safe-ai-skill/bin/ with the four ${TAG} release binaries + regenerated SHA256SUMS so marketplace installs work on every platform and verify-plugin-bin stays green. Built from the same run that created the GitHub Release. Review the binary diff, then merge."
+          gh pr create --base main --head "$BRANCH" --title "release: vendor ${TAG} platform binaries" --body "$BODY" || true
+

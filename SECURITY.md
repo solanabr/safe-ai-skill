@@ -8,7 +8,7 @@
 
 **Prompt content.** `prompt-guard` (UserPromptSubmit hook) blocks prompts that contain raw private keys or seed phrases before they reach the model.
 
-**Supply chain.** Every session start runs `verify session` over the installed skills directories, each of the 18 `ext/` git submodules independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; safe-ai-skill does not treat it as an error because solana-ai-kit keeps MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is quarantined before skills are loaded.
+**Supply chain.** Every session start runs `verify session` over the installed skills directories, each `ext/` git submodule independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; safe-ai-skill does not treat it as an error when a hub keeps its MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is quarantined before skills are loaded.
 
 **Install-script execution.** Runtime `curl|bash`, `wget|bash`, and `curl|sh` patterns are intercepted by `gate-bash-secrets` (unconditional, microsecond matching) before the pipe executes. The default policy is `exec_install_scripts: ask` — the user sees the URL and script preview before approval.
 
@@ -16,7 +16,9 @@
 
 ### `ext/` submodule supply chain
 
-solana-ai-kit ships 18 third-party `ext/` git submodules: third-party security tools, DeFi protocol SDKs, NFT tooling, and infrastructure integrations (including `ext/ghostsecurity`, `ext/trailofbits`, `ext/jupiter`, `ext/metaplex`, `ext/helius`, `ext/sendai`, `ext/vercel`, and others). Each is an independent supply-chain unit with a different origin, maintainer, and risk profile.
+safe-ai-skill is general-purpose: it verifies whatever `ext/` submodules, skills, and MCPs a given setup ships — any hub, any count, or none. The walkthrough below uses `solanabr/solana-ai-kit` as a concrete worked example because it ships a large, heterogeneous set of submodules; the same verification applies unchanged to any other configuration.
+
+solana-ai-kit, for example, ships 18 third-party `ext/` git submodules: third-party security tools, DeFi protocol SDKs, NFT tooling, and infrastructure integrations (including `ext/ghostsecurity`, `ext/trailofbits`, `ext/jupiter`, `ext/metaplex`, `ext/helius`, `ext/sendai`, `ext/vercel`, and others). Each is an independent supply-chain unit with a different origin, maintainer, and risk profile.
 
 **What can go wrong per submodule:**
 - Telemetry preambles in SKILL.md files that POST skill-invocation metadata to third-party endpoints.
