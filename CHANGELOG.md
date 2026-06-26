@@ -4,26 +4,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [Unreleased]
-
-### Added
-
-- **Standalone installer** (`install.sh`): one-line `curl … | sh` install of the CLI that downloads the platform binary and verifies its SHA-256 against the release's `SHA256SUMS` before installing — fails loud, installs nothing on mismatch.
-- **README install paths** for the CLI: npm (`npm install -g safe-ai-skill` / `npx`), the standalone script, and cargo — alongside the existing plugin install. The Install section now distinguishes the always-on plugin (firewall) from the `safe-ai-skill` CLI (Tier 1/2 commands).
-- **CI package checks** (`package-checks` job): `node --check` on the npm wrapper, `shellcheck` + `sh -n` on `install.sh`/scripts, and a `scripts/check-versions.sh` guard asserting npm/Cargo/plugin/marketplace/README versions all agree.
-- **npm launcher smoke** in the build matrix and a gated **npm install e2e** workflow (`.github/workflows/npm-e2e.yml`, on release/schedule/dispatch) that packs, installs, checksum-verifies, and execs the CLI end to end.
-
-### Fixed
-
-- `npm/package.json` version `0.1.0` → `1.0.0` so the postinstall/standalone downloads resolve the correct release tag (`v1.0.0`).
-
-### Changed
-
-- `.claude/` (local dogfooding config) is now gitignored; the shipped plugin lives in `plugins/`. `.DS_Store` and the install-time-downloaded `npm/bin/safe-ai-skill-*` binary are also ignored.
-
----
-
-## [1.0.0] — 2026-06-16
+## [1.0.0] — 2026-06-26
 
 ### Summary
 
@@ -70,8 +51,19 @@ First stable release. Ships the safe-ai-skill engine, runtime action firewall, a
 
 ### Distribution
 
-- Standalone plugin (`claude plugin marketplace add solanabr/safe-ai-skill`).
-- CI builds all four platform binaries and regenerates `SHA256SUMS` on every release tag.
+- **Plugin** (always-on firewall): `claude plugin marketplace add solanabr/safe-ai-skill` → `claude plugin install safe-ai-skill@safe-ai-skill`. Ships committed platform binaries; the shim resolves the native prebuilt, else builds from `crates/engine`, else fails closed.
+- **CLI** (`safe-ai-skill` Tier 1/2 commands) via three paths, all checksum-verified against the release `SHA256SUMS`:
+  - npm — `npm install -g safe-ai-skill` / `npx safe-ai-skill`. `postinstall.js` downloads the platform binary from the matching GitHub Release tag and aborts on checksum mismatch (no silent install).
+  - Standalone — `curl -fsSL …/install.sh | sh`. Downloads + verifies the binary before installing to `~/.local/bin` (overridable via `SAFE_AI_SKILL_BIN_DIR`); fails loud, installs nothing on mismatch.
+  - cargo — `cargo install safe-ai-skill` (builds from source on any Rust-capable platform).
+- README Install section separates the always-on plugin (firewall) from the `safe-ai-skill` CLI.
+
+### Tooling & CI
+
+- `release.yml` builds all four platform binaries (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`) and regenerates `SHA256SUMS` on every `v*` tag.
+- `ci.yml`: lint (fmt + clippy), native build+test matrix with an npm-launcher smoke, a build-only cross-build job covering `darwin-x64` + `linux-arm64`, committed-binary checksum verification, and a `package-checks` job (`node --check` on the npm wrapper, `shellcheck`/`sh -n` on shell scripts, and `scripts/check-versions.sh` asserting npm/Cargo/plugin/marketplace/README versions agree).
+- `npm-e2e.yml` (release/schedule/dispatch): packs, installs, checksum-verifies, and execs the published CLI end to end.
+- Repo hygiene: `.claude/` (local dogfooding config) is gitignored and the shipped plugin lives in `plugins/`; `.DS_Store`, OS/editor clutter, and install-time-downloaded `npm/bin/safe-ai-skill-*` binaries are ignored.
 - Folding safe-ai-skill into the `stbr` solana-ai-kit marketplace is deferred to a future release.
 
 ### Out of scope (deferred)
