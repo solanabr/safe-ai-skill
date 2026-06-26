@@ -143,21 +143,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # merge-multiple flattens every artifact into dist/ directly (no per-artifact
+      # subdirs), so the binary filenames don't collide with directory names.
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist/
-
-      # Each artifact was uploaded as its own named artifact; flatten to dist/
-      - name: Flatten artifact directories
-        run: |
-          find dist/ -mindepth 2 -type f -exec mv {} dist/ \;
-          rmdir dist/*/ 2>/dev/null || true
-          ls -lh dist/
+          merge-multiple: true
 
       - name: Generate SHA256SUMS
         working-directory: dist
         run: |
+          ls -lh
           sha256sum safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
             > SHA256SUMS
           cat SHA256SUMS
@@ -213,11 +210,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist/
+          merge-multiple: true
 
       - name: Stage binaries + regenerate SHA256SUMS
         run: |
           set -euo pipefail
-          find dist/ -mindepth 2 -type f -exec mv {} dist/ \; || true
           bindir=plugins/safe-ai-skill/bin
           for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             install -m 0755 "dist/safe-ai-skill-$p" "$bindir/safe-ai-skill-$p"
