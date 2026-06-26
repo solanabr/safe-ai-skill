@@ -1,0 +1,54 @@
+# npm install e2e — safe-ai-skill
+#
+# Proves the FULL published install path end to end: `npm pack` the wrapper,
+# install the tarball, let scripts/postinstall.js download the real release
+# binary, verify its SHA-256 against the published SHA256SUMS, and exec it.
+#
+# This depends on published GitHub Release assets (the binaries + SHA256SUMS for
+# the package's version tag), so it does NOT run on every PR. It runs:
+#   • on release publish (validate the artifacts we just shipped),
+#   • on a weekly schedule (catch release/asset drift), and
+#   • manually via workflow_dispatch.
+
+name: npm install e2e
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  npm-install:
+    name: npm install + verify + exec / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Pack the npm wrapper
+        working-directory: npm
+        run: |
+          tarball=$(npm pack | tail -n1)
+          echo "TARBALL=$PWD/$tarball" >> "$GITHUB_ENV"
+
+      - name: Install globally (runs postinstall download + checksum verify)
+        run: |
+          prefix="$RUNNER_TEMP/npm-global"
+          mkdir -p "$prefix"
+          npm install -g --prefix "$prefix" "$TARBALL"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Smoke — exec the installed CLI
+        run: |
+          out=$(safe-ai-skill status)
+          echo "$out"
+          echo "$out" | grep -q '"command":"status"'

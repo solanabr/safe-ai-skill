@@ -66,8 +66,10 @@ jobs:
         include:
           - name: macos-arm64
             os: macos-15          # GitHub-hosted M-series runner (aarch64-apple-darwin)
+            plat: darwin-arm64
           - name: linux-x64
             os: ubuntu-latest     # x86_64-unknown-linux-gnu
+            plat: linux-x64
 
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +96,73 @@ jobs:
       - name: cargo test --verbose
         run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
 
+      # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
+      # No network: we use the freshly built binary, not a release download.
+      - name: npm launcher smoke (no network)
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="crates/engine/target/debug/safe-ai-skill"
+          test -x "$bin"
+          mkdir -p npm/bin
+          cp "$bin" "npm/bin/safe-ai-skill-${{ matrix.plat }}"
+          node --check npm/bin/cli.js
+          out=$(node npm/bin/cli.js status)
+          echo "$out"
+          echo "$out" | grep -q '"command":"status"'
+
+  # ── cross-build (the two non-native shipped targets, build-only) ──────────
+  # release.yml ships four binaries; the build-test matrix above only builds +
+  # tests the two NATIVE targets. Foreign-arch tests can't run on these runners,
+  # so here we BUILD darwin-x64 and linux-arm64 to catch compile regressions on
+  # those targets before a release tag — mirroring release.yml's target setup.
+  cross-build:
+    name: Cross-build / ${{ matrix.target }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin       # darwin-x64
+            os: macos-15
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu  # linux-arm64
+            os: ubuntu-latest
+            use_cross: true                    # cross handles the aarch64-linux sysroot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-cross-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-cross-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install cross (aarch64-linux only)
+        if: ${{ matrix.use_cross }}
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: ${{ matrix.use_cross }}
+        run: cross build --manifest-path ${{ env.MANIFEST }} --release --target ${{ matrix.target }}
+
   # ── plugin binary checksum + shim syntax ─────────────────────────────────
   verify-plugin-bin:
     name: Verify committed plugin binaries
@@ -114,3 +183,26 @@ jobs:
 
       - name: Shim passes sh -n (syntax check)
         run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill
+
+  # ── package + script checks (npm wrapper, install.sh, version consistency) ─
+  package-checks:
+    name: Package + script checks
+    runs-on: ubuntu-latest      # ships shellcheck + node preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: node --check (npm wrapper)
+        run: |
+          node --check npm/bin/cli.js
+          node --check npm/scripts/postinstall.js
+
+      - name: shellcheck (install.sh + scripts)
+        run: shellcheck install.sh scripts/check-versions.sh
+
+      - name: sh -n (install.sh + scripts)
+        run: |
+          sh -n install.sh
+          sh -n scripts/check-versions.sh
+
+      - name: Version consistency across manifests
+        run: sh scripts/check-versions.sh

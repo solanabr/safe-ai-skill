@@ -62,7 +62,7 @@ catalog:
 supply_chain:
   verify_skills_dirs: [ "~/.claude/skills", ".claude/skills" ]
   flag_unpinned_mcp: true           # @latest in .mcp.json — INFORMATIONAL/LOW (MCPs kept @latest), not blocking
-  flag_telemetry_curl: true         # solana-new Convex preamble (generic telemetry detector)
+  flag_telemetry_curl: true         # generic telemetry preamble detector (e.g. Convex /api/mutation)
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny

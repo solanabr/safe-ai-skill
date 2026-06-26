@@ -1,0 +1,6 @@
+# Downloaded at install time by scripts/postinstall.js — never commit the binary.
+bin/safe-ai-skill-*
+bin/SHA256SUMS
+
+# npm pack output
+*.tgz

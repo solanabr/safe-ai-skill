@@ -1,6 +1,6 @@
 {
   "name": "safe-ai-skill",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions, deploys, and secrets; verifies skills and MCPs.",
   "keywords": [
     "solana",

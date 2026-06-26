@@ -31,6 +31,7 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64|amd64)  plat="linux-x64" ;;
+      aarch64|arm64) plat="linux-arm64" ;;
     esac
     ;;
 esac

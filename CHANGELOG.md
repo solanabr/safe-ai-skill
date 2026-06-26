@@ -4,15 +4,34 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Standalone installer** (`install.sh`): one-line `curl … | sh` install of the CLI that downloads the platform binary and verifies its SHA-256 against the release's `SHA256SUMS` before installing — fails loud, installs nothing on mismatch.
+- **README install paths** for the CLI: npm (`npm install -g safe-ai-skill` / `npx`), the standalone script, and cargo — alongside the existing plugin install. The Install section now distinguishes the always-on plugin (firewall) from the `safe-ai-skill` CLI (Tier 1/2 commands).
+- **CI package checks** (`package-checks` job): `node --check` on the npm wrapper, `shellcheck` + `sh -n` on `install.sh`/scripts, and a `scripts/check-versions.sh` guard asserting npm/Cargo/plugin/marketplace/README versions all agree.
+- **npm launcher smoke** in the build matrix and a gated **npm install e2e** workflow (`.github/workflows/npm-e2e.yml`, on release/schedule/dispatch) that packs, installs, checksum-verifies, and execs the CLI end to end.
+
+### Fixed
+
+- `npm/package.json` version `0.1.0` → `1.0.0` so the postinstall/standalone downloads resolve the correct release tag (`v1.0.0`).
+
+### Changed
+
+- `.claude/` (local dogfooding config) is now gitignored; the shipped plugin lives in `plugins/`. `.DS_Store` and the install-time-downloaded `npm/bin/safe-ai-skill-*` binary are also ignored.
+
+---
+
 ## [1.0.0] — 2026-06-16
 
 ### Summary
 
-First stable release. Ships the safe-ai-skill engine, runtime action firewall, and supply-chain verifier as a standalone Claude Code plugin targeting `solanabr/solana-ai-kit` v2.0.0 as its primary integration hub.
+First stable release. Ships the safe-ai-skill engine, runtime action firewall, and supply-chain verifier as a standalone, general-purpose Claude Code plugin — it secures any skills, MCPs, and agents. `solanabr/solana-ai-kit` v2.0.0 is the reference integration used to exercise and document the gates, not a requirement.
 
 ### Engine
 
-- Static Rust binary (`safe-ai-skill` / `safe-ai-skill`) with synchronous I/O; no runtime dependency. Prebuilt for `darwin-arm64`, `darwin-x64`, `linux-x64` with `SHA256SUMS`. Falls back to `cargo build --release` if no prebuilt matches; shim exits code 2 (block) if neither path is available — never fails open.
+- Static Rust binary (`safe-ai-skill` / `safe-ai-skill`) with synchronous I/O; no runtime dependency. Prebuilt for `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64` with `SHA256SUMS`. Falls back to `cargo build --release` if no prebuilt matches; shim exits code 2 (block) if neither path is available — never fails open.
 - Hook wiring: `gate-bash` (solana/spl-token/anchor CLI), `gate-bash-secrets` (unconditional secret and exfiltration patterns), `gate-read` (secret file globs), `gate-mcp` (value-moving MCP tools), `redact` (PostToolUse secret scrub), `prompt-guard` (UserPromptSubmit private key/seed block).
 - Append-only audit log (`audit.jsonl`), TOFU lockfile (`lockfile.json`), daily spend ledger (`spend.json`), time-boxed grant store (`grants.json`), session keypair dir (mode 0600).
 - Policy DSL (`default.policy.yaml`): full schema synced on-disk including `catalog`, `ext`, and `exec_install_scripts` fields. Deep-merge over project `.safe-ai-skill/policy.yaml`. Fail-closed on parse error.
@@ -51,8 +70,8 @@ First stable release. Ships the safe-ai-skill engine, runtime action firewall, a
 
 ### Distribution
 
-- Standalone plugin (`claude plugin marketplace add solanabr/safe-ai-skill`). Pre-enabled in repo `.claude/settings.json` for contributors.
-- CI builds all three platform binaries and regenerates `SHA256SUMS` on every release tag.
+- Standalone plugin (`claude plugin marketplace add solanabr/safe-ai-skill`).
+- CI builds all four platform binaries and regenerates `SHA256SUMS` on every release tag.
 - Folding safe-ai-skill into the `stbr` solana-ai-kit marketplace is deferred to a future release.
 
 ### Out of scope (deferred)
