@@ -14,7 +14,7 @@
   "homepage": "https://github.com/solanabr/safe-ai-skill#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/solanabr/safe-ai-skill.git"
+    "url": "git+https://github.com/solanabr/safe-ai-skill.git"
   },
   "bugs": {
     "url": "https://github.com/solanabr/safe-ai-skill/issues"
