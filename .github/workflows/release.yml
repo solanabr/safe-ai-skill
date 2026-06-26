@@ -1,0 +1,196 @@
+# Release — safe-ai-skill
+#
+# Triggered by a "v*" tag push (e.g. v0.1.0) or workflow_dispatch.
+# Builds safe-ai-skill for all four shipping targets, collects checksums,
+# and uploads everything to the GitHub Release that the tag creates.
+#
+# Cross-compilation strategy
+# ─────────────────────────────────────────────────────────────────────────────
+# • aarch64-apple-darwin   → macos-15 runner (native M-series, cross-targets arm64)
+# • x86_64-apple-darwin    → macos-15 runner (M-series, cross-targets x86_64 via Apple toolchain)
+# • x86_64-unknown-linux-gnu → ubuntu-latest runner (native x64)
+# • aarch64-unknown-linux-gnu → ubuntu-latest + cross
+#       `cross` (https://github.com/cross-rs/cross) uses a Docker image
+#       that bundles the aarch64-linux-gnu toolchain; this avoids requiring
+#       a self-hosted arm64 Linux runner.  The `cross` binary itself is
+#       installed in the step below; it wraps `cargo` transparently.
+#
+# Artifact naming
+# ─────────────────────────────────────────────────────────────────────────────
+# safe-ai-skill-darwin-arm64   (aarch64-apple-darwin)
+# safe-ai-skill-darwin-x64     (x86_64-apple-darwin)
+# safe-ai-skill-linux-x64      (x86_64-unknown-linux-gnu)
+# safe-ai-skill-linux-arm64    (aarch64-unknown-linux-gnu)
+#
+# Secrets required
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB_TOKEN — automatically provided; used by gh to create/upload the release.
+#
+# TODO (post-v1, optional): add a cosign attestation step for supply-chain
+# transparency.  Workflow stub:
+#
+#   - name: Sign with cosign (TODO)
+#     if: false   # remove to enable; requires COSIGN_PRIVATE_KEY secret
+#     uses: sigstore/cosign-installer@v3
+#     ...
+#     run: cosign sign-blob --key env://COSIGN_PRIVATE_KEY <artifact>
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+env:
+  RUST_TOOLCHAIN: stable
+  MANIFEST: crates/engine/Cargo.toml
+  BIN_NAME: safe-ai-skill
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ── per-platform native builds ────────────────────────────────────────────
+  build:
+    name: Build / ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: safe-ai-skill-darwin-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            use_cross: false
+
+          - artifact_name: safe-ai-skill-darwin-x64
+            os: macos-15
+            target: x86_64-apple-darwin
+            use_cross: false
+
+          - artifact_name: safe-ai-skill-linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use_cross: false
+
+          - artifact_name: safe-ai-skill-linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true    # cross handles the aarch64-linux sysroot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install cross (aarch64-linux only)
+        if: ${{ matrix.use_cross }}
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build release binary (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: |
+          cargo build --manifest-path ${{ env.MANIFEST }} \
+            --release \
+            --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: ${{ matrix.use_cross }}
+        run: |
+          cross build --manifest-path ${{ env.MANIFEST }} \
+            --release \
+            --target ${{ matrix.target }}
+
+      - name: Rename artifact
+        run: |
+          cp "crates/engine/target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" \
+             "${{ matrix.artifact_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── checksum + GitHub Release upload ─────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release create / upload-asset
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      # Each artifact was uploaded as its own named artifact; flatten to dist/
+      - name: Flatten artifact directories
+        run: |
+          find dist/ -mindepth 2 -type f -exec mv {} dist/ \;
+          rmdir dist/*/ 2>/dev/null || true
+          ls -lh dist/
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
+            > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          gh release create "$TAG" \
+            --title "safe-ai-skill $TAG" \
+            --generate-notes \
+            dist/safe-ai-skill-darwin-arm64 \
+            dist/safe-ai-skill-darwin-x64 \
+            dist/safe-ai-skill-linux-x64 \
+            dist/safe-ai-skill-linux-arm64 \
+            dist/SHA256SUMS
+
+      # Optionally update the committed plugin bin/ directory so the
+      # post-release state is self-consistent.  This is a non-blocking step;
+      # it opens a PR or prints a reminder rather than committing directly.
+      - name: Reminder — update committed bin/ artifacts
+        run: |
+          echo "::notice::After verifying the release assets, copy the new"
+          echo "::notice::binaries into plugins/safe-ai-skill/bin/ and update"
+          echo "::notice::SHA256SUMS, then commit.  The CI verify-plugin-bin"
+          echo "::notice::job will confirm the checksums on the next push."

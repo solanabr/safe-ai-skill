@@ -1,0 +1,39 @@
+[package]
+name = "safe-ai-skill"
+version = "1.0.0"
+edition = "2021"
+description = "safe-ai-skill security engine — runtime firewall + supply-chain verifier for Solana AI dev"
+license = "MIT"
+repository = "https://github.com/solanabr/safe-ai-skill"
+homepage = "https://github.com/solanabr/safe-ai-skill"
+keywords = ["solana", "security", "claude-code", "firewall", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
+
+[[bin]]
+name = "safe-ai-skill"
+path = "src/main.rs"
+
+[lib]
+name = "safe_ai_skill"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+glob = "0.3"
+walkdir = "2"
+bs58 = "0.5"
+# rustls TLS only (no native-tls/OpenSSL); default features dropped for a lean binary.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# Ed25519 session keypairs (Phase 3). rand_core for keygen in round-2.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
