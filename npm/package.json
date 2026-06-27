@@ -1,5 +1,5 @@
 {
-  "name": "safe-ai-skill",
+  "name": "@stbr/safe-ai-skill",
   "version": "1.0.0",
   "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions, deploys, and secrets; verifies skills and MCPs.",
   "keywords": [
@@ -23,6 +23,9 @@
   "author": "Superteam Brazil",
   "bin": {
     "safe-ai-skill": "bin/cli.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin/",

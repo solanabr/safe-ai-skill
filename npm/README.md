@@ -13,12 +13,12 @@ the Claude Code plugin). The Claude Code plugin is installed separately.
 ## Install
 
 ```bash
-npm install -g safe-ai-skill
+npm install -g @stbr/safe-ai-skill
 # or
-npx safe-ai-skill <command>
+npx @stbr/safe-ai-skill <command>
 ```
 
-Both `safe-ai-skill` and `safe-ai-skill` are registered as bin aliases.
+The package is scoped (`@stbr/safe-ai-skill`); the installed CLI command is `safe-ai-skill`.
 
 ## Quick start
 

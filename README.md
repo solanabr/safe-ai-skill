@@ -38,8 +38,8 @@ The plugin runs the firewall; the Tier 1/2 commands need the `safe-ai-skill` bin
 **npm**
 
 ```bash
-npm install -g safe-ai-skill          # installs the CLI globally
-npx safe-ai-skill add skill <name|url>  # or run without installing
+npm install -g @stbr/safe-ai-skill           # installs the CLI globally (command: safe-ai-skill)
+npx @stbr/safe-ai-skill add skill <name|url>  # or run without installing
 ```
 
 `safe-ai-skill add skill <name|url>` is the headline command — it runs the full verification pipeline on the fetched content before any install touches your machine (see [Usage tiers](#usage-tiers)).
