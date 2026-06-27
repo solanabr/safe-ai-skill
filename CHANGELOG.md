@@ -51,7 +51,7 @@ First stable release. Ships the safe-ai-skill engine, runtime action firewall, a
 
 ### Distribution
 
-- **Plugin** (always-on firewall): `claude plugin marketplace add solanabr/safe-ai-skill` → `claude plugin install safe-ai-skill@safe-ai-skill`. Ships committed platform binaries; the shim resolves the native prebuilt, else builds from `crates/engine`, else fails closed.
+- **Plugin** (always-on firewall): `claude plugin marketplace add solanabr/safe-ai-skill` → `claude plugin install safe-ai-skill@stbr`. Ships committed platform binaries; the shim resolves the native prebuilt, else builds from `crates/engine`, else fails closed.
 - **CLI** (`safe-ai-skill` Tier 1/2 commands) via three paths, all checksum-verified against the release `SHA256SUMS`:
   - npm — `npm install -g @stbr/safe-ai-skill` / `npx @stbr/safe-ai-skill` (CLI command: `safe-ai-skill`). `postinstall.js` downloads the platform binary from the matching GitHub Release tag and aborts on checksum mismatch (no silent install).
   - Standalone — `curl -fsSL …/install.sh | sh`. Downloads + verifies the binary before installing to `~/.local/bin` (overridable via `SAFE_AI_SKILL_BIN_DIR`); fails loud, installs nothing on mismatch.

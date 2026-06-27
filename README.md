@@ -24,12 +24,12 @@ safe-ai-skill has two layers. The **plugin** is the always-on runtime firewall (
 
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill
-claude plugin install safe-ai-skill@safe-ai-skill
+claude plugin install safe-ai-skill@stbr
 ```
 
 Every Claude Code session is protected automatically from that point. No per-project configuration required.
 
-**Dev install:** `claude plugin marketplace add .` from the repo root, then `claude plugin install safe-ai-skill@safe-ai-skill`.
+**Dev install:** `claude plugin marketplace add .` from the repo root, then `claude plugin install safe-ai-skill@stbr`.
 
 ### CLI (`safe-ai-skill` command)
 

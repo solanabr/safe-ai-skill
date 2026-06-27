@@ -45,7 +45,7 @@ Code session). Install it separately:
 
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill
-claude plugin install safe-ai-skill@safe-ai-skill
+claude plugin install safe-ai-skill@stbr
 ```
 
 Once installed, the firewall is live in every session — no per-skill
