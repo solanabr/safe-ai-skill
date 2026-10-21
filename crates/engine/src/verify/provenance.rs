@@ -116,10 +116,9 @@ pub fn parse_github(url: &str) -> Option<(String, String, String)> {
     // Normalize to the `owner/repo[/...]` path portion.
     let path = if let Some(rest) = base.strip_prefix("git@github.com:") {
         rest.to_string()
-    } else if let Some(idx) = base.find("github.com/") {
-        base[idx + "github.com/".len()..].to_string()
     } else {
-        return None;
+        let idx = base.find("github.com/")?;
+        base[idx + "github.com/".len()..].to_string()
     };
 
     let mut parts = path.split('/').filter(|p| !p.is_empty());
