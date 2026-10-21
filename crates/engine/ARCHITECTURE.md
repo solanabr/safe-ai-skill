@@ -224,7 +224,8 @@ impl Policy {
     // Reads the plugin default, <cwd>/.safe-ai-skill/policy.yaml and PROFILE_ENV, calls
     // from_sources, then keeps project-added scan dirs only if they resolve on disk inside cwd.
     pub fn load_with_mode(cwd: &Path, persisted_profile: Option<&str>) -> Policy;
-    // Pure (no env, no fs): base + ratcheted project overlay + profile resolution.
+    // Pure (no env, no fs): base + ratcheted project overlay + profile resolution. Project scan
+    // dirs get the text check only; on-disk confinement happens in load_with_mode alone.
     pub fn from_sources(base_src: &str, project_src: Option<&str>,
                         persisted_profile: Option<&str>, env_profile: Option<&str>) -> Policy;
     pub fn fail_closed() -> Policy;             // conservative; every soft gate → ask

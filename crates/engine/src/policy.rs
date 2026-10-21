@@ -616,7 +616,8 @@ impl Policy {
     /// `base_src` is the trusted default policy YAML; `project_src` a project's overlay, which
     /// may only tighten it; `persisted_profile` and `env_profile` select the profile as in
     /// [`Policy::load_with_mode`]. Every refused override is noted in
-    /// [`Policy::ignored_overrides`].
+    /// [`Policy::ignored_overrides`]. Scan dirs the project adds get only the text check here:
+    /// confining them on disk (symlinks) happens in [`Policy::load_with_mode`] alone.
     pub fn from_sources(
         base_src: &str,
         project_src: Option<&str>,
