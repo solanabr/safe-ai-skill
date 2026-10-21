@@ -1,8 +1,9 @@
 # Live Claude Code conformance — safe-ai-skill
 #
-# Runs scripts/cc-conformance.sh: headless `claude -p` (haiku) sessions in throwaway projects
-# with this checkout's plugin loaded, asserting how a real Claude Code treats the plugin's hooks
-# (denials, onFailure, SessionStart notice, Grep rewrite, blocked skills).
+# Runs scripts/cc-conformance.sh in plugin mode: headless `claude -p` (haiku) sessions in
+# throwaway projects with this checkout's plugin loaded through --plugin-dir, asserting how a real
+# Claude Code treats the plugin's hooks (denials, onFailure, SessionStart notice, Grep rewrite,
+# blocked skills). Runners have no sandbox, so the SessionStart case runs here too.
 #
 # Every run calls the Anthropic API (secret ANTHROPIC_API_KEY) and costs money, so it never runs
 # on push or PR — only on demand. Transcripts are uploaded as artifacts (the isolated HOME is not).
@@ -61,7 +62,7 @@ jobs:
             exit 1
           fi
           if [ -n "$CASES" ]; then set -- --only "$CASES"; fi
-          scripts/cc-conformance.sh --keep --strict "$@"
+          scripts/cc-conformance.sh --mode plugin --keep --strict "$@"
 
       - name: Upload transcripts
         if: always()
