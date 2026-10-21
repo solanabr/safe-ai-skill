@@ -656,3 +656,56 @@ fn e2e_compound_with_unknown_command_has_no_opinion() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// One argument split for flags, values and the cluster: a word is never both.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn flag_value_reading_as_a_cluster_flag_never_allows() {
+    // `-ud` after `--with-memo` is the memo to one reader and `-u d` to another.
+    for cmd in [
+        format!("solana transfer --with-memo -ud {DEST} 0.5"),
+        format!("solana transfer --with-memo --url=d {DEST} 0.5"),
+        format!("solana transfer --fee-payer -ud {DEST} 0.5"),
+        format!("solana transfer --with-memo=-ud {DEST} 0.5"),
+        format!("solana transfer --with-memo -u d {DEST} 0.5"),
+    ] {
+        for network in [Network::Unknown, Network::Mainnet] {
+            let (d, _) = decide(&cmd, network);
+            assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
+        }
+    }
+}
+
+#[test]
+fn final_after_a_value_flag_still_guards() {
+    // `--with-memo --final`: `--final` is the flag (the memo gets no value) or the memo.
+    let (d, meta) = decide(
+        "solana program deploy ./p.so --with-memo --final",
+        Network::Devnet,
+    );
+    assert!(is_ask(&d), "{d:?}");
+    assert!(meta.hard_guard);
+    let (d, _) = decide(
+        "solana program deploy ./p.so --with-memo --final -um",
+        Network::Devnet,
+    );
+    assert!(is_deny(&d), "{d:?}");
+    // An attached value is only a value: this deploy is not final.
+    let (d, _) = decide(
+        "solana program deploy ./p.so -ud --with-memo=--final",
+        Network::Devnet,
+    );
+    assert_eq!(d, Decision::Defer);
+}
+
+#[test]
+fn e2e_memo_flag_value_does_not_name_the_cluster() {
+    for cmd in [
+        format!("solana transfer --with-memo -ud {DEST} 0.5"),
+        format!("solana transfer --fee-payer -ud {DEST} 0.5"),
+    ] {
+        assert_eq!(gate_bash(&cmd).as_deref(), Some("ask"), "{cmd}");
+    }
+}

@@ -111,62 +111,296 @@ fn classify_url(raw: &str) -> Network {
     Network::Unknown
 }
 
+/// Long flags of the `solana` / `spl-token` / `anchor` CLIs that take a value. Without an
+/// attached `=value`, the next word is the flag's value, never a positional argument.
+const VALUE_FLAGS: &[&str] = &[
+    // Global options.
+    "--url",
+    "--config",
+    "--keypair",
+    "--commitment",
+    "--ws",
+    "--output",
+    "--rpc-timeout",
+    "--confirm-timeout",
+    "--fee-payer",
+    "--program-id",
+    "--with-compute-unit-price",
+    "--with-compute-unit-limit",
+    "--cluster",
+    "--provider.cluster",
+    "--provider.wallet",
+    // Transaction options.
+    "--with-memo",
+    "--from",
+    "--nonce",
+    "--nonce-authority",
+    "--blockhash",
+    "--signer",
+    "--derived-address-seed",
+    "--derived-address-program-id",
+    // `spl-token transfer`.
+    "--owner",
+    "--mint-decimals",
+    "--expected-fee",
+    "--multisig-signer",
+    "--transfer-hook-account",
+    // `anchor deploy` / `anchor program deploy`.
+    "--program-name",
+    "--program-keypair",
+];
+
+/// Long boolean flags of the same CLIs.
+const BOOL_FLAGS: &[&str] = &[
+    // Global flags.
+    "--help",
+    "--version",
+    "--verbose",
+    "--no-address-labels",
+    "--skip-preflight",
+    "--skip-seed-phrase-validation",
+    "--use-quic",
+    "--use-tpu-client",
+    "--use-udp",
+    "--program-2022",
+    "--use-unchecked-instruction",
+    // Transfer flags.
+    "--no-wait",
+    "--allow-unfunded-recipient",
+    "--allow-empty-recipient",
+    "--fund-recipient",
+    "--allow-non-system-account-recipient",
+    "--no-recipient-is-ata-owner",
+    "--recipient-is-ata-owner",
+    "--confidential",
+    "--sign-only",
+    "--dump-transaction-message",
+    // Irreversible-action flags.
+    "--final",
+    "--disable",
+];
+
+/// Short flags that take a value, with the long flag each stands for (`-p` differs by CLI).
+const VALUE_SHORTS: &[(char, &str)] = &[
+    ('u', "--url"),
+    ('k', "--keypair"),
+    ('C', "--config"),
+    ('p', "-p"),
+];
+
+/// Short boolean flags (`-v`, `-h`, `-V`). They may precede a value-taking short in one
+/// cluster (`-vum`).
+const BOOL_SHORTS: &[char] = &['v', 'h', 'V'];
+
 /// Long flags whose value is an RPC URL or cluster moniker (`-u` is the short form).
 const URL_FLAGS: &[&str] = &["--url", "--cluster", "--provider.cluster"];
 
-/// Short boolean flags of the solana-family CLIs (`-v`, `-h`, `-V`). They may precede a
-/// value-taking short in one cluster (`-vum`).
-pub(crate) const BOOL_SHORTS: &[char] = &['v', 'h', 'V'];
-
-/// The cluster `command` names explicitly, or `None` when it names none.
-///
-/// Recognizes `-u`/`--url`/`--cluster`/Anchor's `--provider.cluster` with the value as the next
-/// token, after `=`, or attached to `-u` (`-um`, also after boolean shorts: `-vum`). A value
-/// that names no recognizable cluster is [`Network::Unknown`]: an explicit target never falls
-/// back to the config. So is `-C/--config <file>` without a URL flag (the file is not read).
-/// Several flags fold to the riskiest (mainnet, then unknown). Tokens are quote-aware, so quoted
-/// text such as a memo is never a flag.
+/// The cluster `command` names explicitly, or `None` when it names none: the riskiest of what
+/// each segment's [`Argv::network`] says.
 pub fn network_from_flags(command: &str) -> Option<Network> {
-    let tokens = tokenize(command);
-    let mut named: Option<Network> = None;
-    let mut config_file = false;
-    let mut iter = tokens.iter();
-    while let Some(tok) = iter.next() {
-        if let Some(attached) = flag_value(tok, URL_FLAGS, 'u') {
-            let value = attached.or_else(|| iter.next().map(String::as_str));
-            let net = value.map_or(Network::Unknown, classify_url);
-            named = Some(named.map_or(net, |prev| riskier(prev, net)));
-        } else if flag_value(tok, &["--config"], 'C').is_some() {
-            config_file = true;
-        }
-    }
-    named.or(config_file.then_some(Network::Unknown))
+    split_segments(command)
+        .into_iter()
+        .filter_map(|segment| Argv::parse(&tokenize(segment)).network())
+        .reduce(riskier)
 }
 
-/// Match `tok` against a value-taking flag: one of `longs` (`--url`, `--url=x`) or the short
-/// `short` (`-u`, `-ux`, `-u=x`), possibly after [`BOOL_SHORTS`] in a cluster (`-vux`).
-///
-/// `Some(Some(value))` when the value is attached, `Some(None)` when it is the next token.
-pub(crate) fn flag_value<'a>(tok: &'a str, longs: &[&str], short: char) -> Option<Option<&'a str>> {
-    for long in longs {
-        if let Some(rest) = tok.strip_prefix(long) {
-            if rest.is_empty() {
-                return Some(None);
+/// One command segment's arguments (after the program word) split into flags and positional
+/// words. This is the single flag model: network resolution and the Bash gate both read it, so
+/// a word is never a flag value to one and a flag to the other.
+pub struct Argv<'a> {
+    /// Positional words, without flags, flag values and fd duplications (`2>&1`).
+    pub positionals: Vec<&'a str>,
+    /// Index into `positionals` from which positions are uncertain: a flag of unknown arity was
+    /// followed by a word that may be its value.
+    pub uncertain_from: Option<usize>,
+    /// Flags as `(long name, value)`; shorts appear under their long name.
+    flags: Vec<(&'a str, Option<&'a str>)>,
+    /// A value-taking flag was followed by a `-`-word or by nothing. A CLI may read that word
+    /// as the flag's value or as a flag of its own, so the cluster it names is uncertain.
+    ambiguous_value: bool,
+}
+
+/// How one word relates to the words around it.
+enum Kind<'a> {
+    /// A positional word.
+    Positional,
+    /// A flag with its value attached (`--url=m`, `-um`).
+    Attached(&'a str, &'a str),
+    /// A boolean flag, or a cluster of boolean shorts.
+    Bool(&'a str),
+    /// A flag whose value is the next word.
+    TakesValue(&'a str),
+    /// A flag of unknown arity.
+    Unknown(&'a str),
+}
+
+impl<'a> Argv<'a> {
+    /// Split a tokenized segment (`tokens[0]` is the program word).
+    pub fn parse(tokens: &'a [String]) -> Argv<'a> {
+        let words: Vec<&'a str> = tokens
+            .iter()
+            .skip(1)
+            .map(String::as_str)
+            .filter(|word| !is_fd_duplication(word))
+            .collect();
+        Argv::parse_words(&words)
+    }
+
+    fn parse_words(words: &[&'a str]) -> Argv<'a> {
+        let mut argv = Argv {
+            positionals: Vec::new(),
+            uncertain_from: None,
+            flags: Vec::new(),
+            ambiguous_value: false,
+        };
+        let mut i = 0;
+        while let Some(&word) = words.get(i) {
+            i += 1;
+            if word == "--" {
+                // Positional from here. Anchor hands these words to `solana program deploy`, so
+                // their flags (`-- --final`) count as well.
+                let rest = words.get(i..).unwrap_or_default();
+                argv.positionals.extend_from_slice(rest);
+                let passed_on = Argv::parse_words(rest);
+                argv.flags.extend(passed_on.flags);
+                argv.ambiguous_value |= passed_on.ambiguous_value;
+                break;
             }
-            if let Some(value) = rest.strip_prefix('=') {
-                return Some(Some(value));
+            let next = words.get(i).copied();
+            match kind(word) {
+                Kind::Positional => argv.positionals.push(word),
+                Kind::Attached(name, value) => argv.flags.push((name, Some(value))),
+                Kind::Bool(name) => argv.flags.push((name, None)),
+                Kind::TakesValue(name) => match next {
+                    Some(value) if !is_flag_like(value) => {
+                        argv.flags.push((name, Some(value)));
+                        i += 1;
+                    }
+                    // The following word stays a flag in its own right.
+                    _ => {
+                        argv.flags.push((name, None));
+                        argv.ambiguous_value = true;
+                    }
+                },
+                Kind::Unknown(name) => {
+                    argv.flags.push((name, None));
+                    let word_follows = next.is_some_and(|w| !is_flag_like(w));
+                    if word_follows && argv.uncertain_from.is_none() {
+                        argv.uncertain_from = Some(argv.positionals.len());
+                    }
+                }
             }
         }
+        argv
     }
-    let cluster = tok.strip_prefix('-')?;
-    if cluster.starts_with('-') {
-        return None;
+
+    /// Whether flag `name` (a long name such as `--final`) is present, with or without a value.
+    pub fn has_flag(&self, name: &str) -> bool {
+        self.flags.iter().any(|&(flag, _)| flag == name)
     }
-    let rest = cluster
-        .trim_start_matches(|c| BOOL_SHORTS.contains(&c))
-        .strip_prefix(short)?;
-    let value = rest.strip_prefix('=').unwrap_or(rest);
-    Some((!value.is_empty()).then_some(value))
+
+    /// The cluster these arguments name, or `None` when they name none.
+    ///
+    /// A URL flag (`--url`, `-u`, `--cluster`, Anchor's `--provider.cluster`) whose value names
+    /// no recognizable cluster is [`Network::Unknown`]: an explicit target never falls back to
+    /// the config. So is `-C/--config <file>` without a URL flag (the file is not read), and so
+    /// is an ambiguous flag value. Several flags fold to the riskiest (mainnet, then unknown).
+    pub fn network(&self) -> Option<Network> {
+        let mut named: Option<Network> = None;
+        let mut config_file = false;
+        for &(name, value) in &self.flags {
+            if URL_FLAGS.contains(&name) {
+                let net = value.map_or(Network::Unknown, classify_url);
+                named = Some(named.map_or(net, |prev| riskier(prev, net)));
+            } else if name == "--config" {
+                config_file = true;
+            }
+        }
+        let net = named.or_else(|| config_file.then_some(Network::Unknown));
+        if self.ambiguous_value {
+            return Some(net.map_or(Network::Unknown, |n| riskier(n, Network::Unknown)));
+        }
+        net
+    }
+}
+
+/// Classify one word against the flag tables.
+fn kind(word: &str) -> Kind<'_> {
+    if !is_flag_like(word) {
+        return Kind::Positional;
+    }
+    if word.starts_with("--") {
+        return if let Some((name, value)) = word.split_once('=') {
+            Kind::Attached(name, value)
+        } else if VALUE_FLAGS.contains(&word) {
+            Kind::TakesValue(word)
+        } else if BOOL_FLAGS.contains(&word) {
+            Kind::Bool(word)
+        } else {
+            Kind::Unknown(word)
+        };
+    }
+    // A short cluster: boolean shorts, then at most one value-taking short whose value is the
+    // rest of the word (`-um`, `-u=m`) or the next word (`-u`, `-vu`).
+    let cluster = word.trim_start_matches('-');
+    let rest = cluster.trim_start_matches(|c| BOOL_SHORTS.contains(&c));
+    let Some(first) = rest.chars().next() else {
+        return Kind::Bool(word);
+    };
+    match VALUE_SHORTS.iter().find(|&&(short, _)| short == first) {
+        Some(&(_, long)) => {
+            let value = rest.get(first.len_utf8()..).unwrap_or_default();
+            let value = value.strip_prefix('=').unwrap_or(value);
+            if value.is_empty() {
+                Kind::TakesValue(long)
+            } else {
+                Kind::Attached(long, value)
+            }
+        }
+        None => Kind::Unknown(word),
+    }
+}
+
+/// Whether `word` reads as a flag (`-x`, `--x`); a lone `-` is a value (stdin).
+fn is_flag_like(word: &str) -> bool {
+    word.starts_with('-') && word != "-"
+}
+
+/// Whether `word` is a file-descriptor duplication such as `2>&1`, `>&2` or `1>&-`: the shell
+/// strips it before the CLI sees its argv, and it touches no file. File redirections
+/// (`> out.log`) stay as words, so a transfer carrying one never reads as clean.
+fn is_fd_duplication(word: &str) -> bool {
+    let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    op.strip_prefix(">&")
+        .or_else(|| op.strip_prefix("<&"))
+        .is_some_and(|fd| !fd.is_empty() && fd.chars().all(|c| c.is_ascii_digit() || c == '-'))
+}
+
+/// Split a command on top-level `&&`, `||`, `;`, `|` separators into segments.
+pub fn split_segments(command: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let bytes = command.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let two = bytes.get(i..i + 2);
+        if matches!(two, Some(b"&&")) || matches!(two, Some(b"||")) {
+            segments.push(command[start..i].trim());
+            i += 2;
+            start = i;
+            continue;
+        }
+        let c = bytes[i];
+        if c == b';' || c == b'|' {
+            segments.push(command[start..i].trim());
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    segments.push(command[start..].trim());
+    segments.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 /// The riskier of two networks for gating: mainnet, then unknown, then any identified other.
@@ -495,6 +729,33 @@ mod tests {
         assert_eq!(
             network_from_flags("solana transfer --with-memo \"pay -ud\" D 1"),
             None
+        );
+    }
+
+    #[test]
+    fn flag_values_are_not_cluster_flags() {
+        // A `-`-word after a value-taking flag may be that flag's value: unknown at best.
+        assert_eq!(
+            network_from_flags("solana transfer --with-memo -ud D 1"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer --with-memo --url=d D 1"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer --fee-payer -um D 1"),
+            Some(Network::Mainnet)
+        );
+        // An attached value is only a value.
+        assert_eq!(
+            network_from_flags("solana transfer --with-memo=-ud D 1"),
+            None
+        );
+        // Anchor passes the words after `--` to `solana program deploy`.
+        assert_eq!(
+            network_from_flags("anchor deploy -- --url m"),
+            Some(Network::Mainnet)
         );
     }
 
