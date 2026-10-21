@@ -264,11 +264,11 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `verify session` — the SessionStart supply-chain sweep.
+/// `verify session` — the SessionStart supply-chain sweep (report-only, nothing is moved).
 ///
 /// Runs [`verify::run_session`] over the policy skill roots, additionally scans the project
-/// `.mcp.json` for unpinned MCP servers, and emits the SessionStart decision (injected
-/// warning context + a `reloadSkills` signal when anything was quarantined).
+/// `.mcp.json` for unpinned MCP servers, and emits the SessionStart report (`systemMessage` for
+/// the user + `additionalContext` for the model) — or nothing when there is nothing to report.
 fn cmd_verify_session() -> ExitCode {
     // SessionStart hooks may carry a cwd on stdin; fall back to the process cwd.
     let (_raw, input) = read_input();
@@ -276,7 +276,7 @@ fn cmd_verify_session() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
 
-    let mut res = verify::run_session(&plugin_data, &effective.supply_chain.verify_skills_dirs);
+    let mut res = verify::run_session(&plugin_data, &cwd, &effective);
 
     // Fold an `.mcp.json` scan into the session warning context.
     let mcp_path = cwd.join(".mcp.json");
@@ -298,12 +298,9 @@ fn cmd_verify_session() -> ExitCode {
         }
     }
 
-    let ctx = if res.additional_context.is_empty() {
-        None
-    } else {
-        Some(res.additional_context.as_str())
-    };
-    let _ = io::emit_sessionstart(ctx, res.reload_skills);
+    if let Some(out) = res.hook_output() {
+        print_json(&out);
+    }
     ExitCode::SUCCESS
 }
 
@@ -321,30 +318,9 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let effective = load_effective_policy(&cwd, &plugin_data);
 
-    // Restore into the first configured skills root (the canonical install location).
-    let root = effective
-        .supply_chain
-        .verify_skills_dirs
-        .first()
-        .map(|d| verify::expand_home(d))
-        .unwrap_or_else(|| plugin_data.join("skills"));
-    let restore_to = root.join(name);
-
-    match verify::restore_quarantine(&plugin_data, name, &restore_to) {
-        Ok(()) => {
-            // Re-pin the restored content (trust-on-first-use after explicit approval).
-            let hash = verify::lockfile::hash_tree(&restore_to);
-            let mut lock = verify::lockfile::load(&plugin_data);
-            lock.pin_skill(
-                name,
-                verify::lockfile::SkillPin {
-                    sha256: hash,
-                    source: String::new(),
-                    verified_at: now_secs(),
-                    scan: "approved".to_string(),
-                },
-            );
-            let _ = verify::lockfile::save(&plugin_data, &lock);
+    // Back to its `.gitmodules` submodule path, else under the first swept root; re-pinned.
+    match verify::approve_quarantined(&plugin_data, &cwd, name, &effective) {
+        Ok(restore_to) => {
             audit_event(
                 &plugin_data,
                 "verify_approve",
