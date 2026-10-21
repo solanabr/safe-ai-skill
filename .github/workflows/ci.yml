@@ -184,6 +184,26 @@ jobs:
       - name: Shim passes sh -n (syntax check)
         run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill
 
+  # ── shim failure contract (fake uname + fake engines, no build) ─────────
+  # /bin/sh is dash on Ubuntu and bash 3.2 on macOS; the script also runs dash and
+  # bash --posix wherever they exist.
+  shim-tests:
+    name: Shim tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (shim + test)
+        if: runner.os == 'Linux'
+        run: shellcheck plugins/safe-ai-skill/bin/safe-ai-skill scripts/test-shim.sh
+
+      - name: scripts/test-shim.sh
+        run: sh scripts/test-shim.sh
+
   # ── package + script checks (npm wrapper, install.sh, version consistency) ─
   package-checks:
     name: Package + script checks

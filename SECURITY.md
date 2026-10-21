@@ -84,7 +84,7 @@ Malicious skills can embed instructions targeting the language model in SKILL.md
 
 **Hard guards are unconditional.** The four hard guards — `mainnet_deploy`, `set_authority`, `account_close`, `secret_read` — are enforced by the engine binary regardless of the active profile, any time-boxed grant, or any project policy override. There is no flag or configuration that relaxes them in v1.
 
-**Never fails open.** If the `safe-ai-skill` binary cannot be obtained (no matching prebuilt, no `cargo`), the `bin/safe-ai-skill` shim exits with code 2, which Claude Code interprets as a block on the gated action.
+**Fails open only when the engine cannot run, never past a broken gate.** If no engine runs on this platform (no matching prebuilt, not an executable for this OS, exec failure 126/127), the `bin/safe-ai-skill` shim keeps the Solana CLI hooks at `ask`, reports the firewall INACTIVE at SessionStart, and lets the other hooks continue with a one-line notice. An engine crash blocks `gate-bash` and `gate-mcp` (exit 2). `SAFE_AI_SKILL_STRICT=1` turns every one of these cases into exit 2 (block). `SAFE_AI_SKILL_DISABLE=1` turns the hooks off unless strict mode is set, and SessionStart reports it. The shim never builds from source and never runs a binary outside its own directory. The Solana hooks set `onFailure: block`, the others `onFailure: continue` (honoured from Claude Code 2.1.295).
 
 **Fail-closed policy.** If `policy.yaml` cannot be parsed, `policy.rs` falls back to treating all gated actions as `ask`. The session is not left without gates because of a config file error.
 
