@@ -88,7 +88,7 @@ needed dep, don't add it), `src/main.rs`, `src/lib.rs`, `src/policy.rs`. The `Re
 For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp`):
 
 ```
-stdin → io::read_payload                           # ≤ 1 MiB, else unreadable
+stdin → io::read_payload                           # ≤ 1 MiB, else Unreadable::Oversized
       → Policy::load(cwd) → .effective()           # active-profile overlay applied
       → Context::build(command, cwd)               # network resolution
       → gate::decide(...) -> (Decision, GateMeta)  # PURE
@@ -100,9 +100,12 @@ stdin → io::read_payload                           # ≤ 1 MiB, else unreadabl
 `Defer` from a gate emits nothing (empty stdout, exit 0): no opinion leaves Claude Code's normal
 permission flow in charge. It is never emitted as `permissionDecision: "defer"`, which Claude Code
 treats as "stop this tool call".
-An unreadable payload (malformed, empty, non-UTF-8, over 1 MiB) is no opinion for the broad gates
-(`gate-read`, `gate-bash-secrets`, `gate-mcp`, `redact`, `prompt-guard`). `gate-bash` (the Solana
-surface) asks instead, also when the payload has no `tool_input.command`, under a hard-guard meta.
+A payload over 1 MiB (`Unreadable::Oversized`) is never parsed: every PreToolUse gate (`gate-read`,
+`gate-bash-secrets`, `gate-mcp`, `gate-bash`) asks, so padding cannot slip a call past a gate;
+`redact` and `prompt-guard` have no opinion. A malformed payload (`Unreadable::Malformed`: empty,
+non-UTF-8, not a JSON hook object) is no opinion for the broad gates; `gate-bash` (the Solana
+surface) asks, also when the payload has no `tool_input.command`. Both asks carry the hard-guard
+`GateMeta::unreadable()`, so no grant relaxes them.
 Unknown/missing subcommand → empty stdout, error on stderr, exit 3. `--version` prints
 `safe-ai-skill <version>` (no hook JSON).
 Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` unchanged.
@@ -164,7 +167,8 @@ impl HookInput {
 }
 
 pub const MAX_STDIN_BYTES: usize;                // 1 MiB
-pub fn read_payload(reader: impl std::io::Read) -> Option<(String, HookInput)>;  // None = unreadable
+pub enum Unreadable { Oversized, Malformed }
+pub fn read_payload(reader: impl std::io::Read) -> Result<(String, HookInput), Unreadable>;
 
 pub enum Decision { Allow, Ask { reason: String }, Deny { reason: String }, Defer }
 impl Decision { pub fn label(&self) -> &'static str; pub fn reason(&self) -> &str; }
@@ -290,7 +294,7 @@ pub struct GateMeta {
 impl GateMeta {
     pub fn new(scope: Scope, hard_guard: bool) -> Self;
     pub fn unknown() -> Self;   // Scope::Other, not a hard guard
-    pub fn unreadable() -> Self;   // Scope::Other, hard guard (gate-bash unreadable payload)
+    pub fn unreadable() -> Self;   // Scope::Other, hard guard (oversized / gate-bash malformed)
 }
 ```
 

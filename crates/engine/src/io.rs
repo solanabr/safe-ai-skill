@@ -11,9 +11,18 @@ use std::io::{Read, Write};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Largest hook stdin payload the engine parses (1 MiB). Anything bigger is unreadable: the
-/// broad gates then have no opinion and `gate-bash` asks.
+/// Largest hook stdin payload the engine parses (1 MiB). Anything bigger is
+/// [`Unreadable::Oversized`], which every PreToolUse gate answers with `ask`.
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
+
+/// Why a hook payload could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unreadable {
+    /// Larger than [`MAX_STDIN_BYTES`]; never parsed, so padding cannot hide a call.
+    Oversized,
+    /// Empty, not UTF-8, failed to read, or not a JSON hook object.
+    Malformed,
+}
 
 /// Deserialized Claude Code hook stdin payload.
 ///
@@ -81,20 +90,21 @@ impl HookInput {
 
 /// Read one hook payload from `reader`, bounded at [`MAX_STDIN_BYTES`].
 ///
-/// Returns the raw text and its parse, or `None` when the payload is oversized, not UTF-8,
-/// or not a JSON hook object. Reading stops one byte past the bound, so an oversized or
-/// endless stream is never buffered whole.
-pub fn read_payload(reader: impl Read) -> Option<(String, HookInput)> {
-    let mut raw = String::new();
-    reader
+/// Returns the raw text and its parse, or why it is [`Unreadable`]. Size is checked before
+/// content, and reading stops one byte past the bound, so an oversized or endless stream is
+/// never buffered whole.
+pub fn read_payload(reader: impl Read) -> Result<(String, HookInput), Unreadable> {
+    let mut bytes = Vec::new();
+    let read = reader
         .take(MAX_STDIN_BYTES as u64 + 1)
-        .read_to_string(&mut raw)
-        .ok()?;
-    if raw.len() > MAX_STDIN_BYTES {
-        return None;
+        .read_to_end(&mut bytes);
+    if bytes.len() > MAX_STDIN_BYTES {
+        return Err(Unreadable::Oversized);
     }
-    let input = serde_json::from_str(&raw).ok()?;
-    Some((raw, input))
+    read.map_err(|_| Unreadable::Malformed)?;
+    let raw = String::from_utf8(bytes).map_err(|_| Unreadable::Malformed)?;
+    let input = serde_json::from_str(&raw).map_err(|_| Unreadable::Malformed)?;
+    Ok((raw, input))
 }
 
 /// A gate / scan decision.
@@ -310,20 +320,31 @@ mod tests {
 
     #[test]
     fn read_payload_rejects_malformed_empty_and_non_utf8() {
-        assert!(read_payload("not json at all".as_bytes()).is_none());
-        assert!(read_payload("".as_bytes()).is_none());
-        assert!(read_payload(&[0xff, 0xfe, b'{', b'}'][..]).is_none());
+        let bad: [&[u8]; 3] = [b"not json at all", b"", &[0xff, 0xfe, b'{', b'}']];
+        for body in bad {
+            assert_eq!(read_payload(body).err(), Some(Unreadable::Malformed));
+        }
     }
 
     #[test]
     fn read_payload_is_bounded_at_one_mib() {
-        // A payload of exactly the bound is read; one byte more is unreadable.
+        // A payload of exactly the bound is read; one byte more is oversized.
         let fill = MAX_STDIN_BYTES - r#"{"prompt":""}"#.len();
         let at_bound = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill));
         assert_eq!(at_bound.len(), MAX_STDIN_BYTES);
-        assert!(read_payload(at_bound.as_bytes()).is_some());
+        assert!(read_payload(at_bound.as_bytes()).is_ok());
         let over = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill + 1));
-        assert!(read_payload(over.as_bytes()).is_none());
+        assert_eq!(
+            read_payload(over.as_bytes()).err(),
+            Some(Unreadable::Oversized)
+        );
+    }
+
+    #[test]
+    fn read_payload_checks_size_before_content() {
+        // Past the bound a payload is oversized even when it is not UTF-8 or JSON.
+        let junk = vec![0xff_u8; MAX_STDIN_BYTES + 1];
+        assert_eq!(read_payload(&junk[..]).err(), Some(Unreadable::Oversized));
     }
 
     #[test]

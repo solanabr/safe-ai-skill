@@ -346,7 +346,7 @@ fn gate_writes_audit_into_sandbox_only() {
 // Output contract (#13): no opinion = empty stdout + exit 0; invocation errors exit 3
 // ---------------------------------------------------------------------------------------
 
-/// Hooks that fail open: an unreadable payload gets no opinion (only `gate-bash` asks).
+/// Hooks with no opinion on a malformed payload (only `gate-bash` asks).
 const BROAD_GATES: [&str; 5] = [
     "gate-read",
     "gate-bash-secrets",
@@ -384,6 +384,14 @@ fn oversized(mut payload: serde_json::Value) -> String {
     payload.to_string()
 }
 
+/// The `permissionDecisionReason` of an emitted decision (`""` when absent).
+fn reason_of(run: &Run) -> String {
+    run.json()["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
 #[test]
 fn read_readme_has_no_opinion() {
     let run = run_raw(
@@ -417,22 +425,45 @@ fn empty_stdin_has_no_opinion_on_broad_gates() {
 }
 
 #[test]
-fn oversized_stdin_is_not_parsed_by_broad_gates() {
-    // Each payload draws output when read; padded past 1 MiB it is not parsed at all.
-    let keypair: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+fn oversized_stdin_asks_on_pretooluse_gates() {
+    // Benign calls padded past 1 MiB: never parsed, so padding cannot slip past a gate.
     let cases = [
         (
             "gate-read",
-            serde_json::json!({ "tool_name": "Read", "tool_input": { "file_path": "/project/.env" } }),
+            serde_json::json!({ "tool_name": "Read", "tool_input": { "file_path": "README.md" } }),
         ),
         (
             "gate-bash-secrets",
-            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cat ~/.config/solana/id.json" } }),
+            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
         ),
         (
             "gate-mcp",
-            serde_json::json!({ "tool_name": "mcp__helius__transferSol", "tool_input": { "to": DEST, "amount": 1.0 } }),
+            serde_json::json!({ "tool_name": "mcp__helius__getBalance", "tool_input": { "address": DEST } }),
         ),
+        (
+            "gate-bash",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }),
+        ),
+    ];
+    for (sub, payload) in cases {
+        let control = run_raw(&[sub], &payload.to_string());
+        assert_eq!(
+            decision_label(&control),
+            "",
+            "{sub}: control must have no opinion"
+        );
+        let run = run_raw(&[sub], &oversized(payload));
+        assert_eq!(decision_label(&run), "ask", "{sub}: {}", run.stdout);
+        let reason = reason_of(&run);
+        assert!(reason.contains("1 MiB"), "{sub}: reason {reason:?}");
+    }
+}
+
+#[test]
+fn oversized_stdin_has_no_opinion_on_redact_and_prompt_guard() {
+    // Each payload draws output when read; padded past 1 MiB the scanners stay silent.
+    let keypair: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+    let cases = [
         (
             "redact",
             serde_json::json!({ "tool_name": "Bash", "tool_output": format!("keypair = [{}]", keypair.join(",")) }),
@@ -453,24 +484,17 @@ fn oversized_stdin_is_not_parsed_by_broad_gates() {
 }
 
 #[test]
-fn gate_bash_unreadable_stdin_asks() {
-    // The Solana surface fails closed: a payload it cannot read is an `ask`, never silence.
-    let padded =
-        oversized(serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }));
+fn gate_bash_malformed_stdin_asks() {
+    // The Solana surface fails closed: a payload it cannot parse is an `ask`, never silence.
     let cases = [
         ("malformed", "{not json"),
         ("empty", ""),
         ("no command", r#"{"tool_name":"Bash","tool_input":{}}"#),
-        ("oversized", padded.as_str()),
     ];
     for (what, body) in cases {
         let run = run_raw(&["gate-bash"], body);
         assert_eq!(decision_label(&run), "ask", "{what}: {}", run.stdout);
-        let reason = run.json()["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        assert!(!reason.is_empty(), "{what}: ask without a reason");
+        assert!(!reason_of(&run).is_empty(), "{what}: ask without a reason");
     }
     // Control: the same command, readable, is not a Solana command → no opinion.
     let readable = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
@@ -478,7 +502,7 @@ fn gate_bash_unreadable_stdin_asks() {
 }
 
 #[test]
-fn unreadable_bash_ask_is_not_relaxed_by_a_grant() {
+fn unreadable_ask_is_not_relaxed_by_a_grant() {
     // An `other` grant relaxes unclassified asks; the unreadable-payload ask is a hard guard.
     let data = TempDir::new("unread-grant-data");
     let home = TempDir::new("unread-grant-home");
@@ -488,13 +512,23 @@ fn unreadable_bash_ask_is_not_relaxed_by_a_grant() {
         .cwd(home.path())
         .run();
     assert_eq!(grant.json()["status"], "granted", "{}", grant.stdout);
-    let run = Invocation::new(&["gate-bash"])
-        .plugin_data(data.path())
-        .home(home.path())
-        .cwd(home.path())
-        .stdin("{not json")
-        .run();
-    assert_eq!(decision_label(&run), "ask", "{}", run.stdout);
+    let padded_mcp = oversized(serde_json::json!({
+        "tool_name": "mcp__helius__getBalance",
+        "tool_input": { "address": DEST }
+    }));
+    let cases = [
+        ("gate-bash", "{not json".to_string()),
+        ("gate-mcp", padded_mcp),
+    ];
+    for (sub, body) in cases {
+        let run = Invocation::new(&[sub])
+            .plugin_data(data.path())
+            .home(home.path())
+            .cwd(home.path())
+            .stdin(body)
+            .run();
+        assert_eq!(decision_label(&run), "ask", "{sub}: {}", run.stdout);
+    }
 }
 
 #[test]
