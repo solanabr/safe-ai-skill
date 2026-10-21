@@ -1,74 +1,207 @@
 #!/bin/sh
 # safe-ai-skill platform-dispatch shim.
 #
-# Resolves the native `safe-ai-skill` engine binary and execs it, forwarding all
-# arguments and stdin. Strategy:
-#   1. exec the prebuilt binary matching this platform (bin/safe-ai-skill-<plat>), if present.
-#   2. else one-time `cargo build --release` of crates/engine into
-#      ${CLAUDE_PLUGIN_DATA}/bin/safe-ai-skill, then exec it.
-#   3. else print an error and exit 2.
-#
-# CRITICAL: this shim NEVER exits 0 on failure. The engine gates security-
-# sensitive actions; failing open would silently bypass the firewall. If no
-# engine can be obtained, we exit non-zero so the gated action is blocked.
+# Runs the prebuilt engine for this platform (bin/safe-ai-skill-<plat>) as a child,
+# forwarding all arguments and stdin, and maps the ways that can fail onto the hook
+# contract (spec D6.1):
+#   - Environment failure (no prebuilt for this platform, not an executable here, exit
+#     126/127): fail open with a notice. gate-bash keeps the Solana CLI surface at `ask`,
+#     SessionStart reports the firewall INACTIVE, every other hook exits 0 with one
+#     stderr line.
+#   - Engine crash (signal, or exit not in {0,2,3}): gate-bash and gate-mcp exit 2
+#     (block); every other hook exits 0 with a stderr line, SessionStart with a notice.
+#   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
+#   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
+#     project settings mention it (a repo can't disable the firewall); SessionStart
+#     reports either way.
+# CLI subcommands run the engine with live output and keep its exit status; an
+# environment failure exits 1. Nothing outside this directory is ever executed (no cargo
+# build, no $CLAUDE_PLUGIN_DATA binary), and nothing is cached, so a failed probe never
+# outlives the run that saw it.
 
-set -eu
+set -fu
 
-SELF_DIR=$(dirname "$0")
-
-# Map uname output to our platform binary suffix.
-os=$(uname -s 2>/dev/null || echo unknown)
-arch=$(uname -m 2>/dev/null || echo unknown)
-
-plat=""
-case "$os" in
-  Darwin)
-    case "$arch" in
-      arm64|aarch64) plat="darwin-arm64" ;;
-      x86_64|amd64)  plat="darwin-x64" ;;
-    esac
-    ;;
-  Linux)
-    case "$arch" in
-      x86_64|amd64)  plat="linux-x64" ;;
-      aarch64|arm64) plat="linux-arm64" ;;
-    esac
-    ;;
+case $0 in
+  */*) self_dir=${0%/*} ;;
+  *) self_dir=. ;;
 esac
 
-# 1. Prebuilt platform binary shipped alongside this shim.
-if [ -n "$plat" ]; then
-  prebuilt="$SELF_DIR/safe-ai-skill-$plat"
-  if [ -x "$prebuilt" ]; then
-    exec "$prebuilt" "$@"
-  fi
-fi
+# Which hook contract applies, from the subcommand the hook runs.
+sub=${1:-}
+case $sub in
+  gate-bash) kind=solana ;;
+  gate-mcp) kind=mcp ;;
+  gate-* | redact | prompt-guard) kind=broad ;;
+  verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
+  *) kind=cli ;;
+esac
 
-# 2. Fallback: build from source once into the plugin data dir and cache it.
-data_dir="${CLAUDE_PLUGIN_DATA:-}"
-if [ -n "$data_dir" ]; then
-  built="$data_dir/bin/safe-ai-skill"
-  if [ -x "$built" ]; then
-    exec "$built" "$@"
-  fi
+strict=
+if [ "${SAFE_AI_SKILL_STRICT:-}" = 1 ]; then strict=1; fi
 
-  if command -v cargo >/dev/null 2>&1; then
-    crate_dir="$SELF_DIR/../../../crates/engine"
-    if [ -d "$crate_dir" ]; then
-      mkdir -p "$data_dir/bin"
-      if cargo build --release --manifest-path "$crate_dir/Cargo.toml" >&2; then
-        compiled="$crate_dir/target/release/safe-ai-skill"
-        if [ -x "$compiled" ]; then
-          cp "$compiled" "$built"
-          chmod +x "$built"
-          exec "$built" "$@"
-        fi
-      fi
+# Static PreToolUse `ask` for the Solana surface while the engine can't judge it.
+# Arguments to these two must be JSON-safe.
+ask_json() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask","permissionDecisionReason":"%s"}}\n' "$1"
+}
+
+# SessionStart notice for the user (systemMessage) and the model (additionalContext).
+session_notice() {
+  printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$1" "$1"
+}
+
+# Whether the committed project settings mention SAFE_AI_SKILL_DISABLE, so the env value
+# may come from the repo. A file grep can't read counts as a mention. A plain-text match
+# only stops the obvious case: a repo's settings env is trusted-code-equivalent.
+disable_set_by_repo() {
+  settings=${CLAUDE_PROJECT_DIR:-.}/.claude/settings.json
+  [ -e "$settings" ] || return 1
+  grep -qF SAFE_AI_SKILL_DISABLE "$settings" 2>/dev/null
+  case $? in
+    1) return 1 ;;
+  esac
+}
+
+repo_disable=
+repo_note='SAFE_AI_SKILL_DISABLE set by project settings — ignored.'
+if [ "${SAFE_AI_SKILL_DISABLE:-}" = 1 ] && [ "$kind" != cli ]; then
+  if disable_set_by_repo; then
+    repo_disable=1
+  elif [ -z "$strict" ]; then
+    if [ "$kind" = session ]; then
+      session_notice 'safe-ai-skill firewall INACTIVE: disabled by SAFE_AI_SKILL_DISABLE=1, no gate is running.'
     fi
+    exit 0
   fi
 fi
 
-# 3. No engine could be obtained. Fail closed.
-echo "safe-ai-skill: no safe-ai-skill engine binary available for platform '$os/$arch'" >&2
-echo "safe-ai-skill: install a prebuilt binary in plugins/safe-ai-skill/bin/ or install cargo to build from crates/engine; blocking gated action (exit 2)." >&2
-exit 2
+os=$(uname -s 2>/dev/null) || os=
+arch=$(uname -m 2>/dev/null) || arch=
+ext=
+case $os in
+  Darwin) family=darwin ;;
+  Linux) family=linux ;;
+  MINGW* | MSYS* | CYGWIN*) family=windows ext=.exe ;;
+  *) family=unsupported ;;
+esac
+case $family/$arch in
+  darwin/arm64 | darwin/aarch64) plat=darwin-arm64 ;;
+  darwin/x86_64 | darwin/amd64) plat=darwin-x64 ;;
+  linux/x86_64 | linux/amd64) plat=linux-x64 ;;
+  linux/aarch64 | linux/arm64) plat=linux-arm64 ;;
+  # Windows on ARM runs the x64 build under emulation.
+  windows/x86_64 | windows/amd64 | windows/aarch64 | windows/arm64) plat=windows-x64 ;;
+  *) plat= ;;
+esac
+
+# uname output ends up in JSON, so anything outside this set makes the label "unknown".
+safe=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-
+label=${plat:-${os:-unknown}/${arch:-unknown}}
+case $label in
+  *[!/$safe]*) label=unknown ;;
+esac
+
+# env_failure <reason> [<detail>]: the engine can't run here, so fail open with a notice.
+# <reason> is a fixed phrase (it goes into JSON); <detail> is for stderr only.
+env_failure() {
+  printf 'safe-ai-skill: firewall inactive on %s: %s%s\n' "$label" "$1" "${2:+: $2}" >&2
+  if [ -n "$strict" ]; then exit 2; fi
+  case $kind in
+    solana) ask_json "safe-ai-skill inactive on $label: $1; review this command manually" ;;
+    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
+    cli) exit 1 ;;
+  esac
+  exit 0
+}
+
+# crashed <status>: the engine started and died, so block where a missed verdict is
+# dangerous and continue elsewhere.
+crashed() {
+  if [ "$1" -gt 128 ]; then how="signal $(($1 - 128))"; else how="exit $1"; fi
+  case $kind in
+    solana | mcp)
+      printf 'safe-ai-skill: engine crashed (%s); %s blocked this call\n' "$how" "$sub" >&2
+      exit 2
+      ;;
+  esac
+  printf 'safe-ai-skill: engine crashed (%s); %s skipped\n' "$how" "$sub" >&2
+  if [ -n "$strict" ]; then exit 2; fi
+  if [ "$kind" = session ]; then
+    session_notice "safe-ai-skill firewall INACTIVE on $label: the engine crashed ($how) in the session check. A crashing engine blocks Solana CLI and MCP calls and skips the other gates.${repo_disable:+ $repo_note}"
+  fi
+  exit 0
+}
+
+# exec_format_ok <file>: whether the kernel can exec <file> on this OS. Anything else
+# fails execve with ENOEXEC, and POSIX shells then run the file as a shell script.
+exec_format_ok() {
+  command -v od >/dev/null 2>&1 || return 0
+  magic=$(od -A n -t x1 -N 4 "$1" 2>/dev/null) || return 0
+  IFS=' '
+  # shellcheck disable=SC2086 # split od's output into one argument per byte
+  set -- $magic
+  case ${1:-}${2:-} in
+    2321) return 0 ;; # "#!"
+  esac
+  case $family/${1:-}${2:-}${3:-}${4:-} in
+    linux/7f454c46 | darwin/cffaedfe | darwin/cefaedfe | darwin/cafebabe | darwin/cafebabf) return 0 ;;
+    windows/4d5a*) return 0 ;;
+  esac
+  return 1
+}
+
+if [ -z "$plat" ]; then env_failure 'unsupported platform'; fi
+bin=$self_dir/safe-ai-skill-$plat$ext
+if [ ! -f "$bin" ]; then env_failure 'no engine binary for this platform'; fi
+if [ ! -x "$bin" ]; then env_failure 'engine binary is not executable'; fi
+# The prebuilt's sha256 check against a release-stamped constant (D6.1) goes here.
+if ! exec_format_ok "$bin"; then env_failure "engine binary is not a $family executable"; fi
+
+if [ "$kind" = cli ]; then
+  "$bin" "$@"
+  status=$?
+  case $status in
+    126 | 127) env_failure "engine could not start (exit $status)" ;;
+  esac
+  exit "$status"
+fi
+
+nl='
+'
+# run_engine <args...>: run the engine. Its stdout goes to ours, followed by "." (so
+# trailing newlines survive capture), or on 126/127 by a newline and the first line of
+# the start error. Its stderr is held back until it exits, so a failed start adds no
+# lines of its own.
+run_engine() {
+  { err=$("$bin" "$@" 2>&1 1>&3 3>&-); s=$?; } 3>&1
+  case $s in
+    126 | 127) printf '\n%s' "${err%%"$nl"*}" ;;
+    *)
+      if [ -n "$err" ]; then printf '%s\n' "$err" >&2; fi
+      printf .
+      ;;
+  esac
+  return "$s"
+}
+
+status=0
+out=$(run_engine "$@") || status=$?
+case $status in
+  0 | 2 | 3)
+    out=${out%.}
+    # SessionStart reports an ignored repo-set DISABLE: added as systemMessage to the
+    # engine's JSON object, or on its own when the engine had nothing to say.
+    if [ -n "$repo_disable" ] && [ "$kind" = session ] && [ "$status" = 0 ]; then
+      case $out in
+        '' | '{}') session_notice "safe-ai-skill: $repo_note" ;;
+        '{"'*) printf '{"systemMessage":"safe-ai-skill: %s",%s' "$repo_note" "${out#?}" ;;
+        *) printf '%s' "$out" ;;
+      esac
+      exit 0
+    fi
+    printf '%s' "$out"
+    exit "$status"
+    ;;
+  126 | 127) env_failure "engine could not start (exit $status)" "${out##*"$nl"}" ;;
+esac
+crashed "$status"
