@@ -181,6 +181,35 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Create a fresh `safe-ai-skill-install-<pid>-<nanos>[-n]` dir under the temp dir.
+///
+/// `create_dir` (not `_all`) fails on an existing dir, so a concurrent install never shares
+/// (or removes) another's staging dir; a taken name is retried with a counter suffix.
+fn create_staging_dir() -> std::io::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = format!("safe-ai-skill-install-{}-{nanos}", std::process::id());
+    let tmp = std::env::temp_dir();
+    std::fs::create_dir_all(&tmp)?;
+    let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for n in 0..100u32 {
+        let name = if n == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        let dir = tmp.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
 /// Audit a non-gate management event (grant create, mode change, revoke, …).
 ///
 /// Unlike [`write_audit`] this is not tied to a hook payload; it records the CLI action with
@@ -669,10 +698,10 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     }
 
     // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
-    let stage = std::env::temp_dir().join(format!("safe-ai-skill-install-{}", now_secs()));
-    if let Err(e) = std::fs::create_dir_all(&stage) {
-        return install_err(&format!("could not create staging dir: {e}"));
-    }
+    let stage = match create_staging_dir() {
+        Ok(stage) => stage,
+        Err(e) => return install_err(&format!("could not create staging dir: {e}")),
+    };
     let extract = stage.join("extract");
     let _ = std::fs::create_dir_all(&extract);
 

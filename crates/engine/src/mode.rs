@@ -41,7 +41,12 @@ pub fn is_known_profile(profile: &str) -> bool {
 /// policy default. Not the profile gates use: there the env var may only tighten
 /// [`persisted`] (see [`crate::policy::Policy::load_with_mode`]).
 pub fn get(plugin_data: &Path) -> Option<String> {
-    if let Ok(env_profile) = std::env::var(PROFILE_ENV) {
+    get_with(plugin_data, std::env::var(PROFILE_ENV).ok().as_deref())
+}
+
+/// [`get`] with the [`PROFILE_ENV`] value passed in (tests never touch the process env).
+fn get_with(plugin_data: &Path, env_profile: Option<&str>) -> Option<String> {
+    if let Some(env_profile) = env_profile {
         let trimmed = env_profile.trim();
         if is_known_profile(trimmed) {
             return Some(trimmed.to_string());
@@ -115,18 +120,15 @@ mod tests {
     #[test]
     fn set_then_get_roundtrip() {
         let dir = tmp_dir("roundtrip");
-        // Ensure no env override interferes.
-        std::env::remove_var(PROFILE_ENV);
         set(&dir, "autopilot").unwrap();
-        assert_eq!(get(&dir), Some("autopilot".to_string()));
+        assert_eq!(get_with(&dir, None), Some("autopilot".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_none_when_unset() {
         let dir = tmp_dir("unset");
-        std::env::remove_var(PROFILE_ENV);
-        assert_eq!(get(&dir), None);
+        assert_eq!(get_with(&dir, None), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -141,12 +143,12 @@ mod tests {
     fn env_overrides_file() {
         let dir = tmp_dir("env");
         set(&dir, "strict").unwrap();
-        std::env::set_var(PROFILE_ENV, "paranoid");
-        assert_eq!(get(&dir), Some("paranoid".to_string()));
+        assert_eq!(
+            get_with(&dir, Some("paranoid")),
+            Some("paranoid".to_string())
+        );
         // Garbage env value is ignored; file value wins.
-        std::env::set_var(PROFILE_ENV, "garbage");
-        assert_eq!(get(&dir), Some("strict".to_string()));
-        std::env::remove_var(PROFILE_ENV);
+        assert_eq!(get_with(&dir, Some("garbage")), Some("strict".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
