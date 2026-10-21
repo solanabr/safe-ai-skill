@@ -47,6 +47,7 @@ claude plugin marketplace list
 - If `stbr` comes from `solanabr/safe-ai-skill`, switch to the new name:
 
   ```bash
+  # only if 'marketplace list' shows stbr → solanabr/safe-ai-skill
   claude plugin uninstall safe-ai-skill@stbr --keep-data
   claude plugin marketplace remove stbr
   claude plugin marketplace add solanabr/safe-ai-skill

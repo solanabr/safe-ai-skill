@@ -4,15 +4,17 @@
 # ships. v1.0.0 didn't (the tag predates the vendor commit), so a release now
 # runs in this order (maintainer steps: docs/RELEASING.md):
 #
-#   1. Actions → Release → Run workflow, input `version` (e.g. 1.0.1):
-#        preflight  every manifest is at that version; neither tag exists yet
+#   1. Actions → Release → Run workflow on main, input `version` (e.g. 1.0.1):
+#        preflight  dispatched from main; every manifest is at that version;
+#                   neither tag exists yet
 #        build      the four binaries, smoke-tested and attested
 #        vendor     commits them + SHA256SUMS on release/vX.Y.Z and opens a PR
 #   2. The maintainer merges the PR, tags the vendor commit vX.Y.Z and
 #      safe-ai-skill--vX.Y.Z, and pushes both tags.
 #   3. The vX.Y.Z push runs publish: it re-checks the tagged commit (versions,
-#      twin tag, checksums, attestations), uploads exactly those binaries to the
-#      GitHub Release, then runs the npm install e2e against it.
+#      twin tag, checksums, attestations made by this workflow on main),
+#      uploads exactly those binaries to the GitHub Release, then runs the npm
+#      install e2e against it.
 #
 # Targets (artifact names unchanged since 1.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,13 +61,27 @@ env:
 permissions:
   contents: read
 
+# One run per version: a second dispatch of the same version waits, then fails
+# in vendor instead of racing the first one's release branch.
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  # ── 1. versions agree, tags are free ──────────────────────────────────────
+  # ── 1. built from main, versions agree, tags are free ─────────────────────
   preflight:
     name: Preflight
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
+      # publish and CI only accept attestations whose source ref is main.
+      - name: Releases are built from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::dispatch the release from main, not $GITHUB_REF"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - name: Check version and tags
@@ -246,9 +262,29 @@ jobs:
           git switch -c "$BRANCH"
           git add plugins/safe-ai-skill/bin
           git commit -m "release: vendor v${VERSION} platform binaries"
-          git push -f origin "$BRANCH"
+          # Never overwrite binaries that may already be under review.
+          rc=0
+          git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null || rc=$?
+          case "$rc" in
+            2) git push origin "$BRANCH" ;;
+            0) git fetch --no-tags --depth=1 origin "refs/heads/$BRANCH"
+               if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" != "$(git rev-parse 'HEAD^{tree}')" ]; then
+                 echo "::error::$BRANCH already exists with different binaries. Close its PR and delete the branch, or bump the version."
+                 exit 1
+               fi
+               echo "::notice::$BRANCH already holds these exact files; not pushing." ;;
+            *) echo "::error::git ls-remote failed ($rc)"
+               exit 1 ;;
+          esac
           BODY="Automated: vendors the four v${VERSION} binaries + regenerated SHA256SUMS into plugins/safe-ai-skill/bin/, built and attested by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}. Merge with a merge commit (not squash or rebase), then tag this PR's head commit v${VERSION} and safe-ai-skill--v${VERSION} and push both tags; the tag push publishes the release. See docs/RELEASING.md."
-          gh pr create --base "$BASE" --head "$BRANCH" --title "release: vendor v${VERSION} platform binaries" --body "$BODY" || true
+          if ! out=$(gh pr create --base "$BASE" --head "$BRANCH" --title "release: vendor v${VERSION} platform binaries" --body "$BODY" 2>&1); then
+            case "$out" in
+              *"already exists"*) echo "::notice::$out" ;;
+              *) echo "$out" >&2
+                 exit 1 ;;
+            esac
+          fi
+          echo "$out"
 
   # ── 3. publish the release from the tagged commit's binaries ──────────────
   publish:
@@ -281,7 +317,8 @@ jobs:
           for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             gh attestation verify "safe-ai-skill-$p" \
               --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref refs/heads/main
           done
 
       - name: Create the GitHub Release from the committed binaries

@@ -17,6 +17,8 @@ after reviewing the binary PR.
 - **`RELEASE_PAT`** secret (optional): a fine-grained token with contents and pull-requests write.
   Without it the vendor PR is opened with `GITHUB_TOKEN`, which doesn't trigger CI; close and
   reopen the PR to run it.
+- Without `RELEASE_PAT`, also turn on **Allow GitHub Actions to create and approve pull requests**
+  (Settings → Actions → General → Workflow permissions), or `gh pr create` in the vendor job fails.
 
 ## Cutting a release
 
@@ -25,10 +27,15 @@ after reviewing the binary PR.
    `.claude-plugin/marketplace.json`, the README badge and the `install.sh` default.
    `sh scripts/check-versions.sh` must pass. Date the CHANGELOG entry. Merge to `main`.
 2. **Build.** Actions → Release → Run workflow on `main`, with `version` set to `X.Y.Z` (no `v`).
-   The run checks the manifests and that neither tag exists yet, builds the four binaries (Linux:
-   static musl, smoke-tested in alpine, debian:11 and ubuntu:20.04; macOS: minimum OS checked),
-   attests each binary's build provenance, and opens a PR from `release/vX.Y.Z` that commits them
-   with a regenerated `SHA256SUMS`.
+   Any other ref is rejected, because publish and CI only accept attestations whose source ref is
+   `refs/heads/main`. The run checks the manifests and that neither tag exists yet, builds the four
+   binaries (Linux: static musl, smoke-tested in alpine, debian:11 and ubuntu:20.04; macOS: minimum
+   OS checked), attests each binary's build provenance, and opens a PR from `release/vX.Y.Z` that
+   commits them with a regenerated `SHA256SUMS`.
+   - If `release/vX.Y.Z` already exists with different binaries, the run fails instead of
+     overwriting them. Close that PR and delete the branch, or bump the version.
+   - If the built binaries are byte-identical to the ones the dispatched commit already has, there
+     is nothing to commit and no PR: the run says so, and step 4 tags the dispatched commit itself.
 3. **Review and merge the PR** once CI is green, using **Create a merge commit**. Squash or rebase
    would give the vendor commit a new SHA.
 4. **Tag the vendor commit** (the PR's head) with both names and push them together:
@@ -43,8 +50,8 @@ after reviewing the binary PR.
 
    Pushing `vX.Y.Z` runs the publish job. It checks that the manifests say `X.Y.Z`, that
    `safe-ai-skill--vX.Y.Z` points at the same commit, that the binaries match `SHA256SUMS`, and
-   that each one carries a provenance attestation from `release.yml`. It then creates the GitHub
-   Release from those exact files and runs the npm install e2e against it.
+   that each one carries a provenance attestation from `release.yml` run on `main`. It then creates
+   the GitHub Release from those exact files and runs the npm install e2e against it.
 5. **Publish to npm** once the GitHub Release exists, because `postinstall` downloads from it:
    `cd npm && npm publish`.
 6. **Downstream:** solana-ai-kit re-pins its `stbr` entry to the tagged commit in its own PR and
@@ -81,5 +88,12 @@ Both point at the same commit, and that commit contains the binaries.
 
 ## Bumping the toolchain
 
-`RUST_TOOLCHAIN` is pinned in `release.yml` and in the `linux-musl` job of `ci.yml`. Change both in
-the same PR, so CI builds the musl targets with the new compiler before a release does.
+`RUST_TOOLCHAIN` is pinned at the top of both `release.yml` and `ci.yml`. Change both in the same
+PR, so CI lints, tests and builds the musl targets with the new compiler before a release does.
+
+## Not done yet
+
+- **Reproducible double-build** (design D5.4): building the musl and Windows binaries twice
+  (`--locked`, `--remap-path-prefix`) and failing on any byte difference. It is deferred because the
+  musl targets can't be checked offline, and a failing check would block the hotfix. Until it lands,
+  the provenance attestation is the only link between a binary and its source.

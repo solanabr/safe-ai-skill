@@ -19,8 +19,11 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
-  RUST_TOOLCHAIN: stable
+  RUST_TOOLCHAIN: "1.98.1"   # same pin as release.yml; bump both together
   MANIFEST: crates/engine/Cargo.toml
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -148,7 +151,7 @@ jobs:
             cargo-cross-${{ runner.os }}-${{ matrix.target }}-
 
       - name: Build
-        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --target ${{ matrix.target }}
+        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --locked --target ${{ matrix.target }}
 
   # ── Linux release targets: static musl build + container smoke ────────────
   # Builds the two Linux targets exactly as release.yml does (preinstalled
@@ -158,8 +161,6 @@ jobs:
     name: Linux static (musl) / ${{ matrix.target }}
     needs: lint
     runs-on: ${{ matrix.os }}
-    env:
-      RUST_TOOLCHAIN: "1.98.1"   # same pin as release.yml
     strategy:
       fail-fast: false
       matrix:
@@ -205,10 +206,6 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --manifest-path ${{ env.MANIFEST }} --release --locked --target ${{ matrix.target }}
-
-      - name: shellcheck smoke script
-        if: matrix.os == 'ubuntu-24.04'
-        run: shellcheck scripts/smoke-static-linux.sh
 
       - name: Smoke — static, runs on alpine / debian:11 / ubuntu:20.04
         env:
@@ -261,7 +258,8 @@ jobs:
             esac
             gh attestation verify "$f" \
               --repo "$RELEASE_REPO" \
-              --signer-workflow "$RELEASE_REPO/.github/workflows/release.yml"
+              --signer-workflow "$RELEASE_REPO/.github/workflows/release.yml" \
+              --source-ref refs/heads/main
           done
 
   # ── plugin binary checksum + shim syntax ─────────────────────────────────
@@ -298,12 +296,17 @@ jobs:
           node --check npm/scripts/postinstall.js
 
       - name: shellcheck (install.sh + scripts)
-        run: shellcheck install.sh scripts/check-versions.sh
+        run: shellcheck install.sh scripts/check-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh
 
       - name: sh -n (install.sh + scripts)
         run: |
           sh -n install.sh
           sh -n scripts/check-versions.sh
+          sh -n scripts/smoke-static-linux.sh
+          sh -n scripts/test-smoke-static-linux.sh
+
+      - name: smoke-static-linux.sh logic (stubbed readelf + docker)
+        run: sh scripts/test-smoke-static-linux.sh
 
       - name: Version consistency across manifests
         run: sh scripts/check-versions.sh

@@ -4,6 +4,9 @@
   "owner": {
     "name": "Superteam Brazil"
   },
+  "metadata": {
+    "description": "safe-ai-skill: security firewall and supply-chain verifier for Claude Code."
+  },
   "plugins": [
     {
       "name": "safe-ai-skill",
