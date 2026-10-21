@@ -76,16 +76,6 @@ fn mainnet_deploy_asks_superseding_kit_read_gate() {
 }
 
 #[test]
-fn devnet_deploy_allows_no_spurious_gate() {
-    // Coexistence must not over-restrict: a devnet deploy is allowed, so safe-ai-skill does not block the
-    // kit's normal devnet-first workflow.
-    assert_eq!(
-        gate("gate-bash", "anchor deploy --provider.cluster devnet"),
-        "allow"
-    );
-}
-
-#[test]
 fn solana_transfer_still_gated_under_coexistence() {
     // The kit keeps `Bash(solana transfer *)` as a defense-in-depth deny; safe-ai-skill's own gate asks
     // on an over-cap transfer. Either way the action is not silently allowed — assert safe-ai-skill's

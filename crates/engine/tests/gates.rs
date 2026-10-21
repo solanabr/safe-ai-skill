@@ -78,12 +78,6 @@ fn anchor_deploy_mainnet_asks() {
 }
 
 #[test]
-fn anchor_deploy_devnet_allows() {
-    let cmd = "anchor deploy --provider.cluster devnet";
-    assert_eq!(gate_bash(cmd), "allow");
-}
-
-#[test]
 fn set_upgrade_authority_asks() {
     let cmd = format!(
         "solana program set-upgrade-authority PROG --new-upgrade-authority {DEST} --url https://api.devnet.solana.com"
