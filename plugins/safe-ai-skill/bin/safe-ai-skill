@@ -9,13 +9,15 @@
 #     SessionStart reports the firewall INACTIVE, every other hook exits 0 with one
 #     stderr line.
 #   - Engine crash (signal, or exit not in {0,2,3}): gate-bash and gate-mcp exit 2
-#     (block); every other hook exits 0 with a stderr line.
-#   - SAFE_AI_SKILL_STRICT=1 (or userConfig `strict`) makes every unusable case exit 2.
-#   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off unless strict; SessionStart
-#     says so.
-# CLI subcommands exec the engine and keep its exit status. Nothing outside this
-# directory is ever executed (no cargo build, no $CLAUDE_PLUGIN_DATA binary), and nothing
-# is cached, so a failed probe never outlives the run that saw it.
+#     (block); every other hook exits 0 with a stderr line, SessionStart with a notice.
+#   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
+#   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
+#     project settings mention it (a repo can't disable the firewall); SessionStart
+#     reports either way.
+# CLI subcommands run the engine with live output and keep its exit status; an
+# environment failure exits 1. Nothing outside this directory is ever executed (no cargo
+# build, no $CLAUDE_PLUGIN_DATA binary), and nothing is cached, so a failed probe never
+# outlives the run that saw it.
 
 set -fu
 
@@ -36,9 +38,6 @@ esac
 
 strict=
 if [ "${SAFE_AI_SKILL_STRICT:-}" = 1 ]; then strict=1; fi
-case ${CLAUDE_PLUGIN_OPTION_STRICT:-} in
-  1 | true) strict=1 ;;
-esac
 
 # Static PreToolUse `ask` for the Solana surface while the engine can't judge it.
 # Arguments to these two must be JSON-safe.
@@ -51,11 +50,29 @@ session_notice() {
   printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$1" "$1"
 }
 
-if [ "${SAFE_AI_SKILL_DISABLE:-}" = 1 ] && [ -z "$strict" ] && [ "$kind" != cli ]; then
-  if [ "$kind" = session ]; then
-    session_notice 'safe-ai-skill firewall INACTIVE: disabled by SAFE_AI_SKILL_DISABLE=1, no gate is running.'
+# Whether the committed project settings mention SAFE_AI_SKILL_DISABLE, so the env value
+# may come from the repo. A file grep can't read counts as a mention. A plain-text match
+# only stops the obvious case: a repo's settings env is trusted-code-equivalent.
+disable_set_by_repo() {
+  settings=${CLAUDE_PROJECT_DIR:-.}/.claude/settings.json
+  [ -e "$settings" ] || return 1
+  grep -qF SAFE_AI_SKILL_DISABLE "$settings" 2>/dev/null
+  case $? in
+    1) return 1 ;;
+  esac
+}
+
+repo_disable=
+repo_note='SAFE_AI_SKILL_DISABLE set by project settings — ignored.'
+if [ "${SAFE_AI_SKILL_DISABLE:-}" = 1 ] && [ "$kind" != cli ]; then
+  if disable_set_by_repo; then
+    repo_disable=1
+  elif [ -z "$strict" ]; then
+    if [ "$kind" = session ]; then
+      session_notice 'safe-ai-skill firewall INACTIVE: disabled by SAFE_AI_SKILL_DISABLE=1, no gate is running.'
+    fi
+    exit 0
   fi
-  exit 0
 fi
 
 os=$(uname -s 2>/dev/null) || os=
@@ -91,7 +108,7 @@ env_failure() {
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
     solana) ask_json "safe-ai-skill inactive on $label: $1; review this command manually" ;;
-    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off." ;;
+    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
     cli) exit 1 ;;
   esac
   exit 0
@@ -109,6 +126,9 @@ crashed() {
   esac
   printf 'safe-ai-skill: engine crashed (%s); %s skipped\n' "$how" "$sub" >&2
   if [ -n "$strict" ]; then exit 2; fi
+  if [ "$kind" = session ]; then
+    session_notice "safe-ai-skill firewall INACTIVE on $label: the engine crashed ($how) in the session check. A crashing engine blocks Solana CLI and MCP calls and skips the other gates.${repo_disable:+ $repo_note}"
+  fi
   exit 0
 }
 
@@ -137,7 +157,14 @@ if [ ! -x "$bin" ]; then env_failure 'engine binary is not executable'; fi
 # The prebuilt's sha256 check against a release-stamped constant (D6.1) goes here.
 if ! exec_format_ok "$bin"; then env_failure "engine binary is not a $family executable"; fi
 
-if [ "$kind" = cli ]; then exec "$bin" "$@"; fi
+if [ "$kind" = cli ]; then
+  "$bin" "$@"
+  status=$?
+  case $status in
+    126 | 127) env_failure "engine could not start (exit $status)" ;;
+  esac
+  exit "$status"
+fi
 
 nl='
 '
@@ -161,7 +188,18 @@ status=0
 out=$(run_engine "$@") || status=$?
 case $status in
   0 | 2 | 3)
-    printf '%s' "${out%.}"
+    out=${out%.}
+    # SessionStart reports an ignored repo-set DISABLE: added as systemMessage to the
+    # engine's JSON object, or on its own when the engine had nothing to say.
+    if [ -n "$repo_disable" ] && [ "$kind" = session ] && [ "$status" = 0 ]; then
+      case $out in
+        '' | '{}') session_notice "safe-ai-skill: $repo_note" ;;
+        '{"'*) printf '{"systemMessage":"safe-ai-skill: %s",%s' "$repo_note" "${out#?}" ;;
+        *) printf '%s' "$out" ;;
+      esac
+      exit 0
+    fi
+    printf '%s' "$out"
     exit "$status"
     ;;
   126 | 127) env_failure "engine could not start (exit $status)" "${out##*"$nl"}" ;;

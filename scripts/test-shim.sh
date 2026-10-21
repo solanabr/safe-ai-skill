@@ -24,13 +24,28 @@ trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 
 # The shim and the fakes read these; the caller's own values must not leak into the cases.
-unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE CLAUDE_PLUGIN_OPTION_STRICT \
-  FAKE_UNAME_S FAKE_UNAME_M FAKE_MARKS
+unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE CLAUDE_PROJECT_DIR FAKE_UNAME_S \
+  FAKE_UNAME_M FAKE_MARKS
+
+# The real platform, for the cases that run a native executable as the engine.
+host_s=$(uname -s)
+host_m=$(uname -m)
+native_true=
+for d in /usr/bin /bin; do
+  if [ -z "$native_true" ] && [ -f "$d/true" ]; then native_true=$d/true; fi
+done
 
 ALLOW='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
+SESSION='{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
 payload_text=$(cat "$payload")
+big_in=$work/big-in
+dd if=/dev/zero bs=1024 count=200 2>/dev/null | tr '\000' x >"$big_in"
+nul_in=$work/nul-in
+printf '{"a":"\000"}\n' >"$nul_in"
+big_out=$work/big-out
+dd if=/dev/zero bs=1024 count=200 2>/dev/null | tr '\000' y >"$big_out"
 
 fakebin=$work/fakebin
 mkdir "$fakebin"
@@ -63,7 +78,11 @@ mk() {
 engine() {
   case $2 in
     ok) mk "$1" 'printf "ran=%s args=%s stdin=%s" "${0##*/}" "$*" "$(cat)"' ;;
+    silent) mk "$1" ':' ;;
+    session) mk "$1" "printf '%s' '$SESSION'" ;;
     bytes) mk "$1" "printf 'line1\\n\\nline3\\n\\n'" ;;
+    cksum) mk "$1" 'cksum' ;;
+    bigout) mk "$1" "cat '$big_out'" ;;
     planted) mk "$1" "printf '%s' '$ALLOW'" ;;
     exit:*) mk "$1" "printf '%s' '$ALLOW'; echo 'engine stderr' >&2; exit ${2#exit:}" ;;
     kill) mk "$1" "printf '%s' '$ALLOW'; kill -s KILL \$\$" ;;
@@ -76,17 +95,18 @@ engine() {
   esac
 }
 
-# fresh [<suffix>]: a new plugin layout with a planted data-dir engine and a crates/engine
-# dir (so a cargo fallback, if any, would fire). Resets the case environment to
-# Linux/x86_64.
+# fresh [<suffix>]: a new plugin layout with a planted data-dir engine, a crates/engine dir
+# (so a cargo fallback, if any, would fire) and an empty project dir. Resets the case
+# environment to Linux/x86_64 with the default hook payload.
 n=0
 fresh() {
   n=$((n + 1))
   case_dir=$work/case$n${1:-}
   bin_dir=$case_dir/plugins/safe-ai-skill/bin
   data_dir=$case_dir/data
+  project_dir=$case_dir/project
   marks=$case_dir/marks
-  mkdir -p "$bin_dir" "$data_dir/bin" "$marks" "$case_dir/crates/engine"
+  mkdir -p "$bin_dir" "$data_dir/bin" "$project_dir/.claude" "$marks" "$case_dir/crates/engine"
   : >"$case_dir/crates/engine/Cargo.toml"
   cp "$shim_src" "$bin_dir/safe-ai-skill"
   chmod +x "$bin_dir/safe-ai-skill"
@@ -96,12 +116,12 @@ fresh() {
   u_fail=
   e_strict=
   e_disable=
-  e_opt=
   bare=
+  payload_f=$payload
 }
 
-# run <args...>: run the case's shim under $sh_cmd with the hook payload on stdin (by bare
-# name from its own directory when $bare is set). Sets rc; stdout and stderr land in
+# run <args...>: run the case's shim under $sh_cmd with $payload_f on stdin (by bare name
+# from its own directory when $bare is set). Sets rc; stdout and stderr land in
 # $case_dir/out and $case_dir/err. The outer 2>/dev/null only swallows this shell's own
 # "Killed" job notices.
 run() {
@@ -110,16 +130,18 @@ run() {
       PATH=$fakebin:$PATH
       FAKE_MARKS=$marks
       CLAUDE_PLUGIN_DATA=$data_dir
+      CLAUDE_PROJECT_DIR=$project_dir
       FAKE_UNAME_M=$u_m
-      export PATH FAKE_MARKS CLAUDE_PLUGIN_DATA FAKE_UNAME_M
+      export PATH FAKE_MARKS CLAUDE_PLUGIN_DATA CLAUDE_PROJECT_DIR FAKE_UNAME_M
       if [ -z "$u_fail" ]; then FAKE_UNAME_S=$u_s && export FAKE_UNAME_S; fi
       if [ -n "$e_strict" ]; then SAFE_AI_SKILL_STRICT=$e_strict && export SAFE_AI_SKILL_STRICT; fi
       if [ -n "$e_disable" ]; then SAFE_AI_SKILL_DISABLE=$e_disable && export SAFE_AI_SKILL_DISABLE; fi
-      if [ -n "$e_opt" ]; then CLAUDE_PLUGIN_OPTION_STRICT=$e_opt && export CLAUDE_PLUGIN_OPTION_STRICT; fi
       if [ "$sh_cmd" = direct ]; then exec "$bin_dir/safe-ai-skill" "$@"; fi
+      # shellcheck disable=SC2086 # sh_cmd is one shell or two words, e.g. "bash --posix"
       if [ -n "$bare" ]; then cd "$bin_dir" && exec $sh_cmd safe-ai-skill "$@"; fi
+      # shellcheck disable=SC2086 # as above
       exec $sh_cmd "$bin_dir/safe-ai-skill" "$@"
-    ) <"$payload" >"$case_dir/out" 2>"$case_dir/err"
+    ) <"$payload_f" >"$case_dir/out" 2>"$case_dir/err"
     exit $?
   ) 2>/dev/null
   rc=$?
@@ -139,13 +161,13 @@ expect_rc() {
   check
   [ "$rc" = "$1" ] || fail "exit $rc, want $1; stderr <$(snippet "$case_dir/err")>"
 }
-expect_rc_nonzero() {
-  check
-  [ "$rc" != 0 ] || fail "exit 0, want non-zero"
-}
 expect_out() {
   check
   [ "$(cat "$case_dir/out")" = "$1" ] || fail "stdout <$(snippet "$case_dir/out")>, want <$1>"
+}
+expect_out_file() {
+  check
+  cmp -s "$1" "$case_dir/out" || fail "stdout <$(snippet "$case_dir/out")> differs from $1"
 }
 expect_no_out() {
   check
@@ -172,29 +194,31 @@ expect_not_ran() {
   check
   [ ! -e "$marks/$1" ] || fail "$1 ran"
 }
-expect_ask() {
+# expect_json <python expression>: stdout is one JSON value `d` for which it holds.
+expect_json() {
   check
   "$py" -I -c '
 import json, sys
-d = json.load(open(sys.argv[1]))
-h = d["hookSpecificOutput"]
-assert list(d) == ["hookSpecificOutput"], d
-assert h["hookEventName"] == "PreToolUse" and h["permissionDecision"] == "ask", h
-assert "inactive" in h["permissionDecisionReason"], h
-' "$case_dir/out" </dev/null 2>/dev/null ||
-    fail "stdout <$(snippet "$case_dir/out")> is not a PreToolUse ask"
-}
-expect_notice() {
-  check
-  "$py" -I -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-needle = sys.argv[2]
-h = d["hookSpecificOutput"]
-assert needle in d["systemMessage"], d
-assert h["hookEventName"] == "SessionStart" and needle in h["additionalContext"], h
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+assert eval("(" + sys.argv[2] + ")"), d
 ' "$case_dir/out" "$1" </dev/null 2>/dev/null ||
-    fail "stdout <$(snippet "$case_dir/out")> is not a SessionStart notice with '$1'"
+    fail "stdout <$(snippet "$case_dir/out")> fails: $(printf '%s' "$1" | tr -s '\n ' '  ')"
+}
+expect_ask() {
+  expect_json 'list(d) == ["hookSpecificOutput"]
+    and d["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    and d["hookSpecificOutput"]["permissionDecision"] == "ask"
+    and "inactive" in d["hookSpecificOutput"]["permissionDecisionReason"]'
+}
+# expect_notice <needle>: a SessionStart notice whose two texts both contain <needle>.
+expect_notice() {
+  expect_json "'$1' in d['systemMessage']
+    and d['hookSpecificOutput']['hookEventName'] == 'SessionStart'
+    and '$1' in d['hookSpecificOutput']['additionalContext']"
+}
+expect_repo_note() {
+  expect_json '"SAFE_AI_SKILL_DISABLE set by project settings" in d["systemMessage"]
+    and "ignored" in d["systemMessage"]'
 }
 
 # env_case <scenario>: a fresh case where the engine can't run. Decoy prebuilts for other
@@ -218,6 +242,7 @@ env_case() {
   case $1 in
     mingw | msys | cygwin | sunos | riscv | nouname) decoys="$decoys linux-x64" ;;
   esac
+  # shellcheck disable=SC2086 # one word per platform
   for p in $decoys; do engine "$bin_dir/safe-ai-skill-$p" ok; done
 }
 
@@ -241,6 +266,27 @@ matrix() {
     expect_out "ran=safe-ai-skill-$want args=gate-read two words stdin=$payload_text"
   done
 
+  # A real native executable, so the ELF / Mach-O checks run and not only "#!".
+  if [ -n "$native_true" ]; then
+    fresh
+    u_s=$host_s
+    u_m=$host_m
+    for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+      cp "$native_true" "$bin_dir/safe-ai-skill-$p"
+    done
+    t "a native $host_s/$host_m executable passes the format check and runs"
+    check
+    case $(od -A n -t x1 -N 2 "$native_true") in
+      *23*21*) fail "$native_true is a script, not a native executable" ;;
+    esac
+    run gate-bash
+    expect_rc 0
+    expect_no_out
+    expect_no_err
+  else
+    echo "skip: no native true to run as the engine"
+  fi
+
   # Engine verdicts (exit 0/2/3) pass through untouched.
   fresh
   engine "$bin_dir/safe-ai-skill-linux-x64" bytes
@@ -262,6 +308,26 @@ matrix() {
     expect_rc "$code"
     expect_out "$ALLOW"
   done
+
+  # Big and binary payloads cross the shim intact in both directions.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" cksum
+  payload_f=$big_in
+  t "a 200 KiB stdin reaches the engine byte for byte"
+  run gate-read
+  expect_rc 0
+  expect_out "$(cksum <"$big_in")"
+  payload_f=$nul_in
+  t "a stdin with a NUL byte reaches the engine byte for byte"
+  run gate-read
+  expect_rc 0
+  expect_out "$(cksum <"$nul_in")"
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" bigout
+  t "a 200 KiB engine stdout comes back byte for byte"
+  run redact
+  expect_rc 0
+  expect_out_file "$big_out"
 
   # Environment failure: fail open with a notice, but the Solana surface stays at ask.
   for sc in mingw msys cygwin sunos riscv nouname missing exit127 exit126 badinterp garbage \
@@ -292,26 +358,28 @@ matrix() {
     expect_rc 0
     expect_notice INACTIVE
     expect_err_lines 1
-    t "$sc: a CLI command reports the failure"
+    # CLI output is live, so only the status and the notice are checked.
+    t "$sc: a CLI command exits 1"
     run status
-    expect_rc_nonzero
+    expect_rc 1
+    expect_err_has 'firewall inactive'
     t "$sc: SAFE_AI_SKILL_STRICT=1 fails closed"
     e_strict=1
     for args in gate-read gate-bash gate-mcp 'verify session'; do
+      # shellcheck disable=SC2086 # 'verify session' is two arguments
       run $args
       expect_rc 2
       expect_no_out
     done
-    e_strict=
-    t "$sc: userConfig strict fails closed"
-    e_opt=true
-    run gate-read
+    t "$sc: SAFE_AI_SKILL_STRICT=1 makes a CLI command exit 2"
+    run status
     expect_rc 2
-    expect_no_out
-    e_opt=
+    expect_err_has 'firewall inactive'
+    e_strict=
     t "$sc: no planted engine, cargo build or other platform's binary runs"
     expect_not_ran safe-ai-skill
     expect_not_ran cargo
+    # shellcheck disable=SC2086 # one word per platform
     for p in $decoys; do expect_not_ran "safe-ai-skill-$p"; done
   done
 
@@ -334,17 +402,21 @@ matrix() {
     expect_rc 0
     expect_no_out
     expect_err_has crashed
-    t "crash $sc: redact and SessionStart continue"
+    t "crash $sc: redact continues"
     run redact
     expect_rc 0
     expect_no_out
+    t "crash $sc: SessionStart reports the firewall INACTIVE"
     run verify session
     expect_rc 0
-    expect_no_out
+    expect_notice INACTIVE
     expect_err_has 'verify session skipped'
     t "crash $sc: SAFE_AI_SKILL_STRICT=1 fails closed"
     e_strict=1
     run gate-read
+    expect_rc 2
+    expect_no_out
+    run verify session
     expect_rc 2
     expect_no_out
     e_strict=
@@ -357,13 +429,13 @@ matrix() {
     expect_rc "$want"
   done
 
-  # SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off; SessionStart says so.
+  # SAFE_AI_SKILL_DISABLE=1 (exact) from the user turns the hooks off; SessionStart says so.
   fresh
   engine "$bin_dir/safe-ai-skill-linux-x64" ok
   e_disable=1
   t "SAFE_AI_SKILL_DISABLE=1 silences every gate"
   for args in gate-read gate-bash gate-mcp gate-bash-secrets redact prompt-guard; do
-    run $args
+    run "$args"
     expect_rc 0
     expect_no_out
     expect_no_err
@@ -403,6 +475,56 @@ matrix() {
   run gate-read
   expect_rc 0
   expect_ran safe-ai-skill-linux-x64
+
+  # A repo can't disable the firewall: DISABLE is ignored when the committed project
+  # settings mention it, and honoured from the user's own settings.local.json.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" session
+  e_disable=1
+  printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.json"
+  t "SAFE_AI_SKILL_DISABLE from the committed project settings is ignored"
+  for args in gate-read gate-bash gate-mcp redact prompt-guard; do
+    rm -f "$marks/safe-ai-skill-linux-x64"
+    run "$args"
+    expect_rc 0
+    expect_ran safe-ai-skill-linux-x64
+  done
+  t "SessionStart adds the ignored-DISABLE notice to the engine's output"
+  run verify session
+  expect_rc 0
+  expect_repo_note
+  expect_json 'd["hookSpecificOutput"]["additionalContext"] == "engine context"'
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" silent
+  e_disable=1
+  printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.json"
+  t "SessionStart prints the ignored-DISABLE notice on its own when the engine is silent"
+  run verify session
+  expect_rc 0
+  expect_repo_note
+  expect_json 'd["hookSpecificOutput"]["hookEventName"] == "SessionStart"'
+  fresh
+  e_disable=1
+  printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.json"
+  t "an environment failure still names the ignored DISABLE at SessionStart"
+  run verify session
+  expect_rc 0
+  expect_notice INACTIVE
+  expect_repo_note
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  e_disable=1
+  printf '{"permissions":{"allow":[]}}\n' >"$project_dir/.claude/settings.json"
+  printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.local.json"
+  t "SAFE_AI_SKILL_DISABLE from the user's settings.local.json is honoured"
+  run gate-read
+  expect_rc 0
+  expect_no_out
+  expect_no_err
+  run verify session
+  expect_rc 0
+  expect_notice INACTIVE
+  expect_not_ran safe-ai-skill-linux-x64
 
   # uname output lands in JSON; hostile characters must not break it.
   fresh
@@ -453,6 +575,7 @@ matrix() {
     fresh
     u_s=SunOS
     t "hooks.json '$args' fails open on an unsupported platform"
+    # shellcheck disable=SC2086 # 'verify session' is two arguments
     run $args
     expect_rc 0
     case $args in
