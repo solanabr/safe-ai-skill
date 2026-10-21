@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml"><img src="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.0.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Rust-1.82+-orange?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-purple" alt="Claude Code plugin">
@@ -14,7 +14,7 @@
 
 safe-ai-skill is a Claude Code security plugin — a Rust hook-based firewall and registry-free supply-chain verifier that works with **any skills, MCPs, or agents** to add a policy-driven security layer. It was built with `solanabr/solana-ai-kit` as the reference integration (gating Solana transactions and deploys, verifying its `ext/` submodules and `skill-registry.json` catalog), but the gates, guards, and verifier are general-purpose and protect any Claude Code setup.
 
-At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and quarantines anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never bypassed regardless of profile or flags.
+At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never bypassed regardless of profile or flags.
 
 ## Install
 
@@ -22,14 +22,43 @@ safe-ai-skill has two layers. The **plugin** is the always-on runtime firewall (
 
 ### Plugin (runtime firewall)
 
+Requires Claude Code 2.1.295 or newer. Older versions still run the hooks but ignore their `onFailure` setting, so a hook that can't start never blocks anything. The prebuilt engine covers macOS (arm64, x64) and Linux (x64, arm64). The Linux builds are static (musl), so they run on any distribution, Alpine included.
+
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill
-claude plugin install safe-ai-skill@stbr
+claude plugin install safe-ai-skill@safe-ai-skill
 ```
 
 Every Claude Code session is protected automatically from that point. No per-project configuration required.
 
-**Dev install:** `claude plugin marketplace add .` from the repo root, then `claude plugin install safe-ai-skill@stbr`.
+**Dev install:** `claude plugin marketplace add .` from the repo root, then `claude plugin install safe-ai-skill@safe-ai-skill`.
+
+**solana-ai-kit users: do nothing.** The kit's `stbr` marketplace already installs safe-ai-skill for you. Don't add this marketplace as well: with two copies installed, only one copy's hooks register, and you can't tell which one.
+
+#### Moving from `safe-ai-skill@stbr`
+
+Between 1.0.0 and 1.0.1 this README said to install `safe-ai-skill@stbr`. The solana-ai-kit marketplace is also named `stbr`, and removing it uninstalls the kit and deletes its data. Check what your `stbr` is before you remove anything:
+
+```bash
+claude plugin marketplace list
+```
+
+- If `stbr` comes from anything other than `solanabr/safe-ai-skill` (for example `solanabr/solana-ai-kit`), stop. You have the kit's copy and there is nothing to move.
+- If `stbr` comes from `solanabr/safe-ai-skill`, switch to the new name:
+
+  ```bash
+  claude plugin uninstall safe-ai-skill@stbr --keep-data
+  claude plugin marketplace remove stbr
+  claude plugin marketplace add solanabr/safe-ai-skill
+  claude plugin install safe-ai-skill@safe-ai-skill
+  ```
+
+The plugin keeps its pins, grants and audit log in a directory named after `plugin@marketplace`, so the new install starts empty, and its first session pins whatever is on disk at that moment. To keep your existing pins, copy the old state across before you start a session:
+
+```bash
+mkdir -p ~/.claude/plugins/data/safe-ai-skill-safe-ai-skill
+cp -R ~/.claude/plugins/data/safe-ai-skill-stbr/. ~/.claude/plugins/data/safe-ai-skill-safe-ai-skill/
+```
 
 ### CLI (`safe-ai-skill` command)
 
@@ -71,7 +100,7 @@ The npm and standalone paths download the binary matching their release tag and 
 
 **Supply-chain (SessionStart verifier)**
 
-- Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); quarantines drift
+- Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); reports drift without moving anything
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute
 - MCP version tracking: flags `@latest` entries as informational — does not silently rewrite them
@@ -127,7 +156,7 @@ The `install` subcommand is the secure drop-in for `curl <url> | bash`. It downl
 Trust is based on the artifact itself, not a hash allowlist to maintain:
 
 1. **Static heuristics** — scan SKILL.md, scripts, and package.json for outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec, and `curl | bash` patterns. Generic patterns — they do not grow per-package.
-2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA triggers quarantine and a diff for review.
+2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA is reported with a diff for review. Nothing is moved, so the working tree stays clean.
 3. **Catalog gating** — entries are classified by risk class. High-risk classes require explicit policy approval; safe-ai-skill blocks installation of denied classes without prompting.
 4. **Provenance pinning** — GitHub URLs resolve to immutable commit SHAs (moving refs are rejected). npm packages pin to `pkg@x.y.z` plus `dist.shasum`. `@latest` entries are flagged informational.
 5. **CVE lookup** — query osv.dev for every resolved `pkg@version`. No API key required.

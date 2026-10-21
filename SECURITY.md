@@ -8,7 +8,7 @@
 
 **Prompt content.** `prompt-guard` (UserPromptSubmit hook) blocks prompts that contain raw private keys or seed phrases before they reach the model.
 
-**Supply chain.** Every session start runs `verify session` over the installed skills directories, each `ext/` git submodule independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; safe-ai-skill does not treat it as an error when a hub keeps its MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is quarantined before skills are loaded.
+**Supply chain.** Every session start runs `verify session` over the installed skills directories, each `ext/` git submodule independently, MCP server entries in `.claude/settings.json`, and all registry-installed catalog entries. The `@latest` MCP posture is flagged as INFORMATIONAL; safe-ai-skill does not treat it as an error when a hub keeps its MCPs `@latest` by design. Content that drifts from its pinned hash or git SHA is reported at session start. Since 1.0.1 it is not moved, so it still loads: read the report.
 
 **Install-script execution.** Runtime `curl|bash`, `wget|bash`, and `curl|sh` patterns are intercepted by `gate-bash-secrets` (unconditional, microsecond matching) before the pipe executes. The default policy is `exec_install_scripts: ask` — the user sees the URL and script preview before approval.
 
@@ -27,7 +27,7 @@ solana-ai-kit, for example, ships 18 third-party `ext/` git submodules: third-pa
 - Dependency changes in a submodule's npm/Cargo manifests that introduce CVEs.
 - Compromised upstream repository — a submodule commit SHA can change on any `git submodule update`.
 
-**safe-ai-skill's response:** each submodule is walked by `ext_verify.rs` at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the submodule is quarantined and the diff is surfaced in `additionalContext`. The user must explicitly re-pin with `safe-ai-skill verify approve <name>` after reviewing the diff.
+**safe-ai-skill's response:** each submodule is walked by `ext_verify.rs` at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the drift and its diff are reported in the session, and the submodule stays where it is. The user must explicitly re-pin with `safe-ai-skill verify approve <name>` after reviewing the diff.
 
 **No special-casing:** some submodules carry known supply-chain risks — attacker-mutable telemetry endpoints, unsigned tarball installers, and global Bash/Read permission grant patterns. safe-ai-skill treats every `ext/` submodule identically: telemetry preambles and installer patterns are flagged and neutralized generically by `heuristics.rs`; no submodule is special-cased.
 
