@@ -302,9 +302,14 @@ pub fn gates::bash::decide(command: &str, ctx: &Context, policy: &Policy) -> (De
 pub fn gates::secrets::decide(command: &str, policy: &Policy) -> Decision;                            // Defer
 pub fn gates::read::decide(path: &str, policy: &Policy) -> Decision;                                  // Defer
 pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, ctx: &Context, policy: &Policy) -> (Decision, GateMeta); // (Defer, unknown)
+pub fn gates::tamper::decide_bash(command: &str, protected: &Protected) -> Decision;                  // Deny | Defer
+pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &Path, protected: &Protected) -> Decision; // Deny | Defer
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
+> `tamper` is the self-grant tripwire (spec D4.3): `secrets::decide` runs `decide_bash` first, and
+> `gate-tamper` (`Write|Edit|MultiEdit|NotebookEdit`) runs `decide_file`, audits as `tamper`, and
+> skips `relax::apply`.
 
 ### `redact` / `promptguard` (STUBS)
 ```rust
@@ -397,7 +402,7 @@ pub fn session::status(plugin_data: &Path) -> error::Result<String>;            
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `redact` · `prompt-guard` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `redact` · `prompt-guard` ·
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
