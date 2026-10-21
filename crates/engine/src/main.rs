@@ -697,8 +697,14 @@ fn cmd_install(rest: &[String]) -> ExitCode {
             continue;
         }
 
-        // Pin the installed content (TOFU). The recorded source is the local `--from` path.
-        let pin_source = from.clone().unwrap_or_default();
+        // Pin the installed content (TOFU), marked as an install so the session sweep checks it.
+        // The recorded source is the canonical local `--from` path.
+        let pin_source = from
+            .as_deref()
+            .and_then(|src| std::fs::canonicalize(verify::expand_home(src)).ok())
+            .map(|path| path.display().to_string())
+            .or_else(|| from.clone())
+            .unwrap_or_default();
         let hash = verify::lockfile::hash_tree(&dest);
         lock.pin_skill(
             &name,
@@ -711,6 +717,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                origin: verify::lockfile::ORIGIN_INSTALL.to_string(),
             },
         );
         installed.push(name);
@@ -820,6 +827,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                origin: verify::lockfile::ORIGIN_IN_PLACE.to_string(),
             },
         );
         verified.push(name);

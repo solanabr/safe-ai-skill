@@ -292,7 +292,7 @@ pub fn scan_text(name: &str, text: &str, report: &mut Report) {
 // ---------------------------------------------------------------------------------------
 
 /// 1-based line number of byte `offset` within `haystack`.
-pub(super) fn line_at(haystack: &str, offset: usize) -> usize {
+fn line_at(haystack: &str, offset: usize) -> usize {
     let end = offset.min(haystack.len());
     haystack.as_bytes()[..end]
         .iter()

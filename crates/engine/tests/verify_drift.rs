@@ -250,6 +250,83 @@ fn install_managed_user_skills_swept_personal_ones_not() {
 }
 
 #[test]
+fn install_from_an_absolute_claude_skills_dir_is_swept() {
+    // `install --from ~/solana-ai-kit/.claude/skills`: the shell hands over an absolute
+    // `…/.claude/skills` path, which must still count as an install into ~/.claude/skills.
+    let project = TempDir::new("kit-proj");
+    let home = TempDir::new("kit-home");
+    let data = TempDir::new("kit-data");
+    let kit = TempDir::new("kit-src");
+    let skills = kit.join("kit").join(".claude").join("skills");
+    std::fs::create_dir_all(skills.join("managed")).unwrap();
+    std::fs::write(
+        skills.join("managed").join("SKILL.md"),
+        "# Managed\nFormats lamports.\n",
+    )
+    .unwrap();
+
+    let run = Invocation::new(&["install", "--from", skills.to_str().unwrap()])
+        .plugin_data(data.path())
+        .home(home.path())
+        .stdin("{}")
+        .run();
+    assert_eq!(run.json()["installed"][0], "managed", "{}", run.stdout);
+
+    // The pin carries the install marker and the canonical source.
+    let pin = lockfile(data.path())["skills"]["managed"].clone();
+    assert_eq!(pin["origin"], "install", "{pin}");
+    let canonical = std::fs::canonicalize(&skills).unwrap();
+    assert_eq!(pin["source"], canonical.to_str().unwrap(), "{pin}");
+
+    let first = verify_session(project.path(), home.path(), data.path());
+    assert!(emit(&first).is_none(), "{}", first.stdout);
+    tamper(
+        &home
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("managed")
+            .join("SKILL.md"),
+    );
+    assert_drift_reported(
+        &verify_session(project.path(), home.path(), data.path()),
+        "managed",
+    );
+}
+
+#[test]
+fn in_place_install_marks_its_pins() {
+    // `install` without `--from` verifies the project's `.claude/skills` in place; its pins are
+    // marked, so a same-named personal skill is never taken for an installed one.
+    let project = TempDir::new("inplace-proj");
+    let other = TempDir::new("inplace-other");
+    let home = TempDir::new("inplace-home");
+    let data = TempDir::new("inplace-data");
+    let helper = skills_root(project.path()).join("helper");
+    std::fs::create_dir_all(&helper).unwrap();
+    std::fs::write(helper.join("SKILL.md"), "# Helper\n").unwrap();
+
+    let run = Invocation::new(&["install"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(project.path())
+        .stdin("{}")
+        .run();
+    assert_eq!(run.json()["verified"][0], "helper", "{}", run.stdout);
+    assert_eq!(
+        lockfile(data.path())["skills"]["helper"]["origin"],
+        "in-place"
+    );
+
+    // A personal `~/.claude/skills/helper`, seen from another project, is not that pin's pack.
+    let personal = home.path().join(".claude").join("skills").join("helper");
+    std::fs::create_dir_all(&personal).unwrap();
+    std::fs::write(personal.join("SKILL.md"), "# Someone else's helper\n").unwrap();
+    let run = verify_session(other.path(), home.path(), data.path());
+    assert!(emit(&run).is_none(), "{}", run.stdout);
+}
+
+#[test]
 fn mcp_json_findings_carry_path_line_for_user_and_model() {
     let project = TempDir::new("mcp-proj");
     let home = TempDir::new("mcp-home");

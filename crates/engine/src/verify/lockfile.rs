@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+/// [`SkillPin::origin`] of a pin `install --from` wrote for a pack it installed into the user
+/// skills dir.
+pub const ORIGIN_INSTALL: &str = "install";
+/// [`SkillPin::origin`] of a pin an in-place `install` wrote for a project pack.
+pub const ORIGIN_IN_PLACE: &str = "in-place";
+
 /// A pinned skill directory entry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillPin {
@@ -28,6 +34,10 @@ pub struct SkillPin {
     /// Highest severity observed at pin time (`"low"`/`"medium"`/`"high"`/`""`).
     #[serde(default)]
     pub scan: String,
+    /// What wrote the pin: [`ORIGIN_INSTALL`], [`ORIGIN_IN_PLACE`], or empty (a session sweep,
+    /// a quarantine restore, or a pin from v1.0.0, which had no such field).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
 
 /// A pinned MCP server entry.
@@ -405,6 +415,7 @@ mod tests {
                 source: "local".into(),
                 verified_at: 1,
                 scan: "low".into(),
+                origin: String::new(),
             },
         );
         assert_eq!(detect_drift(&lock, "my-skill", &skill), DriftStatus::Clean);
@@ -430,6 +441,7 @@ mod tests {
                 source: "gh".into(),
                 verified_at: 42,
                 scan: "high".into(),
+                origin: ORIGIN_INSTALL.into(),
             },
         );
         lock.pin_mcp(
@@ -446,8 +458,21 @@ mod tests {
         let loaded = load(&data);
         assert_eq!(loaded.skills.get("s1").unwrap().sha256, "abc");
         assert_eq!(loaded.skills.get("s1").unwrap().verified_at, 42);
+        assert_eq!(loaded.skills.get("s1").unwrap().origin, ORIGIN_INSTALL);
         assert_eq!(loaded.mcps.get("helius").unwrap().version, "1.2.3");
         fs::remove_dir_all(&data).ok();
+    }
+
+    #[test]
+    fn v1_skill_pins_stay_readable_without_origin() {
+        // A v1.0.0 lockfile has no `origin`; it reads as unmarked, and an unmarked pin is still
+        // written without the field.
+        let v1 = r#"{"skills":{"s1":{"sha256":"abc","source":"./kit","verified_at":1,"scan":""}}}"#;
+        let lock: Lockfile = serde_json::from_str(v1).unwrap();
+        assert_eq!(lock.skills["s1"].origin, "");
+        assert_eq!(lock.skills["s1"].source, "./kit");
+        let written = serde_json::to_string(&lock).unwrap();
+        assert!(!written.contains("origin"), "{written}");
     }
 
     #[test]
