@@ -112,7 +112,8 @@ profiles:
     disabled: true
 "#;
 
-/// Environment variable that overrides [`Policy::active_profile`].
+/// Environment variable that may select a profile stricter than the active one; a looser or
+/// unknown value is ignored and noted (see [`Policy::load_with_mode`]).
 pub const PROFILE_ENV: &str = "SAFE_AI_SKILL_PROFILE";
 
 fn default_version() -> u32 {

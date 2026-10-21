@@ -667,16 +667,42 @@ fn repo_scan_dir_symlinked_out_of_the_project_is_refused() {
     let ctx = session_in(&proj, data.path());
 
     assert!(ctx.contains("supply_chain.verify_skills_dirs"), "{ctx:?}");
-    assert!(
-        !ctx.contains("sibling-leaky"),
-        "swept outside the project: {ctx:?}"
-    );
-    assert!(leaky.join("install.sh").exists(), "sibling pack was moved");
-    // Nothing outside the project was even pinned.
-    let lock = std::fs::read_to_string(data.join("lockfile.json")).unwrap_or_default();
-    for name in ["sibling-clean", "sibling-leaky", "ratchet-project"] {
-        assert!(!lock.contains(name), "{name} scanned: {lock}");
+    // Nothing outside the project was moved...
+    for kept in [
+        proj.join(".safe-ai-skill").join("policy.yaml"),
+        outer.join("sibling-clean").join("SKILL.md"),
+        leaky.join("install.sh"),
+    ] {
+        assert!(kept.exists(), "moved: {}", kept.display());
     }
+    // ...or scanned: no warning names it, and nothing in plugin data (pins, quarantine,
+    // state) records it.
+    for name in ["sibling-clean", "sibling-leaky", "ratchet-project"] {
+        assert!(!ctx.contains(name), "{name} swept: {ctx:?}");
+        assert!(
+            !mentions(data.path(), name),
+            "{name} recorded under plugin data"
+        );
+    }
+}
+
+/// Whether any path or file under `dir` contains `needle`.
+fn mentions(dir: &Path, needle: &str) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.to_string_lossy().contains(needle)
+            || if path.is_dir() {
+                mentions(&path, needle)
+            } else {
+                std::fs::read_to_string(&path)
+                    .map(|body| body.contains(needle))
+                    .unwrap_or(false)
+            }
+    })
 }
 
 // ---------------------------------------------------------------------------------------

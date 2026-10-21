@@ -1,9 +1,11 @@
 # safe-ai-skill default policy — the FULL schema (kept equivalent to the embedded
-# DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project may deep-merge an override
-# at <cwd>/.safe-ai-skill/policy.yaml; every field below has a serde default so a partial
-# override still parses.
+# DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project's
+# <cwd>/.safe-ai-skill/policy.yaml may only tighten it, field by field: caps take the lower
+# value, deny-lists add entries, allow-lists drop them; anything looser (and any profile
+# setting) is ignored and listed at SessionStart. Every field below has a serde default so a
+# partial override still parses.
 version: 1
-active_profile: strict    # strict | autopilot | paranoid | off (env SAFE_AI_SKILL_PROFILE wins)
+active_profile: strict    # strict | autopilot | paranoid | off; `safe-ai-skill mode` sets it; env SAFE_AI_SKILL_PROFILE may only pick a stricter one
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
