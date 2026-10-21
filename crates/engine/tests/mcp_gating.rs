@@ -3,7 +3,7 @@
 //! Drives `gate-mcp` with PreToolUse MCP hook payloads and asserts the emitted
 //! `permissionDecision`. Covers the solana-ai-kit MCP surface:
 //!   - `heliusWrite.sendSol` / `sendToken` / `stake*` → ask (value-moving),
-//!   - `getBalance` → defer (read),
+//!   - `getBalance` → no opinion (read: empty stdout),
 //!   - `phantom__signTransaction` / `x402__*` → ask (high-risk wallet-signing / key-custody),
 //!   - the hook gates regardless of `enableAllProjectMcpServers` pre-approval — a PreToolUse
 //!     `ask`/`deny` fires before (and survives) the permission check, so MCP pre-approval in the
@@ -14,7 +14,7 @@
 
 mod common;
 
-use common::{permission_decision, Invocation, TempDir};
+use common::{decision_label, permission_decision, Invocation, TempDir};
 
 /// Build a PreToolUse MCP hook payload for `tool` with optional `input`.
 fn mcp_payload(tool: &str, input: serde_json::Value) -> String {
@@ -27,7 +27,8 @@ fn mcp_payload(tool: &str, input: serde_json::Value) -> String {
     .to_string()
 }
 
-/// Run `gate-mcp` against `tool`/`input` in a fresh sandbox; return the decision label.
+/// Run `gate-mcp` against `tool`/`input` in a fresh sandbox; return the decision label
+/// (`""` = no opinion).
 fn gate_mcp(tool: &str, input: serde_json::Value) -> String {
     let data = TempDir::new("mcp-data");
     let home = TempDir::new("mcp-home");
@@ -36,8 +37,7 @@ fn gate_mcp(tool: &str, input: serde_json::Value) -> String {
         .home(home.path())
         .stdin(mcp_payload(tool, input))
         .run();
-    let v = run.json();
-    permission_decision(&v).unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+    decision_label(&run)
 }
 
 const DEST: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
@@ -81,21 +81,21 @@ fn helius_write_stake_delegate_asks() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Reads → defer
+// Reads → no opinion
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn helius_get_balance_defers() {
+fn helius_get_balance_has_no_opinion() {
     assert_eq!(
         gate_mcp("mcp__helius__getBalance", serde_json::json!({})),
-        "defer"
+        ""
     );
 }
 
 #[test]
-fn helius_get_asset_defers() {
+fn helius_get_asset_has_no_opinion() {
     let input = serde_json::json!({ "id": "So11111111111111111111111111111111111111112" });
-    assert_eq!(gate_mcp("mcp__helius__getAsset", input), "defer");
+    assert_eq!(gate_mcp("mcp__helius__getAsset", input), "");
 }
 
 // ---------------------------------------------------------------------------------------
