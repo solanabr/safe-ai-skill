@@ -2,9 +2,7 @@
 //!
 //! Most tests drive `gates::bash::decide` in-process with a pinned network and assert on the
 //! `Decision` value; no opinion is `Decision::Defer`. The end-to-end tests drive the built binary
-//! with the network pinned by explicit flags (no `solana config get`), and accept no opinion as
-//! either empty stdout or the legacy `defer` rendering, so they hold across the verdict-output
-//! change.
+//! with the network pinned by explicit flags (no `solana config get`); no opinion is empty stdout.
 
 mod common;
 
@@ -59,7 +57,7 @@ fn run_gate_bash(command: &str) -> Run {
         .run()
 }
 
-/// The emitted decision label, or `None` for no opinion (empty stdout or legacy `defer`).
+/// The emitted decision label, or `None` for no opinion (empty stdout).
 fn gate_bash(command: &str) -> Option<String> {
     let run = run_gate_bash(command);
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
@@ -68,7 +66,8 @@ fn gate_bash(command: &str) -> Option<String> {
     }
     let label = permission_decision(&run.json())
         .unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout));
-    (label != "defer").then_some(label)
+    assert_ne!(label, "defer", "no opinion must be empty stdout");
+    Some(label)
 }
 
 // ---------------------------------------------------------------------------------------
