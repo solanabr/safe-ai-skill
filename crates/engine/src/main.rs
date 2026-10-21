@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         "mode" => cmd_mode(rest),
         "revoke" => cmd_revoke(),
         "status" => cmd_status(),
+        "env" => safe_ai_skill::env::main(rest),
         _ => {
             // Unknown / missing subcommand: never block a hook. Emit a permissive default.
             let _ = io::emit_pretooluse(&Decision::Allow);
