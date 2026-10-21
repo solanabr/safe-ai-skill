@@ -12,15 +12,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// Largest hook stdin payload the engine parses (1 MiB). Anything bigger is
-/// [`Unreadable::Oversized`], which every PreToolUse gate answers with `ask`.
+/// [`Unreadable::Oversized`] and is never parsed.
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 /// Why a hook payload could not be read.
+///
+/// The model shapes `tool_input`, so it can force `Oversized` and `Malformed`: every
+/// PreToolUse gate asks on both. Only `Empty`, which Claude Code never sends, is benign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unreadable {
+    /// Nothing but whitespace: no hook payload at all.
+    Empty,
     /// Larger than [`MAX_STDIN_BYTES`]; never parsed, so padding cannot hide a call.
     Oversized,
-    /// Empty, not UTF-8, failed to read, or not a JSON hook object.
+    /// Not a JSON hook object: bad JSON or UTF-8, a lone surrogate escape, nesting past
+    /// serde's recursion limit, or a fragment cut short by a read error.
     Malformed,
 }
 
@@ -57,9 +63,7 @@ impl HookInput {
     /// Any read or parse failure, or an oversized payload, yields [`HookInput::default`] so
     /// a hook never crashes on malformed input.
     pub fn from_stdin() -> Self {
-        read_payload(std::io::stdin())
-            .map(|(_, input)| input)
-            .unwrap_or_default()
+        read_payload(std::io::stdin()).1.unwrap_or_default()
     }
 
     /// Parse from a string slice; malformed / empty input → [`HookInput::default`].
@@ -90,21 +94,23 @@ impl HookInput {
 
 /// Read one hook payload from `reader`, bounded at [`MAX_STDIN_BYTES`].
 ///
-/// Returns the raw text and its parse, or why it is [`Unreadable`]. Size is checked before
-/// content, and reading stops one byte past the bound, so an oversized or endless stream is
-/// never buffered whole.
-pub fn read_payload(reader: impl Read) -> Result<(String, HookInput), Unreadable> {
+/// Returns the bytes received (kept for the audit hash) and their parse. Size is checked
+/// before content, and reading stops one byte past the bound, so an oversized or endless
+/// stream is never buffered whole.
+pub fn read_payload(reader: impl Read) -> (Vec<u8>, Result<HookInput, Unreadable>) {
     let mut bytes = Vec::new();
-    let read = reader
+    // A read error keeps the bytes that arrived; the checks below classify them.
+    let _ = reader
         .take(MAX_STDIN_BYTES as u64 + 1)
         .read_to_end(&mut bytes);
-    if bytes.len() > MAX_STDIN_BYTES {
-        return Err(Unreadable::Oversized);
-    }
-    read.map_err(|_| Unreadable::Malformed)?;
-    let raw = String::from_utf8(bytes).map_err(|_| Unreadable::Malformed)?;
-    let input = serde_json::from_str(&raw).map_err(|_| Unreadable::Malformed)?;
-    Ok((raw, input))
+    let parsed = if bytes.len() > MAX_STDIN_BYTES {
+        Err(Unreadable::Oversized)
+    } else if bytes.trim_ascii().is_empty() {
+        Err(Unreadable::Empty)
+    } else {
+        serde_json::from_slice(&bytes).map_err(|_| Unreadable::Malformed)
+    };
+    (bytes, parsed)
 }
 
 /// A gate / scan decision.
@@ -179,48 +185,38 @@ pub fn render_pretooluse(d: &Decision) -> Option<Value> {
 
 /// Emit a PreToolUse permission decision to stdout and flush; a `Defer` writes nothing.
 pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()> {
-    match render_pretooluse(d) {
-        Some(value) => write_json(&value),
-        None => Ok(()),
-    }
+    write_opinion(render_pretooluse(d))
 }
 
 /// Build the PostToolUse redaction JSON value (no I/O).
 ///
-/// `None` → empty object (no change). `Some(text)` → `updatedMCPToolOutput` when
-/// `mcp` is true, else `updatedToolOutput`.
-pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Value {
-    match updated {
-        None => json!({}),
-        Some(text) => {
-            let key = if mcp {
-                "updatedMCPToolOutput"
-            } else {
-                "updatedToolOutput"
-            };
-            json!({ key: text })
-        }
-    }
+/// `None` (no change) renders to `None`: no output. `Some(text)` → `updatedMCPToolOutput`
+/// when `mcp` is true, else `updatedToolOutput`.
+pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Option<Value> {
+    let text = updated?;
+    let key = if mcp {
+        "updatedMCPToolOutput"
+    } else {
+        "updatedToolOutput"
+    };
+    Some(json!({ key: text }))
 }
 
-/// Emit a PostToolUse redaction result to stdout and flush.
+/// Emit a PostToolUse redaction result to stdout and flush; no change writes nothing.
 pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()> {
-    write_json(&render_posttooluse_redact(updated, mcp))
+    write_opinion(render_posttooluse_redact(updated, mcp))
 }
 
 /// Build the UserPromptSubmit JSON value (no I/O).
 ///
-/// `Some(reason)` → `{"decision":"block","reason":…}`; `None` → empty object.
-pub fn render_userpromptsubmit(block: Option<&str>) -> Value {
-    match block {
-        Some(reason) => json!({ "decision": "block", "reason": reason }),
-        None => json!({}),
-    }
+/// `Some(reason)` → `{"decision":"block","reason":…}`; `None` → `None` (no output).
+pub fn render_userpromptsubmit(block: Option<&str>) -> Option<Value> {
+    block.map(|reason| json!({ "decision": "block", "reason": reason }))
 }
 
-/// Emit a UserPromptSubmit decision to stdout and flush.
+/// Emit a UserPromptSubmit decision to stdout and flush; a pass writes nothing.
 pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()> {
-    write_json(&render_userpromptsubmit(block))
+    write_opinion(render_userpromptsubmit(block))
 }
 
 /// Build the SessionStart JSON value (no I/O).
@@ -248,6 +244,14 @@ pub fn emit_sessionstart(
     reload_skills: bool,
 ) -> std::io::Result<()> {
     write_json(&render_sessionstart(additional_context, reload_skills))
+}
+
+/// Write `value` like [`write_json`]; `None` (no opinion) writes nothing.
+fn write_opinion(value: Option<Value>) -> std::io::Result<()> {
+    match value {
+        Some(value) => write_json(&value),
+        None => Ok(()),
+    }
 }
 
 /// Serialize `value` as a single line to stdout and flush.
@@ -313,38 +317,66 @@ mod tests {
 
     #[test]
     fn read_payload_parses_a_hook_object() {
-        let (raw, input) = read_payload(PRETOOLUSE_BASH.as_bytes()).expect("readable payload");
-        assert_eq!(raw, PRETOOLUSE_BASH);
+        let (raw, parsed) = read_payload(PRETOOLUSE_BASH.as_bytes());
+        assert_eq!(raw, PRETOOLUSE_BASH.as_bytes());
+        let input = parsed.expect("readable payload");
         assert_eq!(input.bash_command(), Some("solana transfer DEST 0.5"));
     }
 
     #[test]
-    fn read_payload_rejects_malformed_empty_and_non_utf8() {
-        let bad: [&[u8]; 3] = [b"not json at all", b"", &[0xff, 0xfe, b'{', b'}']];
-        for body in bad {
-            assert_eq!(read_payload(body).err(), Some(Unreadable::Malformed));
+    fn read_payload_treats_blank_input_as_empty() {
+        for body in [&b""[..], b" \n\t"] {
+            assert_eq!(read_payload(body).1.err(), Some(Unreadable::Empty));
         }
     }
 
     #[test]
+    fn read_payload_rejects_malformed_payloads() {
+        let nest = |depth: usize| {
+            format!(
+                r#"{{"tool_input":{{"x":{}{}}}}}"#,
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        let lone = r#"{"tool_input":{"x":"\ud800"}}"#.to_string();
+        let bad: Vec<Vec<u8>> = vec![
+            b"not json at all".to_vec(),
+            vec![0xff, 0xfe, b'{', b'}'],
+            nest(127).into_bytes(),
+            nest(200).into_bytes(),
+            lone.into_bytes(),
+        ];
+        for body in bad {
+            assert_eq!(read_payload(&body[..]).1.err(), Some(Unreadable::Malformed));
+        }
+        assert!(read_payload(nest(100).as_bytes()).1.is_ok());
+    }
+
+    #[test]
     fn read_payload_is_bounded_at_one_mib() {
-        // A payload of exactly the bound is read; one byte more is oversized.
+        // A payload of exactly the bound is read; one byte more is oversized, and only the
+        // bound plus one byte is ever buffered.
         let fill = MAX_STDIN_BYTES - r#"{"prompt":""}"#.len();
         let at_bound = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill));
         assert_eq!(at_bound.len(), MAX_STDIN_BYTES);
-        assert!(read_payload(at_bound.as_bytes()).is_ok());
-        let over = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill + 1));
-        assert_eq!(
-            read_payload(over.as_bytes()).err(),
-            Some(Unreadable::Oversized)
-        );
+        assert!(read_payload(at_bound.as_bytes()).1.is_ok());
+        let over = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill + 10));
+        let (raw, parsed) = read_payload(over.as_bytes());
+        assert_eq!(parsed.err(), Some(Unreadable::Oversized));
+        assert_eq!(raw.len(), MAX_STDIN_BYTES + 1);
     }
 
     #[test]
     fn read_payload_checks_size_before_content() {
-        // Past the bound a payload is oversized even when it is not UTF-8 or JSON.
+        // Past the bound a payload is oversized even when it is not UTF-8, JSON or text.
         let junk = vec![0xff_u8; MAX_STDIN_BYTES + 1];
-        assert_eq!(read_payload(&junk[..]).err(), Some(Unreadable::Oversized));
+        assert_eq!(read_payload(&junk[..]).1.err(), Some(Unreadable::Oversized));
+        let blank = vec![b' '; MAX_STDIN_BYTES + 1];
+        assert_eq!(
+            read_payload(&blank[..]).1.err(),
+            Some(Unreadable::Oversized)
+        );
     }
 
     #[test]
@@ -386,23 +418,25 @@ mod tests {
 
     #[test]
     fn render_redact_variants() {
-        assert_eq!(render_posttooluse_redact(None, false), json!({}));
+        // No change is no output, not `{}`.
+        assert_eq!(render_posttooluse_redact(None, false), None);
         assert_eq!(
             render_posttooluse_redact(Some("clean".into()), false),
-            json!({ "updatedToolOutput": "clean" })
+            Some(json!({ "updatedToolOutput": "clean" }))
         );
         assert_eq!(
             render_posttooluse_redact(Some("clean".into()), true),
-            json!({ "updatedMCPToolOutput": "clean" })
+            Some(json!({ "updatedMCPToolOutput": "clean" }))
         );
     }
 
     #[test]
     fn render_prompt_block_and_pass() {
-        assert_eq!(render_userpromptsubmit(None), json!({}));
+        // A pass is no output, not `{}`.
+        assert_eq!(render_userpromptsubmit(None), None);
         assert_eq!(
             render_userpromptsubmit(Some("contains seed phrase")),
-            json!({ "decision": "block", "reason": "contains seed phrase" })
+            Some(json!({ "decision": "block", "reason": "contains seed phrase" }))
         );
     }
 

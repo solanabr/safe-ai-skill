@@ -276,8 +276,8 @@ fn redact_clean_output_is_noop() {
         .plugin_data(data.path())
         .stdin(body)
         .run();
-    // Clean output → empty object (no change).
-    assert_eq!(run.json(), serde_json::json!({}));
+    // Clean output → no opinion (nothing to change, nothing printed).
+    assert_no_opinion(&run, "redact clean output");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -304,7 +304,7 @@ fn prompt_with_seed_phrase_blocks() {
 }
 
 #[test]
-fn benign_prompt_is_empty_object() {
+fn benign_prompt_has_no_opinion() {
     let data = TempDir::new("pg-benign");
     let body = serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
@@ -315,7 +315,7 @@ fn benign_prompt_is_empty_object() {
         .plugin_data(data.path())
         .stdin(body)
         .run();
-    assert_eq!(run.json(), serde_json::json!({}));
+    assert_no_opinion(&run, "prompt-guard benign prompt");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -346,7 +346,7 @@ fn gate_writes_audit_into_sandbox_only() {
 // Output contract (#13): no opinion = empty stdout + exit 0; invocation errors exit 3
 // ---------------------------------------------------------------------------------------
 
-/// Hooks with no opinion on a malformed payload (only `gate-bash` asks).
+/// Hooks with no opinion on empty stdin (only `gate-bash` asks).
 const BROAD_GATES: [&str; 5] = [
     "gate-read",
     "gate-bash-secrets",
@@ -354,6 +354,73 @@ const BROAD_GATES: [&str; 5] = [
     "redact",
     "prompt-guard",
 ];
+
+/// `(scanner, payload fields)` that make each scanner act when read: a keypair in tool output
+/// to redact, a seed phrase in a prompt to block.
+fn scanner_triggers() -> [(&'static str, String); 2] {
+    let keypair: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+    [
+        (
+            "redact",
+            format!(
+                r#""tool_name":"Bash","tool_output":"keypair = [{}]""#,
+                keypair.join(",")
+            ),
+        ),
+        (
+            "prompt-guard",
+            r#""prompt":"here is my seed phrase: legal winner thank year wave sausage worth useful legal winner thank yellow""#
+                .to_string(),
+        ),
+    ]
+}
+
+/// Assert a scanner acted on a readable payload: output redacted, or prompt blocked.
+fn assert_scanner_acted(run: &Run, sub: &str) {
+    let v = run.json();
+    if sub == "redact" {
+        let updated = v["updatedToolOutput"].as_str().unwrap_or("");
+        assert!(updated.contains("***REDACTED:keypair***"), "redact: {v}");
+    } else {
+        assert_eq!(v["decision"], "block", "{sub}: {v}");
+    }
+}
+
+/// Real calls that draw a verdict when read: `(gate, tool_name, tool_input fields)`.
+const VERDICT_CALLS: [(&str, &str, &str); 4] = [
+    ("gate-read", "Read", r#""file_path":"/project/.env""#),
+    (
+        "gate-bash-secrets",
+        "Bash",
+        r#""command":"cat ~/.config/solana/id.json""#,
+    ),
+    (
+        "gate-mcp",
+        "mcp__helius__transferSol",
+        r#""to":"9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin","amount":1.0"#,
+    ),
+    (
+        "gate-bash",
+        "Bash",
+        r#""command":"solana transfer 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin 5 --url https://api.devnet.solana.com""#,
+    ),
+];
+
+/// A hook payload for `tool` whose `tool_input` holds `fields` plus an extra `x` value.
+fn call_with(tool: &str, fields: &str, x: &str) -> String {
+    format!(r#"{{"tool_name":"{tool}","tool_input":{{{fields},"x":{x}}}}}"#)
+}
+
+/// `x` values serde cannot parse: arrays nested 127 and 200 deep (past its recursion limit)
+/// and a lone UTF-16 surrogate escape, as JavaScript's `JSON.stringify` emits it.
+fn poisons() -> [(&'static str, String); 3] {
+    let nest = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    [
+        ("depth 127", nest(127)),
+        ("depth 200", nest(200)),
+        ("lone surrogate", r#""\ud800""#.to_string()),
+    ]
+}
 
 /// Run `args` with raw stdin `body` in a fresh sandbox (process cwd = sandbox home).
 fn run_raw(args: &[&str], body: &str) -> Run {
@@ -411,16 +478,87 @@ fn secrets_ls_has_no_opinion() {
 }
 
 #[test]
-fn malformed_stdin_has_no_opinion_on_broad_gates() {
-    for sub in BROAD_GATES {
+fn malformed_stdin_asks_on_pretooluse_gates() {
+    // A real call wrapped so serde cannot parse it must not slip past any PreToolUse gate.
+    for (sub, tool, fields) in VERDICT_CALLS {
+        let control = run_raw(&[sub], &call_with(tool, fields, "0"));
+        assert_ne!(
+            decision_label(&control),
+            "",
+            "{sub}: control must draw a verdict"
+        );
+        let mut bodies = vec![("bad json", "{not json".to_string())];
+        bodies.extend(
+            poisons()
+                .into_iter()
+                .map(|(what, x)| (what, call_with(tool, fields, &x))),
+        );
+        for (what, body) in bodies {
+            let run = run_raw(&[sub], &body);
+            assert_eq!(decision_label(&run), "ask", "{sub} {what}: {}", run.stdout);
+            let reason = reason_of(&run);
+            assert!(reason.contains("malformed"), "{sub} {what}: {reason:?}");
+        }
+    }
+}
+
+#[test]
+fn malformed_stdin_has_no_opinion_on_scanners() {
+    for (sub, fields) in scanner_triggers() {
+        assert_scanner_acted(&run_raw(&[sub], &format!("{{{fields}}}")), sub);
         assert_no_opinion(&run_raw(&[sub], "{not json"), sub);
+        for (what, x) in poisons() {
+            // serde skips unknown top-level fields without its depth limit; `tool_input` is a
+            // parsed value, so the poison goes there (where model-written content lives).
+            let body = format!(r#"{{{fields},"tool_input":{{"x":{x}}}}}"#);
+            assert_no_opinion(&run_raw(&[sub], &body), &format!("{sub} {what}"));
+        }
     }
 }
 
 #[test]
 fn empty_stdin_has_no_opinion_on_broad_gates() {
+    // No payload at all (only CC builds the envelope, so this is never attacker-shaped).
     for sub in BROAD_GATES {
         assert_no_opinion(&run_raw(&[sub], ""), sub);
+        assert_no_opinion(&run_raw(&[sub], " \n"), &format!("{sub} whitespace"));
+    }
+}
+
+#[test]
+fn unreadable_ask_is_audited_with_the_raw_input_sha() {
+    let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let malformed = call_with("Read", r#""file_path":"/project/.env""#, &nested);
+    let padded = oversized(serde_json::json!({
+        "tool_name": "mcp__helius__getBalance",
+        "tool_input": { "address": DEST }
+    }));
+    // The engine reads (and hashes) at most one byte past the bound.
+    let read_prefix = &padded.as_bytes()[..safe_ai_skill::io::MAX_STDIN_BYTES + 1];
+    let cases = [
+        ("gate-read", malformed.as_str(), malformed.as_bytes()),
+        ("gate-mcp", padded.as_str(), read_prefix),
+    ];
+    for (sub, body, hashed) in cases {
+        let data = TempDir::new("unread-audit-data");
+        let home = TempDir::new("unread-audit-home");
+        let run = Invocation::new(&[sub])
+            .plugin_data(data.path())
+            .home(home.path())
+            .cwd(home.path())
+            .stdin(body)
+            .run();
+        assert_eq!(decision_label(&run), "ask", "{sub}: {}", run.stdout);
+        let log = std::fs::read_to_string(data.join("audit.jsonl")).expect("audit.jsonl");
+        let entry: serde_json::Value =
+            serde_json::from_str(log.lines().last().expect("an audit line")).unwrap();
+        assert_eq!(entry["classification"], "unreadable", "{sub}: {entry}");
+        assert_eq!(entry["decision"], "ask", "{sub}: {entry}");
+        assert_eq!(
+            entry["input_sha256"],
+            safe_ai_skill::audit::sha256_hex(hashed),
+            "{sub}: audit must hash the bytes received, not an empty string"
+        );
     }
 }
 
@@ -460,26 +598,12 @@ fn oversized_stdin_asks_on_pretooluse_gates() {
 }
 
 #[test]
-fn oversized_stdin_has_no_opinion_on_redact_and_prompt_guard() {
-    // Each payload draws output when read; padded past 1 MiB the scanners stay silent.
-    let keypair: Vec<String> = (0..64).map(|i| i.to_string()).collect();
-    let cases = [
-        (
-            "redact",
-            serde_json::json!({ "tool_name": "Bash", "tool_output": format!("keypair = [{}]", keypair.join(",")) }),
-        ),
-        (
-            "prompt-guard",
-            serde_json::json!({ "prompt": "here is my seed phrase: legal winner thank year wave sausage worth useful legal winner thank yellow" }),
-        ),
-    ];
-    for (sub, payload) in cases {
-        let control = run_raw(&[sub], &payload.to_string());
-        assert!(
-            !control.stdout.is_empty(),
-            "{sub}: control payload must draw output"
-        );
-        assert_no_opinion(&run_raw(&[sub], &oversized(payload)), sub);
+fn oversized_stdin_has_no_opinion_on_scanners() {
+    // Read, the keypair is redacted and the seed phrase blocked; past 1 MiB both stay silent.
+    for (sub, fields) in scanner_triggers() {
+        assert_scanner_acted(&run_raw(&[sub], &format!("{{{fields}}}")), sub);
+        let padded = format!(r#"{{{fields},"pad":"{}"}}"#, "x".repeat(1024 * 1024));
+        assert_no_opinion(&run_raw(&[sub], &padded), sub);
     }
 }
 
@@ -494,7 +618,8 @@ fn gate_bash_malformed_stdin_asks() {
     for (what, body) in cases {
         let run = run_raw(&["gate-bash"], body);
         assert_eq!(decision_label(&run), "ask", "{what}: {}", run.stdout);
-        assert!(!reason_of(&run).is_empty(), "{what}: ask without a reason");
+        let reason = reason_of(&run);
+        assert!(reason.contains("malformed"), "{what}: {reason:?}");
     }
     // Control: the same command, readable, is not a Solana command → no opinion.
     let readable = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
@@ -516,9 +641,14 @@ fn unreadable_ask_is_not_relaxed_by_a_grant() {
         "tool_name": "mcp__helius__getBalance",
         "tool_input": { "address": DEST }
     }));
+    let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
     let cases = [
         ("gate-bash", "{not json".to_string()),
         ("gate-mcp", padded_mcp),
+        (
+            "gate-read",
+            call_with("Read", r#""file_path":"README.md""#, &nested),
+        ),
     ];
     for (sub, body) in cases {
         let run = Invocation::new(&[sub])

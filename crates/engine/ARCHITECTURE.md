@@ -88,7 +88,7 @@ needed dep, don't add it), `src/main.rs`, `src/lib.rs`, `src/policy.rs`. The `Re
 For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp`):
 
 ```
-stdin → io::read_payload                           # ≤ 1 MiB, else Unreadable::Oversized
+stdin → io::read_payload                           # bytes (≤ 1 MiB + 1) + parse or Unreadable
       → Policy::load(cwd) → .effective()           # active-profile overlay applied
       → Context::build(command, cwd)               # network resolution
       → gate::decide(...) -> (Decision, GateMeta)  # PURE
@@ -100,12 +100,16 @@ stdin → io::read_payload                           # ≤ 1 MiB, else Unreadabl
 `Defer` from a gate emits nothing (empty stdout, exit 0): no opinion leaves Claude Code's normal
 permission flow in charge. It is never emitted as `permissionDecision: "defer"`, which Claude Code
 treats as "stop this tool call".
-A payload over 1 MiB (`Unreadable::Oversized`) is never parsed: every PreToolUse gate (`gate-read`,
-`gate-bash-secrets`, `gate-mcp`, `gate-bash`) asks, so padding cannot slip a call past a gate;
-`redact` and `prompt-guard` have no opinion. A malformed payload (`Unreadable::Malformed`: empty,
-non-UTF-8, not a JSON hook object) is no opinion for the broad gates; `gate-bash` (the Solana
-surface) asks, also when the payload has no `tool_input.command`. Both asks carry the hard-guard
-`GateMeta::unreadable()`, so no grant relaxes them.
+A payload the engine cannot read is an `ask` on every PreToolUse gate (`gate-read`,
+`gate-bash-secrets`, `gate-mcp`, `gate-bash`): the model shapes `tool_input`, so it can force
+either kind. `Unreadable::Oversized` is over 1 MiB and never parsed. `Unreadable::Malformed` is
+bad JSON or UTF-8, a lone surrogate escape (`"\ud800"`, as `JSON.stringify` emits it), or nesting
+past serde's recursion limit (about 128 levels, a few hundred bytes). Only `Unreadable::Empty`
+(whitespace-only stdin, which Claude Code never sends) is no opinion on the broad gates; `gate-bash`
+(the Solana surface) asks on it too, and when the payload has no `tool_input.command`. These asks
+run under the hard-guard `GateMeta::unreadable()`, so no grant relaxes them, and are audited with
+classification `unreadable` and the sha256 of the bytes received (the first 1 MiB + 1 when
+oversized). `redact` and `prompt-guard` have no opinion on any unreadable payload.
 Unknown/missing subcommand → empty stdout, error on stderr, exit 3. `--version` prints
 `safe-ai-skill <version>` (no hook JSON).
 Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` unchanged.
@@ -117,9 +121,9 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 - **PreToolUse**:
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny"[,"permissionDecisionReason":"…"]}}`
   (reason key omitted for `allow`); `Defer` → no output.
-- **PostToolUse redact**: `{}` (no change) or `{"updatedToolOutput":"…"}` /
+- **PostToolUse redact**: no output (no change) or `{"updatedToolOutput":"…"}` /
   `{"updatedMCPToolOutput":"…"}` (mcp tools).
-- **UserPromptSubmit**: `{}` (allow) or `{"decision":"block","reason":"…"}`.
+- **UserPromptSubmit**: no output (allow) or `{"decision":"block","reason":"…"}`.
 - **SessionStart**:
   `{"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":bool[,"additionalContext":"…"]}}`.
 
@@ -167,17 +171,17 @@ impl HookInput {
 }
 
 pub const MAX_STDIN_BYTES: usize;                // 1 MiB
-pub enum Unreadable { Oversized, Malformed }
-pub fn read_payload(reader: impl std::io::Read) -> Result<(String, HookInput), Unreadable>;
+pub enum Unreadable { Empty, Oversized, Malformed }
+pub fn read_payload(reader: impl std::io::Read) -> (Vec<u8>, Result<HookInput, Unreadable>);
 
 pub enum Decision { Allow, Ask { reason: String }, Deny { reason: String }, Defer }
 impl Decision { pub fn label(&self) -> &'static str; pub fn reason(&self) -> &str; }
 
 pub fn render_pretooluse(d: &Decision) -> Option<serde_json::Value>;  // Defer → None
 pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()>;
-pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> serde_json::Value;
+pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Option<serde_json::Value>;  // no change → None
 pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()>;
-pub fn render_userpromptsubmit(block: Option<&str>) -> serde_json::Value;
+pub fn render_userpromptsubmit(block: Option<&str>) -> Option<serde_json::Value>;  // pass → None
 pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()>;
 pub fn render_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> serde_json::Value;
 pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> std::io::Result<()>;
@@ -294,7 +298,7 @@ pub struct GateMeta {
 impl GateMeta {
     pub fn new(scope: Scope, hard_guard: bool) -> Self;
     pub fn unknown() -> Self;   // Scope::Other, not a hard guard
-    pub fn unreadable() -> Self;   // Scope::Other, hard guard (oversized / gate-bash malformed)
+    pub fn unreadable() -> Self;   // Scope::Other, hard guard (unreadable-payload asks)
 }
 ```
 
