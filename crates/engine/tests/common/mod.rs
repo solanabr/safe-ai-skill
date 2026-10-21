@@ -196,3 +196,20 @@ pub fn permission_decision(v: &serde_json::Value) -> Option<String> {
         .as_str()
         .map(str::to_string)
 }
+
+/// The `permissionDecision` a PreToolUse gate run emitted, or `""` when it printed nothing
+/// (no opinion: empty stdout, exit 0). Panics on a non-zero exit or on any other output.
+pub fn decision_label(run: &Run) -> String {
+    assert_eq!(
+        run.code,
+        Some(0),
+        "gate exited {:?}\n--- stderr ---\n{}",
+        run.code,
+        run.stderr
+    );
+    if run.stdout.is_empty() {
+        return String::new();
+    }
+    permission_decision(&run.json())
+        .unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+}

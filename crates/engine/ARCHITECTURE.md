@@ -88,7 +88,7 @@ needed dep, don't add it), `src/main.rs`, `src/lib.rs`, `src/policy.rs`. The `Re
 For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp`):
 
 ```
-stdin → HookInput::parse
+stdin → io::read_payload                           # ≤ 1 MiB, else unreadable
       → Policy::load(cwd) → .effective()           # active-profile overlay applied
       → Context::build(command, cwd)               # network resolution
       → gate::decide(...) -> (Decision, GateMeta)  # PURE
@@ -97,8 +97,14 @@ stdin → HookInput::parse
       → io::emit_pretooluse(final_decision)         # authoritative JSON; exit 0
 ```
 
-`Defer` from a gate is emitted as `permissionDecision: "defer"` (let the default stand).
-Unknown/missing subcommand → `emit_pretooluse(Allow)` (never block a hook on dispatch error).
+`Defer` from a gate emits nothing (empty stdout, exit 0): no opinion leaves Claude Code's normal
+permission flow in charge. It is never emitted as `permissionDecision: "defer"`, which Claude Code
+treats as "stop this tool call".
+An unreadable payload (malformed, empty, non-UTF-8, over 1 MiB) is no opinion for the broad gates
+(`gate-read`, `gate-bash-secrets`, `gate-mcp`, `redact`, `prompt-guard`). `gate-bash` (the Solana
+surface) asks instead, also when the payload has no `tool_input.command`, under a hard-guard meta.
+Unknown/missing subcommand → empty stdout, error on stderr, exit 3. `--version` prints
+`safe-ai-skill <version>` (no hook JSON).
 Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` unchanged.
 
 ---
@@ -106,8 +112,8 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 ## Decision → JSON shapes
 
 - **PreToolUse**:
-  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny|defer"[,"permissionDecisionReason":"…"]}}`
-  (reason key omitted for `allow`/`defer`).
+  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny"[,"permissionDecisionReason":"…"]}}`
+  (reason key omitted for `allow`); `Defer` → no output.
 - **PostToolUse redact**: `{}` (no change) or `{"updatedToolOutput":"…"}` /
   `{"updatedMCPToolOutput":"…"}` (mcp tools).
 - **UserPromptSubmit**: `{}` (allow) or `{"decision":"block","reason":"…"}`.
@@ -150,17 +156,20 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 impl HookInput {
-    pub fn from_stdin() -> Self;
+    pub fn from_stdin() -> Self;                 // bounded; unreadable → default
     pub fn parse(raw: &str) -> Self;
     pub fn bash_command(&self) -> Option<&str>;
     pub fn read_path(&self) -> Option<&str>;
     pub fn mcp_payload(&self) -> Option<&serde_json::Value>;
 }
 
+pub const MAX_STDIN_BYTES: usize;                // 1 MiB
+pub fn read_payload(reader: impl std::io::Read) -> Option<(String, HookInput)>;  // None = unreadable
+
 pub enum Decision { Allow, Ask { reason: String }, Deny { reason: String }, Defer }
 impl Decision { pub fn label(&self) -> &'static str; pub fn reason(&self) -> &str; }
 
-pub fn render_pretooluse(d: &Decision) -> serde_json::Value;
+pub fn render_pretooluse(d: &Decision) -> Option<serde_json::Value>;  // Defer → None
 pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()>;
 pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> serde_json::Value;
 pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()>;
@@ -281,6 +290,7 @@ pub struct GateMeta {
 impl GateMeta {
     pub fn new(scope: Scope, hard_guard: bool) -> Self;
     pub fn unknown() -> Self;   // Scope::Other, not a hard guard
+    pub fn unreadable() -> Self;   // Scope::Other, hard guard (gate-bash unreadable payload)
 }
 ```
 
@@ -401,10 +411,10 @@ pub fn session::status(plugin_data: &Path) -> error::Result<String>;            
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`mode [<profile>]` · `revoke` · `status`.
+`mode [<profile>]` · `revoke` · `status` · `--version`.
 
-Gate subcommands emit the authoritative PreToolUse decision; the rest print a JSON result line.
-Unknown subcommand → `emit_pretooluse(Allow)`.
+Gate subcommands emit the authoritative PreToolUse decision (nothing for no opinion); the rest
+print a JSON result line. Unknown or missing subcommand → empty stdout, stderr message, exit 3.
 
 **`install` (replaces `bootstrap`; remote tarball path REMOVED).** Hub-agnostic, LOCAL
 source only — there is no hardcoded download URL (the remote `skills.tar.gz` + the

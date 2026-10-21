@@ -1,15 +1,19 @@
 //! Hook stdin parsing and decision emitters.
 //!
 //! `main.rs` owns all stdin reading and stdout emission so feature modules stay pure
-//! and unit-testable. This module defines the [`HookInput`] payload, the [`Decision`]
-//! enum, and the emitter functions. Each public `emit_*` is backed by a pure
-//! `render_*` that returns a [`serde_json::Value`] so the exact JSON can be asserted
+//! and unit-testable. This module defines the [`HookInput`] payload and its bounded reader,
+//! the [`Decision`] enum, and the emitter functions. Each public `emit_*` is backed by a
+//! pure `render_*` that builds the [`serde_json::Value`] so the exact JSON can be asserted
 //! in tests without capturing stdout.
 
 use std::io::{Read, Write};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// Largest hook stdin payload the engine parses (1 MiB). Anything bigger is unreadable: the
+/// broad gates then have no opinion and `gate-bash` asks.
+pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 /// Deserialized Claude Code hook stdin payload.
 ///
@@ -39,16 +43,14 @@ pub struct HookInput {
 }
 
 impl HookInput {
-    /// Read and parse the full stdin payload.
+    /// Read and parse the stdin payload, bounded at [`MAX_STDIN_BYTES`].
     ///
-    /// Any read or parse failure yields [`HookInput::default`] so a hook never crashes
-    /// on malformed input.
+    /// Any read or parse failure, or an oversized payload, yields [`HookInput::default`] so
+    /// a hook never crashes on malformed input.
     pub fn from_stdin() -> Self {
-        let mut buf = String::new();
-        if std::io::stdin().read_to_string(&mut buf).is_err() {
-            return HookInput::default();
-        }
-        HookInput::parse(&buf)
+        read_payload(std::io::stdin())
+            .map(|(_, input)| input)
+            .unwrap_or_default()
     }
 
     /// Parse from a string slice; malformed / empty input → [`HookInput::default`].
@@ -77,11 +79,30 @@ impl HookInput {
     }
 }
 
+/// Read one hook payload from `reader`, bounded at [`MAX_STDIN_BYTES`].
+///
+/// Returns the raw text and its parse, or `None` when the payload is oversized, not UTF-8,
+/// or not a JSON hook object. Reading stops one byte past the bound, so an oversized or
+/// endless stream is never buffered whole.
+pub fn read_payload(reader: impl Read) -> Option<(String, HookInput)> {
+    let mut raw = String::new();
+    reader
+        .take(MAX_STDIN_BYTES as u64 + 1)
+        .read_to_string(&mut raw)
+        .ok()?;
+    if raw.len() > MAX_STDIN_BYTES {
+        return None;
+    }
+    let input = serde_json::from_str(&raw).ok()?;
+    Some((raw, input))
+}
+
 /// A gate / scan decision.
 ///
-/// `Defer` means "this gate has no opinion" — `main.rs` translates it to an `allow`
-/// permission decision so an undecided gate does not block. The relaxation layer may
-/// upgrade an `Ask` to `Allow` when a matching grant exists.
+/// `Defer` means "this gate has no opinion": it is emitted as nothing at all (empty stdout,
+/// exit 0), which leaves Claude Code's normal permission flow in charge. It is never sent as
+/// a `defer` permission decision, which Claude Code treats as "stop this tool call". The
+/// relaxation layer may upgrade an `Ask` to `Allow` when a matching grant exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// Permit the action.
@@ -96,12 +117,13 @@ pub enum Decision {
         /// Human-readable reason shown to the user.
         reason: String,
     },
-    /// No opinion; let the default (allow) stand.
+    /// No opinion; emits nothing, so the normal permission flow decides.
     Defer,
 }
 
 impl Decision {
-    /// Stable label used in audit logs and the PreToolUse `permissionDecision` field.
+    /// Stable label used in audit logs and the PreToolUse `permissionDecision` field
+    /// (`defer` is audit-only: a `Defer` emits nothing).
     pub fn label(&self) -> &'static str {
         match self {
             Decision::Allow => "allow",
@@ -123,9 +145,13 @@ impl Decision {
 /// Build the PreToolUse decision JSON value (no I/O).
 ///
 /// Shape: `{"hookSpecificOutput":{"hookEventName":"PreToolUse",
-/// "permissionDecision":"allow|ask|deny|defer","permissionDecisionReason":"…"}}`.
-/// The reason key is omitted for `allow` and `defer`.
-pub fn render_pretooluse(d: &Decision) -> Value {
+/// "permissionDecision":"allow|ask|deny","permissionDecisionReason":"…"}}`.
+/// The reason key is omitted for `allow`. [`Decision::Defer`] renders to `None`: no
+/// opinion is no output.
+pub fn render_pretooluse(d: &Decision) -> Option<Value> {
+    if matches!(d, Decision::Defer) {
+        return None;
+    }
     let mut inner = json!({
         "hookEventName": "PreToolUse",
         "permissionDecision": d.label(),
@@ -138,12 +164,15 @@ pub fn render_pretooluse(d: &Decision) -> Value {
             );
         }
     }
-    json!({ "hookSpecificOutput": inner })
+    Some(json!({ "hookSpecificOutput": inner }))
 }
 
-/// Emit a PreToolUse permission decision to stdout and flush.
+/// Emit a PreToolUse permission decision to stdout and flush; a `Defer` writes nothing.
 pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()> {
-    write_json(&render_pretooluse(d))
+    match render_pretooluse(d) {
+        Some(value) => write_json(&value),
+        None => Ok(()),
+    }
 }
 
 /// Build the PostToolUse redaction JSON value (no I/O).
@@ -273,8 +302,33 @@ mod tests {
     }
 
     #[test]
+    fn read_payload_parses_a_hook_object() {
+        let (raw, input) = read_payload(PRETOOLUSE_BASH.as_bytes()).expect("readable payload");
+        assert_eq!(raw, PRETOOLUSE_BASH);
+        assert_eq!(input.bash_command(), Some("solana transfer DEST 0.5"));
+    }
+
+    #[test]
+    fn read_payload_rejects_malformed_empty_and_non_utf8() {
+        assert!(read_payload("not json at all".as_bytes()).is_none());
+        assert!(read_payload("".as_bytes()).is_none());
+        assert!(read_payload(&[0xff, 0xfe, b'{', b'}'][..]).is_none());
+    }
+
+    #[test]
+    fn read_payload_is_bounded_at_one_mib() {
+        // A payload of exactly the bound is read; one byte more is unreadable.
+        let fill = MAX_STDIN_BYTES - r#"{"prompt":""}"#.len();
+        let at_bound = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill));
+        assert_eq!(at_bound.len(), MAX_STDIN_BYTES);
+        assert!(read_payload(at_bound.as_bytes()).is_some());
+        let over = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(fill + 1));
+        assert!(read_payload(over.as_bytes()).is_none());
+    }
+
+    #[test]
     fn render_allow_omits_reason() {
-        let v = render_pretooluse(&Decision::Allow);
+        let v = render_pretooluse(&Decision::Allow).expect("allow renders");
         let inner = &v["hookSpecificOutput"];
         assert_eq!(inner["permissionDecision"], "allow");
         assert_eq!(inner["hookEventName"], "PreToolUse");
@@ -282,19 +336,17 @@ mod tests {
     }
 
     #[test]
-    fn render_defer_omits_reason() {
-        let v = render_pretooluse(&Decision::Defer);
-        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "defer");
-        assert!(v["hookSpecificOutput"]
-            .get("permissionDecisionReason")
-            .is_none());
+    fn render_defer_is_nothing() {
+        // No opinion is no output at all: a `defer` decision would stop the tool call.
+        assert!(render_pretooluse(&Decision::Defer).is_none());
     }
 
     #[test]
     fn render_ask_includes_reason() {
         let v = render_pretooluse(&Decision::Ask {
             reason: "MAINNET DEPLOY".into(),
-        });
+        })
+        .expect("ask renders");
         let inner = &v["hookSpecificOutput"];
         assert_eq!(inner["permissionDecision"], "ask");
         assert_eq!(inner["permissionDecisionReason"], "MAINNET DEPLOY");
@@ -304,7 +356,8 @@ mod tests {
     fn render_deny_includes_reason() {
         let v = render_pretooluse(&Decision::Deny {
             reason: "secret read".into(),
-        });
+        })
+        .expect("deny renders");
         let inner = &v["hookSpecificOutput"];
         assert_eq!(inner["permissionDecision"], "deny");
         assert_eq!(inner["permissionDecisionReason"], "secret read");

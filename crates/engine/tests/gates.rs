@@ -7,11 +7,12 @@
 //! `--provider.cluster` flags (highest-precedence in `context::resolve_network`), so no test
 //! shells out to `solana config get`.
 //!
-//! Covers the plan's Verification table (PreToolUse gate rows + redact + prompt-guard).
+//! Covers the plan's Verification table (PreToolUse gate rows + redact + prompt-guard) and the
+//! output contract: no opinion is empty stdout + exit 0, never a `defer` decision.
 
 mod common;
 
-use common::{permission_decision, Invocation, TempDir};
+use common::{decision_label, permission_decision, Invocation, Run, TempDir};
 
 /// A valid devnet/base58 destination pubkey used across the transfer tests.
 const DEST: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
@@ -28,7 +29,8 @@ fn bash_payload(command: &str, cwd: &str) -> String {
     .to_string()
 }
 
-/// Run `gate-bash` against `command` in a fresh sandbox and return the decision label.
+/// Run `gate-bash` against `command` in a fresh sandbox and return the decision label
+/// (`""` = no opinion).
 fn gate_bash(command: &str) -> String {
     let data = TempDir::new("gb-data");
     let home = TempDir::new("gb-home");
@@ -38,8 +40,7 @@ fn gate_bash(command: &str) -> String {
         .home(home.path())
         .stdin(payload)
         .run();
-    let v = run.json();
-    permission_decision(&v).unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+    decision_label(&run)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -118,8 +119,8 @@ fn mainnet_deploy_reason_is_present() {
 // gate-read (secret-glob deny)
 // ---------------------------------------------------------------------------------------
 
-/// Run `gate-read` against `file_path` and return the decision label.
-fn gate_read(file_path: &str) -> (String, serde_json::Value) {
+/// Run `gate-read` against `file_path` and return the decision label (`""` = no opinion).
+fn gate_read(file_path: &str) -> String {
     let data = TempDir::new("gr-data");
     let home = TempDir::new("gr-home");
     let payload = serde_json::json!({
@@ -134,40 +135,32 @@ fn gate_read(file_path: &str) -> (String, serde_json::Value) {
         .home(home.path())
         .stdin(payload)
         .run();
-    let v = run.json();
-    let label = permission_decision(&v)
-        .unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout));
-    (label, v)
+    decision_label(&run)
 }
 
 #[test]
 fn read_id_json_denies() {
-    let (label, _) = gate_read("/home/u/.config/solana/id.json");
-    assert_eq!(label, "deny");
+    assert_eq!(gate_read("/home/u/.config/solana/id.json"), "deny");
 }
 
 #[test]
 fn read_dotenv_denies() {
-    let (label, _) = gate_read("/project/.env");
-    assert_eq!(label, "deny");
+    assert_eq!(gate_read("/project/.env"), "deny");
 }
 
 #[test]
-fn read_env_example_allows_or_defers() {
-    // `.env.example` is on the allow list → the gate defers (no opinion). main maps Defer to
-    // the `defer` permissionDecision, which lets the default (allow) stand.
-    let (label, _) = gate_read("/project/.env.example");
-    assert!(
-        label == "defer" || label == "allow",
-        "expected defer/allow for .env.example, got {label}"
-    );
+fn read_env_example_has_no_opinion() {
+    // `.env.example` is on the allow list → no opinion: nothing on stdout, so Claude Code's
+    // normal permission flow decides.
+    assert_eq!(gate_read("/project/.env.example"), "");
 }
 
 // ---------------------------------------------------------------------------------------
 // gate-bash-secrets (raw string secret/exfil)
 // ---------------------------------------------------------------------------------------
 
-/// Run `gate-bash-secrets` against `command` and return the decision label.
+/// Run `gate-bash-secrets` against `command` and return the decision label
+/// (`""` = no opinion).
 fn gate_secrets(command: &str) -> String {
     let data = TempDir::new("gs-data");
     let home = TempDir::new("gs-home");
@@ -177,8 +170,7 @@ fn gate_secrets(command: &str) -> String {
         .home(home.path())
         .stdin(payload)
         .run();
-    let v = run.json();
-    permission_decision(&v).unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+    decision_label(&run)
 }
 
 #[test]
@@ -201,7 +193,8 @@ fn telemetry_curl_post_asks_or_denies() {
 // gate-mcp
 // ---------------------------------------------------------------------------------------
 
-/// Run `gate-mcp` for `tool` with `payload` and return the decision label.
+/// Run `gate-mcp` for `tool` with `payload` and return the decision label
+/// (`""` = no opinion).
 fn gate_mcp(tool: &str, payload: serde_json::Value) -> String {
     let data = TempDir::new("gm-data");
     let home = TempDir::new("gm-home");
@@ -217,8 +210,7 @@ fn gate_mcp(tool: &str, payload: serde_json::Value) -> String {
         .home(home.path())
         .stdin(body)
         .run();
-    let v = run.json();
-    permission_decision(&v).unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+    decision_label(&run)
 }
 
 #[test]
@@ -231,13 +223,13 @@ fn mcp_transfer_sol_asks() {
 }
 
 #[test]
-fn mcp_get_balance_defers() {
+fn mcp_get_balance_has_no_opinion() {
     // A read-only tool whose name is not sensitive and payload has no value-moving signal.
     let label = gate_mcp(
         "mcp__helius__getBalance",
         serde_json::json!({ "address": DEST }),
     );
-    assert_eq!(label, "defer");
+    assert_eq!(label, "");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -348,4 +340,193 @@ fn gate_writes_audit_into_sandbox_only() {
     assert!(audit.exists(), "audit.jsonl not written to sandbox");
     let text = std::fs::read_to_string(&audit).unwrap();
     assert!(text.contains("allow"), "audit did not record the decision");
+}
+
+// ---------------------------------------------------------------------------------------
+// Output contract (#13): no opinion = empty stdout + exit 0; invocation errors exit 3
+// ---------------------------------------------------------------------------------------
+
+/// Hooks that fail open: an unreadable payload gets no opinion (only `gate-bash` asks).
+const BROAD_GATES: [&str; 5] = [
+    "gate-read",
+    "gate-bash-secrets",
+    "gate-mcp",
+    "redact",
+    "prompt-guard",
+];
+
+/// Run `args` with raw stdin `body` in a fresh sandbox (process cwd = sandbox home).
+fn run_raw(args: &[&str], body: &str) -> Run {
+    let data = TempDir::new("raw-data");
+    let home = TempDir::new("raw-home");
+    Invocation::new(args)
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(home.path())
+        .stdin(body)
+        .run()
+}
+
+/// Assert the no-opinion contract: nothing at all on stdout, exit 0.
+fn assert_no_opinion(run: &Run, what: &str) {
+    assert_eq!(run.stdout, "", "{what}: expected empty stdout");
+    assert_eq!(
+        run.code,
+        Some(0),
+        "{what}: expected exit 0; stderr: {}",
+        run.stderr
+    );
+}
+
+/// Serialize `payload` padded past the 1 MiB stdin bound with an extra top-level field.
+fn oversized(mut payload: serde_json::Value) -> String {
+    payload["pad"] = serde_json::Value::String("x".repeat(1024 * 1024));
+    payload.to_string()
+}
+
+#[test]
+fn read_readme_has_no_opinion() {
+    let run = run_raw(
+        &["gate-read"],
+        r#"{"tool_input":{"file_path":"README.md"}}"#,
+    );
+    assert_no_opinion(&run, "gate-read README.md");
+}
+
+#[test]
+fn secrets_ls_has_no_opinion() {
+    let run = run_raw(
+        &["gate-bash-secrets"],
+        r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+    );
+    assert_no_opinion(&run, "gate-bash-secrets ls");
+}
+
+#[test]
+fn malformed_stdin_has_no_opinion_on_broad_gates() {
+    for sub in BROAD_GATES {
+        assert_no_opinion(&run_raw(&[sub], "{not json"), sub);
+    }
+}
+
+#[test]
+fn empty_stdin_has_no_opinion_on_broad_gates() {
+    for sub in BROAD_GATES {
+        assert_no_opinion(&run_raw(&[sub], ""), sub);
+    }
+}
+
+#[test]
+fn oversized_stdin_is_not_parsed_by_broad_gates() {
+    // Each payload draws output when read; padded past 1 MiB it is not parsed at all.
+    let keypair: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+    let cases = [
+        (
+            "gate-read",
+            serde_json::json!({ "tool_name": "Read", "tool_input": { "file_path": "/project/.env" } }),
+        ),
+        (
+            "gate-bash-secrets",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "cat ~/.config/solana/id.json" } }),
+        ),
+        (
+            "gate-mcp",
+            serde_json::json!({ "tool_name": "mcp__helius__transferSol", "tool_input": { "to": DEST, "amount": 1.0 } }),
+        ),
+        (
+            "redact",
+            serde_json::json!({ "tool_name": "Bash", "tool_output": format!("keypair = [{}]", keypair.join(",")) }),
+        ),
+        (
+            "prompt-guard",
+            serde_json::json!({ "prompt": "here is my seed phrase: legal winner thank year wave sausage worth useful legal winner thank yellow" }),
+        ),
+    ];
+    for (sub, payload) in cases {
+        let control = run_raw(&[sub], &payload.to_string());
+        assert!(
+            !control.stdout.is_empty(),
+            "{sub}: control payload must draw output"
+        );
+        assert_no_opinion(&run_raw(&[sub], &oversized(payload)), sub);
+    }
+}
+
+#[test]
+fn gate_bash_unreadable_stdin_asks() {
+    // The Solana surface fails closed: a payload it cannot read is an `ask`, never silence.
+    let padded =
+        oversized(serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" } }));
+    let cases = [
+        ("malformed", "{not json"),
+        ("empty", ""),
+        ("no command", r#"{"tool_name":"Bash","tool_input":{}}"#),
+        ("oversized", padded.as_str()),
+    ];
+    for (what, body) in cases {
+        let run = run_raw(&["gate-bash"], body);
+        assert_eq!(decision_label(&run), "ask", "{what}: {}", run.stdout);
+        let reason = run.json()["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(!reason.is_empty(), "{what}: ask without a reason");
+    }
+    // Control: the same command, readable, is not a Solana command → no opinion.
+    let readable = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    assert_eq!(decision_label(&run_raw(&["gate-bash"], readable)), "");
+}
+
+#[test]
+fn unreadable_bash_ask_is_not_relaxed_by_a_grant() {
+    // An `other` grant relaxes unclassified asks; the unreadable-payload ask is a hard guard.
+    let data = TempDir::new("unread-grant-data");
+    let home = TempDir::new("unread-grant-home");
+    let grant = Invocation::new(&["allow", "--scope", "other", "--for", "1h"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(home.path())
+        .run();
+    assert_eq!(grant.json()["status"], "granted", "{}", grant.stdout);
+    let run = Invocation::new(&["gate-bash"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(home.path())
+        .stdin("{not json")
+        .run();
+    assert_eq!(decision_label(&run), "ask", "{}", run.stdout);
+}
+
+#[test]
+fn unknown_subcommand_exits_3_with_empty_stdout() {
+    let run = run_raw(&["bogus"], "");
+    assert_eq!(run.stdout, "");
+    assert_eq!(run.code, Some(3));
+    assert!(
+        run.stderr.contains("bogus"),
+        "stderr should name the subcommand: {:?}",
+        run.stderr
+    );
+}
+
+#[test]
+fn no_args_exits_3_with_empty_stdout() {
+    let run = run_raw(&[], "");
+    assert_eq!(run.stdout, "");
+    assert_eq!(run.code, Some(3));
+    assert!(!run.stderr.is_empty(), "expected a usage error on stderr");
+}
+
+#[test]
+fn version_prints_a_plain_version_line() {
+    let run = run_raw(&["--version"], "");
+    assert_eq!(
+        run.stdout,
+        format!("safe-ai-skill {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(run.code, Some(0));
+    assert!(
+        !run.stdout.contains('{'),
+        "--version must not print hook JSON"
+    );
 }
