@@ -11,24 +11,55 @@
 
 mod common;
 
-use common::{permission_decision, Invocation, Run, TempDir};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use common::{permission_decision, Invocation, Run};
 use serde_json::{json, Value};
+
+/// A self-cleaning temp dir. Unlike `common::TempDir` (`safe-ai-skill-it-…`), its name is not a
+/// `safe-ai-skill-*` component, which the tripwire treats as a plugin data dir.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tw-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn join(&self, rel: impl AsRef<Path>) -> PathBuf {
+        self.0.join(rel)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// Isolated HOME, plugin data dir, plugin root and project dir for one test.
 struct Sandbox {
-    home: TempDir,
-    data: TempDir,
-    root: TempDir,
-    project: TempDir,
+    home: Scratch,
+    data: Scratch,
+    root: Scratch,
+    project: Scratch,
 }
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
         Sandbox {
-            home: TempDir::new(&format!("{tag}-home")),
-            data: TempDir::new(&format!("{tag}-data")),
-            root: TempDir::new(&format!("{tag}-root")),
-            project: TempDir::new(&format!("{tag}-proj")),
+            home: Scratch::new(&format!("{tag}-home")),
+            data: Scratch::new(&format!("{tag}-data")),
+            root: Scratch::new(&format!("{tag}-root")),
+            project: Scratch::new(&format!("{tag}-proj")),
         }
     }
 
@@ -262,6 +293,57 @@ fn bash_state_references_deny() {
         format!("echo '{{}}' > {root}/hooks/hooks.json"),
     ] {
         assert_deny(&sb.bash(&cmd), &cmd);
+    }
+}
+
+#[test]
+fn bash_relative_and_glob_data_dir_paths_deny() {
+    let sb = Sandbox::new("tw-reldata");
+    for cmd in [
+        "cd ~/.claude/plugins/data && echo '{\"profile\":\"autopilot\"}' > safe-ai-skill-stbr/mode.json",
+        "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-*",
+        "cd ~/.claude/plugins && rm -rf data/safe-ai-skill-stbr",
+        "ln -s ~/.claude/plugins/data /tmp/d && echo '{}' > /tmp/d/safe-ai-skill-stbr/mode.json",
+        "rm -rf ~/.claude/plugins/data/*-stbr",
+        "cat ~/.claude/plugins/data/*stbr/grants.json",
+        "cat ~/.claude/plugins/d*/safe-ai-skill-stbr/grants.json",
+        "echo x > ~/.claude/plugins/data/[s]afe-ai-skill-stbr/mode.json",
+        "rm -rf ~/.[s]afe-ai-skill",
+        "ls ~someone/.safe-ai-skill",
+        "python3 -c \"import os; open(os.environ['CLAUDE_PLUGIN_DATA'] + '/grants.json', 'w')\"",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+}
+
+#[test]
+fn bash_computed_or_split_binary_with_mutating_subcommand_denies() {
+    let sb = Sandbox::new("tw-computed");
+    for cmd in [
+        "safe-ai-\\\nskill allow",
+        "safe-ai-skill al\\\nlow",
+        "$(which safe-ai-skill) allow",
+        "\"$(command -v safe-ai-skill)\" mode autopilot",
+        "$(find / -name safe-ai-skill -type f | head -1) allow",
+        "safe-ai-skill${IFS}allow",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+}
+
+#[test]
+fn bash_near_misses_have_no_opinion() {
+    // A glob inside another plugin's cache dir, `.safe-ai-skill` named without a `cd` into it, a
+    // glob that cannot reach a dotfile, a read-only computed binary, and a release tag name.
+    let sb = Sandbox::new("tw-near");
+    for cmd in [
+        "ls ~/.claude/plugins/cache/stbr/ai-kit/1.0.0/skills/*",
+        "cat .safe-ai-skill/policy.yaml src/state.json",
+        "ls ~/*",
+        "$(which safe-ai-skill) status",
+        "git tag safe-ai-skill--v1.0.1",
+    ] {
+        assert_no_opinion(&sb.bash(cmd), cmd);
     }
 }
 
