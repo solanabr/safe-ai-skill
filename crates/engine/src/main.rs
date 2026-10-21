@@ -222,9 +222,20 @@ fn cmd_gate_tamper() -> ExitCode {
     let cwd = cwd_of(&input);
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
-    let protected = safe_ai_skill::gates::tamper::Protected::from_env();
-    let decision =
-        safe_ai_skill::gates::tamper::decide_file(input.tool_input.as_ref(), &cwd, &protected);
+    // Unreadable non-empty payload (oversized, malformed, too deep, lone surrogate) → ask. Kept
+    // in this one spot so it can switch to `read_input`'s own verdict.
+    let unreadable = raw.len() > 1 << 20
+        || (!raw.trim().is_empty() && serde_json::from_str::<HookInput>(&raw).is_err());
+    let decision = if unreadable {
+        Decision::Ask {
+            reason: "safe-ai-skill could not read this tool call (oversized or malformed \
+                     payload), so it cannot check the target path; review the write manually"
+                .to_string(),
+        }
+    } else {
+        let protected = safe_ai_skill::gates::tamper::Protected::from_env();
+        safe_ai_skill::gates::tamper::decide_file(input.tool_input.as_ref(), &cwd, &protected)
+    };
     // A tamper verdict is final: no grant or profile relaxes it, so it skips `relax::apply`.
     write_audit(&effective, &plugin_data, &input, &raw, "tamper", &decision);
     let _ = io::emit_pretooluse(&decision);

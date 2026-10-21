@@ -56,11 +56,16 @@ impl Sandbox {
             "tool_name": tool,
             "tool_input": tool_input,
         });
+        self.raw(sub, payload.to_string())
+    }
+
+    /// Run `sub` on a raw (possibly unreadable) stdin body.
+    fn raw(&self, sub: &str, body: String) -> Run {
         Invocation::new(&[sub])
             .plugin_data(self.data.path())
             .home(self.home.path())
             .env("CLAUDE_PLUGIN_ROOT", &self.root())
-            .stdin(payload.to_string())
+            .stdin(body)
             .run()
     }
 
@@ -378,6 +383,85 @@ fn write_through_symlink_into_data_dir_denies() {
     std::os::unix::fs::symlink(&target, sb.project.join("state")).unwrap();
     let path = format!("{}/state/grants.json", sb.project());
     assert_deny(&sb.write(&path), &path);
+}
+
+#[test]
+fn every_installed_data_dir_name_is_protected() {
+    // `safe-ai-skill-safe-ai-skill` after the marketplace rename, `safe-ai-skill-stbr` for
+    // ai-kit users, and either under `$CLAUDE_CONFIG_DIR` instead of `~/.claude`.
+    let sb = Sandbox::new("tw-names");
+    let home = sb.home();
+    for cmd in [
+        "cat ~/.claude/plugins/data/safe-ai-skill-safe-ai-skill/grants.json".to_string(),
+        "cat ~/.claude/plugins/data/safe-ai-skill-stbr/grants.json".to_string(),
+        "echo {} > $CLAUDE_CONFIG_DIR/plugins/data/safe-ai-skill-stbr/mode.json".to_string(),
+        "rm \"${CLAUDE_CONFIG_DIR}\"/plugins/data/safe-ai-skill-safe-ai-skill/spend.json"
+            .to_string(),
+        "rm -rf ~/.claude/plugins/data/safe-ai-skill-*".to_string(),
+        format!("cp x {home}/cfg/plugins/data/safe-ai-skill-safe-ai-skill/lockfile.json"),
+        "sed -i s/a/b/ ~/.claude/plugins/cache/safe-ai-skill/safe-ai-skill/1.1.0/hooks/hooks.json"
+            .to_string(),
+    ] {
+        assert_deny(&sb.bash(&cmd), &cmd);
+    }
+    for path in [
+        format!("{home}/.claude/plugins/data/safe-ai-skill-safe-ai-skill/grants.json"),
+        format!("{home}/cfg/plugins/data/safe-ai-skill-stbr/mode.json"),
+        format!("{home}/.claude/plugins/cache/safe-ai-skill/safe-ai-skill/1.1.0/hooks/hooks.json"),
+    ] {
+        assert_deny(&sb.write(&path), &path);
+    }
+}
+
+#[test]
+fn unreadable_payload_asks() {
+    let sb = Sandbox::new("tw-unread");
+    let deep = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":{}"x"{}}}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let oversized = json!({
+        "tool_name": "Write",
+        "cwd": sb.project(),
+        "tool_input": {
+            "file_path": format!("{}/big.json", sb.project()),
+            "content": "x".repeat(1 << 20),
+        },
+    })
+    .to_string();
+    for (what, body) in [
+        (
+            "malformed",
+            r#"{"tool_name":"Write","tool_input":{"file_path":"#.to_string(),
+        ),
+        (
+            "lone surrogate",
+            r#"{"tool_name":"Write","tool_input":{"file_path":"/p/\ud800x"}}"#.to_string(),
+        ),
+        (
+            "wrong field type",
+            json!({ "tool_name": "Write", "cwd": 5, "tool_input": { "file_path": "/p/x" } })
+                .to_string(),
+        ),
+        ("nested too deep", deep),
+        ("oversized", oversized),
+    ] {
+        let run = sb.raw("gate-tamper", body);
+        assert_eq!(
+            verdict(&run).as_deref(),
+            Some("ask"),
+            "{what}: {}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn empty_payload_has_no_opinion() {
+    let sb = Sandbox::new("tw-empty");
+    assert_no_opinion(&sb.raw("gate-tamper", String::new()), "empty stdin");
+    assert_no_opinion(&sb.raw("gate-tamper", " \n".to_string()), "blank stdin");
 }
 
 #[test]
