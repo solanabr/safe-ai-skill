@@ -32,6 +32,7 @@ jobs:
   conformance:
     name: conformance / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +52,7 @@ jobs:
           claude --version
 
       - name: Run conformance cases
+        timeout-minutes: 40
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CASES: ${{ inputs.cases }}
@@ -64,8 +66,21 @@ jobs:
           if [ -n "$CASES" ]; then set -- --only "$CASES"; fi
           scripts/cc-conformance.sh --mode plugin --keep --strict "$@"
 
-      - name: Upload transcripts
+      - name: Check transcripts for the API key
+        id: leakcheck
         if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Lists matching files, never the key. The isolated HOME is not uploaded, so not checked.
+          if [ -n "$ANTHROPIC_API_KEY" ] &&
+            grep -rlF --exclude-dir=home -- "$ANTHROPIC_API_KEY" "$RUNNER_TEMP"/cc-conformance.* 2>/dev/null; then
+            echo "ANTHROPIC_API_KEY found in the files above; not uploading transcripts" >&2
+            exit 1
+          fi
+
+      - name: Upload transcripts
+        if: always() && steps.leakcheck.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: cc-conformance-${{ matrix.os }}
