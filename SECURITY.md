@@ -49,7 +49,7 @@ solana-ai-kit's `skill-registry.json` includes entries classified by safe-ai-ski
 | `key_custody` | `x402-proxy-mcp` | Holds BIP-39 mnemonic or derived keys for x402 payment channel operations. Key material is exposed to the MCP process boundary. |
 | `installer_script` | `ghostsecurity`, others with `curl\|bash` setup | The `setup_command` or installer invokes a network fetch piped to a shell. The fetched content is not verifiable at catalog-entry-audit time; it can change between audit and execution. |
 
-Entries in `wallet_signing` and `key_custody` are denied by default policy (configurable in `.safe-ai-skill/policy.yaml`). Entries in `installer_script` trigger the `exec_install_scripts` policy gate. At runtime, tools from approved `wallet_signing` entries are gated by `gate-mcp` with a risk-class header in the approval prompt — the user is reminded of the class on every invocation.
+Entries in `wallet_signing` and `key_custody` force `ask` under the default policy (the class decisions live in the plugin's `default.policy.yaml`; a project's `.safe-ai-skill/policy.yaml` cannot change the catalog). Entries in `installer_script` trigger the `exec_install_scripts` policy gate, which a project policy can only move toward `deny`. At runtime, tools from approved `wallet_signing` entries are gated by `gate-mcp` with a risk-class header in the approval prompt — the user is reminded of the class on every invocation.
 
 ### TOCTOU and simulation spoofing
 
@@ -86,7 +86,7 @@ Malicious skills can embed instructions targeting the language model in SKILL.md
 
 **Never fails open.** If the `safe-ai-skill` binary cannot be obtained (no matching prebuilt, no `cargo`), the `bin/safe-ai-skill` shim exits with code 2, which Claude Code interprets as a block on the gated action.
 
-**Fail-closed policy.** If `policy.yaml` cannot be parsed, `policy.rs` falls back to treating all gated actions as `ask`. The session is not left without gates because of a config file error.
+**Fail-closed policy.** If the plugin's `default.policy.yaml` cannot be parsed, `policy.rs` falls back to treating all gated actions as `ask`. A project's `.safe-ai-skill/policy.yaml` can only tighten the policy: a setting that would loosen it is ignored and listed at SessionStart, invalid YAML is ignored, and ill-typed values fail closed. The session is not left without gates because of a config file error.
 
 **External API timeouts do not allow.** Rugcheck and osv.dev are external network calls. On timeout or API unavailability, the decision is `ask` (not `allow`, not `deny`). The user is informed and must approve.
 

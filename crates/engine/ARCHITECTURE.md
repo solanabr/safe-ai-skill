@@ -192,7 +192,7 @@ pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) 
 ### `policy`
 ```rust
 pub const DEFAULT_POLICY_YAML: &str;     // embedded default (literal; crate is standalone)
-pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE"
+pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE" — may only pick a stricter profile
 
 pub struct Policy {
     pub version: u32, pub active_profile: String,
@@ -203,6 +203,8 @@ pub struct Policy {
     pub catalog: CatalogPolicy,             // NEW (solana-ai-kit milestone)
     pub supply_chain: SupplyChainPolicy,
     pub profiles: std::collections::BTreeMap<String, ProfileOverlay>,
+    pub ignored_overrides: Vec<String>,     // refused project/env overrides (serde-skipped)
+    // private, serde-skipped: caps the project lowered; scan dirs it added
 }
 pub struct NetworkPolicy { pub default: String, pub mainnet: String }
 pub struct SpendPolicy { pub per_tx_sol_max: f64, pub hard_tx_sol_max: f64, pub daily_sol_max: f64 }
@@ -235,21 +237,45 @@ pub struct ProfileOverlay {
 }
 
 impl Policy {
-    pub fn load(cwd: &Path) -> Policy;          // deep-merge + fail-closed + env profile override
+    pub fn load(cwd: &Path) -> Policy;          // load_with_mode(cwd, None)
+    // Reads the plugin default, <cwd>/.safe-ai-skill/policy.yaml and PROFILE_ENV, calls
+    // from_sources, then keeps project-added scan dirs only if they resolve on disk inside cwd.
+    pub fn load_with_mode(cwd: &Path, persisted_profile: Option<&str>) -> Policy;
+    // Pure (no env, no fs): base + ratcheted project overlay + profile resolution. Project scan
+    // dirs get the text check only; on-disk confinement happens in load_with_mode alone.
+    pub fn from_sources(base_src: &str, project_src: Option<&str>,
+                        persisted_profile: Option<&str>, env_profile: Option<&str>) -> Policy;
     pub fn fail_closed() -> Policy;             // conservative; every soft gate → ask
     pub fn is_fail_closed(&self) -> bool;
     pub fn is_hard_guard(&self, scope_label: &str) -> bool;
-    pub fn effective(&self) -> Policy;          // apply active profile overlay
+    pub fn effective(&self) -> Policy;          // apply active profile overlay, then re-clamp project caps
     pub fn active_overlay(&self) -> ProfileOverlay;
+    pub fn ignored_notice(&self) -> Option<String>; // SessionStart block listing ignored_overrides
 }
 ```
-**Fail-closed guarantee:** any unrecoverable parse error in `load` returns `fail_closed()`
-(caps zero, mainnet `ask`, profile `strict`, all hard guards present). A malformed *project
-override* is ignored (base default still applies).
+**Fail-closed guarantee:** an unparsable plugin default returns `fail_closed()` (caps zero,
+mainnet `ask`, profile `strict`, all hard guards present). A *project override* that is not
+valid YAML (or not a mapping) is ignored; one with ill-typed values fails closed through the
+ratchet, so no other field ends up looser than the base. Either way it is noted.
+
+**Project ratchet (D1.10).** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
+tighten the base, field by field: caps take the lower value (and still bind under any
+profile); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
+`network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`, `gates`,
+`hard_guards`, `mcp.sensitive_name_pattern` alternatives) add entries; allow-lists
+(`secrets.allow_read_globs`, `swap.trusted_mints`) drop them; toggles can only turn on;
+`verify_skills_dirs` keeps every base dir and may add dirs strictly inside the project
+(lexically in `from_sources`, then canonicalized on disk in `load_with_mode`). Fields with no
+safe direction stay fixed: `catalog`, `swap.rugcheck_timeout_ms`, `supply_chain.ext_dir`,
+`supply_chain.verify_ext_submodules`. `active_profile` / `profiles` are ignored. Every refused
+change lands in `ignored_overrides`, which `verify session` appends to the SessionStart
+`additionalContext`; the notes never echo repo text.
 
 **Profiles:** `strict` (no-op), `autopilot` (relax_transfer/swap + per_tx cap 2.0),
-`paranoid` (ask_all), `off` (disabled). `effective()` applies cap overrides; the boolean
-flags are consumed by gates / `relax`. Hard guards are never relaxed.
+`paranoid` (ask_all), `off` (disabled). The active profile is the `safe-ai-skill mode` choice
+(`mode.json`) if set, else the plugin default's; `PROFILE_ENV` may then only pick a stricter
+one (`off` < `autopilot` < `strict` < `paranoid`). `effective()` applies cap overrides; the
+boolean flags are consumed by gates / `relax`. Hard guards are never relaxed.
 
 **On-disk ⇄ embedded equivalence (FROZEN invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
@@ -353,7 +379,8 @@ pub fn grants::debit(plugin_data: &Path, grant_id: &str, sol_amount: f64) -> std
 pub fn grants::cleanup_expired(plugin_data: &Path) -> usize;
 
 // mode
-pub fn mode::get(plugin_data: &Path) -> Option<String>;
+pub fn mode::get(plugin_data: &Path) -> Option<String>;        // env-if-known, else mode.json (raw read)
+pub fn mode::persisted(plugin_data: &Path) -> Option<String>;  // mode.json only; what load_with_mode takes
 pub fn mode::set(plugin_data: &Path, profile: &str) -> std::io::Result<()>;
 
 // relax  (called by main.rs after every gate)
