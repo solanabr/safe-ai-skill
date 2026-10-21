@@ -442,7 +442,8 @@ fn set_quote_styles() {
     let f = dir.join(".env.local");
     fs::write(
         &f,
-        "S='old'\nD=\"old\"\nB1=old\nB2=old\nS2='old'\nB3=old\nB4=old\nB5=old\nD2=\"old\"\nB6=old\n",
+        "S='old'\nD=\"old\"\nB1=old\nB2=old\nS2='old'\nB3=old\nB4=old\nB5=old\nD2=\"old\"\nB6=old\n\
+         B7=old\nB8=old\n",
     )
     .unwrap();
     let cases = [
@@ -456,6 +457,9 @@ fn set_quote_styles() {
         ("B5", "back`tick"),
         ("D2", "q\"uo\\te"),
         ("B6", ""),
+        // Tilde expansion when the file is `source`d (direnv): quote `~…` and `…:~…`.
+        ("B7", "~/keys/id.json"),
+        ("B8", "/opt/bin:~/bin"),
     ];
     for (k, v) in cases {
         ok(&set(dir.path(), ".env.local", k, v, &[]));
@@ -463,7 +467,8 @@ fn set_quote_styles() {
     assert_eq!(
         read(&f),
         "S='it is $5'\nD=\"it is \\$5\"\nB1=plain-value_1.x/y:z@h%2B,=?&~\nB2=\"has space\"\n\
-         S2=\"it's\"\nB3=\"a#b c\"\nB4=\"x'y\\$z\"\nB5='back`tick'\nD2=\"q\\\"uo\\\\te\"\nB6=\n"
+         S2=\"it's\"\nB3=\"a#b c\"\nB4=\"x'y\\$z\"\nB5='back`tick'\nD2=\"q\\\"uo\\\\te\"\nB6=\n\
+         B7=\"~/keys/id.json\"\nB8=\"/opt/bin:~/bin\"\n"
     );
 }
 
@@ -799,6 +804,53 @@ fn directory_named_like_env_is_refused() {
     assert!(r.stderr.contains("not a regular file"), "{}", r.stderr);
 }
 
+#[test]
+fn refusals_never_echo_the_file_argument() {
+    let dir = TempDir::new("env-refuse-echo");
+    let d = dir.path();
+    // A secret pasted where FILE goes must not be printed back.
+    let secret = "sk_\x6cive_51Hx9QbF2eZvKYlo2C8dK3mN";
+    let existing = format!("{secret}.txt");
+    fs::write(dir.join(&existing), "A=1\n").unwrap();
+    let nested = format!("{secret}/notes.txt");
+    let env_in_missing_dir = format!("{secret}/.env.local");
+    let runs: Vec<(Vec<&str>, Option<&str>)> = vec![
+        (vec!["keys", secret], None),
+        (vec!["keys", &existing], None),
+        (vec!["keys", &existing, "--require", "A"], None),
+        (vec!["set", secret, "K"], Some("v")),
+        (vec!["set", &existing, "K"], Some("v")),
+        (vec!["unset", &existing, "K"], None),
+        (vec!["unset", secret, "K"], None),
+        (vec!["keys", &nested], None),
+        (vec!["set", &nested, "K"], Some("v")),
+        (vec!["set", &env_in_missing_dir, "K"], Some("v")),
+        (vec!["keys", &env_in_missing_dir], None),
+    ];
+    for (args, stdin) in runs {
+        let r = run_env_in(d, &args, stdin);
+        code(&r, 1);
+        assert_eq!(r.stdout, "", "{args:?}");
+        assert!(
+            !r.stderr.contains(secret),
+            "{args:?} echoed FILE: {}",
+            r.stderr
+        );
+    }
+    assert_eq!(read(&dir.join(&existing)), "A=1\n");
+
+    // Once FILE passes the env-class check, only its basename is printed.
+    let r = run_env(d, &["keys", &env_in_missing_dir]);
+    assert!(r.stderr.contains(".env.local"), "{}", r.stderr);
+    fs::create_dir(dir.join("sub")).unwrap();
+    let r = set(d, "sub/.env.local", "K", "v", &[]);
+    ok(&r);
+    assert_eq!(
+        r.stdout,
+        "created .env.local (mode 0600)\nadded K L1 set len=1\n"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // unset
 // ---------------------------------------------------------------------------------------
@@ -1018,6 +1070,17 @@ fn never_prints_values() {
     let new_url_key = "Zx81Kq0Lm2Np3Rt4";
     let new_url = format!("https://other-rpc.example.org/v2/{new_url_key}");
     let pem2 = "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBc9Yq3hX7vT1mR4nP8kL2wS6jD0fG5aZ\n-----END EC PRIVATE KEY-----";
+    // URLs with credentials in the userinfo, one with a `?` inside the password.
+    let db_user = "svc_admin_q9";
+    let db_pass = "Pa55w0rdS3cretZ";
+    let db_url = format!("https://{db_user}:{db_pass}@db.example.com/x");
+    let alt_user = "alice.smith";
+    let alt_pass = "s3cr?etP4ssW0rd";
+    let alt_url = format!("https://{alt_user}:{alt_pass}@db2.example.com");
+    let new_db_pass = "N3wPassw0rdQ7";
+    let new_db_url = format!("https://{db_user}:{new_db_pass}@db3.example.com/x");
+    let new_alt_pass = "N3w?Pass99Word";
+    let new_alt_url = format!("https://{alt_user}:{new_alt_pass}@db2.example.com");
 
     let probes = probes(&[
         s1,
@@ -1029,11 +1092,18 @@ fn never_prints_values() {
         new1,
         new_url_key,
         pem2,
+        db_user,
+        db_pass,
+        alt_user,
+        alt_pass,
+        new_db_pass,
+        new_alt_pass,
     ]);
 
     let file = ".env.local";
     let body = format!(
-        "S1={s1}\nPEM=\"{pem}\"\nRPC_URL={url}\nS4='{s4}'\nSHORT={short}\nDUP={dup_old}\nDUP={dup_old}\n#OLD={s1}\n"
+        "S1={s1}\nPEM=\"{pem}\"\nRPC_URL={url}\nS4='{s4}'\nSHORT={short}\nDUP={dup_old}\nDUP={dup_old}\n#OLD={s1}\n\
+         DB_URL={db_url}\nALT_URL={alt_url}\n"
     );
     fs::write(dir.join(file), &body).unwrap();
     fs::write(dir.join("notes.txt"), format!("S1={s1}\n")).unwrap();
@@ -1069,6 +1139,9 @@ fn never_prints_values() {
         (vec!["set", file, "PEM", "--multiline"], Some(pem2), 0),
         (vec!["set", file, "RPC_URL"], Some(new_url.as_str()), 0),
         (vec!["set", file, "S4"], Some(s4), 0),
+        // credentials in a URL's userinfo (host change warning on DB_URL)
+        (vec!["set", file, "DB_URL"], Some(new_db_url.as_str()), 0),
+        (vec!["set", file, "ALT_URL"], Some(new_alt_url.as_str()), 0),
         // unset
         (vec!["unset", file, "SHORT"], None, 0),
         (vec!["unset", file, "NEVER_SET"], None, 0),
@@ -1085,9 +1158,12 @@ fn never_prints_values() {
             Some(new1),
             3,
         ),
-        // refused files
+        // refused files, including a secret pasted where FILE goes
         (vec!["set", "notes.txt", "S1"], Some(new1), 1),
         (vec!["keys", "notes.txt"], None, 1),
+        (vec!["keys", s1], None, 1),
+        (vec!["set", new1, "K"], Some(new1), 1),
+        (vec!["unset", s1, "K"], None, 1),
         (vec!["set", ".env.d", "S1"], Some(new1), 1),
         (
             vec!["set", "~/.config/solana/cli/config.yml", "json_rpc_url"],

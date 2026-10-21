@@ -75,11 +75,14 @@ pub fn normalize_value(raw: &[u8], multiline: bool) -> Result<Vec<u8>, ValueErro
     Ok(value)
 }
 
-/// Whether `value` can be written without quotes (`[A-Za-z0-9_./:@%+,=?&~-]*`).
+/// Whether `value` can be written without quotes (`[A-Za-z0-9_./:@%+,=?&~-]*`). A leading `~`
+/// or a `:~` is quoted too: a shell that `source`s the file (direnv) would tilde-expand it.
 pub fn is_bare_safe(value: &[u8]) -> bool {
     value
         .iter()
         .all(|b| b.is_ascii_alphanumeric() || BARE_SAFE.contains(b))
+        && value.first() != Some(&b'~')
+        && !value.windows(2).any(|w| w == b":~")
 }
 
 /// The quote style for `value`: the `existing` one when it can hold the value, otherwise bare
@@ -554,6 +557,13 @@ mod tests {
         assert_eq!(choose_quote(b"a b", Some(Bare)), Double);
         assert_eq!(choose_quote(b"$a", Some(Bare)), Single);
         assert_eq!(choose_quote(b"abc", Some(Bare)), Bare);
+        // Tilde expansion in `source`d files: a leading `~` or a `:~` must be quoted.
+        assert_eq!(choose_quote(b"~/keys/id.json", None), Double);
+        assert_eq!(choose_quote(b"~", None), Double);
+        assert_eq!(choose_quote(b"/a:~/b", None), Double);
+        assert_eq!(choose_quote(b"~$x", None), Single);
+        assert_eq!(choose_quote(b"~/x", Some(Bare)), Double);
+        assert_eq!(choose_quote(b"a~b=~c", None), Bare);
     }
 
     #[test]

@@ -266,79 +266,121 @@ fn parse_key_list(list: &str) -> Result<Vec<String>, Failure> {
 struct Target {
     /// Canonical path (symlinks resolved; for a new file, canonical parent plus name).
     path: PathBuf,
+    /// How messages name the file: its basename, set only once it passed the env-class check.
+    label: String,
     format: Format,
     /// Permission bits of the existing file; `None` when it does not exist yet.
     mode: Option<u32>,
 }
 
 /// Resolve FILE and check it is env-class. A symlink is followed and its target must be
-/// env-class too, since that is the file read and written.
+/// env-class too, since that is the file read and written. Until a name has passed the check,
+/// messages never name the file: a value pasted where FILE goes must not be printed back.
+/// After it, they name only the basename.
 fn resolve(file: &str) -> Result<Target, Failure> {
     let raw = expand_tilde(file);
     match fs::symlink_metadata(&raw) {
         Ok(meta) => {
             let link = meta.file_type().is_symlink();
-            let path = fs::canonicalize(&raw).map_err(|e| {
-                Failure::error(if link {
-                    format!("refusing {file}: its symlink target does not exist")
-                } else {
-                    format!("{file}: {e}")
-                })
-            })?;
+            let path = match fs::canonicalize(&raw) {
+                Ok(path) => path,
+                Err(_) if link && is_env_class(&raw) => {
+                    return Err(Failure::error(format!(
+                        "refusing {}: its symlink target does not exist",
+                        file_name(&raw)
+                    )));
+                }
+                Err(e) if is_env_class(&raw) => {
+                    return Err(Failure::error(format!("{}: {e}", file_name(&raw))));
+                }
+                Err(_) => return Err(refusal(&raw)),
+            };
             if !is_env_class(&path) {
                 return Err(if link && is_env_class(&raw) {
                     Failure::error(format!(
-                        "refusing {file}: its symlink target is not an env-class file"
+                        "refusing {}: its symlink target is not an env-class file",
+                        file_name(&raw)
                     ))
                 } else {
-                    refusal(file, &path)
+                    refusal(&path)
                 });
             }
-            let meta = fs::metadata(&path).map_err(|e| Failure::error(format!("{file}: {e}")))?;
+            let label = label_of(&raw, &path);
+            let meta = fs::metadata(&path).map_err(|e| Failure::error(format!("{label}: {e}")))?;
             if !meta.is_file() {
                 return Err(Failure::error(format!(
-                    "refusing {file}: not a regular file"
+                    "refusing {label}: not a regular file"
                 )));
             }
             Ok(Target {
+                label,
                 format: format_of(&path),
                 mode: Some(mode_of(&meta)),
                 path,
             })
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let name = raw
-                .file_name()
-                .ok_or_else(|| Failure::error(format!("refusing {file}: not a file path")))?;
+            let Some(name) = raw.file_name() else {
+                return Err(refusal(&raw));
+            };
             let parent = match raw.parent() {
                 Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
                 _ => PathBuf::from("."),
             };
-            let parent = fs::canonicalize(&parent)
-                .map_err(|_| Failure::error(format!("{file}: no such directory")))?;
+            let parent = match fs::canonicalize(&parent) {
+                Ok(parent) => parent,
+                Err(_) if is_env_class(&raw) => {
+                    return Err(Failure::error(format!(
+                        "{}: no such directory",
+                        file_name(&raw)
+                    )));
+                }
+                Err(_) => return Err(refusal(&raw)),
+            };
             let path = parent.join(name);
             if !is_env_class(&path) {
-                return Err(refusal(file, &path));
+                return Err(refusal(&path));
             }
             Ok(Target {
+                label: label_of(&raw, &path),
                 format: format_of(&path),
                 mode: None,
                 path,
             })
         }
-        Err(e) => Err(Failure::error(format!("{file}: {e}"))),
+        Err(e) => Err(Failure::error(format!(
+            "refusing: cannot access the file ({e})"
+        ))),
     }
 }
 
-fn refusal(file: &str, path: &Path) -> Failure {
+/// The refusal for a file that is not env-class. It never names the file.
+fn refusal(path: &Path) -> Failure {
     if is_template(path) {
-        Failure::error(format!(
-            "refusing {file}: not secret (an env template); read or edit it directly"
-        ))
+        Failure::error(
+            "refusing: an env template (.env.example, .env.sample, .env.template, .env.dist) is not secret; read or edit it directly",
+        )
     } else {
-        Failure::error(format!(
-            "refusing {file}: not an env-class file (.env, .env.*, *.env, .envrc, .dev.vars, ~/.config/solana/cli/config.yml)"
-        ))
+        Failure::error(
+            "refusing: not an env-class file (env accepts .env, .env.*, *.env, .envrc, .dev.vars and ~/.config/solana/cli/config.yml)",
+        )
+    }
+}
+
+/// The final component of `path`, as given.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The basename to print: FILE's own when it is env-class, else its symlink target's (also
+/// env-class at this point).
+fn label_of(raw: &Path, target: &Path) -> String {
+    if is_env_class(raw) {
+        file_name(raw)
+    } else {
+        file_name(target)
     }
 }
 
@@ -361,26 +403,27 @@ fn mode_of(_meta: &fs::Metadata) -> u32 {
     0o600
 }
 
-fn read_env(file: &str, target: &Target) -> Result<EnvFile, Failure> {
+fn read_env(target: &Target) -> Result<EnvFile, Failure> {
+    let label = &target.label;
     let mut bytes = Vec::new();
     File::open(&target.path)
         .and_then(|f| f.take((MAX_FILE_BYTES + 1) as u64).read_to_end(&mut bytes))
-        .map_err(|e| Failure::error(format!("{file}: {e}")))?;
+        .map_err(|e| Failure::error(format!("{label}: {e}")))?;
     if bytes.len() > MAX_FILE_BYTES {
-        return Err(Failure::error(format!("{file}: larger than 8 MiB")));
+        return Err(Failure::error(format!("{label}: larger than 8 MiB")));
     }
     Ok(EnvFile::parse_as(&bytes, target.format))
 }
 
-fn not_for_yaml(file: &str) -> Failure {
+fn not_for_yaml(label: &str) -> Failure {
     Failure::error(format!(
-        "refusing {file}: the Solana CLI config is changed with `solana config set`, not `env`"
+        "refusing {label}: the Solana CLI config is changed with `solana config set`, not `env`"
     ))
 }
 
-fn reparse_refusal(file: &str) -> Failure {
+fn reparse_refusal(label: &str) -> Failure {
     Failure::error(format!(
-        "refusing to edit {file}: the change would alter how other lines parse (look for an unterminated quote); file unchanged"
+        "refusing to edit {label}: the change would alter how other lines parse (look for an unterminated quote); file unchanged"
     ))
 }
 
@@ -390,8 +433,9 @@ fn warn(err: &mut dyn Write, message: &str) {
 
 fn keys(file: &str, json: bool, require: &[String], out: &mut dyn Write) -> Result<u8, Failure> {
     let target = resolve(file)?;
+    let label = target.label.as_str();
     if target.mode.is_none() {
-        let mut message = format!("{file}: no such file");
+        let mut message = format!("{label}: no such file");
         if require.is_empty() {
             return Err(Failure::error(message));
         }
@@ -405,20 +449,20 @@ fn keys(file: &str, json: bool, require: &[String], out: &mut dyn Write) -> Resu
         ));
         return Err(Failure::unmet(message));
     }
-    let parsed = read_env(file, &target)?;
+    let parsed = read_env(&target)?;
     let unmet = render::unmet(&parsed, require);
     let written = if json {
         let report = (!require.is_empty()).then_some(unmet.as_slice());
-        writeln!(out, "{}", render::keys_json(file, &parsed, report))
+        writeln!(out, "{}", render::keys_json(label, &parsed, report))
     } else {
-        out.write_all(render::keys_text(file, &parsed).as_bytes())
+        out.write_all(render::keys_text(label, &parsed).as_bytes())
     };
     written.map_err(|e| Failure::error(format!("cannot write output: {e}")))?;
     if unmet.is_empty() {
         return Ok(0);
     }
     Err(Failure::unmet(format!(
-        "required keys not usable in {file}: {}",
+        "required keys not usable in {label}: {}",
         render::unmet_text(&unmet)
     )))
 }
@@ -433,8 +477,9 @@ fn set(
     err: &mut dyn Write,
 ) -> Result<u8, Failure> {
     let target = resolve(file)?;
+    let label = target.label.as_str();
     if target.format == Format::Yaml {
-        return Err(not_for_yaml(file));
+        return Err(not_for_yaml(label));
     }
     if stdin.is_tty {
         let _ = writeln!(
@@ -451,16 +496,16 @@ fn set(
     let value = write::normalize_value(&raw, multiline).map_err(|e| Failure::error(e.message()))?;
 
     let current = match target.mode {
-        Some(_) => read_env(file, &target)?,
+        Some(_) => read_env(&target)?,
         None => EnvFile::parse(b""),
     };
     let envrc = basename(&target.path) == ".envrc";
     let export = write::export_for_new(&current, envrc);
     let plan =
-        write::plan_set(&current, key, &value, all, export).map_err(|_| reparse_refusal(file))?;
+        write::plan_set(&current, key, &value, all, export).map_err(|_| reparse_refusal(label))?;
     if target.mode.is_none() || plan.bytes != current.to_bytes() {
         write::atomic_replace(&target.path, &plan.bytes, target.mode.unwrap_or(0o600))
-            .map_err(|e| Failure::error(format!("cannot write {file}: {e}")))?;
+            .map_err(|e| Failure::error(format!("cannot write {label}: {e}")))?;
     }
 
     if !plan.duplicates.is_empty() && !all {
@@ -476,7 +521,7 @@ fn set(
     }
     let new_shown = Shown::of(&value);
     if target.mode.is_none() {
-        let _ = writeln!(out, "created {file} (mode 0600)");
+        let _ = writeln!(out, "created {label} (mode 0600)");
     }
     for change in &plan.changes {
         let _ = match change {
@@ -498,20 +543,21 @@ fn set(
 
 fn unset(file: &str, key: &str, out: &mut dyn Write) -> Result<u8, Failure> {
     let target = resolve(file)?;
+    let label = target.label.as_str();
     if target.format == Format::Yaml {
-        return Err(not_for_yaml(file));
+        return Err(not_for_yaml(label));
     }
     let Some(mode) = target.mode else {
-        return Err(Failure::error(format!("{file}: no such file")));
+        return Err(Failure::error(format!("{label}: no such file")));
     };
-    let current = read_env(file, &target)?;
-    let plan = write::plan_unset(&current, key).map_err(|_| reparse_refusal(file))?;
+    let current = read_env(&target)?;
+    let plan = write::plan_unset(&current, key).map_err(|_| reparse_refusal(label))?;
     if plan.removed.is_empty() {
-        let _ = writeln!(out, "{key} not set in {file} (no change)");
+        let _ = writeln!(out, "{key} not set in {label} (no change)");
         return Ok(0);
     }
     write::atomic_replace(&target.path, &plan.bytes, mode)
-        .map_err(|e| Failure::error(format!("cannot write {file}: {e}")))?;
+        .map_err(|e| Failure::error(format!("cannot write {label}: {e}")))?;
     let lines: Vec<String> = plan.removed.iter().map(|l| format!("L{l}")).collect();
     let _ = writeln!(out, "removed {key} {}", lines.join(", "));
     Ok(0)

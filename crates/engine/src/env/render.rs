@@ -159,7 +159,9 @@ fn is_placeholder(value: &[u8]) -> bool {
 
 /// Lowercased `(scheme, host)` of a URL value. Userinfo and port are dropped. `None` unless
 /// the host is a dotted name, `localhost` or a bracketed IPv6 address, so a token after `://`
-/// (or a malformed userinfo) is never mistaken for a host and printed.
+/// (or a malformed userinfo) is never mistaken for a host and printed. `None` too when an `@`
+/// follows the first `/`, `?` or `#`: the userinfo may contain that delimiter
+/// (`https://user:pa?ss@host`), and the text before it would be shown as the host.
 fn url_parts(value: &[u8]) -> Option<(String, String)> {
     let text = std::str::from_utf8(value).ok()?;
     let (scheme, rest) = text.split_once("://")?;
@@ -169,7 +171,10 @@ fn url_parts(value: &[u8]) -> Option<(String, String)> {
     {
         return None;
     }
-    let authority = rest.split(['/', '?', '#']).next()?;
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    if tail.contains('@') {
+        return None;
+    }
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -531,6 +536,27 @@ mod tests {
         assert_eq!(
             shown(userinfo),
             format!("set len={} fp={}", userinfo.len(), fp(userinfo))
+        );
+        // An `@` after the first `/?#` means the userinfo may hold one of them: no host shown.
+        for ambiguous in [
+            "https://alice.smith:s3cr?et@db.example.com",
+            "https://alice.smith:pa#ss@db.example.com/x",
+            "https://host.example.com/users/@alice",
+            "https://api.example.com/?email=a@b.example.com",
+        ] {
+            assert_eq!(
+                shown(ambiguous),
+                format!("set len={} fp={}", ambiguous.len(), fp(ambiguous)),
+                "{ambiguous}"
+            );
+        }
+        let plain_userinfo = "https://user:pass@host.example.com/x";
+        assert_eq!(
+            shown(plain_userinfo),
+            format!(
+                "set url=https://host.example.com/… fp={}",
+                fp(plain_userinfo)
+            )
         );
         assert_eq!(shown("https://"), "set len=8");
         assert_eq!(shown("1http://x.io"), "set len=12");
