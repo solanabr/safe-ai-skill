@@ -4,6 +4,33 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [1.0.1] — Unreleased
+
+### Summary
+
+Security hotfix for #5–#13. Several defaults change; each change is listed below. Design and evidence: `docs/superpowers/specs/2026-10-21-open-issues-design.md`.
+
+### Behaviour changes
+
+- **No opinion means no output.** A gate with nothing to say prints nothing and exits 0. 1.0.0 printed `defer` on every benign call, and `defer` stops the tool call under `claude -p`. Unknown subcommands exit 3, and `--version` prints the version. (#13)
+- **Skill packs are reported, not quarantined.** SessionStart findings and pin drift are reported in the session. Nothing is moved, so `git status` stays clean. `~/.claude/skills` is scanned only when policy lists it. `verify approve` still restores packs that 1.0.0 moved into `quarantine/`. (#5, #9)
+- **Unsupported platforms fail open with a notice; Solana commands still ask.** If the engine can't run (no binary for the platform, exit 126/127, a broken interpreter), hooks exit 0 with one stderr line and SessionStart reports the firewall INACTIVE, while `solana`, `spl-token` and `anchor` commands get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead, and `SAFE_AI_SKILL_DISABLE=1` switches the hooks off. The shim no longer falls back to `cargo build` or runs a binary from the plugin data directory. (#6)
+- **Irreversible flags and unknown networks ask.** `--final` deploys and upgrades, upgrade-authority changes, `program close`, `spl-token authorize … --disable`, `spl-token close|close-mint`, `anchor idl erase-authority|set-authority|close` and `solana close-vote-account` ask on every cluster, and mainnet `--final` is denied. A command whose cluster can't be identified asks instead of passing. Transfer amounts are read from positional arguments only. (#13)
+- **The agent can't grant itself permissions.** When the agent runs `safe-ai-skill allow`, `mode`, `verify approve` and similar commands, or writes the plugin's state files (`grants.json`, `mode.json`, …), the call is denied. Run those commands yourself in a terminal.
+- **Repo policy can only tighten.** A project's `.safe-ai-skill/policy.yaml` can lower caps and add checks, but it can no longer raise caps, shrink the scanned skill directories or change the profile. Ignored keys are listed at SessionStart.
+- **The marketplace is named `safe-ai-skill` again.** Install `safe-ai-skill@safe-ai-skill`, as in 1.0.0. If you installed `safe-ai-skill@stbr`, follow the README migration and don't remove `stbr` without checking it first: the solana-ai-kit marketplace has the same name. solana-ai-kit users don't need to do anything. (#8)
+- **Linux binaries are static (musl).** 1.0.0's `linux-x64` needed glibc 2.39, so it failed on Ubuntu 22.04 and Debian 12 and the firewall was silently off. File names are unchanged. (#6)
+- **Claude Code 2.1.295 or newer is required** for the hooks' `onFailure` setting. Older versions still run the hooks, but a hook that can't start never blocks.
+
+### Release process
+
+- Release tags now point at a commit that contains the binaries. `v1.0.0` predates the commit that vendored its binaries (a8d20f8), so anything that resolved the tag got a plugin without them. `release.yml` now builds on manual dispatch from `main` only, attests each binary's build provenance and opens a PR that commits the binaries. The maintainer tags that commit `vX.Y.Z` and `safe-ai-skill--vX.Y.Z` (the form plugin dependency version ranges resolve), and the tag push publishes the GitHub Release from the committed binaries once their checksums check out and their attestations prove they were built by `release.yml` on `main`. Steps, including the one-off `safe-ai-skill--v1.0.0` tag on a8d20f8, are in `docs/RELEASING.md`.
+- Release builds use a pinned toolchain (1.98.1, the same pin as CI), `--locked`, explicit macOS minimums (11.0 on arm64, 10.12 on x64), no build cache and no third-party actions. The unused cosign stub is gone.
+- CI builds the musl binaries, checks that they're static and run on alpine, debian:11 and ubuntu:20.04, and verifies the provenance attestation of every committed binary. The npm e2e also runs in alpine and Debian 11 containers on x64 and arm64, and `release.yml` runs it after each publish.
+- `scripts/check-versions.sh` also checks `Cargo.lock` and `install.sh`, and accepts an expected version.
+
+---
+
 ## [1.0.0] — 2026-06-26
 
 ### Summary
@@ -51,7 +78,7 @@ First stable release. Ships the safe-ai-skill engine, runtime action firewall, a
 
 ### Distribution
 
-- **Plugin** (always-on firewall): `claude plugin marketplace add solanabr/safe-ai-skill` → `claude plugin install safe-ai-skill@stbr`. Ships committed platform binaries; the shim resolves the native prebuilt, else builds from `crates/engine`, else fails closed.
+- **Plugin** (always-on firewall): `claude plugin marketplace add solanabr/safe-ai-skill` → `claude plugin install safe-ai-skill@safe-ai-skill`. Ships committed platform binaries; the shim resolves the native prebuilt, else builds from `crates/engine`, else fails closed.
 - **CLI** (`safe-ai-skill` Tier 1/2 commands) via three paths, all checksum-verified against the release `SHA256SUMS`:
   - npm — `npm install -g @stbr/safe-ai-skill` / `npx @stbr/safe-ai-skill` (CLI command: `safe-ai-skill`). `postinstall.js` downloads the platform binary from the matching GitHub Release tag and aborts on checksum mismatch (no silent install).
   - Standalone — `curl -fsSL …/install.sh | sh`. Downloads + verifies the binary before installing to `~/.local/bin` (overridable via `SAFE_AI_SKILL_BIN_DIR`); fails loud, installs nothing on mismatch.

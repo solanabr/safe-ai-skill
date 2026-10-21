@@ -2,12 +2,18 @@
 # check-versions.sh — assert the release version is identical across all
 # distribution manifests. Run in CI and before tagging a release.
 #
+# Usage: check-versions.sh [expected-version]
+#   With an argument (e.g. 1.0.1, no "v"), every source must also equal it.
+#   release.yml passes the version it builds and the tag it publishes.
+#
 # Sources checked:
 #   npm/package.json                              "version": "X"
 #   crates/engine/Cargo.toml                      version = "X"
+#   crates/engine/Cargo.lock                      safe-ai-skill package version
 #   plugins/safe-ai-skill/.claude-plugin/plugin.json   "version": "X"
 #   .claude-plugin/marketplace.json               "version": "X"
 #   README.md                                     badge/version-X-blue
+#   install.sh                                    ${SAFE_AI_SKILL_VERSION:-X}
 #
 # Exits non-zero (and prints the offending values) if any disagree.
 
@@ -16,6 +22,7 @@ set -eu
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 
 fail=0
+expected="${1:-}"
 
 # Extract the first "version" string value from a JSON file.
 json_version() {
@@ -24,17 +31,24 @@ json_version() {
 
 npm_v="$(json_version npm/package.json)"
 cargo_v="$(grep -m1 '^version' crates/engine/Cargo.toml | sed 's/.*"\([^"]*\)".*/\1/')"
+# The "version" line right after `name = "safe-ai-skill"`. A stale lock makes the
+# release's `cargo build --locked` fail.
+lock_v="$(awk 'found && /^version = / { gsub(/^version = "|"$/, ""); print; exit }
+  { found = ($0 == "name = \"safe-ai-skill\"") }' crates/engine/Cargo.lock)"
 plugin_v="$(json_version plugins/safe-ai-skill/.claude-plugin/plugin.json)"
 market_v="$(json_version .claude-plugin/marketplace.json)"
 readme_v="$(grep -m1 'badge/version-' README.md | sed 's/.*badge\/version-\([0-9][^-]*\)-.*/\1/')"
+install_v="$(grep -m1 '^VERSION=' install.sh | sed 's/.*:-\([^}]*\)}.*/\1/')"
 
 printf '%-12s %s\n' "npm:"        "${npm_v}"
 printf '%-12s %s\n' "cargo:"      "${cargo_v}"
+printf '%-12s %s\n' "cargo.lock:" "${lock_v}"
 printf '%-12s %s\n' "plugin:"     "${plugin_v}"
 printf '%-12s %s\n' "marketplace:" "${market_v}"
 printf '%-12s %s\n' "readme:"     "${readme_v}"
+printf '%-12s %s\n' "install.sh:" "${install_v}"
 
-for v in "${cargo_v}" "${plugin_v}" "${market_v}" "${readme_v}"; do
+for v in "${cargo_v}" "${lock_v}" "${plugin_v}" "${market_v}" "${readme_v}" "${install_v}"; do
   if [ "${v}" != "${npm_v}" ]; then
     fail=1
   fi
@@ -42,6 +56,11 @@ done
 
 if [ -z "${npm_v}" ]; then
   echo "check-versions: could not parse npm version" >&2
+  fail=1
+fi
+
+if [ -n "${expected}" ] && [ "${npm_v}" != "${expected}" ]; then
+  echo "check-versions: manifests are at ${npm_v}, expected ${expected}." >&2
   fail=1
 fi
 

@@ -32,7 +32,7 @@ const binaryPath = plat ? path.join(ACTUAL_BIN_DIR, `safe-ai-skill-${plat}`) : n
 if (!binaryPath || !fs.existsSync(binaryPath)) {
   process.stderr.write(
     `safe-ai-skill: no binary found for platform ${process.platform}/${process.arch}.\n` +
-    `Run: npm install safe-ai-skill  (to trigger postinstall)\n` +
+    `Run: npm install -g @stbr/safe-ai-skill  (to trigger postinstall)\n` +
     `Or:  cargo install safe-ai-skill\n`
   );
   process.exit(2);
