@@ -163,6 +163,9 @@ pub struct Policy {
     /// Spend caps the project overlay lowered, re-applied by [`Policy::effective`].
     #[serde(skip)]
     project_caps: ProjectCaps,
+    /// Scan dirs the project overlay added, confined on disk by [`Policy::load_with_mode`].
+    #[serde(skip)]
+    project_scan_dirs: Vec<String>,
 }
 
 /// Network gating policy.
@@ -501,6 +504,7 @@ impl Default for Policy {
             profiles: default_profiles(),
             ignored_overrides: Vec::new(),
             project_caps: ProjectCaps::default(),
+            project_scan_dirs: Vec::new(),
         }
     }
 }
@@ -547,7 +551,8 @@ impl Policy {
     /// it, which may only tighten it. An unparsable base → [`Policy::fail_closed`] (every
     /// soft gate becomes `ask`). The active profile is `persisted_profile` (the user's
     /// `safe-ai-skill mode` choice) when given, else the base one; the [`PROFILE_ENV`] env var
-    /// may then only select a stricter profile.
+    /// may then only select a stricter profile. Scan dirs the project added are kept only when
+    /// they resolve, on disk, to a directory strictly inside `cwd`.
     ///
     /// Note: this returns the *base* policy. Call [`Policy::effective`] to apply the active
     /// profile overlay before gating.
@@ -556,12 +561,53 @@ impl Policy {
         let project_src =
             std::fs::read_to_string(cwd.join(".safe-ai-skill").join("policy.yaml")).ok();
         let env_profile = std::env::var(PROFILE_ENV).ok();
-        Policy::from_sources(
+        let mut policy = Policy::from_sources(
             &base_src,
             project_src.as_deref(),
             persisted_profile,
             env_profile.as_deref(),
-        )
+        );
+        policy.confine_project_dirs(cwd);
+        policy
+    }
+
+    /// Re-check the scan dirs the project overlay added against the filesystem. The ratchet
+    /// checks the text only, so a committed symlink (`up -> ..`) would pass it and sweep
+    /// whatever it points at. Each dir becomes its canonical path when it is a directory
+    /// strictly inside the canonical `root`, so the sweep scans exactly what was checked;
+    /// otherwise it is dropped (and noted when it resolves outside).
+    fn confine_project_dirs(&mut self, root: &Path) {
+        let added = std::mem::take(&mut self.project_scan_dirs);
+        if added.is_empty() {
+            return;
+        }
+        let canonical_root = std::fs::canonicalize(root).ok();
+        let mut outside = false;
+        for dir in added {
+            let resolved = std::fs::canonicalize(root.join(&dir)).ok();
+            let within = match (&canonical_root, &resolved) {
+                (Some(r), Some(path)) => path != r && path.starts_with(r),
+                _ => false,
+            };
+            // A dir that does not resolve has nothing to sweep: drop it quietly.
+            outside |= resolved.is_some() && !within;
+            let keep = resolved
+                .filter(|path| within && path.is_dir())
+                .and_then(|path| path.to_str().map(str::to_string));
+            let dirs = &mut self.supply_chain.verify_skills_dirs;
+            if let Some(slot) = dirs.iter().position(|d| *d == dir) {
+                match keep {
+                    Some(path) => dirs[slot] = path,
+                    None => {
+                        dirs.remove(slot);
+                    }
+                }
+            }
+        }
+        let note = SCAN_DIRS_OUTSIDE.to_string();
+        if outside && !self.ignored_overrides.contains(&note) {
+            self.ignored_overrides.push(note);
+        }
     }
 
     /// Build a policy from its sources without touching the environment or the filesystem.
@@ -640,6 +686,7 @@ impl Policy {
             },
             ignored_overrides: Vec::new(),
             project_caps: ProjectCaps::default(),
+            project_scan_dirs: Vec::new(),
         }
     }
 
@@ -737,6 +784,10 @@ const PROJECT_POLICY: &str = ".safe-ai-skill/policy.yaml";
 /// Known profiles from loosest to strictest. [`PROFILE_ENV`] may only move right.
 const PROFILE_STRICTNESS: [&str; 4] = ["off", "autopilot", "strict", "paranoid"];
 
+/// The skill scan dirs, and the note for project dirs that leave the project.
+const SCAN_DIRS: &str = "supply_chain.verify_skills_dirs";
+const SCAN_DIRS_OUTSIDE: &str = "supply_chain.verify_skills_dirs: dirs outside the project ignored";
+
 /// Fold a project's overlay `text` into `policy` (parsed from `base`), keeping only what
 /// tightens it.
 fn apply_project_overlay(policy: &mut Policy, base: &Yaml, text: &str) {
@@ -790,9 +841,9 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
     let mut notes = Vec::new();
     let n = &mut notes;
 
-    keep_fixed(
+    keep_mainnet_default(
         "network.default",
-        &policy.network.default,
+        &mut policy.network.default,
         &asked.network.default,
         n,
     );
@@ -851,11 +902,12 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         asked.swap.rugcheck_max_score,
         n,
     );
-    // A longer timeout only risks the hook timing out, which Claude Code treats as no opinion.
-    keep_min(
+    // A timed-out rugcheck asks where a bad score denies, so a shorter timeout turns denies
+    // into asks, and a longer one risks the hook timing out (no opinion): no safe direction.
+    keep_fixed(
         "swap.rugcheck_timeout_ms",
-        &mut swap.rugcheck_timeout_ms,
-        asked.swap.rugcheck_timeout_ms,
+        &swap.rugcheck_timeout_ms,
+        &asked.swap.rugcheck_timeout_ms,
         n,
     );
     keep_subset(
@@ -896,8 +948,7 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
 
     let chain = &mut policy.supply_chain;
     let asked_chain = &asked.supply_chain;
-    keep_scan_dirs(
-        "supply_chain.verify_skills_dirs",
+    let added_dirs = keep_scan_dirs(
         &mut chain.verify_skills_dirs,
         &asked_chain.verify_skills_dirs,
         n,
@@ -932,6 +983,7 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         &asked_chain.exec_install_scripts,
         n,
     );
+    policy.project_scan_dirs = added_dirs;
 
     notes
 }
@@ -1015,23 +1067,27 @@ fn keep_subset(path: &str, current: &mut Vec<String>, asked: &[String], notes: &
 }
 
 /// [`keep_union`] for skill scan dirs, except an added dir must stay inside the project:
-/// sweeping `~`, `/` or `..` could take the SessionStart hook past its timeout. The project's
-/// order comes first, since `verify approve` restores into the first dir.
+/// sweeping `~`, `/`, `..` or the project root itself would treat unrelated dirs as packs.
+/// The project's order comes first, since `verify approve` restores into the first dir.
+/// Returns the added dirs; [`Policy::load_with_mode`] re-checks them on disk.
 fn keep_scan_dirs(
-    path: &str,
     current: &mut Vec<String>,
     asked: &[String],
     notes: &mut Vec<String>,
-) {
-    note_dropped(path, current, asked, notes);
+) -> Vec<String> {
+    note_dropped(SCAN_DIRS, current, asked, notes);
     let mut dirs: Vec<String> = Vec::new();
+    let mut added = Vec::new();
     let mut outside = false;
     for dir in asked {
         if dirs.contains(dir) {
             continue;
         }
-        if current.contains(dir) || is_inside_project(dir) {
+        if current.contains(dir) {
             dirs.push(dir.clone());
+        } else if is_inside_project(dir) {
+            dirs.push(dir.clone());
+            added.push(dir.clone());
         } else {
             outside = true;
         }
@@ -1043,8 +1099,9 @@ fn keep_scan_dirs(
     }
     *current = dirs;
     if outside {
-        notes.push(format!("{path}: dirs outside the project ignored"));
+        notes.push(SCAN_DIRS_OUTSIDE.to_string());
     }
+    added
 }
 
 /// Note the entries of `current` that `asked` leaves out; they stay.
@@ -1062,13 +1119,27 @@ fn note_dropped(path: &str, current: &[String], asked: &[String], notes: &mut Ve
     }
 }
 
-/// Whether `dir` is a relative path that cannot leave the project.
+/// Whether `dir` is, as text, a relative path below the project root. Symlinks are checked
+/// on disk by [`Policy::load_with_mode`].
 fn is_inside_project(dir: &str) -> bool {
-    !dir.trim().is_empty()
-        && !dir.starts_with('~')
-        && Path::new(dir)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    let components = || Path::new(dir).components();
+    !dir.starts_with('~')
+        && components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        && components().any(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Move the assumed network only to mainnet: assuming mainnet asks more, never less.
+fn keep_mainnet_default(path: &str, current: &mut String, asked: &str, notes: &mut Vec<String>) {
+    if asked == current {
+        return;
+    }
+    if matches!(asked, "mainnet" | "mainnet-beta") {
+        *current = asked.to_string();
+    } else {
+        notes.push(format!(
+            "{path}: kept at {current} (a project may only change it to mainnet)"
+        ));
+    }
 }
 
 /// [`keep_union`] over the alternatives of an `a|b|c` name pattern.
