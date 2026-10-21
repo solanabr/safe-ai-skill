@@ -93,7 +93,6 @@ catalog:
       ids: []
 supply_chain:
   verify_skills_dirs:
-    - "~/.claude/skills"
     - ".claude/skills"
   flag_unpinned_mcp: true
   flag_telemetry_curl: true
@@ -408,7 +407,7 @@ impl Default for TogglePolicy {
 impl Default for SupplyChainPolicy {
     fn default() -> Self {
         SupplyChainPolicy {
-            verify_skills_dirs: vec!["~/.claude/skills".into(), ".claude/skills".into()],
+            verify_skills_dirs: vec![".claude/skills".into()],
             flag_unpinned_mcp: true,
             flag_telemetry_curl: true,
             verify_ext_submodules: true,

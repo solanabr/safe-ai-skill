@@ -499,6 +499,14 @@ fn session(project: &Path) -> String {
 
 /// [`session`] with an explicit plugin-data dir (lockfile / quarantine land there).
 fn session_in(project: &Path, data: &Path) -> String {
+    session_output(project, data)["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The full `verify session` hook output (`Null` when it printed nothing).
+fn session_output(project: &Path, data: &Path) -> serde_json::Value {
     let home = TempDir::new("ratchet-home");
     let payload = json!({
         "hook_event_name": "SessionStart",
@@ -512,10 +520,10 @@ fn session_in(project: &Path, data: &Path) -> String {
         .cwd(project)
         .stdin(payload)
         .run();
-    run.json()["hookSpecificOutput"]["additionalContext"]
-        .as_str()
-        .unwrap_or("")
-        .to_string()
+    if run.stdout.trim().is_empty() {
+        return serde_json::Value::Null;
+    }
+    run.json()
 }
 
 fn devnet_transfer(amount: &str) -> String {
@@ -667,13 +675,13 @@ fn repo_scan_dir_symlinked_out_of_the_project_is_refused() {
     let ctx = session_in(&proj, data.path());
 
     assert!(ctx.contains("supply_chain.verify_skills_dirs"), "{ctx:?}");
-    // Nothing outside the project was moved...
+    // Nothing outside the project was touched...
     for kept in [
         proj.join(".safe-ai-skill").join("policy.yaml"),
         outer.join("sibling-clean").join("SKILL.md"),
         leaky.join("install.sh"),
     ] {
-        assert!(kept.exists(), "moved: {}", kept.display());
+        assert!(kept.exists(), "removed: {}", kept.display());
     }
     // ...or scanned: no warning names it, and nothing in plugin data (pins, quarantine,
     // state) records it.
@@ -712,7 +720,15 @@ fn mentions(dir: &Path, needle: &str) -> bool {
 #[test]
 fn session_start_lists_ignored_overrides() {
     let proj = project("active_profile: autopilot\nspend:\n  hard_tx_sol_max: 1e9\n");
-    let ctx = session(proj.path());
-    assert!(ctx.contains("active_profile"), "{ctx:?}");
-    assert!(ctx.contains("spend.hard_tx_sol_max"), "{ctx:?}");
+    let data = TempDir::new("ratchet-data");
+    let out = session_output(proj.path(), data.path());
+    // Both the model (additionalContext) and the user (systemMessage) see it.
+    for text in [
+        out["hookSpecificOutput"]["additionalContext"].as_str(),
+        out["systemMessage"].as_str(),
+    ] {
+        let text = text.unwrap_or("");
+        assert!(text.contains("active_profile"), "{out}");
+        assert!(text.contains("spend.hard_tx_sol_max"), "{out}");
+    }
 }

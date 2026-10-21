@@ -124,8 +124,9 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 - **PostToolUse redact**: no output (no change) or `{"updatedToolOutput":"…"}` /
   `{"updatedMCPToolOutput":"…"}` (mcp tools).
 - **UserPromptSubmit**: no output (allow) or `{"decision":"block","reason":"…"}`.
-- **SessionStart**:
-  `{"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":bool[,"additionalContext":"…"]}}`.
+- **SessionStart** (`verify::SessionResult::hook_output`, report-only): no output when there is
+  nothing to report, else `{["systemMessage":"…",]["hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"…"}]}`
+  (each part only when non-empty).
 
 ---
 
@@ -183,8 +184,6 @@ pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Option<s
 pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()>;
 pub fn render_userpromptsubmit(block: Option<&str>) -> Option<serde_json::Value>;  // pass → None
 pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()>;
-pub fn render_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> serde_json::Value;
-pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> std::io::Result<()>;
 ```
 > The `render_*` functions are the pure JSON builders the `emit_*` functions wrap; tests
 > assert against `render_*` so stdout never needs capturing.

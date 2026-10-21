@@ -219,33 +219,6 @@ pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()> {
     write_opinion(render_userpromptsubmit(block))
 }
 
-/// Build the SessionStart JSON value (no I/O).
-///
-/// Emits `hookSpecificOutput.additionalContext` (when provided) and `reloadSkills`.
-pub fn render_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> Value {
-    let mut inner = json!({
-        "hookEventName": "SessionStart",
-        "reloadSkills": reload_skills,
-    });
-    if let Some(ctx) = additional_context {
-        if let Value::Object(map) = &mut inner {
-            map.insert(
-                "additionalContext".to_string(),
-                Value::String(ctx.to_string()),
-            );
-        }
-    }
-    json!({ "hookSpecificOutput": inner })
-}
-
-/// Emit a SessionStart result to stdout and flush.
-pub fn emit_sessionstart(
-    additional_context: Option<&str>,
-    reload_skills: bool,
-) -> std::io::Result<()> {
-    write_json(&render_sessionstart(additional_context, reload_skills))
-}
-
 /// Write `value` like [`write_json`]; `None` (no opinion) writes nothing.
 fn write_opinion(value: Option<Value>) -> std::io::Result<()> {
     match value {
@@ -438,16 +411,6 @@ mod tests {
             render_userpromptsubmit(Some("contains seed phrase")),
             Some(json!({ "decision": "block", "reason": "contains seed phrase" }))
         );
-    }
-
-    #[test]
-    fn render_sessionstart_shape() {
-        let v = render_sessionstart(Some("warning"), true);
-        let inner = &v["hookSpecificOutput"];
-        assert_eq!(inner["additionalContext"], "warning");
-        assert_eq!(inner["reloadSkills"], true);
-        let v2 = render_sessionstart(None, false);
-        assert!(v2["hookSpecificOutput"].get("additionalContext").is_none());
     }
 
     #[test]

@@ -342,11 +342,11 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `verify session` — the SessionStart supply-chain sweep.
+/// `verify session` — the SessionStart supply-chain sweep (report-only, nothing is moved).
 ///
-/// Runs [`verify::run_session`] over the policy skill roots, additionally scans the project
-/// `.mcp.json` for unpinned MCP servers, and emits the SessionStart decision (injected
-/// warning context + a `reloadSkills` signal when anything was quarantined).
+/// Runs [`verify::run_session`] (skill packs + the project `.mcp.json`) and emits the
+/// SessionStart report (`systemMessage` for the user + `additionalContext` for the model) — or
+/// nothing when there is nothing to report.
 fn cmd_verify_session() -> ExitCode {
     // SessionStart hooks may carry a cwd on stdin; fall back to the process cwd.
     let input = read_input().1.unwrap_or_default();
@@ -354,46 +354,27 @@ fn cmd_verify_session() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
 
-    let mut res = verify::run_session(&plugin_data, &effective.supply_chain.verify_skills_dirs);
+    let mut res = verify::run_session(&plugin_data, &cwd, &effective);
 
-    // Fold an `.mcp.json` scan into the session warning context.
-    let mcp_path = cwd.join(".mcp.json");
-    if let Ok(body) = std::fs::read_to_string(&mcp_path) {
-        let report = verify::scan_mcp_json(&body);
-        if !report.findings.is_empty() {
-            let lines: Vec<String> = report
-                .findings
-                .iter()
-                .map(|f| format!("{}: {}", f.kind, f.detail))
-                .collect();
-            let block = format!(".mcp.json findings:\n - {}", lines.join("\n - "));
-            if res.additional_context.is_empty() {
-                res.additional_context = block;
-            } else {
-                res.additional_context.push('\n');
-                res.additional_context.push_str(&block);
-            }
-        }
-    }
-
-    // Overrides the policy ratchet refused (project overlay, looser profile env var).
+    // Overrides the policy ratchet refused (project overlay, looser profile env var): shown to
+    // the user and given to the model.
     if let Some(notice) = effective.ignored_notice() {
-        if !res.additional_context.is_empty() {
-            res.additional_context.push('\n');
+        for field in [&mut res.system_message, &mut res.additional_context] {
+            if !field.is_empty() {
+                field.push('\n');
+            }
+            field.push_str(&notice);
         }
-        res.additional_context.push_str(&notice);
     }
 
-    let ctx = if res.additional_context.is_empty() {
-        None
-    } else {
-        Some(res.additional_context.as_str())
-    };
-    let _ = io::emit_sessionstart(ctx, res.reload_skills);
+    if let Some(out) = res.hook_output() {
+        print_json(&out);
+    }
     ExitCode::SUCCESS
 }
 
-/// `verify approve <name>` — restore a quarantined skill and re-pin it (TOFU).
+/// `verify approve <name>` — accept a pack: restore one an earlier version quarantined, or
+/// re-pin a drifted one where it is.
 fn cmd_verify_approve(name: &str) -> ExitCode {
     if name.is_empty() {
         print_json(&serde_json::json!({
@@ -405,44 +386,39 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
     }
     let plugin_data = context::plugin_data_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
+    let project = verify::project_root(&cwd);
+    let effective = load_effective_policy(&project, &plugin_data);
 
-    // Restore into the first configured skills root (the canonical install location).
-    let root = effective
-        .supply_chain
-        .verify_skills_dirs
-        .first()
-        .map(|d| verify::expand_home(d))
-        .unwrap_or_else(|| plugin_data.join("skills"));
-    let restore_to = root.join(name);
-
-    match verify::restore_quarantine(&plugin_data, name, &restore_to) {
-        Ok(()) => {
-            // Re-pin the restored content (trust-on-first-use after explicit approval).
-            let hash = verify::lockfile::hash_tree(&restore_to);
-            let mut lock = verify::lockfile::load(&plugin_data);
-            lock.pin_skill(
-                name,
-                verify::lockfile::SkillPin {
-                    sha256: hash,
-                    source: String::new(),
-                    verified_at: now_secs(),
-                    scan: "approved".to_string(),
-                },
-            );
-            let _ = verify::lockfile::save(&plugin_data, &lock);
+    match verify::approve(&plugin_data, &project, name, &effective) {
+        Ok(approval) => {
             audit_event(
                 &plugin_data,
                 "verify_approve",
                 "approve",
                 &format!("skill={name}"),
             );
-            print_json(&serde_json::json!({
+            let (key, value) = match approval {
+                verify::Approval::Restored(path) => {
+                    ("restored_to", serde_json::json!(path.display().to_string()))
+                }
+                verify::Approval::PinnedInPlace(paths) => (
+                    "pinned_in_place",
+                    serde_json::json!(paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()),
+                ),
+            };
+            let mut out = serde_json::json!({
                 "command": "verify approve",
                 "status": "approved",
                 "skill": name,
-                "restored_to": restore_to.display().to_string(),
-            }));
+            });
+            if let Some(map) = out.as_object_mut() {
+                map.insert(key.to_string(), value);
+            }
+            print_json(&out);
         }
         Err(e) => {
             print_json(&serde_json::json!({
@@ -811,8 +787,14 @@ fn cmd_install(rest: &[String]) -> ExitCode {
             continue;
         }
 
-        // Pin the installed content (TOFU). The recorded source is the local `--from` path.
-        let pin_source = from.clone().unwrap_or_default();
+        // Pin the installed content (TOFU), marked as an install so the session sweep checks it.
+        // The recorded source is the canonical local `--from` path.
+        let pin_source = from
+            .as_deref()
+            .and_then(|src| std::fs::canonicalize(verify::expand_home(src)).ok())
+            .map(|path| path.display().to_string())
+            .or_else(|| from.clone())
+            .unwrap_or_default();
         let hash = verify::lockfile::hash_tree(&dest);
         lock.pin_skill(
             &name,
@@ -825,6 +807,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                origin: verify::lockfile::ORIGIN_INSTALL.to_string(),
             },
         );
         installed.push(name);
@@ -934,6 +917,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                origin: verify::lockfile::ORIGIN_IN_PLACE.to_string(),
             },
         );
         verified.push(name);
