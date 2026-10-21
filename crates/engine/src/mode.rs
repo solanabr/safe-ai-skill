@@ -1,8 +1,9 @@
 //! Active profile selection (`${CLAUDE_PLUGIN_DATA}/mode.json`).
 //!
-//! The runtime profile override. Precedence at load time (see [`crate::policy::Policy::load`]):
-//! the [`crate::policy::PROFILE_ENV`] env var wins; otherwise the value persisted here is
-//! used; otherwise the policy file's `active_profile`.
+//! The runtime profile override. Precedence at load time (see
+//! [`crate::policy::Policy::load_with_mode`]): the value persisted here replaces the policy
+//! file's `active_profile`; the [`crate::policy::PROFILE_ENV`] env var may then only select a
+//! stricter profile.
 //!
 //! This module owns ONLY the grant/profile *name* persistence. The profile's *effect* (cap
 //! overrides, `relax_transfer`/`relax_swap` flags) lives in [`crate::policy::Policy::effective`]
@@ -32,12 +33,13 @@ pub fn is_known_profile(profile: &str) -> bool {
     KNOWN_PROFILES.contains(&profile)
 }
 
-/// Read the active profile.
+/// Read the requested profile.
 ///
 /// Precedence: the [`PROFILE_ENV`] env var (when set to a known profile) overrides the
 /// persisted file; otherwise the value in `mode.json` is returned. `None` when neither a
 /// valid env override nor a persisted record exists, so the caller may fall back to the
-/// policy default.
+/// policy default. Not the profile gates use: there the env var may only tighten
+/// [`persisted`] (see [`crate::policy::Policy::load_with_mode`]).
 pub fn get(plugin_data: &Path) -> Option<String> {
     if let Ok(env_profile) = std::env::var(PROFILE_ENV) {
         let trimmed = env_profile.trim();
@@ -45,6 +47,12 @@ pub fn get(plugin_data: &Path) -> Option<String> {
             return Some(trimmed.to_string());
         }
     }
+    persisted(plugin_data)
+}
+
+/// Read the profile persisted in `mode.json` alone, ignoring the env override. `None` when
+/// absent or not a known profile.
+pub fn persisted(plugin_data: &Path) -> Option<String> {
     let path = plugin_data.join("mode.json");
     let text = std::fs::read_to_string(path).ok()?;
     let record: ModeRecord = serde_json::from_str(&text).ok()?;

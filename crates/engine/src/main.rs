@@ -59,23 +59,12 @@ fn read_input() -> (String, HookInput) {
 
 /// Load the policy for `cwd` and resolve it to its EFFECTIVE form (profile overlay applied).
 ///
-/// The active profile is resolved with this precedence: the `SAFE_AI_SKILL_PROFILE` env var
-/// (applied inside [`Policy::load`]) wins; otherwise the persistent runtime override written
-/// by `safe-ai-skill mode <profile>` (`mode.json`) is consulted. This is what makes `safe-ai-skill mode
+/// The persistent runtime override written by `safe-ai-skill mode <profile>` (`mode.json`)
+/// replaces the policy's profile; the `SAFE_AI_SKILL_PROFILE` env var may then only select a
+/// stricter one (see [`Policy::load_with_mode`]). This is what makes `safe-ai-skill mode
 /// autopilot` actually take effect for every subsequent gate.
 fn load_effective_policy(cwd: &Path, plugin_data: &Path) -> Policy {
-    let mut base = Policy::load(cwd);
-    let env_set = std::env::var(safe_ai_skill::policy::PROFILE_ENV)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    if !env_set {
-        if let Some(profile) = mode::get(plugin_data) {
-            if !profile.trim().is_empty() {
-                base.active_profile = profile;
-            }
-        }
-    }
-    base.effective()
+    Policy::load_with_mode(cwd, mode::persisted(plugin_data).as_deref()).effective()
 }
 
 /// Resolve the session cwd from the hook payload, defaulting to the process cwd.
@@ -296,6 +285,14 @@ fn cmd_verify_session() -> ExitCode {
                 res.additional_context.push_str(&block);
             }
         }
+    }
+
+    // Overrides the policy ratchet refused (project overlay, looser profile env var).
+    if let Some(notice) = effective.ignored_notice() {
+        if !res.additional_context.is_empty() {
+            res.additional_context.push('\n');
+        }
+        res.additional_context.push_str(&notice);
     }
 
     let ctx = if res.additional_context.is_empty() {
@@ -1101,7 +1098,8 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
             }
         },
         None => {
-            let current = mode::get(&plugin_data).unwrap_or_else(|| "strict".to_string());
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let current = load_effective_policy(&cwd, &plugin_data).active_profile;
             print_json(&serde_json::json!({ "command": "mode", "active_profile": current }));
         }
     }
@@ -1129,8 +1127,6 @@ fn cmd_revoke() -> ExitCode {
 fn cmd_status() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let plugin_data = context::plugin_data_dir();
-    let policy = Policy::load(&cwd);
-    let active = mode::get(&plugin_data).unwrap_or_else(|| policy.active_profile.clone());
     let effective = load_effective_policy(&cwd, &plugin_data);
 
     // Live grants with derived remaining-budget / time-left.
@@ -1165,7 +1161,7 @@ fn cmd_status() -> ExitCode {
 
     print_json(&serde_json::json!({
         "command": "status",
-        "active_profile": active,
+        "active_profile": effective.active_profile,
         "grants": grants_view,
         "spend": spend_view,
         "recent_audit": recent_audit_lines(&plugin_data, 5),
