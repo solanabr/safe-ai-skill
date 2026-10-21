@@ -266,9 +266,9 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
 
 /// `verify session` — the SessionStart supply-chain sweep (report-only, nothing is moved).
 ///
-/// Runs [`verify::run_session`] over the policy skill roots, additionally scans the project
-/// `.mcp.json` for unpinned MCP servers, and emits the SessionStart report (`systemMessage` for
-/// the user + `additionalContext` for the model) — or nothing when there is nothing to report.
+/// Runs [`verify::run_session`] (skill packs + the project `.mcp.json`) and emits the
+/// SessionStart report (`systemMessage` for the user + `additionalContext` for the model) — or
+/// nothing when there is nothing to report.
 fn cmd_verify_session() -> ExitCode {
     // SessionStart hooks may carry a cwd on stdin; fall back to the process cwd.
     let (_raw, input) = read_input();
@@ -276,35 +276,15 @@ fn cmd_verify_session() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
 
-    let mut res = verify::run_session(&plugin_data, &cwd, &effective);
-
-    // Fold an `.mcp.json` scan into the session warning context.
-    let mcp_path = cwd.join(".mcp.json");
-    if let Ok(body) = std::fs::read_to_string(&mcp_path) {
-        let report = verify::scan_mcp_json(&body);
-        if !report.findings.is_empty() {
-            let lines: Vec<String> = report
-                .findings
-                .iter()
-                .map(|f| format!("{}: {}", f.kind, f.detail))
-                .collect();
-            let block = format!(".mcp.json findings:\n - {}", lines.join("\n - "));
-            if res.additional_context.is_empty() {
-                res.additional_context = block;
-            } else {
-                res.additional_context.push('\n');
-                res.additional_context.push_str(&block);
-            }
-        }
-    }
-
+    let res = verify::run_session(&plugin_data, &cwd, &effective);
     if let Some(out) = res.hook_output() {
         print_json(&out);
     }
     ExitCode::SUCCESS
 }
 
-/// `verify approve <name>` — restore a quarantined skill and re-pin it (TOFU).
+/// `verify approve <name>` — accept a pack: restore one an earlier version quarantined, or
+/// re-pin a drifted one where it is.
 fn cmd_verify_approve(name: &str) -> ExitCode {
     if name.is_empty() {
         print_json(&serde_json::json!({
@@ -316,23 +296,39 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
     }
     let plugin_data = context::plugin_data_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
+    let project = verify::project_root(&cwd);
+    let effective = load_effective_policy(&project, &plugin_data);
 
-    // Back to its `.gitmodules` submodule path, else under the first swept root; re-pinned.
-    match verify::approve_quarantined(&plugin_data, &cwd, name, &effective) {
-        Ok(restore_to) => {
+    match verify::approve(&plugin_data, &project, name, &effective) {
+        Ok(approval) => {
             audit_event(
                 &plugin_data,
                 "verify_approve",
                 "approve",
                 &format!("skill={name}"),
             );
-            print_json(&serde_json::json!({
+            let (key, value) = match approval {
+                verify::Approval::Restored(path) => {
+                    ("restored_to", serde_json::json!(path.display().to_string()))
+                }
+                verify::Approval::PinnedInPlace(paths) => (
+                    "pinned_in_place",
+                    serde_json::json!(paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()),
+                ),
+            };
+            let mut out = serde_json::json!({
                 "command": "verify approve",
                 "status": "approved",
                 "skill": name,
-                "restored_to": restore_to.display().to_string(),
-            }));
+            });
+            if let Some(map) = out.as_object_mut() {
+                map.insert(key.to_string(), value);
+            }
+            print_json(&out);
         }
         Err(e) => {
             print_json(&serde_json::json!({

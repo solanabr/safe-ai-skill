@@ -307,7 +307,7 @@ fn clean_submodule_tofu_pinned_silently() {
 }
 
 #[test]
-fn submodule_drift_warns_once_without_moving() {
+fn submodule_drift_warns_until_approved() {
     let project = TempDir::new("ext-drift-proj");
     let home = TempDir::new("ext-drift-home");
     let data = TempDir::new("ext-drift-data");
@@ -321,27 +321,40 @@ fn submodule_drift_warns_once_without_moving() {
         "submodule not pinned on first sweep: {lock}"
     );
 
-    // A resync bumps its content (hash-fallback drift since the fixture is not a real git repo).
+    // A resync bumps its content (hash-fallback drift since the fixture is not a real git repo):
+    // every following session reports it, and nothing moves.
     std::fs::write(dir.join("SKILL.md"), "# jupiter v2 (resynced)\n").unwrap();
-    let second = emit(&verify_session(project.path(), home.path(), data.path()))
-        .expect("drift must be reported");
-    let (sys, ctx) = messages(&second);
-    for text in [&sys, &ctx] {
-        let lower = text.to_lowercase();
-        assert!(
-            lower.contains("warn") && lower.contains("jupiter") && lower.contains("drift"),
-            "drift not reported for the submodule: {text:?}"
-        );
+    for _ in 0..2 {
+        let swept = emit(&verify_session(project.path(), home.path(), data.path()))
+            .expect("drift must be reported");
+        let (sys, ctx) = messages(&swept);
+        for text in [&sys, &ctx] {
+            let lower = text.to_lowercase();
+            assert!(
+                lower.contains("warn") && lower.contains("jupiter") && lower.contains("drift"),
+                "drift not reported for the submodule: {text:?}"
+            );
+        }
     }
     assert!(dir.join("SKILL.md").exists(), "drifted submodule was moved");
     assert!(!data.path().join("quarantine").exists());
 
-    // Reported once: the new content is re-pinned, so the next sweep is quiet again.
-    let third = verify_session(project.path(), home.path(), data.path());
+    // `verify approve` re-pins it in place; the next session is quiet again.
+    let run = Invocation::new(&["verify", "approve", "jupiter"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(project.path())
+        .stdin("{}")
+        .run();
+    let approved = run.json();
+    assert_eq!(approved["status"], "approved", "{}", run.stdout);
+    let lock: serde_json::Value = serde_json::from_str(&lockfile(data.path())).unwrap();
+    assert_eq!(lock["ext"]["jupiter"]["scan"], "approved", "{lock}");
+    let last = verify_session(project.path(), home.path(), data.path());
     assert!(
-        emit(&third).is_none(),
-        "unchanged content re-reported: {}",
-        third.stdout
+        emit(&last).is_none(),
+        "approved content re-reported: {}",
+        last.stdout
     );
 }
 
