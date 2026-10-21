@@ -1,0 +1,54 @@
+# ai-kit acceptance corpus (spec D2.10). Not vendored: the opt-in test
+# (SAFE_AI_SKILL_CORPUS=1) fetches it at the pinned commit and checks every pack SHA.
+# `expected` is what the rule engine must grade; `precise_py` is the research baseline
+# (docs/superpowers/research/2026-10-21/aikit_precise.tsv).
+# repo	https://github.com/solanabr/ai-kit
+# commit	f70345db63014c3fb42b872ddfca65f80c83a418
+# packs	.claude/skills/ext
+pack	sha	expected	precise_py
+alchemy	4caf3e555c3af8dbb9e5b540aed558aef986d885	warn	warn
+auditor-skill	c6a4a17297f8994dfb1bb9f2e9e0d19acaab421a	high	high
+circle	58ab8648bb1ae9d037a3bf5197ad3bb01262f5b1	warn	warn
+cloudflare	41e0d19858946d18af9ee2c2feebbe2e11d829ff	high	high
+colosseum	0453ffe26e8d245152619fcc949689a6adaab1c6	warn	warn
+community-moderation	e10790ea57cba41626704560a9355b2761d77816	clean	clean
+content-gen-skill	ce49a7e82b7120dd49be22c015648f9deeb3b86e	warn	warn
+counterparty-gate	86fc51eb9ef9efbe23d0d864bddec9cbafd843e0	high	high
+crypto-legal	0f0de7ccbf39213c20bc34fa76791628ad43b838	clean	clean
+duckdb	7feda8e01e22bc0886c86123f3884947e36d8c69	clean	clean
+dune	cf5c7fae42b03ed653bd49ae44d775f5c803ce72	warn	warn
+elevenlabs	81f1eafc65c9219ab4aa305d81ffc552a6f43f9d	warn	warn
+expo	13ad8e05874195633b5c185f6947bb6400e228fc	high	high
+frontend-slides	9906a34d640d2111f724544cbc50f7f130569ae1	clean	clean
+get-shit-pretty	5754ce8c44cd9cc9d9207e25955a1a89cf875bb8	warn	warn
+gmgn	4575ef539e6a3115fa0481d41285cb79e77970bf	warn	warn
+google	1d77046ad3670d62227f50a8f53286f6c6cde08b	high	high
+gsap-skills	aed9cfd3277740755f6bfc1155c7aa645403b760	high	high
+helius	21347a28f7d8042d60b5c85c86a80b841daf42a7	high	high
+huggingface-skills	ca0325bb20b2d0a1b2efa893670c4c72f79e707b	warn	warn
+jupiter	a2211e3f6a7caa03310c7a9a8d816e723b0bdc5f	clean	clean
+knowledge-work	8444efcd48f7012f09797778a36a33e73d0861f4	high	high
+light-protocol	0f52958edd1872d43c9d94fd58f558abb250789a	warn	warn
+magicblock	f250461282e8c4b6f4485be6ec12b2eaff68b5ff	warn	warn
+metaplex	f5bf13b357ee44bfb23a3b02f9193c314b05f5ab	warn	warn
+meteora-invent	dd77ef3d5aede3f0ff21d566d052097200417f5e	high	high
+mongodb	18b014ee53f5e8a824942cc6b0ced37f921e7b3c	clean	clean
+obsidian-skills	3ccff5338ea700537839b21900aa5358a0402c98	clean	clean
+playwright-skill	dd47a6a023e249eb1b36e9e943eab89d0900865d	clean	clean
+position-manager-skill	4885751c627a1db038e4aa0a513d248895fe6a0c	clean	clean
+pulumi	9b794aec9c4169f137285c2763c06064d247dd47	clean	clean
+qedgen	449296729087a2e9f3229f51af45355782eede6a	clean	clean
+redis	a84871d065f398fed55e1633f66b66f731eb4e2b	high	high
+resend	edbfece3f4029ff8258ac74e000ec8282377f317	warn	warn
+sendai	06b36b8b420e705ffd57b29e463f01093959d8d4	high	high
+sign-safe	e288e9dc9760501399b02e905e1007fa210b9ddf	clean	clean
+solana-dev	bb24c39dbdfc3afd27eb0540b9fdd2e4482c4e25	warn	warn
+solana-fuzz	f44b71054b7a164224aedb6e4c9427e2aa9a5ff7	clean	clean
+solana-game	762b3b28e62b4c6cabc01ae179d316958a852a07	clean	clean
+solana-mobile	4c38c11620c73ac8125ca6fb6be94ad263ee774e	warn	warn
+solana-new	e81c261645035c0e902eaaa518ff58722d188bb7	high	high
+startup-builder	e02c5c2e69fa6f264073eb45dcfc4616b4a1c6f7	clean	clean
+supabase	c9be0e931b7930f7d02126d04774d904c381e7d7	clean	clean
+superseo	9cf22cc065a294bf0077ea6af6b4ea0eb7f89cdc	clean	clean
+vercel	063bee94c3f4df8453406c830b0a7df0f2860278	clean	clean
+writer-style-skill	77372715fb5596cd29cc9fbbcaeb859cc9335b39	high	high

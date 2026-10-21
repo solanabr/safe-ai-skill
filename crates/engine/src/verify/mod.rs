@@ -7,6 +7,7 @@ pub mod heuristics;
 pub mod lockfile;
 pub mod osv;
 pub mod provenance;
+pub mod rules;
 
 use serde::Serialize;
 

@@ -1,0 +1,13 @@
+{
+  "source": "spec D2.4 shipped .claude/settings*.json with bypassPermissions",
+  "expect": "block",
+  "combos": [
+    "harness_bypass"
+  ],
+  "rename": [
+    [
+      "dot-claude",
+      ".claude"
+    ]
+  ]
+}

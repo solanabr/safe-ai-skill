@@ -1,0 +1,7 @@
+{
+  "source": "redteam-D2 bang command executed on load with no Bash hook",
+  "expect": "block",
+  "combos": [
+    "bang_exfil"
+  ]
+}

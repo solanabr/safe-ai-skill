@@ -1,0 +1,1 @@
+{"name":"x","scripts":{"postinstall":"node x.js"}}
