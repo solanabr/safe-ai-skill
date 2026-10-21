@@ -1,7 +1,7 @@
 //! Execution context: network resolution and well-known directories.
 //!
-//! [`resolve_network`] implements the precedence: explicit `-u`/`--url`/`--cluster` flag
-//! in the command, then `ANCHOR_PROVIDER_URL`, then `<cwd>/Anchor.toml` `[provider]
+//! [`resolve_network`] implements the precedence: explicit cluster flags in the command
+//! ([`network_from_flags`]), then `ANCHOR_PROVIDER_URL`, then `<cwd>/Anchor.toml` `[provider]
 //! cluster`, then a cached `solana config get` (60s TTL). It never panics — any failure
 //! yields [`Network::Unknown`].
 
@@ -60,9 +60,10 @@ impl Context {
 
 /// Resolve the network for `command` in `cwd`.
 ///
-/// Precedence: explicit flag in the command → `ANCHOR_PROVIDER_URL` env → `Anchor.toml`
-/// `[provider] cluster` → cached `solana config get` (60s TTL). Returns
-/// [`Network::Unknown`] when nothing resolves. Never panics.
+/// Precedence: explicit flags in the command ([`network_from_flags`], which may itself be
+/// [`Network::Unknown`]) → `ANCHOR_PROVIDER_URL` env → `Anchor.toml` `[provider] cluster` →
+/// cached `solana config get` (60s TTL). Returns [`Network::Unknown`] when nothing resolves.
+/// Never panics.
 pub fn resolve_network(command: &str, cwd: &Path) -> Network {
     if let Some(net) = network_from_flags(command) {
         return net;
@@ -93,6 +94,11 @@ fn classify_url(raw: &str) -> Network {
         "l" | "localnet" | "localhost" => return Network::Localnet,
         _ => {}
     }
+    // Mainnet first: a URL naming mainnet anywhere is mainnet, whatever else it mentions
+    // (`…mainnet…/?x=localhost`). Helius mainnet RPCs and mainnet-beta endpoints land here.
+    if s.contains("mainnet") {
+        return Network::Mainnet;
+    }
     if s.contains("127.0.0.1") || s.contains("localhost") || s.contains("localnet") {
         return Network::Localnet;
     }
@@ -102,45 +108,111 @@ fn classify_url(raw: &str) -> Network {
     if s.contains("testnet") {
         return Network::Testnet;
     }
-    // Mainnet last, and only if not already a dev/test endpoint. Helius mainnet RPCs and
-    // generic mainnet-beta endpoints land here.
-    if s.contains("mainnet") || s.contains("mainnet-beta") {
-        return Network::Mainnet;
-    }
     Network::Unknown
 }
 
-/// Extract a network from an explicit `-u <x>`, `--url <x>`, `--cluster <x>`, or Anchor's
-/// native `--provider.cluster <x>` flag.
-fn network_from_flags(command: &str) -> Option<Network> {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let mut i = 0;
-    while i < tokens.len() {
-        let tok = tokens[i];
-        // --url=value / --cluster=value / --provider.cluster=value / -u=value forms.
-        if let Some(val) = tok
-            .strip_prefix("--url=")
-            .or_else(|| tok.strip_prefix("--cluster="))
-            .or_else(|| tok.strip_prefix("--provider.cluster="))
-            .or_else(|| tok.strip_prefix("-u="))
-        {
-            let net = classify_url(val);
-            if net != Network::Unknown {
-                return Some(net);
-            }
+/// Long flags whose value is an RPC URL or cluster moniker (`-u` is the short form).
+const URL_FLAGS: &[&str] = &["--url", "--cluster", "--provider.cluster"];
+
+/// Short boolean flags of the solana-family CLIs (`-v`, `-h`, `-V`). They may precede a
+/// value-taking short in one cluster (`-vum`).
+pub(crate) const BOOL_SHORTS: &[char] = &['v', 'h', 'V'];
+
+/// The cluster `command` names explicitly, or `None` when it names none.
+///
+/// Recognizes `-u`/`--url`/`--cluster`/Anchor's `--provider.cluster` with the value as the next
+/// token, after `=`, or attached to `-u` (`-um`, also after boolean shorts: `-vum`). A value
+/// that names no recognizable cluster is [`Network::Unknown`]: an explicit target never falls
+/// back to the config. So is `-C/--config <file>` without a URL flag (the file is not read).
+/// Several flags fold to the riskiest (mainnet, then unknown). Tokens are quote-aware, so quoted
+/// text such as a memo is never a flag.
+pub fn network_from_flags(command: &str) -> Option<Network> {
+    let tokens = tokenize(command);
+    let mut named: Option<Network> = None;
+    let mut config_file = false;
+    let mut iter = tokens.iter();
+    while let Some(tok) = iter.next() {
+        if let Some(attached) = flag_value(tok, URL_FLAGS, 'u') {
+            let value = attached.or_else(|| iter.next().map(String::as_str));
+            let net = value.map_or(Network::Unknown, classify_url);
+            named = Some(named.map_or(net, |prev| riskier(prev, net)));
+        } else if flag_value(tok, &["--config"], 'C').is_some() {
+            config_file = true;
         }
-        // -u value / --url value / --cluster value / --provider.cluster value forms.
-        if (tok == "-u" || tok == "--url" || tok == "--cluster" || tok == "--provider.cluster")
-            && i + 1 < tokens.len()
-        {
-            let net = classify_url(tokens[i + 1]);
-            if net != Network::Unknown {
-                return Some(net);
-            }
-        }
-        i += 1;
     }
-    None
+    named.or(config_file.then_some(Network::Unknown))
+}
+
+/// Match `tok` against a value-taking flag: one of `longs` (`--url`, `--url=x`) or the short
+/// `short` (`-u`, `-ux`, `-u=x`), possibly after [`BOOL_SHORTS`] in a cluster (`-vux`).
+///
+/// `Some(Some(value))` when the value is attached, `Some(None)` when it is the next token.
+pub(crate) fn flag_value<'a>(tok: &'a str, longs: &[&str], short: char) -> Option<Option<&'a str>> {
+    for long in longs {
+        if let Some(rest) = tok.strip_prefix(long) {
+            if rest.is_empty() {
+                return Some(None);
+            }
+            if let Some(value) = rest.strip_prefix('=') {
+                return Some(Some(value));
+            }
+        }
+    }
+    let cluster = tok.strip_prefix('-')?;
+    if cluster.starts_with('-') {
+        return None;
+    }
+    let rest = cluster
+        .trim_start_matches(|c| BOOL_SHORTS.contains(&c))
+        .strip_prefix(short)?;
+    let value = rest.strip_prefix('=').unwrap_or(rest);
+    Some((!value.is_empty()).then_some(value))
+}
+
+/// The riskier of two networks for gating: mainnet, then unknown, then any identified other.
+fn riskier(a: Network, b: Network) -> Network {
+    let rank = |n: Network| match n {
+        Network::Mainnet => 2,
+        Network::Unknown => 1,
+        Network::Devnet | Network::Testnet | Network::Localnet => 0,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Split `text` into words on whitespace, honoring single and double quotes (quotes removed).
+pub fn tokenize(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for c in text.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
 }
 
 /// Parse `[provider] cluster = "..."` from `<cwd>/Anchor.toml`.
@@ -344,6 +416,113 @@ mod tests {
             network_from_flags("anchor deploy --provider.cluster=devnet"),
             Some(Network::Devnet)
         );
+    }
+
+    #[test]
+    fn flags_attached_short_forms() {
+        assert_eq!(
+            network_from_flags("solana transfer -um D 1"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer -ud D 1"),
+            Some(Network::Devnet)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer -u=m D 1"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer --url=m D 1"),
+            Some(Network::Mainnet)
+        );
+        // Boolean shorts may precede `u` in a cluster.
+        assert_eq!(
+            network_from_flags("solana -vum transfer D 1"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("solana -uhttp://127.0.0.1:8899 balance"),
+            Some(Network::Localnet)
+        );
+        // `-k` takes a value, so `-ku` is a keypair path, not a URL flag.
+        assert_eq!(network_from_flags("solana -ku balance"), None);
+    }
+
+    #[test]
+    fn explicit_unrecognized_url_is_unknown() {
+        assert_eq!(
+            network_from_flags("solana transfer D 1 --url https://rpc.example.com"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer D 1 -u"),
+            Some(Network::Unknown)
+        );
+    }
+
+    #[test]
+    fn config_file_without_url_is_unknown() {
+        assert_eq!(
+            network_from_flags("solana transfer -C ./c.yml D 1"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer --config=./c.yml D 1"),
+            Some(Network::Unknown)
+        );
+        // An explicit URL overrides the config file's.
+        assert_eq!(
+            network_from_flags("solana transfer -C ./c.yml -ud D 1"),
+            Some(Network::Devnet)
+        );
+    }
+
+    #[test]
+    fn several_flags_fold_to_the_riskiest() {
+        assert_eq!(
+            network_from_flags("solana transfer -ud -um D 1"),
+            Some(Network::Mainnet)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer -ud --url https://rpc.example.com D 1"),
+            Some(Network::Unknown)
+        );
+    }
+
+    #[test]
+    fn quoted_text_is_not_a_flag() {
+        assert_eq!(
+            network_from_flags("solana transfer --with-memo \"pay -ud\" D 1"),
+            None
+        );
+    }
+
+    #[test]
+    fn url_naming_mainnet_wins_over_other_hints() {
+        assert_eq!(
+            classify_url("https://mainnet.helius-rpc.com/?x=localhost"),
+            Network::Mainnet
+        );
+        assert_eq!(
+            classify_url("https://mainnet.example.com/devnet"),
+            Network::Mainnet
+        );
+    }
+
+    #[test]
+    fn explicit_unknown_url_does_not_fall_back() {
+        let dir =
+            std::env::temp_dir().join(format!("safe_ai_skill_explicit_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("Anchor.toml"),
+            "[provider]\ncluster = \"devnet\"\n",
+        )
+        .unwrap();
+        let net = resolve_network("solana transfer D 1 --url https://rpc.example.com", &dir);
+        assert_eq!(net, Network::Unknown);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
