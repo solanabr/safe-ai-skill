@@ -432,6 +432,11 @@ pub struct SessionResult {
     pub quarantined: Vec<String>,
     /// Names freshly pinned (TOFU) this sweep.
     pub pinned: Vec<String>,
+    /// Names whose scan the time budget cut short: unreviewed, never pinned.
+    pub unreviewed: Vec<String>,
+    /// Names not scanned because the sweep's time budget was spent: never pinned, scanned next
+    /// session.
+    pub deferred: Vec<String>,
     /// `additionalContext` warning to inject (empty when nothing to warn about).
     pub additional_context: String,
     /// Whether skills should be reloaded (true if anything was quarantined).
@@ -467,11 +472,30 @@ pub fn run_session_with_policy(
     skill_dirs: &[String],
     policy: &crate::policy::Policy,
 ) -> SessionResult {
+    // One scan budget for the whole sweep: a crafted pack cannot stall SessionStart.
+    run_session_with_budget(
+        plugin_data,
+        skill_dirs,
+        policy,
+        &rules::ScanBudget::session(),
+    )
+}
+
+/// [`run_session_with_policy`] under an explicit scan budget.
+///
+/// A pack whose scan the budget cuts short is unreviewed: quarantined only for what was found
+/// before the cut (or drift), otherwise never pinned and surfaced in `additional_context`. Once
+/// the sweep's budget is spent, unpinned packs are deferred (never pinned, scanned next
+/// session); pinned ones still get their drift check.
+pub fn run_session_with_budget(
+    plugin_data: &Path,
+    skill_dirs: &[String],
+    policy: &crate::policy::Policy,
+    budget: &rules::ScanBudget,
+) -> SessionResult {
     let mut lock = lockfile::load(plugin_data);
     let mut result = SessionResult::default();
     let mut warnings: Vec<String> = Vec::new();
-    // One scan budget for the whole sweep: a crafted pack cannot stall SessionStart.
-    let budget = rules::ScanBudget::session();
 
     // The ext dir name (e.g. `ext`) is skipped as a top-level skill child: its submodules are
     // verified individually below, so the `ext/` blob is never pinned as one unit.
@@ -502,10 +526,16 @@ pub fn run_session_with_policy(
                 continue;
             }
 
+            if budget.exhausted() && !lock.skills.contains_key(&name) {
+                defer(&mut result, &mut warnings, "skill", &name, &dir);
+                continue;
+            }
             let hash = lockfile::hash_tree(&dir);
             let drift = lock.skill_drift(&name, &hash);
-            let report = heuristics::scan_within(&dir, &budget);
-            let eval = eval_skill(&name, hash.clone(), drift, &report);
+            let scan = (!budget.exhausted()).then(|| heuristics::scan_within(&dir, budget));
+            let unscanned = Report::default();
+            let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
+            let eval = eval_skill(&name, hash.clone(), drift, report);
 
             if eval.quarantine {
                 match quarantine_dir(plugin_data, &name, &dir) {
@@ -523,6 +553,10 @@ pub fn run_session_with_policy(
                         warnings.push(format!("failed to quarantine `{name}`: {e}"));
                     }
                 }
+            } else if scan.is_none() {
+                defer(&mut result, &mut warnings, "skill", &name, &dir);
+            } else if scan.as_ref().is_some_and(|s| !s.complete) {
+                unreviewed(&mut result, &mut warnings, "skill", &name, &dir);
             } else if drift == lockfile::DriftStatus::Unpinned {
                 lock.pin_skill(
                     &name,
@@ -548,7 +582,7 @@ pub fn run_session_with_policy(
             process_ext_submodule(
                 plugin_data,
                 &sub,
-                &budget,
+                budget,
                 &mut lock,
                 &mut result,
                 &mut warnings,
@@ -566,6 +600,37 @@ pub fn run_session_with_policy(
         );
     }
     result
+}
+
+/// A pack the sweep did not scan this session: never pinned, surfaced, scanned next session.
+fn defer(
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+    what: &str,
+    name: &str,
+    dir: &Path,
+) {
+    warnings.push(format!(
+        "{what} `{name}` deferred: the SessionStart scan budget ran out before it; not pinned, \
+         scanned next session (now: `safe-ai-skill verify check {}`)",
+        dir.display()
+    ));
+    result.deferred.push(name.to_string());
+}
+
+/// A pack whose scan the time budget cut short: unreviewed, never pinned, surfaced.
+fn unreviewed(
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+    what: &str,
+    name: &str,
+    dir: &Path,
+) {
+    warnings.push(format!(
+        "{what} `{name}` not fully scanned — rerun `safe-ai-skill verify check {}` (not pinned)",
+        dir.display()
+    ));
+    result.unreviewed.push(name.to_string());
 }
 
 /// Verify one `ext/<name>` submodule as an individual unit: SHA/hash pin, drift, heuristics.
@@ -587,10 +652,16 @@ fn process_ext_submodule(
         None => return,
     };
 
+    if budget.exhausted() && !lock.ext.contains_key(&name) {
+        defer(result, warnings, "ext submodule", &name, dir);
+        return;
+    }
     let identity = lockfile::resolve_ext_identity(dir);
     let drift = lock.ext_drift(&name, &identity.sha);
-    let report = heuristics::scan_within(dir, budget);
-    let eval = eval_skill(&name, identity.sha.clone(), drift, &report);
+    let scan = (!budget.exhausted()).then(|| heuristics::scan_within(dir, budget));
+    let unscanned = Report::default();
+    let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
+    let eval = eval_skill(&name, identity.sha.clone(), drift, report);
 
     if eval.quarantine {
         match quarantine_dir(plugin_data, &name, dir) {
@@ -608,6 +679,10 @@ fn process_ext_submodule(
                 warnings.push(format!("failed to quarantine ext `{name}`: {e}"));
             }
         }
+    } else if scan.is_none() {
+        defer(result, warnings, "ext submodule", &name, dir);
+    } else if scan.as_ref().is_some_and(|s| !s.complete) {
+        unreviewed(result, warnings, "ext submodule", &name, dir);
     } else if drift == lockfile::DriftStatus::Unpinned {
         lock.pin_ext(
             &name,
@@ -907,6 +982,181 @@ mod orchestration_tests {
         let result = run_session_with_policy(&data, &dirs, &ext_policy(true));
         assert!(result.quarantined.contains(&"ghostsecurity".to_string()));
         assert!(data.join("quarantine/ghostsecurity").exists());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A skills root holding `(pack, [(file, body)])` packs.
+    fn seed_packs(tag: &str, packs: &[(&str, Vec<(&str, String)>)]) -> PathBuf {
+        let root = tempdir(tag);
+        for (pack, files) in packs {
+            for (rel, body) in files {
+                let p = root.join(pack).join(rel);
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, body).unwrap();
+            }
+        }
+        root
+    }
+
+    fn mal_js() -> String {
+        format!("x();{}eval(atob(s));\n", " ".repeat(200))
+    }
+
+    fn secs(n: u64) -> std::time::Duration {
+        std::time::Duration::from_secs(n)
+    }
+
+    #[test]
+    fn budget_cut_packs_are_unreviewed_and_never_pinned() {
+        let data = tempdir("cut-data");
+        let root = seed_packs(
+            "cut-skills",
+            &[
+                ("aaa-big", vec![("README.md", "# big\n".to_string())]),
+                ("zzz-mal", vec![("z.js", mal_js())]),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        // Every pack's own allowance is spent before its first file.
+        let cut = rules::ScanBudget::new(std::time::Duration::ZERO, secs(60));
+        let result = run_session_with_budget(&data, &dirs, &ext_policy(false), &cut);
+        assert!(result.pinned.is_empty(), "{result:?}");
+        assert!(result.quarantined.is_empty(), "{result:?}");
+        let mut unreviewed = result.unreviewed.clone();
+        unreviewed.sort();
+        assert_eq!(unreviewed, ["aaa-big", "zzz-mal"]);
+        assert!(result.additional_context.contains("not fully scanned"));
+        assert!(result
+            .additional_context
+            .contains("safe-ai-skill verify check"));
+        assert!(lockfile::load(&data).skills.is_empty());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_spent_sweep_defers_unpinned_packs() {
+        let data = tempdir("defer-data");
+        let root = seed_packs(
+            "defer-skills",
+            &[
+                ("clean", vec![("SKILL.md", "# Clean\n".to_string())]),
+                ("zzz-mal", vec![("z.js", mal_js())]),
+            ],
+        );
+        seed_ext_submodule(&root, "sendai", "# sendai\nDocs only.");
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let spent = rules::ScanBudget::new(secs(60), std::time::Duration::ZERO);
+        let result = run_session_with_budget(&data, &dirs, &ext_policy(true), &spent);
+        assert!(result.pinned.is_empty(), "{result:?}");
+        let mut deferred = result.deferred.clone();
+        deferred.sort();
+        assert_eq!(deferred, ["clean", "sendai", "zzz-mal"]);
+        assert!(result.additional_context.contains("deferred"));
+        let lock = lockfile::load(&data);
+        assert!(lock.skills.is_empty() && lock.ext.is_empty());
+        // Next session, with time to scan, the packs are scanned for real.
+        let next = run_session_with_policy(&data, &dirs, &ext_policy(true));
+        assert!(next.pinned.contains(&"clean".to_string()), "{next:?}");
+        assert!(
+            next.quarantined.contains(&"zzz-mal".to_string()),
+            "{next:?}"
+        );
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pinned_pack_deferred_by_the_budget_still_gets_its_drift_check() {
+        let data = tempdir("defer-drift-data");
+        let root = seed_packs(
+            "defer-drift-skills",
+            &[("clean", vec![("SKILL.md", "# Clean\n".to_string())])],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let first = run_session_with_policy(&data, &dirs, &ext_policy(false));
+        assert!(first.pinned.contains(&"clean".to_string()));
+        fs::write(root.join("clean").join("run.sh"), "echo changed\n").unwrap();
+        let spent = rules::ScanBudget::new(secs(60), std::time::Duration::ZERO);
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &spent);
+        assert!(
+            second.quarantined.contains(&"clean".to_string()),
+            "{second:?}"
+        );
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_payload_found_before_the_cut_still_quarantines() {
+        let data = tempdir("cut-mal-data");
+        // `a.js` is scanned first; the dense file after it runs out of time.
+        let dense = "curl x;".repeat(4 * 1024 * 1024 / 7);
+        let root = seed_packs(
+            "cut-mal-skills",
+            &[("mal", vec![("a.js", mal_js()), ("b.sh", dense)])],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let short = rules::ScanBudget::new(std::time::Duration::from_millis(300), secs(60));
+        let result = run_session_with_budget(&data, &dirs, &ext_policy(false), &short);
+        assert!(
+            result.quarantined.contains(&"mal".to_string()),
+            "{result:?}"
+        );
+        assert!(result.pinned.is_empty());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_three_pack_budget_probe_pins_nothing() {
+        // `evade4.rs`: one big pack burns the time, one malicious pack, one with the payload
+        // behind dense files. Whatever the directory order, nothing is pinned unscanned.
+        let data = tempdir("three-data");
+        let dense = "curl x;".repeat(2 * 1024 * 1024 / 7);
+        let big = |extra: Option<String>| {
+            let mut files = vec![
+                ("a1.sh", dense.clone()),
+                ("a2.sh", dense.clone()),
+                ("a3.sh", dense.clone()),
+            ];
+            if let Some(js) = extra {
+                files.push(("z.js", js));
+            }
+            files
+        };
+        let root = seed_packs(
+            "three-skills",
+            &[
+                ("aaa-big", big(None)),
+                ("zzz-mal", vec![("z.js", mal_js())]),
+                ("mmm-inpack", big(Some(mal_js()))),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let budget = rules::ScanBudget::new(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(700),
+        );
+        let result = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget);
+        assert!(result.pinned.is_empty(), "{result:?}");
+        let is = |name: &str, lists: &[&Vec<String>]| {
+            lists.iter().any(|l| l.contains(&name.to_string()))
+        };
+        assert!(
+            is("aaa-big", &[&result.unreviewed, &result.deferred]),
+            "{result:?}"
+        );
+        assert!(
+            is("mmm-inpack", &[&result.unreviewed, &result.deferred]),
+            "{result:?}"
+        );
+        assert!(
+            is("zzz-mal", &[&result.quarantined, &result.deferred]),
+            "{result:?}"
+        );
+        assert!(lockfile::load(&data).skills.is_empty());
         fs::remove_dir_all(&data).ok();
         fs::remove_dir_all(&root).ok();
     }

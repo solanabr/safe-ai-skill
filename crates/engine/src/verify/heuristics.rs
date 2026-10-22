@@ -9,9 +9,11 @@
 //! * a `High` finding → `High`; a documentation finding capped from a code-`High` rule also →
 //!   `High` (v1 never told docs from code — the grader is where the doc cap bites);
 //! * any other `Warn` → `Medium`; `Info` → `Low`, except `unpinned_npx`, which v1 graded
-//!   `Medium` and keeps;
-//! * `scan_budget_exceeded` → `Medium`: the pack is unscanned, so it is surfaced, but v1
-//!   quarantines on `High` and a slow machine must not quarantine packs.
+//!   `Medium` and keeps.
+//!
+//! [`scan_within`] reports a scan cut by its time budget as `complete: false` instead of a
+//! finding: the SessionStart sweep keeps such a pack unreviewed (never pinned), and only what
+//! was found before the cut can quarantine it.
 //!
 //! Detectors ported from v1 keep their v1 kind (`install_hook`, `eval`, `base64_exec`,
 //! `unicode_obfuscation`, `broad_permissions`, and `telemetry_post` for any outbound POST); new
@@ -29,9 +31,23 @@ pub fn scan(path: &Path) -> Report {
     legacy_report(&rules::scan_pack(path))
 }
 
+/// A [`scan_within`] result.
+pub struct BudgetedScan {
+    /// Findings of what was scanned (the budget marker is reported as `complete` instead).
+    pub report: Report,
+    /// False when the time budget cut the scan short: the pack is unreviewed.
+    pub complete: bool,
+}
+
 /// [`scan`] under a wall-clock budget shared across a sweep (SessionStart).
-pub fn scan_within(path: &Path, budget: &rules::ScanBudget) -> Report {
-    legacy_report(&rules::scan_pack_within(path, budget))
+pub fn scan_within(path: &Path, budget: &rules::ScanBudget) -> BudgetedScan {
+    let mut pack = rules::scan_pack_within(path, budget);
+    let before = pack.findings.len();
+    pack.findings.retain(|f| f.rule != "scan_budget_exceeded");
+    BudgetedScan {
+        complete: pack.findings.len() == before,
+        report: legacy_report(&pack),
+    }
 }
 
 fn legacy_report(pack: &rules::PackReport) -> Report {
@@ -68,9 +84,6 @@ fn legacy(sev: Severity, kind: &str, summary: &str, path: &Path, line: Option<u3
 
 /// v1 severity of a rule finding (see the module docs).
 fn legacy_severity(f: &rules::Finding) -> Severity {
-    if f.rule == "scan_budget_exceeded" {
-        return Severity::Medium;
-    }
     match f.sev {
         rules::Severity::High => Severity::High,
         rules::Severity::Warn
@@ -227,18 +240,28 @@ mod tests {
     }
 
     #[test]
-    fn a_budget_overrun_is_medium_in_v1() {
+    fn a_budget_cut_is_reported_as_incomplete_not_as_a_finding() {
         let dir = tempdir("budget");
         fs::write(dir.join("README.md"), "# plain\n").unwrap();
-        let none = rules::ScanBudget::new(Duration::ZERO, Duration::ZERO);
-        let report = scan_within(&dir, &none);
-        let f = report
-            .findings
-            .iter()
-            .find(|f| f.kind == "scan_budget_exceeded")
-            .expect("scan_budget_exceeded");
-        assert_eq!(f.severity, Severity::Medium);
-        assert!(report.findings.iter().all(|f| f.severity < Severity::High));
+        let none = rules::ScanBudget::new(Duration::ZERO, Duration::from_secs(60));
+        let scan = scan_within(&dir, &none);
+        assert!(!scan.complete);
+        assert!(
+            scan.report.findings.is_empty(),
+            "{:?}",
+            scan.report.findings
+        );
+        let ample = rules::ScanBudget::new(Duration::from_secs(60), Duration::from_secs(60));
+        assert!(scan_within(&dir, &ample).complete);
+        // The marker itself maps to High wherever a v1 report carries it.
+        let marker = rules::Finding {
+            rule: "scan_budget_exceeded",
+            sev: rules::Severity::High,
+            path: dir.clone(),
+            line: None,
+            ctx: Ctx::Meta,
+        };
+        assert_eq!(legacy_severity(&marker), Severity::High);
         fs::remove_dir_all(&dir).ok();
     }
 

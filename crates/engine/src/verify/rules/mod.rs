@@ -182,6 +182,11 @@ impl ScanBudget {
         }
     }
 
+    /// True once the sweep's time is spent: packs not yet scanned are deferred, not cut.
+    pub fn exhausted(&self) -> bool {
+        self.sweep_deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
     /// The deadline of a pack that starts now.
     fn pack_deadline(&self) -> Option<Instant> {
         let pack = Instant::now().checked_add(self.per_pack);

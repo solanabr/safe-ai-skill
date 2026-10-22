@@ -1409,3 +1409,51 @@ fn padding_the_hit_cap_hides_no_combo() {
         Some(safe_ai_skill::verify::Severity::High)
     );
 }
+
+#[test]
+fn budget_cut_packs_keep_what_they_found_and_never_grade_clean() {
+    let pad = " ".repeat(200);
+    let mal_js = format!("x();{pad}eval(atob(s));\n");
+    // Far longer to scan than the 300 ms allowance in either build.
+    let mib = if cfg!(debug_assertions) { 2 } else { 8 };
+    let dense = "curl x;".repeat(mib * 1024 * 1024 / 7);
+    let cut = |r: &PackReport| r.findings.iter().any(|f| f.rule == "scan_budget_exceeded");
+    let budget = || {
+        rules::ScanBudget::new(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(60),
+        )
+    };
+    let pack = |files: &[(&str, &str)]| {
+        let tmp = TempDir::new("budget");
+        for (rel, body) in files {
+            std::fs::write(tmp.join(rel), body).unwrap();
+        }
+        tmp
+    };
+    // bud-dense-alone / bud-dense-before-mal: cut, unreviewed (HIGH), never clean.
+    for files in [
+        vec![("a.sh", dense.as_str())],
+        vec![("a1.sh", dense.as_str()), ("z.js", mal_js.as_str())],
+    ] {
+        let tmp = pack(&files);
+        let r = rules::scan_pack_within(tmp.path(), &budget());
+        assert!(cut(&r), "{r:?}");
+        assert_eq!(rules::grade(&r), Grade::High, "{r:?}");
+    }
+    // bud-mal-before-dense: the payload found before the cut still blocks.
+    let tmp = pack(&[("a.js", mal_js.as_str()), ("b1.sh", dense.as_str())]);
+    let r = rules::scan_pack_within(tmp.path(), &budget());
+    assert!(cut(&r), "{r:?}");
+    assert_eq!(rules::grade(&r), Grade::Block, "{r:?}");
+    // sweep-a/b/c: a pack that burns its allowance does not cut the small ones after it.
+    let sweep = rules::ScanBudget::new(
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(60),
+    );
+    let a = pack(&[("a1.sh", dense.as_str())]);
+    let b = pack(&[("z.js", mal_js.as_str())]);
+    assert!(cut(&rules::scan_pack_within(a.path(), &sweep)));
+    let rb = rules::scan_pack_within(b.path(), &sweep);
+    assert!(!cut(&rb) && rules::grade(&rb) == Grade::Block, "{rb:?}");
+}

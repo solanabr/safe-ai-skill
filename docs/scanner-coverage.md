@@ -137,16 +137,31 @@ build-time execution, reported at `verify add|check` (D7.2), not at SessionStart
 
 SessionStart must stay fast, so a crafted pack cannot stall it:
 
-* **Per rule.** In one file, a rule stops being evaluated after 50 hits
-  (`rules::MAX_HITS_PER_RULE`). `PackReport::capped` records each such rule, file and count.
-  Stored findings stay capped at five per rule and severity.
+* **Per rule.**
+  * Only live hits count: code outside strings and comments. Quoted or commented hits never
+    count, so they cannot be used to pad the cap.
+  * After 50 live hits in one file (`rules::MAX_HITS_PER_RULE`), a rule stops creating findings
+    there. Detection and combo signals carry on, so a payload after the cap still blocks.
+  * `PackReport::capped` records each such rule, file and true hit count, and any entry grades
+    the pack at least HIGH.
+  * Stored findings stay capped at five per rule and severity.
 * **Per pack and per sweep.** `rules::scan_pack_within` takes a `ScanBudget`: 2 s per pack, and
   4 s for every pack of one SessionStart sweep (`ScanBudget::session`, used by the verify
   sweep). The clock is checked between files, every 256 lines, statements or commands.
 * **When the budget runs out.** The pack stops with `scan_budget_exceeded` HIGH: never clean,
-  graded unreviewed with the findings and combos found so far. The sweep moves on to the next
-  pack. The v1 compatibility shim maps the finding to Medium, because v1 quarantines on High and
-  a slow machine must not quarantine packs.
+  graded with the findings and combos found so far. A payload found before the cut still
+  blocks.
+* **In the SessionStart sweep.**
+  * A cut pack is **unreviewed**: never pinned, and never recorded as scanned.
+  * It is quarantined only for what was found before the cut, or for drift.
+  * The session context lists it as "not fully scanned — rerun `safe-ai-skill verify check
+    <dir>`" (`verify check` scans without a budget).
+  * Once the sweep's budget is spent, the remaining unpinned packs are **deferred**: not
+    scanned, not pinned, and listed in the session context. They are scanned at the next
+    session.
+  * Pinned packs still get their drift check when deferred.
+  * The v1 shim reports a cut scan as incomplete rather than as a finding (the marker maps to
+    High wherever it appears).
 
 `tests/rules_perf.rs` replays the 23 performance probes from the round-2 review, at 16 MiB each in
 release builds and 256 KiB in debug builds. Each must return within the pack budget plus 3 s of
@@ -222,9 +237,12 @@ rule ideas were reimplemented here; no rule lists were copied.
 * **Bundle exemption.** A file can pose as a bundle (bundler helper names, a minified shape) to
   stay out of the cross-file `eval_decoder` rule. It still grades HIGH for its own `eval`, and
   in-statement combos still apply.
-* **Budget cut-offs.** After a rule's 50th hit in a file, later lines no longer feed combos
-  through that rule. That file is already HIGH, and a later decoder still meets the earlier
-  `eval` in `eval_decoder`. A pack cut by the time budget is HIGH with partial findings.
+* **Budget cut-offs.** A pack cut by the time budget is graded on what was scanned before the
+  cut: HIGH at least, BLOCK if a payload was already found. At SessionStart it stays unreviewed
+  until `verify check` scans it in full.
+* **Hit-cap escalation.** Any rule with more than 50 live hits in one file makes the pack HIGH,
+  INFO rules included. None of the ai-kit packs reaches the cap, but a very large legitimate
+  file could (for example, more than 50 `child_process` calls).
 * **Indirect load-time commands.** A `` !`cmd` `` is followed into a pack script one level deep,
   and only when the script is named directly (an interpreter and a path, or a path).
 * **Descriptions.** Only `SKILL.md` frontmatter is checked, not the frontmatter of agent or
