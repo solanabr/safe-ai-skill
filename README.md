@@ -14,7 +14,7 @@
 
 safe-ai-skill is a Claude Code security plugin — a Rust hook-based firewall and registry-free supply-chain verifier that works with **any skills, MCPs, or agents** to add a policy-driven security layer. It was built with `solanabr/solana-ai-kit` as the reference integration (gating Solana transactions and deploys, verifying its `ext/` submodules and `skill-registry.json` catalog), but the gates, guards, and verifier are general-purpose and protect any Claude Code setup.
 
-At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never bypassed regardless of profile or flags.
+At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never relaxed by any profile, grant or flag.
 
 ## Install
 
@@ -101,20 +101,31 @@ The npm and standalone paths download the binary matching their release tag and 
 
 **Supply-chain (SessionStart verifier)**
 
-- Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); reports drift without moving anything
+- Skill packs: sweeps the project's `.claude/skills`; `~/.claude/skills` only when `supply_chain.verify_skills_dirs` lists it, plus packs installed there with `install --from`
+- Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); reports drift without moving anything. A drifted pack is reported every session until you run `safe-ai-skill verify approve <name>`, which re-pins it in place
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute
 - MCP version tracking: flags `@latest` entries as informational — does not silently rewrite them
-- CVE lookup: queries osv.dev for every resolved `pkg@version` (no API key required)
+- CVE lookup: `add mcp` queries osv.dev for the resolved `pkg@version` (no API key required). The session sweep makes no network calls
 - Heuristic scan: outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec
 
 **Hard guards (never relaxable)**
 
 `mainnet_deploy` · `set_authority` · `account_close` · `secret_read`
 
-These block unconditionally. No profile flag or explicit grant overrides them.
+No profile, grant, flag or repo policy relaxes them. Mainnet deploys, authority changes and account closes always ask you (a mainnet `--final` deploy is denied), and secret reads are denied. Deploys to other clusters are not hard guards, so a grant or profile can relax them.
 
 ## Threat model
+
+safe-ai-skill protects against a careless model and prompt-injected instructions. It is not a sandbox. Code that runs unsandboxed as your user can rewrite any user-space state, including the plugin's grants, pins and settings, so the Claude Code sandbox is the hard boundary. A tamper tripwire denies agent tool calls that would loosen the firewall from the inside, but encoded commands, variable indirection and scripts written now and run later can get past it. Run `allow`, `mode <profile>` and `verify approve` yourself in a terminal.
+
+If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE, but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
+
+## Known limitations in 1.0.1 (fixed in 1.1.0)
+
+- A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
+- A Solana CLI command wrapped in another command, or prefixed with environment assignments, may not reach the Solana gate, because Claude Code's `if: Bash(solana *)` filter matches only the plain form. Keep the sandbox on.
+- There is no SessionStart notice yet for Claude Code older than 2.1.295.
 
 **Runtime threats** — agentic workflows drive CLI commands and value-moving MCP calls with no gating. Interactive `read -r` prompts silently fail in hook context (no TTY). safe-ai-skill intercepts every such action before execution.
 
@@ -133,35 +144,41 @@ safe-ai-skill registry list          # list catalog entries with risk classifica
 safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
-safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
-safe-ai-skill status                 # pins, quarantine list, active profile, live grants, recent decisions
-safe-ai-skill mode <profile>         # switch relaxation profile (strict / standard / dev)
-safe-ai-skill allow <gate>           # grant a specific gate for the current session
-safe-ai-skill session                # show active session state
+safe-ai-skill verify                 # on-demand sweep of installed skills and MCPs (what SessionStart runs)
+safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
+safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
+safe-ai-skill status                 # active profile, live grants, spend, recent decisions
+safe-ai-skill mode <profile>         # switch profile (strict / autopilot / paranoid / off); bare `mode` shows it
+safe-ai-skill allow --scope <scope> --for <duration> [--max-tx <SOL>] [--budget <SOL>]
+                                     # time-boxed grant for a soft gate (e.g. --scope transfer --for 30m)
+safe-ai-skill revoke                 # cancel grants early
+safe-ai-skill session                # show session keypair state
 ```
+
+`allow`, `revoke`, `mode <profile>` and `verify approve` change what the firewall permits, so the agent can't run them: the tamper tripwire denies them. Run them in your own terminal.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 
 ### Tier 2 — verified hub install
 
 ```bash
-safe-ai-skill install                        # verified install of a skill hub
-safe-ai-skill install --from <url>           # install from a specific source URL or GitHub ref
-safe-ai-skill install --home ~/.claude       # override install destination
+safe-ai-skill install                        # verify the project's .claude/skills in place (scan, pin, no copy)
+safe-ai-skill install --from <dir|tarball>   # verified install from a local skill directory or tarball
+safe-ai-skill install --home ~               # install into <dir>/.claude/skills (default: ~)
 ```
 
-The `install` subcommand is the secure drop-in for `curl <url> | bash`. It downloads the target hub, runs the verification pipeline on every SKILL.md and catalog entry, walks each `ext/` submodule individually, pins each to its current git SHA, flags `@latest` MCP entries, shows a diff of flagged content, and installs only on approval. It does not auto-widen `~/.claude/settings.json` permissions.
+`install` never downloads anything: `--from` takes a local directory or tarball, so fetch a hub yourself (for example `git clone`) and point `--from` at it. It runs the verification pipeline on every skill, neutralizes telemetry preambles, pins each pack, and holds a skill with a High finding, always. A skill with only Medium findings is held unless you pass `--yes`. With no `--from` it verifies the current project's `.claude/skills` in place, and rewrites a `SKILL.md` there to remove a telemetry preamble it finds. It does not auto-widen `~/.claude/settings.json` permissions.
 
 ## Registry-free verification model
 
 Trust is based on the artifact itself, not a hash allowlist to maintain:
 
 1. **Static heuristics** — scan SKILL.md, scripts, and package.json for outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec, and `curl | bash` patterns. Generic patterns — they do not grow per-package.
-2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA is reported with a diff for review. Nothing is moved, so the working tree stays clean.
+2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA is reported in every session (High findings listed at `path:line`) until you run `verify approve <name>`. Nothing is moved, so the working tree stays clean.
 3. **Catalog gating** — entries are classified by risk class. High-risk classes require explicit policy approval; safe-ai-skill blocks installation of denied classes without prompting.
 4. **Provenance pinning** — GitHub URLs resolve to immutable commit SHAs (moving refs are rejected). npm packages pin to `pkg@x.y.z` plus `dist.shasum`. `@latest` entries are flagged informational.
-5. **CVE lookup** — query osv.dev for every resolved `pkg@version`. No API key required.
-6. **Local TOFU lockfile** — pin the content hash on first install; any later change surfaces a diff requiring explicit approval.
+5. **CVE lookup** — `add mcp` queries osv.dev for the resolved `pkg@version`. No API key required. This is the only network step; the session sweep and gates make no network calls.
+6. **Local TOFU lockfile** — pin the content hash on first install; any later change is reported as drift until you approve it.
 
 Block on high-severity heuristic match or known CVE. Warn and `ask` on medium. Pass and pin on clean.
 

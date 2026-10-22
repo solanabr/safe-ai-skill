@@ -5,7 +5,8 @@ every Solana CLI command, SPL Token operation, Anchor invocation, and
 value-moving MCP call — requiring explicit approval for mainnet deploys,
 authority changes, and over-cap transfers. Runs a supply-chain verifier at
 every session start that scans skills and MCPs, flags telemetry preambles and
-plaintext JWTs, pins content hashes, and reports anything that drifted.
+plaintext JWTs, pins content hashes, and reports anything that drifted. It
+reports and never moves a skill.
 
 This npm package installs the `safe-ai-skill` CLI binary (the same binary that backs
 the Claude Code plugin). The Claude Code plugin is installed separately.
@@ -31,17 +32,20 @@ safe-ai-skill add repo <url>          # any clonable repo; pins to commit SHA
 # Audit what is already installed
 safe-ai-skill verify
 
-# Show status: pins, quarantine list, active profile, live grants, recent decisions
+# Re-pin a drifted pack after you reviewed it (reported every session until then)
+safe-ai-skill verify approve <name>
+
+# Show status: active profile, live grants, spend, recent decisions
 safe-ai-skill status
 
-# Hub-agnostic secure install: verify, diff, and approve before writing
-safe-ai-skill install --from <url|ref>
+# Verified install from a local skill directory or tarball (no network)
+safe-ai-skill install --from <dir|tarball>
 ```
 
 ## Claude Code plugin
 
 The Claude Code plugin provides the runtime firewall (hooks into every Claude
-Code session). Install it separately:
+Code session) and requires Claude Code 2.1.295 or newer. Install it separately:
 
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill
