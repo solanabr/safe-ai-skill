@@ -25,7 +25,8 @@
 # Assertions (a PASS/FAIL line each; exit 1 when any FAIL):
 #   1 no pack moved or deleted by NEW (packs OLD already quarantined are reported, not counted)
 #   2 NEW exits 0 and prints hook JSON or nothing, WARN-only (no deny/block/ask/defer, continue not false)
-#   3 grants and mode survive, by NEW's rules (see below)
+#   3 grants and mode survive, by NEW's rules (see below); for 1.1.x also: the migration
+#     notice once, grants pending, a raw .env read still denied
 #   4 NEW wrote nothing into proj/ or the home skills dir
 #   5 `git status` of proj is unchanged by NEW
 #   6 control run: NEW on the pristine project moves nothing and stays WARN-only
@@ -34,10 +35,11 @@
 # Grants and mode are version-aware, keyed on `NEW_BIN --version`:
 #   1.0.x  state is unchanged: grants.json and mode.json byte-identical, `mode` still reports
 #          the profile OLD set, `status` still lists the grant unexpired.
-#   1.1.x  state is authenticated (HMAC) and relaxations are prompt-nonce confirmed: a v1
-#          grants.json/mode.json carries no MAC, so it is PRESERVED but pending, not effective,
-#          until the user re-confirms. Asserted: both files still exist and still hold the grant
-#          id and the profile; effectiveness is not asserted. Nothing may delete or quarantine.
+#   1.1.x  OLD sets the 1.0 default profile `strict`. State is authenticated (HMAC) and
+#          relaxations are prompt-nonce confirmed, so the first NEW session migrates once:
+#          each unexpired v1 grant becomes a pending request (its id named in the notice, none
+#          live in `status`), `strict` becomes tier `relaxed` with its one-line notice, and a
+#          second NEW session prints neither. A raw Read of the project's `.env` is still denied.
 #   other  checked as 1.0.x, with a notice.
 #
 # Env: R2_KEEP=1 keeps the scratch tree (it is kept on FAIL anyway).
@@ -152,6 +154,8 @@ else
 fi
 mkdir -p "$proj/.safe-ai-skill"
 cp "$policy_fixture" "$proj/.safe-ai-skill/policy.yaml"
+# A project env file the NEW engine must keep unreadable.
+printf 'HELIUS_KEY=r2_fixture_value_aaaaaaaaaaaaaaaa\n' >"$proj/.env"
 
 # A personal pack under the scratch HOME; no engine may touch it with the project policy.
 mkdir -p "$home/.claude/skills/personal-canary"
@@ -176,10 +180,13 @@ g -C "$proj" add -A >/dev/null 2>&1 || note "git add -A was partial"
 g -C "$proj" commit -q --allow-empty -m "fixture" >/dev/null 2>&1 || note "git commit failed"
 
 # ---------------------------------------------------------------- OLD: state + session
+new_ver="$(eng "$NEW_BIN" --version | sed -n 's/^safe-ai-skill \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1)"
+[ -n "$new_ver" ] || new_ver=unknown
+case "$new_ver" in 1.1.*) old_profile=strict ;; *) old_profile=autopilot ;; esac
 printf '== OLD session (%s) ==\n' "$OLD_BIN"
 eng "$OLD_BIN" allow --scope swap --for 24h --max-tx 1 --budget 5 >"$snap/old-allow.out"
 eng "$OLD_BIN" allow --scope transfer --for 2h --max-tx 0.5 --budget 2 --to 11111111111111111111111111111112 >>"$snap/old-allow.out"
-eng "$OLD_BIN" mode autopilot >"$snap/old-mode.out"
+eng "$OLD_BIN" mode "$old_profile" >"$snap/old-mode.out"
 grant_id="$(jq -r '.grants[0].id' "$data/grants.json")"
 grant_count="$(jq -r '.grants | length' "$data/grants.json")"
 [ "$grant_count" = 2 ] && [ -f "$data/mode.json" ] || { echo "OLD CLI did not create grants/mode" >&2; exit 2; }
@@ -208,8 +215,6 @@ fi
 [ -d "$data/quarantine" ] && note "quarantine after OLD: $(find "$data/quarantine" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') pack(s)"
 
 # ---------------------------------------------------------------- NEW session over the same data dir
-new_ver="$(eng "$NEW_BIN" --version | sed -n 's/^safe-ai-skill \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1)"
-[ -n "$new_ver" ] || new_ver=unknown
 printf '== NEW session (%s %s) ==\n' "$NEW_BIN" "$new_ver"
 t0="$(now_ms)"
 set +e
@@ -262,12 +267,29 @@ fi
 # 3 grants and mode, by the NEW version's rules (see the header).
 case "$new_ver" in
   1.1.*)
-    if [ -f "$data/grants.json" ] && [ -f "$data/mode.json" ] &&
-      grep -q "$grant_id" "$data/grants.json" &&
-      [ "$(jq -r .profile "$data/mode.json")" = autopilot ]; then
-      pass "3 [1.1 rules] grants.json and mode.json preserved (pending confirmation, not asserted effective)"
+    s3=ok
+    msg="$(jq -r '.systemMessage // empty' "$snap/new-session.out" 2>/dev/null || true)"
+    printf '%s' "$msg" | grep -q "1.0 grant $grant_id kept as pending request" ||
+      s3="first session does not name grant $grant_id as a pending request"
+    printf '%s' "$msg" | grep -q "profile strict is now tier relaxed" ||
+      s3="$s3; first session has no strict -> relaxed notice"
+    printf '%s' "$msg" | grep -q "safe-ai-skill tier: relaxed" ||
+      s3="$s3; first session has no tier line"
+    live="$(eng "$NEW_BIN" status | jq -r '[.grants[] | select(.expired == false)] | length')"
+    [ "$live" = 0 ] || s3="$s3; NEW status lists $live live grants, expected 0 (pending only)"
+    [ "$(eng "$NEW_BIN" status | jq -r .tier)" = relaxed ] || s3="$s3; NEW tier is not relaxed"
+    printf '%s' "$payload" | eng "$NEW_BIN" verify session >"$snap/new-session2.out" 2>/dev/null || true
+    msg2="$(jq -r '.systemMessage // empty' "$snap/new-session2.out" 2>/dev/null || true)"
+    if printf '%s' "$msg2" | grep -q -e "kept as pending request" -e "profile strict is now"; then
+      s3="$s3; the migration notice was shown again"
+    fi
+    env_out="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Read","tool_input":{"file_path":"%s/.env"}}\n' "$proj" "$proj" |
+      eng "$NEW_BIN" gate-read | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null || true)"
+    [ "$env_out" = deny ] || s3="$s3; a raw Read of .env gave '${env_out:-no opinion}', expected deny"
+    if [ "$s3" = ok ]; then
+      pass "3 [1.1 rules] tier line and migration notice once (grant $grant_id pending, strict -> relaxed), 0 live grants, .env read denied"
     else
-      fail "3 [1.1 rules] grants.json/mode.json lost or rewritten without the original grant/profile"
+      fail "3 [1.1 rules] $s3"
     fi
     ;;
   *)
