@@ -449,6 +449,13 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
         return ReadVerdict::Decide(verdict.into());
     }
+    if !credpaths::lists_available() {
+        return ReadVerdict::Decide(Decision::Ask {
+            reason: "safe-ai-skill: the credential lists failed to load, so this directory \
+                     search cannot exclude credential files — approve to proceed"
+                .into(),
+        });
+    }
     // An env glob the user's opt-in leaves open (no opinion) still gets the key-material
     // exclusion, minus the env-file globs it opted into.
     let mut keep_env = false;

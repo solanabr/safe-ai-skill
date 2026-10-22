@@ -210,6 +210,73 @@ pub fn is_hard_tree(dir: &str, homes: &[String]) -> bool {
         .any(|tree| tree_rest(&rooted, tree).is_some())
 }
 
+/// Where a directory stands relative to a safe-ai-skill data dir (whose `key` authenticates
+/// the tier, grants and pending requests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataDirReach {
+    /// The directory is a data dir or lies inside one.
+    Inside,
+    /// The directory contains a data dir.
+    Above,
+}
+
+/// [`DataDirReach`] of `dir`: data dirs are `<…>/plugins/data/safe-ai-skill-*` and
+/// `$CLAUDE_PLUGIN_DATA`; the homes' (and `$CLAUDE_CONFIG_DIR`'s) `plugins/data` are known
+/// parents. `None` when `dir` neither is in one nor contains one.
+pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
+    let full = normalize(dir, homes.first().map(String::as_str));
+    let rooted = if full.starts_with('/') {
+        full.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", full.trim_end_matches('/'))
+    };
+    let below = |parent: &str, child: &str| {
+        parent == "/" || child == parent || child.starts_with(&format!("{parent}/"))
+    };
+    if let Some(rest) = tree_rest(&rooted, "plugins/data") {
+        if rest
+            .split('/')
+            .next()
+            .is_some_and(|d| d.starts_with("safe-ai-skill-"))
+        {
+            return Some(DataDirReach::Inside);
+        }
+        // `plugins/data` itself holds the data dirs.
+        if rest.is_empty() {
+            return Some(DataDirReach::Above);
+        }
+    }
+    let env_dir = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| normalize(&v, None).trim_end_matches('/').to_string())
+    };
+    if let Some(data) = env_dir("CLAUDE_PLUGIN_DATA") {
+        if below(&data, &rooted) {
+            return Some(DataDirReach::Inside);
+        }
+        if below(&rooted, &data) {
+            return Some(DataDirReach::Above);
+        }
+    }
+    let parents = homes
+        .iter()
+        .map(|h| {
+            format!(
+                "{}/.claude/plugins/data",
+                normalize(h, None).trim_end_matches('/')
+            )
+        })
+        .chain(env_dir("CLAUDE_CONFIG_DIR").map(|c| format!("{c}/plugins/data")));
+    for parent in parents {
+        if below(&rooted, &parent) {
+            return Some(DataDirReach::Above);
+        }
+    }
+    None
+}
+
 /// `$HOME` (when set) as the classification home list.
 pub fn homes() -> Vec<String> {
     std::env::var("HOME")
@@ -474,6 +541,34 @@ mod tests {
         assert_eq!(class("/p/sub/.ENV.SCHEMA"), Class::Schema);
         for p in [".env.schema.bak", ".env.schema.local", ".env.local"] {
             assert_eq!(class(p), Class::Env, "{p}");
+        }
+    }
+
+    #[test]
+    fn data_dir_reach_of_directories() {
+        let homes = ["/home/u".to_string()];
+        let reach = |d: &str| data_dir_reach(d, &homes);
+        for d in [
+            "/home/u/.claude/plugins/data/safe-ai-skill-stbr",
+            "/home/u/.claude/plugins/data/safe-ai-skill-stbr/sub",
+            "/x/plugins/data/safe-ai-skill-a/",
+        ] {
+            assert_eq!(reach(d), Some(DataDirReach::Inside), "{d}");
+        }
+        for d in [
+            "/home/u/.claude/plugins/data",
+            "/home/u/.claude/plugins",
+            "/home/u/.claude",
+            "/home/u",
+            "/",
+        ] {
+            assert_eq!(reach(d), Some(DataDirReach::Above), "{d}");
+        }
+        for d in [
+            "/home/u/dev/app",
+            "/home/u/.claude/plugins/data/other-plugin",
+        ] {
+            assert_eq!(reach(d), None, "{d}");
         }
     }
 

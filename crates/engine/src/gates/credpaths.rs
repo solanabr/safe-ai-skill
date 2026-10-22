@@ -422,6 +422,9 @@ pub fn reaches_store(dir: &Path) -> bool {
     let Some(entries) = entries() else {
         return true;
     };
+    if secretpath::data_dir_reach(&dir.to_string_lossy(), &secretpath::homes_resolved()).is_some() {
+        return true;
+    }
     let text = secretpath::normalize(&dir.to_string_lossy(), None);
     let mut segs = segments(&text);
     if let Some(i) = segs.iter().position(|s| is_home_seg(s)) {
@@ -481,7 +484,42 @@ pub fn grep_root(target: &Path, real: &Path, homes: &[String]) -> Option<Verdict
     let denied = [target, real]
         .iter()
         .any(|p| secretpath::is_hard_tree(&p.to_string_lossy(), homes) || is_credential(p));
-    denied.then(|| hard_deny("search inside a credential store"))
+    if denied {
+        return Some(hard_deny("search inside a credential store"));
+    }
+    let in_data = [target, real].iter().any(|p| {
+        secretpath::data_dir_reach(&p.to_string_lossy(), homes)
+            == Some(secretpath::DataDirReach::Inside)
+    });
+    in_data.then(|| hard_deny("search inside the safe-ai-skill data dir (its state key)"))
+}
+
+/// Whether the credential lists loaded; without them a directory Grep cannot be given its
+/// exclusions and asks.
+pub fn lists_available() -> bool {
+    entries().is_some()
+}
+
+/// The exclusion globs for the state key of every data dir a Grep over `dir` reaches
+/// ([`secretpath::data_dir_reach`]): `**/safe-ai-skill-*/key`, and `$CLAUDE_PLUGIN_DATA`'s
+/// own directory name when it is another one.
+fn data_key_globs() -> Vec<String> {
+    let mut out = vec!["**/safe-ai-skill-*/key".to_string()];
+    let custom = std::env::var("CLAUDE_PLUGIN_DATA").ok().and_then(|d| {
+        Path::new(d.trim_end_matches(['/', '\\']))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    });
+    if let Some(name) = custom {
+        let plain = !name.starts_with("safe-ai-skill-")
+            && !name.is_empty()
+            && !name.contains(['*', '?', '[', ']', '{', '}', ',', '!', '\\']);
+        if plain {
+            out.push(format!("**/{name}/key"));
+        }
+    }
+    out
 }
 
 /// The exclusion globs for a directory Grep rooted at `dir`: the short 1.1.0 list plus the
@@ -504,6 +542,12 @@ pub fn grep_exclusions(dir: &Path) -> Vec<String> {
         .filter(|e| !e.exception && e.root == Root::Anywhere)
     {
         for glob in exclusion_globs(entry) {
+            push(glob, &mut globs);
+        }
+    }
+    let homes = secretpath::homes_resolved();
+    if secretpath::data_dir_reach(&dir.to_string_lossy(), &homes).is_some() {
+        for glob in data_key_globs() {
             push(glob, &mut globs);
         }
     }

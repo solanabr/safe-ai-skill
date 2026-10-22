@@ -1007,6 +1007,66 @@ fn mcp_executor_code_gets_the_bash_checks() {
 }
 
 #[test]
+fn no_search_returns_the_state_key() {
+    let w = World::new("data-key");
+    // A state file first, so the key exists.
+    let _ = w.x4("Bash", &bash("ls"));
+    assert!(w.data.join("key").exists());
+    let data = w.data.path().to_str().unwrap();
+    for input in [
+        json!({ "pattern": ".", "path": data, "glob": "key" }),
+        json!({ "pattern": ".", "path": data }),
+    ] {
+        check(&format!("Grep {input}"), w.x4("Grep", &input), DENY4);
+    }
+    check(
+        "grep -r data dir",
+        w.x4("Bash", &bash(&format!("grep -r . {data}"))),
+        DENY4,
+    );
+    // Above the data dir: the search proceeds with the key excluded.
+    let parent = w.data.path().parent().unwrap().to_str().unwrap();
+    let name = w.data.path().file_name().unwrap().to_str().unwrap();
+    let payload = json!({
+        "session_id": "it-matrix", "hook_event_name": "PreToolUse", "cwd": w.proj.path(),
+        "tool_name": "Grep", "tool_input": { "pattern": ".", "path": parent },
+    })
+    .to_string();
+    let run = w
+        .invocation(&["gate-read"], Setup::at(Tier::Relaxed), payload)
+        .run();
+    let glob = run.json()["hookSpecificOutput"]["updatedInput"]["glob"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lower: String = glob
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']'))
+        .collect::<String>()
+        .to_lowercase();
+    let own = format!("{}/key", name.to_lowercase());
+    let wants: Vec<&str> = if name.starts_with("safe-ai-skill-") {
+        vec!["safe-ai-skill-*/key"]
+    } else {
+        vec!["safe-ai-skill-*/key", &own]
+    };
+    for want in wants {
+        // Each letter is a two-case class (`[kK]`); folded back it reads `kkeeyy`.
+        let doubled: String = want
+            .chars()
+            .flat_map(|c| {
+                if c.is_ascii_alphabetic() {
+                    vec![c, c]
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        assert!(lower.contains(&doubled), "{want} not excluded: {glob}");
+    }
+}
+
+#[test]
 fn raw_env_reads_behind_wrappers_and_shell_strings_deny_at_every_tier() {
     let w = env_world("env-wrapped");
     for cmd in [
