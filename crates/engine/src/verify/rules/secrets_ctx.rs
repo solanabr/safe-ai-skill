@@ -72,11 +72,14 @@ const ENV_DUMPS: &[&str] = &[
     "print(os.environ",
     "pprint(os.environ",
     "{**os.environ",
+    "os.environ.copy(",
     "json.stringify(process.env",
     "object.entries(process.env",
     "object.keys(process.env",
     "object.values(process.env",
     "object.assign({}, process.env",
+    "{...process.env",
+    "{ ...process.env",
     "util.inspect(process.env",
     "console.log(process.env",
     "env::vars()",
@@ -417,6 +420,10 @@ mod tests {
             (Severity::Info, Ctx::Code, Some(1))
         );
         let r = scan_one("t.py", "env = os.environ.copy()\nenv[\"A\"] = \"1\"\n");
+        assert!(has(&r, "env_dump"), "{r:?}");
+        let r = scan_one("w.js", "const all = {...process.env};\n");
+        assert!(has(&r, "env_dump"), "{r:?}");
+        let r = scan_one("x.js", "const url = process.env.RPC_URL;\n");
         assert!(!has(&r, "env_dump"), "{r:?}");
         let r = scan_one("u.js", "send(JSON.stringify(process.env));\n");
         assert!(has(&r, "env_dump"), "{r:?}");

@@ -1,6 +1,6 @@
 //! Invisible and bidirectional Unicode (spec D2.4): bidi controls (Trojan Source), zero-width
-//! characters and tag characters (invisible ASCII smuggling). HIGH in code; in documentation
-//! bidi and zero-width are INFO (emoji joiners, RTL text) and tag characters WARN.
+//! characters and tag characters (invisible ASCII smuggling). WARN in code and metadata; in
+//! documentation bidi and zero-width are INFO (emoji joiners, RTL text) and tag characters WARN.
 
 use super::context::Document;
 use super::{line_no, Ctx, FileOut, Severity};

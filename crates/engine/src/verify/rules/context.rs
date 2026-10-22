@@ -395,6 +395,7 @@ impl<'a> Document<'a> {
                 None => self.fm = Frontmatter::Unterminated,
             }
         }
+        let mut unclosed = [usize::MAX; 2];
         while i < n {
             let open = fence_open(self.line(i).trim_start());
             let Some((ch, count, info)) = open else {
@@ -402,12 +403,24 @@ impl<'a> Document<'a> {
                 continue;
             };
             let lang = fence_lang(info);
-            self.roles[i] = Role::FenceMark;
             let start = i + 1;
-            let mut j = start;
-            while j < n && !fence_close(self.line(j).trim(), ch, count) {
-                self.roles[j] = Role::Fence;
-                j += 1;
+            // A fence that never closes hides nothing: its lines stay prose. Once a run of
+            // `count` finds no closer, no later run that long can (keeps this linear).
+            let slot = usize::from(ch == b'~');
+            if count >= unclosed[slot] {
+                i = start;
+                continue;
+            }
+            let Some(close) = (start..n).find(|&j| fence_close(self.line(j).trim(), ch, count))
+            else {
+                unclosed[slot] = count;
+                i = start;
+                continue;
+            };
+            let j = close;
+            self.roles[i] = Role::FenceMark;
+            for role in &mut self.roles[start..j] {
+                *role = Role::Fence;
             }
             self.units.push(Unit {
                 ctx: Ctx::Doc,
@@ -1584,10 +1597,15 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_fence_runs_to_eof_and_longer_fence_needs_longer_close() {
-        let doc = Document::new("````\n```\nstill fenced\n", FileClass::Markdown);
+    fn unclosed_fence_stays_prose_and_longer_fence_needs_longer_close() {
+        let doc = Document::new("````\n```\nstill fenced\n````\n", FileClass::Markdown);
         assert_eq!(doc.role(1), Role::Fence);
         assert_eq!(doc.role(2), Role::Fence);
+        assert_eq!(doc.units().len(), 1);
+        let open = Document::new("````\n```\nnot fenced\n", FileClass::Markdown);
+        assert_eq!(open.role(1), Role::Prose);
+        assert_eq!(open.role(2), Role::Prose);
+        assert!(open.units().is_empty());
     }
 
     #[test]

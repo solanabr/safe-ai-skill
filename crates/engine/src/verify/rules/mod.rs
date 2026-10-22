@@ -392,6 +392,8 @@ pub(crate) struct PackFacts {
     pub(crate) pyc: Vec<PathBuf>,
     /// Archive/executable bytes behind a text extension.
     pub(crate) masquerade: Vec<PathBuf>,
+    /// Load-time commands that run pack scripts.
+    pub(crate) bang_runs: Vec<bang_cmd::BangRun>,
 }
 
 /// 1-based line number of 0-based line index `i`.
@@ -453,6 +455,19 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
         }
     }
 
+    // A load-time command that runs a pack script inherits the script's network/secret access.
+    for run in std::mem::take(&mut facts.bang_runs) {
+        let reaches = run
+            .scripts
+            .iter()
+            .any(|s| facts.files.contains(s) && bang_cmd::script_reaches_out(&base.join(s), cap));
+        if !reaches {
+            continue;
+        }
+        if let Some(out) = outs.iter_mut().find(|o| o.path == run.file) {
+            out.signal(Signal::BangExfil(run.line), Ctx::Code);
+        }
+    }
     let combos = combo::evaluate(&outs, &facts);
     let findings = outs.into_iter().flat_map(|o| o.findings).collect();
     PackReport { findings, combos }
@@ -603,7 +618,7 @@ fn scan_text(
     }
     if markdown {
         context::for_each_prose_stmt(doc, |stmt| scan_stmt(stmt, doc, &mut vars, out));
-        bang_cmd::scan(doc, out);
+        bang_cmd::scan(doc, rel, out, facts);
         if name == "skill.md" {
             description::scan_frontmatter(doc, out);
             harness_config::scan_frontmatter(doc, out);

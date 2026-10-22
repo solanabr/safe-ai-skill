@@ -8,7 +8,8 @@
 //! * a combo → `High`;
 //! * a `High` finding → `High`; a documentation finding capped from a code-`High` rule also →
 //!   `High` (v1 never told docs from code — the grader is where the doc cap bites);
-//! * any other `Warn` → `Medium`; `Info` → `Low`.
+//! * any other `Warn` → `Medium`; `Info` → `Low`, except `unpinned_npx`, which v1 graded
+//!   `Medium` and keeps.
 //!
 //! Detectors ported from v1 keep their v1 kind (`install_hook`, `eval`, `base64_exec`,
 //! `unicode_obfuscation`, `broad_permissions`, and `telemetry_post` for any outbound POST); new
@@ -65,6 +66,7 @@ fn legacy_severity(f: &rules::Finding) -> Severity {
             Severity::High
         }
         rules::Severity::Warn => Severity::Medium,
+        rules::Severity::Info if f.rule == "unpinned_npx" => Severity::Medium,
         rules::Severity::Info => Severity::Low,
     }
 }
@@ -211,13 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn info_maps_to_low() {
-        let report = scan_text("setup.sh", "#!/bin/sh\nnpx -y some-mcp-server\n");
+    fn info_maps_to_low_but_unpinned_npx_stays_medium() {
+        let report = scan_text(
+            "setup.sh",
+            "#!/bin/sh\nnpx -y some-mcp-server\nchmod +x run.sh\n",
+        );
         let f = report
             .findings
             .iter()
             .find(|f| f.kind == "unpinned_npx")
             .expect("unpinned_npx");
-        assert_eq!(f.severity, Severity::Low);
+        assert_eq!(f.severity, Severity::Medium);
+        let report = scan_text("README.md", "# R\n\nhttps://example.invalid/docs\n");
+        assert!(
+            report.findings.iter().all(|f| f.severity <= Severity::Low),
+            "{:?}",
+            report.findings
+        );
     }
 }

@@ -1,10 +1,61 @@
 //! `` !`cmd` `` lines (spec D2.4): Claude Code runs them when the skill or command file loads,
 //! and no PreToolUse Bash hook fires. Outside fences they are code (HIGH); with network or
-//! secret access they feed the `bang_exfil` combo.
+//! secret access — directly, or in a pack script the command runs — they feed the `bang_exfil`
+//! combo.
 
-use super::context::{find_word, inline_spans, Document, Role};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+
+use super::context::{find_word, inline_spans, shell_tokens, unquote, Document, Role};
 use super::secrets_ctx::has_secret_path;
-use super::{line_no, Ctx, FileOut, Severity, Signal};
+use super::{line_no, Ctx, FileOut, PackFacts, Severity, Signal};
+
+/// A load-time command that runs pack files; resolved once the walk has seen every file.
+pub(crate) struct BangRun {
+    /// The Markdown file holding the command.
+    pub(crate) file: PathBuf,
+    pub(crate) line: u32,
+    /// Pack-relative candidates for the script it runs.
+    pub(crate) scripts: Vec<PathBuf>,
+}
+
+/// Interpreters whose first path argument is the script they run.
+const RUNNERS: &[&str] = &[
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "source",
+    ".",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "tsx",
+    "ts-node",
+    "python",
+    "python2",
+    "python3",
+    "uv",
+    "ruby",
+    "perl",
+    "php",
+    "pwsh",
+    "powershell",
+    "npx",
+    "bunx",
+];
+/// Subcommands skipped on the way to the script argument (`deno run x`, `npx tsx x`).
+const RUNNER_WORDS: &[&str] = &["run", "exec", "tsx", "ts-node", "node", "--"];
+/// Variables a load-time command uses to reach its own pack.
+const PACK_VARS: &[&str] = &[
+    "${claude_skill_dir}/",
+    "$claude_skill_dir/",
+    "${claude_plugin_root}/",
+    "$claude_plugin_root/",
+];
 
 /// Network tools that make a load-time command phone home.
 const NETWORK: &[&str] = &[
@@ -22,7 +73,7 @@ const SECRET_VARS: &[&str] = &[
     "seed",
 ];
 
-pub(super) fn scan(doc: &Document<'_>, out: &mut FileOut) {
+pub(super) fn scan(doc: &Document<'_>, rel: &Path, out: &mut FileOut, facts: &mut PackFacts) {
     for i in 0..doc.len() {
         if doc.role(i) != Role::Prose {
             continue;
@@ -48,9 +99,103 @@ pub(super) fn scan(doc: &Document<'_>, out: &mut FileOut) {
             out.emit("bang_cmd", Severity::High, Some(line_no(i)), Ctx::Code);
             if exfil(&doc.lower_line(i)[s..e]) {
                 out.signal(Signal::BangExfil(line_no(i)), Ctx::Code);
+                continue;
+            }
+            let dir = rel.parent().unwrap_or_else(|| Path::new(""));
+            let scripts = scripts(&line[s..e], dir);
+            if !scripts.is_empty() {
+                facts.bang_runs.push(BangRun {
+                    file: rel.to_path_buf(),
+                    line: line_no(i),
+                    scripts,
+                });
             }
         }
     }
+}
+
+/// Pack files a load-time command runs: the first path argument of an interpreter, or a command
+/// named by its path. Each is resolved from the Markdown file's directory `dir` and from the
+/// pack root (`$CLAUDE_PLUGIN_ROOT` need not be either).
+fn scripts(cmd: &str, dir: &Path) -> Vec<PathBuf> {
+    let tokens: Vec<&str> = shell_tokens(cmd)
+        .into_iter()
+        .map(|(_, t)| unquote(t))
+        .collect();
+    let mut found = Vec::new();
+    let mut runner = false;
+    for (k, tok) in tokens.iter().enumerate() {
+        let lower = tok.to_ascii_lowercase();
+        if runner {
+            if tok.starts_with('-') || RUNNER_WORDS.contains(&lower.as_str()) {
+                continue;
+            }
+            runner = false;
+            found.extend(local_paths(tok, dir));
+            continue;
+        }
+        if RUNNERS.contains(&lower.as_str()) {
+            runner = true;
+            continue;
+        }
+        let command = k == 0 || matches!(tokens[k - 1], "&&" | "||" | ";" | "|");
+        if command && tok.contains('/') {
+            found.extend(local_paths(tok, dir));
+        }
+    }
+    found
+}
+
+/// Pack-relative candidates for a path token; none for absolute, home, URL or other `$` paths.
+fn local_paths(tok: &str, dir: &Path) -> Vec<PathBuf> {
+    let lower = tok.to_ascii_lowercase();
+    let rest = PACK_VARS
+        .iter()
+        .find(|v| lower.starts_with(*v))
+        .map_or(tok, |v| &tok[v.len()..]);
+    if rest.is_empty() || rest.starts_with(['/', '~', '$']) || rest.contains("://") {
+        return Vec::new();
+    }
+    [dir.join(rest), PathBuf::from(rest)]
+        .iter()
+        .filter_map(|p| normalize(p))
+        .collect()
+}
+
+/// `p` with `.` and `..` resolved lexically; `None` when it climbs out of the pack.
+fn normalize(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Normal(name) => out.push(name),
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// True when the script at `abs` (first `cap` bytes) touches the network, a secret path, the
+/// environment or a credential variable on a line that is not a comment.
+pub(super) fn script_reaches_out(abs: &Path, cap: u64) -> bool {
+    let mut buf = Vec::new();
+    let Ok(file) = std::fs::File::open(abs) else {
+        return false;
+    };
+    if file.take(cap).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+    text.split(['\n', '\r']).any(|line| {
+        let t = line.trim_start();
+        let comment = (t.starts_with('#') && !t.starts_with("#!")) || t.starts_with("//");
+        !comment && exfil(line)
+    })
 }
 
 /// Network or secret access in a load-time command.

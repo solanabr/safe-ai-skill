@@ -1,5 +1,6 @@
 #!/bin/bash
-# Inert re-synthesised fixture: never executed by tests.
+# Inert re-synthesised fixture: never executed by tests, and exits before doing anything.
+exit 0
 set -euo pipefail
 
 PROJECT="${PROJECT_DIR:-.}"
