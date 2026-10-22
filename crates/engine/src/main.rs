@@ -23,7 +23,7 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::{creddump, envwrite, exfil, read, wallet};
+use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
 use safe_ai_skill::policy::{self, Policy};
@@ -653,11 +653,19 @@ fn cmd_gate_mcp() -> ExitCode {
     let decision = match decision {
         Decision::Ask { reason } if effective.tier() == Tier::High => Decision::Deny {
             reason: format!(
-                "{} — denied at tier high: an MCP call names no cluster, so it cannot be                  identified as localnet or devnet",
+                "{} — denied at tier high: an MCP call names no cluster, so it cannot be \
+                 identified as localnet or devnet",
                 reason.trim_end_matches(" — approve to proceed")
             ),
         },
         other => other,
+    };
+    // Code the server runs gets the Bash checks, under a hard guard (no grant lifts it).
+    let (exec, exec_meta) = mcpexec::decide(payload, &cwd, &effective);
+    let (decision, meta) = if decision_rank(&exec) > decision_rank(&decision) {
+        (exec, exec_meta)
+    } else {
+        (decision, meta)
     };
     let (decision, meta) = join_tier(tier_verdict, decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)

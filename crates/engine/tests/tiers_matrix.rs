@@ -911,6 +911,102 @@ fn a_grant_never_covers_an_mcp_transfer_whose_amount_it_cannot_read() {
 }
 
 #[test]
+fn mcp_executor_code_gets_the_bash_checks() {
+    let w = env_world("mcp-exec");
+    w.grant_everything();
+    let exec = "mcp__context-mode__ctx_execute";
+    let batch = "mcp__context-mode__ctx_batch_execute";
+    for (tool, input) in [
+        (exec, json!({ "language": "shell", "code": "cat .env" })),
+        (
+            exec,
+            json!({ "language": "shell", "code": "cat ~/.ssh/id_rsa" }),
+        ),
+        (exec, json!({ "code": "solana-keygen new --force" })),
+        (
+            exec,
+            json!({ "language": "shell", "code": "paste ~/.aws/credentials" }),
+        ),
+        (
+            exec,
+            json!({ "language": "shell", "code": "solana program deploy --final x.so -um" }),
+        ),
+        (
+            batch,
+            json!({ "commands": [{ "label": "a", "command": "cat .env" }] }),
+        ),
+        (
+            exec,
+            json!({ "language": "python", "code": "print(open(\".env\").read())" }),
+        ),
+        (
+            exec,
+            json!({ "language": "python", "code": "import os\nos.system('cat .env')" }),
+        ),
+        ("mcp__fs__read_file", json!({ "path": "my dir/.env" })),
+        (
+            "mcp__fs__read_file",
+            json!({ "path": "~/Library/Application Support/Google/Chrome/Default/Login Data" }),
+        ),
+    ] {
+        check(&format!("{tool} {input}"), w.x4(tool, &input), DENY4);
+    }
+    // Class U on devnet and a mainnet transfer: a grant of every scope lifts neither.
+    check(
+        "ctx_execute Class U -ud",
+        w.x4(
+            exec,
+            &json!({ "code": "solana program deploy --final x.so -ud" }),
+        ),
+        ASK4,
+    );
+    check(
+        "ctx_execute mainnet transfer",
+        w.x4(
+            exec,
+            &json!({ "code": format!("solana transfer {D} 0.5 -um") }),
+        ),
+        ASK_HIGH_DENY,
+    );
+    check(
+        "ctx_execute python solana",
+        w.x4(
+            exec,
+            &json!({ "language": "python", "code": "subprocess.run(['solana', 'balance'])" }),
+        ),
+        ASK_HIGH_DENY,
+    );
+    // A within-cap devnet transfer is allowed in Bash, never through an executor.
+    check(
+        "ctx_execute devnet transfer",
+        w.x4(
+            exec,
+            &json!({ "code": format!("solana transfer {D} 0.01 -ud") }),
+        ),
+        NO4,
+    );
+    for (tool, input) in [
+        (
+            exec,
+            json!({ "language": "shell", "code": "ls -la && cat .env.example" }),
+        ),
+        (
+            exec,
+            json!({ "language": "python", "code": "print('hello world')" }),
+        ),
+    ] {
+        check(&format!("{tool} {input}"), w.x4(tool, &input), NO4);
+    }
+    // Padding past the argument limit asks rather than ending the scan.
+    let padded = json!({ "a": vec!["x"; 1025], "path": "notes.txt" });
+    check(
+        "padded mcp args",
+        w.x4("mcp__fs__read_file", &padded),
+        ASK_HIGH_DENY,
+    );
+}
+
+#[test]
 fn raw_env_reads_behind_wrappers_and_shell_strings_deny_at_every_tier() {
     let w = env_world("env-wrapped");
     for cmd in [

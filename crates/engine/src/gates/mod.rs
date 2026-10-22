@@ -11,6 +11,7 @@ pub mod envread;
 pub mod envwrite;
 pub mod exfil;
 pub mod mcp;
+pub mod mcpexec;
 pub mod read;
 pub mod secretpath;
 pub mod secrets;

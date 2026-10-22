@@ -612,9 +612,8 @@ fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a st
         Value::String(s) => {
             // Multi-line text is code or prose, never a path (executor code is judged by
             // `mcpexec`); a string longer than any path is not one either.
-            let looks_like_path = !s.trim().is_empty()
-                && s.len() <= MAX_MCP_PATH_LEN
-                && !s.contains(['\n', '\r']);
+            let looks_like_path =
+                !s.trim().is_empty() && s.len() <= MAX_MCP_PATH_LEN && !s.contains(['\n', '\r']);
             if !looks_like_path {
                 return true;
             }
