@@ -141,8 +141,9 @@ pub fn skill_verdict(dir: &DataDir, cwd: &Path, policy: &Policy, skill: &str) ->
 ///   when it may provide the name, it is hashed and re-graded on the spot. Running out of
 ///   budget then denies the names that pack may provide (drift until the next sweep).
 ///
-/// A pack the stat walk itself cannot cover in time denies only the names it may provide (its
-/// directory name and recorded names), never every name. When no pack resolves the name and a
+/// A pack the stat walk itself cannot cover in time denies the names it may provide (its
+/// directory name and recorded names) and, since it may have gained a name, every name no
+/// verified pack resolves. When no pack resolves the name and a
 /// pack in scope has names that may be incomplete (an escaping link, unparseable frontmatter,
 /// a name walk out of budget), the name is denied, unless it is plugin-namespaced
 /// (`plugin:skill`), which a project pack cannot provide.
@@ -211,9 +212,10 @@ pub(super) fn skill_verdict_in(
         let Some(fingerprint) = fingerprint else {
             if recorded {
                 unverified.get_or_insert_with(|| pack.display.clone());
-            } else if stored.is_none_or(|e| e.names_incomplete || e.unscanned()) {
-                // Its names are unknown or incomplete: it may provide the name. A slower stat
-                // walk must never make the gate more permissive.
+            } else {
+                // Unwalked, it may have gained the name since it was verified (its stored
+                // names describe old content): unsure. A slower stat walk must never make the
+                // gate more permissive.
                 unsure.get_or_insert_with(|| pack.display.clone());
             }
             continue;

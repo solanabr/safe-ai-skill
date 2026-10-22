@@ -3992,6 +3992,25 @@ mod enforce_tests {
     }
 
     #[test]
+    fn a_cut_stat_walk_makes_a_clean_pack_unsure() {
+        // Monotonicity: a clean pack gains a skill name, and the gate's stat walk is cut before
+        // it sees the change. The new name resolves nowhere verified: denied, not allowed.
+        let (d, project) = fresh("cutwalk");
+        md(&skills_of(&project).join("clean"), "clean");
+        sweep_it(&d, &project);
+        assert_eq!(skill(&d, &project, "clean"), GateVerdict::NoOpinion);
+        md(&skills_of(&project).join("clean").join("sub"), "newevil");
+        assert!(is_deny(&skill_budget(
+            &d,
+            &project,
+            "newevil",
+            Duration::ZERO
+        )));
+        // With time, the walk sees it and verifies the changed pack.
+        assert!(!is_deny(&skill(&d, &project, "absent-name")));
+    }
+
+    #[test]
     fn rr5_p4_an_over_budget_pack_denies_only_names_nothing_else_resolves() {
         let (d, project) = fresh("p4");
         let many = skills_of(&project).join("many");
