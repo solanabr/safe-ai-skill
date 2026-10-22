@@ -17,7 +17,7 @@
 //! Grep is judged on `path` and `glob`, never on its regex `pattern`. A directory Grep gets an
 //! `updatedInput` that appends env/key exclusions to `glob` (no permission decision: Claude
 //! Code applies it without `allow`, research hooks-empirical-2.1.304 Q10). Glob is never gated.
-//! MCP tools get the path check on every whitespace-free string argument.
+//! MCP tools get the path check on every single-line string argument.
 
 use std::path::{Path, PathBuf};
 
@@ -53,8 +53,8 @@ const BENIGN_PROBES: &[&str] = &[
     "Cargo.toml",
 ];
 
-/// Most string arguments of one MCP call that are path-checked.
-const MAX_MCP_PATHS: usize = 64;
+/// Most string arguments of one MCP call that are path-checked; more asks.
+const MAX_MCP_PATHS: usize = 1024;
 /// Longest MCP string argument treated as a path.
 const MAX_MCP_PATH_LEN: usize = 4096;
 
@@ -568,12 +568,15 @@ fn expand_braces(glob: &str, depth: usize) -> Vec<String> {
 // MCP
 // ---------------------------------------------------------------------------------------
 
-/// Run the read check on every path-like string argument of an MCP call (spec D3.2): strings
-/// without whitespace, up to [`MAX_MCP_PATHS`] of them. The first non-`Defer` verdict wins.
+/// Run the read check on every path-like string argument of an MCP call (spec D3.2): every
+/// single-line string up to [`MAX_MCP_PATH_LEN`] bytes, spaces included. The first non-`Defer`
+/// verdict wins. A payload with more strings than [`MAX_MCP_PATHS`], or nested deeper than
+/// [`MAX_MCP_DEPTH`], cannot be checked whole: a hard-guard ask (deny at High).
 pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> Decision {
     let mut strings = Vec::new();
+    let mut complete = true;
     if let Some(value) = input {
-        collect_path_strings(value, 0, &mut strings);
+        complete = collect_path_strings(value, 0, &mut strings);
     }
     for s in strings {
         let decision = decide_path(s, cwd, policy);
@@ -581,28 +584,53 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
             return decision;
         }
     }
-    Decision::Defer
+    if complete {
+        return Decision::Defer;
+    }
+    let reason = "safe-ai-skill: this MCP call has too many or too deeply nested arguments to \
+                  check for secret paths";
+    if policy.tier() == crate::policy::tier::Tier::High {
+        Decision::Deny {
+            reason: format!("{reason} — denied at tier high"),
+        }
+    } else {
+        Decision::Ask {
+            reason: format!("{reason} — approve to proceed"),
+        }
+    }
 }
 
-fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a str>) {
-    if depth > 16 || out.len() >= MAX_MCP_PATHS {
-        return;
+/// Deepest MCP argument nesting that is path-checked.
+const MAX_MCP_DEPTH: usize = 32;
+
+/// Collect the path candidates of `value` into `out`; `false` when a limit cut the walk short.
+fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a str>) -> bool {
+    if depth > MAX_MCP_DEPTH {
+        return false;
     }
     match value {
         Value::String(s) => {
-            let looks_like_path =
-                !s.is_empty() && s.len() <= MAX_MCP_PATH_LEN && !s.chars().any(char::is_whitespace);
-            if looks_like_path {
-                out.push(s);
+            // Multi-line text is code or prose, never a path (executor code is judged by
+            // `mcpexec`); a string longer than any path is not one either.
+            let looks_like_path = !s.trim().is_empty()
+                && s.len() <= MAX_MCP_PATH_LEN
+                && !s.contains(['\n', '\r']);
+            if !looks_like_path {
+                return true;
             }
+            if out.len() >= MAX_MCP_PATHS {
+                return false;
+            }
+            out.push(s);
+            true
         }
         Value::Array(items) => items
             .iter()
-            .for_each(|v| collect_path_strings(v, depth + 1, out)),
+            .all(|v| collect_path_strings(v, depth + 1, out)),
         Value::Object(map) => map
             .values()
-            .for_each(|v| collect_path_strings(v, depth + 1, out)),
-        _ => {}
+            .all(|v| collect_path_strings(v, depth + 1, out)),
+        _ => true,
     }
 }
 
@@ -816,8 +844,57 @@ mod tests {
             "nested": {"list": ["a.txt", "b c"]},
         });
         let mut out = Vec::new();
-        collect_path_strings(&v, 0, &mut out);
+        assert!(collect_path_strings(&v, 0, &mut out));
         out.sort_unstable();
-        assert_eq!(out, vec![".env", "a.txt"]);
+        assert_eq!(out, vec![".env", "a.txt", "b c", "cat .env | head"]);
+    }
+
+    #[test]
+    fn mcp_paths_with_spaces_are_checked() {
+        let v = serde_json::json!({ "path": "my dir/.env" });
+        assert!(matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_args_past_the_limits_ask() {
+        let mut padded = serde_json::Map::new();
+        padded.insert(
+            "a".into(),
+            Value::Array(vec![Value::String("x".into()); MAX_MCP_PATHS + 1]),
+        );
+        padded.insert("z".into(), Value::String("notes.txt".into()));
+        let v = Value::Object(padded);
+        assert!(matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Ask { .. }
+        ));
+        // A secret path inside the checked part still denies.
+        let v = serde_json::json!({ "a": vec!["x"; MAX_MCP_PATHS + 1], "b": ".env" });
+        let first = serde_json::json!({ "0": ".env", "a": vec!["x"; MAX_MCP_PATHS + 1] });
+        assert!(matches!(
+            decide_mcp_args(Some(&first), &here(), &policy()),
+            Decision::Deny { .. }
+        ));
+        assert!(!matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Defer
+        ));
+        let mut deep = serde_json::json!(".env");
+        for _ in 0..=MAX_MCP_DEPTH + 1 {
+            deep = serde_json::json!([deep]);
+        }
+        assert!(matches!(
+            decide_mcp_args(Some(&deep), &here(), &policy()),
+            Decision::Ask { .. }
+        ));
+        let mut high = Policy::default();
+        high.runtime.tier = crate::policy::tier::Tier::High;
+        assert!(matches!(
+            decide_mcp_args(Some(&deep), &here(), &high),
+            Decision::Deny { .. }
+        ));
     }
 }
