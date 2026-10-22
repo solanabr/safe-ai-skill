@@ -221,6 +221,27 @@ fn bash_mutating_subcommands_deny() {
 }
 
 #[test]
+fn bash_install_and_hook_only_verify_deny() {
+    // `install` re-pins drifted packs and bare `verify` / `verify session` TOFU-pin packs never
+    // seen before: hook-only or user-terminal, never agent-run.
+    let sb = Sandbox::new("tw-pin");
+    for cmd in [
+        "safe-ai-skill install",
+        "safe-ai-skill install --yes",
+        "safe-ai-skill install --from ./packs",
+        "npx @stbr/safe-ai-skill install --from /tmp/p.tgz --home /tmp/h",
+        "safe-ai-skill verify",
+        "safe-ai-skill verify session",
+        "safe-ai-skill verify $(echo session)",
+        "echo hi && safe-ai-skill verify; ls",
+        "$(which safe-ai-skill) verify session",
+        "bash -c 'safe-ai-skill install'",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+}
+
+#[test]
 fn bash_env_subcommand_has_no_opinion() {
     // Placeholder for WS-C: the `env` subcommand is the sanctioned way to touch `.env`.
     let sb = Sandbox::new("tw-env");

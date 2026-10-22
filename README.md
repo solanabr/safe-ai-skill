@@ -155,7 +155,7 @@ safe-ai-skill revoke                 # cancel grants early
 safe-ai-skill session                # show session keypair state
 ```
 
-`allow`, `revoke`, `mode <profile>` and `verify approve` change what the firewall permits, so the agent can't run them: the tamper tripwire denies them. Run them in your own terminal.
+`allow`, `revoke`, `mode <profile>`, `verify approve` and `install` change what the firewall permits or pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 

@@ -4,7 +4,8 @@
 //!
 //! - **Bash** (checked first by [`crate::gates::secrets`], which runs on every Bash call): a
 //!   command that runs the `safe-ai-skill` binary with a mutating subcommand (`allow`, `grant`,
-//!   `revoke`, `confirm`, `mode <profile>`, `verify approve|trust`), including a binary computed
+//!   `revoke`, `confirm`, `mode <profile>`, `verify approve|trust`, `install`, and the hook-only
+//!   bare `verify` / `verify session`, which pin packs), including a binary computed
 //!   by `$(which safe-ai-skill)`, or that references protected state.
 //! - **Write|Edit|MultiEdit|NotebookEdit** (the `gate-tamper` hook): a write whose target is
 //!   protected state, checked as given and with symlinks resolved.
@@ -1180,6 +1181,8 @@ fn mutating_invocation(rest: &[Tok]) -> Option<String> {
         return Some(sub);
     }
     match sub.as_str() {
+        // `install` pins packs (and re-pins drifted ones), with or without `--from`.
+        "install" => Some(sub),
         // A bare `mode` only prints the active profile.
         "mode" => args.next().map(|profile| {
             if computed(&profile) {
@@ -1188,10 +1191,16 @@ fn mutating_invocation(rest: &[Tok]) -> Option<String> {
                 format!("mode {profile}")
             }
         }),
-        "verify" => args
-            .next()
-            .filter(|a| matches!(a.as_str(), "approve" | "trust"))
-            .map(|a| format!("verify {a}")),
+        // Bare `verify` is `verify session`, which pins packs it has never seen (TOFU).
+        // `verify check <dir>` only scans and writes nothing.
+        "verify" => match args.next() {
+            None => Some("verify".to_string()),
+            Some(a) if computed(&a) => Some("verify <action computed at runtime>".to_string()),
+            Some(a) if matches!(a.as_str(), "session" | "approve" | "trust") => {
+                Some(format!("verify {a}"))
+            }
+            Some(_) => None,
+        },
         _ => None,
     }
 }
@@ -1522,6 +1531,14 @@ fn resolve_existing(path: &Path) -> Option<PathBuf> {
 }
 
 fn subcommand_reason(sub: &str) -> String {
+    if sub == "verify" || sub == "verify session" {
+        return format!(
+            "safe-ai-skill tamper tripwire: `safe-ai-skill {sub}` pins skill packs it has not \
+             seen before, so it runs only from safe-ai-skill's own SessionStart hook or the \
+             user's terminal. Do not retry or work around this check; use `safe-ai-skill verify \
+             check <dir>` to scan a pack without pinning it."
+        );
+    }
     format!(
         "safe-ai-skill tamper tripwire: `safe-ai-skill {sub}` changes what safe-ai-skill permits, \
          so only the user may run it. Do not retry or work around this check; ask the user to \
@@ -1632,7 +1649,6 @@ mod tests {
             "safe-ai-skill env keys .env",
             "safe-ai-skill env set .env MODE",
             "safe-ai-skill env unset .env ALLOW",
-            "safe-ai-skill verify",
             "safe-ai-skill verify check ./skills/x",
             "safe-ai-skill --version",
             "safe-ai-skill mode",
