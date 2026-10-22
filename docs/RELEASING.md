@@ -124,7 +124,7 @@ PR, so CI lints, tests and builds the musl targets with the new compiler before 
 ## The shim's sha256 pins
 
 The shim (`plugins/safe-ai-skill/bin/safe-ai-skill`) carries a `sha256_<platform>=` constant per
-prebuilt and refuses to run a binary that doesn't match it (spec D6.1): `gate-bash` and `gate-mcp`
+prebuilt and refuses to run a binary that doesn't match it: `gate-bash` and `gate-mcp`
 block, the other PreToolUse gates ask, SessionStart reports the firewall TAMPERED. An empty
 constant means the release ships no binary for that platform. The vendor job stamps the constants;
 CI (`verify-plugin-bin`) and publish run `sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin`.

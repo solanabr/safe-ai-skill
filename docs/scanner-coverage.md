@@ -3,7 +3,7 @@
 safe-ai-skill scans skill packs with a native rule engine (`crates/engine/src/verify/rules/`).
 It has no network access, runs no processes and has no LLM. This page maps the engine against the
 pack-review checklist in solanabr/ai-kit's `docs/skill-packs.md`, and lists what stays a manual
-review step. Decision record: design spec D2.4–D2.5, D2.10 and D7.1.
+review step.
 
 ## How a pack is graded
 
@@ -68,9 +68,9 @@ string around a placeholder, stays WARN.
 | `harness_bypass` | A shipped `.claude/settings*.json` contains `bypassPermissions`, a `defaultMode` key or `dangerously*`, compared after JSON decoding (`\u0064efaultMode` counts). |
 | `registry_hijack` | Code writes package-manager registry config (`.npmrc`, `.yarnrc`, `pip.conf`, `npm config set registry`, git `insteadOf` …) and names a registry host other than npmjs, yarnpkg, PyPI, crates.io or rubygems in the same file. A git `insteadOf` that only adds credentials to the same host is not a hijack. |
 
-## Description URLs: a deliberate deviation from D2.4
+## Description URLs: a deliberate deviation from the original design
 
-D2.4 blocks a description URL only when a fetch verb comes before it. The scanner is stricter,
+The original design blocked a description URL only when a fetch verb comes before it. The scanner is stricter,
 because the description is injected into every session: an instruction there to fetch, send to or
 obey a URL acts before any task does.
 
@@ -104,7 +104,7 @@ The checklist from ai-kit's `docs/skill-packs.md` ("Non-official pack provenance
 | Invisible and bidirectional Unicode | `unicode_bidi`, `unicode_invisible` WARN / INFO; `unicode_tag` WARN. Emoji joiners, script joiners and a leading BOM are ignored. | Trojan Source review of flagged lines |
 | Symlinks (target, and whether it leaves the pack) | `symlink` INFO; combo `symlink_escape`. Links are never followed. | — |
 | Executables (`find -perm -u+x`, naming each) | `executable` INFO for each file with an exec bit; shebang and exec-bit files are scanned as code | **What each executable does** |
-| Every blob in full history | Not at SessionStart | **Manual**, or the hardened git reader planned for `verify add` (spec D7.3) |
+| Every blob in full history | Not at SessionStart | **Manual**, or the hardened git reader planned for `verify add` |
 | `hooks.json` | `harness_hooks` WARN (`hooks/`, `.claude-plugin/`, `.codex-plugin/`) | — |
 | `.claude/settings.json` | `harness_settings` WARN; combo `harness_bypass` | — |
 | `.mcp.json` | `mcp_config` INFO; `unpinned_npx` INFO for `@latest` / unpinned runners | Each connector's scope |
@@ -129,9 +129,9 @@ Beyond the checklist, the engine also covers:
 * **Unscanned tails:** `oversize_file`, HIGH for code past the 16 MiB scan cap.
 
 Lockfiles (by exact name, see [What is read](#what-is-read)) without an exec bit or shebang are
-dependency data. They are inventoried at `verify add|check` (spec D7.2), not text-scanned.
+dependency data. They are inventoried at `verify add|check`, not text-scanned.
 `build.rs`, proc-macro crates, `.cargo/config.toml`, `binding.gyp` and npm `hasInstallScript` are
-build-time execution, reported at `verify add|check` (D7.2), not at SessionStart.
+build-time execution, reported at `verify add|check`, not at SessionStart.
 
 ## Scan budget
 
@@ -184,7 +184,7 @@ release builds and 256 KiB in debug builds. Each must return within the pack bud
 slack (reading and splitting a 16 MiB file is not interruptible). A pack that was cut must grade
 HIGH or worse.
 
-## External scanners (spec D7.1)
+## External scanners
 
 | | safe-ai-skill | SkillSpector | Sentry skill-scanner | Cisco skill-scanner |
 |---|---|---|---|---|
@@ -209,7 +209,7 @@ rule ideas were reimplemented here; no rule lists were copied.
   Google's `exec(base64.b64decode('{encoded_script}'))` (built as a string) is **WARN**. Fixtures
   are inert: payloads decode to a `console.log`, and hosts are `example.invalid`.
 * **Evasions** (always run, `tests/rules_evasion.rs`): 47 tests covering every probe of the two
-  WS-D2 reviews, each with the verdict it must have. They cover:
+  adversarial reviews of the scanner, each with the verdict it must have. They cover:
   * interpolations, including frames, f-strings and depth carried across lines;
   * regex literals and division, line terminators, shell quoting;
   * NUL bytes, BOMs, plausible and forged UTF-16/32;
@@ -271,5 +271,5 @@ rule ideas were reimplemented here; no rule lists were copied.
   command files.
 * **Unknown endpoint variables.** An unresolved variable named like an endpoint (`$RPC_URL`) is
   treated as user-configured.
-* **History.** Full-history and docs-only-commit checks (D7.3) are not implemented at
+* **History.** Full-history and docs-only-commit checks are not implemented at
   SessionStart.
