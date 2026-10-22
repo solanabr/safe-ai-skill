@@ -58,14 +58,6 @@ pub struct HookInput {
 }
 
 impl HookInput {
-    /// Read and parse the stdin payload, bounded at [`MAX_STDIN_BYTES`].
-    ///
-    /// Any read or parse failure, or an oversized payload, yields [`HookInput::default`] so
-    /// a hook never crashes on malformed input.
-    pub fn from_stdin() -> Self {
-        read_payload(std::io::stdin()).1.unwrap_or_default()
-    }
-
     /// Parse from a string slice; malformed / empty input → [`HookInput::default`].
     pub fn parse(raw: &str) -> Self {
         serde_json::from_str(raw).unwrap_or_default()

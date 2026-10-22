@@ -143,7 +143,7 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
 - **PreToolUse**:
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny"[,"permissionDecisionReason":"…"]}}`
   (reason key omitted for `allow`); `Defer` → no output.
-- **PostToolUse redact**: no output (no change) or `{"updatedToolOutput":"…"}` /
+- **PostToolUse redact** (intended shape; not active in 1.0.1, see `redact` above): no output (no change) or `{"updatedToolOutput":"…"}` /
   `{"updatedMCPToolOutput":"…"}` (mcp tools).
 - **UserPromptSubmit**: no output (allow) or `{"decision":"block","reason":"…"}`.
 - **SessionStart** (`verify::SessionResult::hook_output`, report-only): no output when there is
@@ -200,7 +200,6 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 impl HookInput {
-    pub fn from_stdin() -> Self;                 // bounded; unreadable → default
     pub fn parse(raw: &str) -> Self;
     pub fn bash_command(&self) -> Option<&str>;
     pub fn read_path(&self) -> Option<&str>;
@@ -401,18 +400,26 @@ pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &
 > (`Write|Edit|MultiEdit|NotebookEdit`) runs `decide_file`, audits as `tamper`, and skips
 > `relax::apply`.
 
-### `redact` / `promptguard` (STUBS)
+### `redact` / `promptguard`
 ```rust
 pub fn redact::scrub(text: &str) -> Option<String>;       // None
 pub fn promptguard::check(prompt: &str) -> Option<String>; // None
 ```
 
-### `spend` / `rugcheck` (STUBS)
+`redact::scrub` is implemented, but the PostToolUse hook is inert in 1.0.1 (fixed in 1.1.0): `cmd_redact`
+reads `tool_output` while Claude Code sends `tool_response`, the emitted JSON lacks the
+`hookSpecificOutput.updatedToolOutput` envelope, and the `hooks.json` matcher (`Bash|Read|Grep`) excludes MCP
+tools. No output is redacted.
+
+### `spend` / `rugcheck`
 ```rust
 pub struct spend::SpendLedger { pub day: u64, pub total_sol: f64 }
 pub fn spend::record_and_check(plugin_data: &Path, sol_amount: f64, policy: &Policy) -> Decision;  // Defer
 pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;                              // Defer
 ```
+
+`rugcheck::check_mint` (trusted mints, score threshold) is implemented but has no callers in 1.0.1: `gate-mcp`
+records the mint, and swap tool calls get `ask`. `swap.rugcheck*` and `swap.trusted_mints` have no effect yet.
 
 ### Relaxation (D4)
 ```rust
@@ -516,12 +523,14 @@ entry against `policy.catalog.high_risk_classes` (id match or case-insensitive k
 against safety/description/tags) and returns the matching class `kind`. `risk_class` is `None`
 until classified. Round-2 Agent A fills the three stub bodies + tests.
 
-### `squads` / `session` (STUBS)
+### `squads` / `session`
 ```rust
 pub fn squads::upgrade_authority_advisory(program: &str, ctx: &Context) -> Option<String>;  // None
 pub fn session::init(cap_sol: f64, dir: &DataDir) -> error::Result<String>;
 pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ```
+
+`squads::upgrade_authority_advisory` has no callers in 1.0.1; no Squads routing happens.
 
 ---
 

@@ -46,8 +46,9 @@
 //! hook past its timeout and fail open.
 //!
 //! This is a tripwire against a careless or prompt-injected model, **not a sandbox**: any
-//! same-UID process can rewrite user-space state, the Claude Code sandbox is the hard boundary,
-//! and authenticated state (D4.2) is the real control. Known ways past it:
+//! same-UID process can rewrite user-space state, and the Claude Code sandbox is the hard
+//! boundary. In 1.0.1 the state files are not authenticated, so the tripwire is best effort.
+//! Known ways past it:
 //! - encoded or generated text: base64, `printf '\x61llow'`, `eval` of a built string;
 //! - variable indirection: `B=safe-ai-skill; $B allow`, `"$BIN" allow`;
 //! - arguments fed on stdin: `echo allow | xargs safe-ai-skill`;

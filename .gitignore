@@ -38,3 +38,9 @@ desktop.ini
 .idea/
 .vscode/
 *.code-workspace
+
+# ── Local agent / planning artifacts ─────────────────────────────────────────
+docs/superpowers/
+.superpowers/
+.worktrees/
+.memsearch/
