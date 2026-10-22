@@ -648,6 +648,17 @@ fn cmd_gate_mcp() -> ExitCode {
     let ctx = Context::build("", &cwd);
     let tier_verdict = exfil::decide_mcp(&tool, payload, &cwd, &effective, effective.tier());
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
+    // An MCP call names no cluster: a value-moving or wallet ask is a counterparty action on
+    // an unidentified cluster, which tier High denies (as for the Bash family).
+    let decision = match decision {
+        Decision::Ask { reason } if effective.tier() == Tier::High => Decision::Deny {
+            reason: format!(
+                "{} — denied at tier high: an MCP call names no cluster, so it cannot be                  identified as localnet or devnet",
+                reason.trim_end_matches(" — approve to proceed")
+            ),
+        },
+        other => other,
+    };
     let (decision, meta) = join_tier(tier_verdict, decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
