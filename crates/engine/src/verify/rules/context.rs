@@ -1248,8 +1248,7 @@ pub(crate) fn is_ident(b: u8) -> bool {
 pub(crate) fn find_word_from(hay: &str, word: &str, from: usize) -> Option<usize> {
     let hb = hay.as_bytes();
     let mut i = from;
-    while let Some(p) = hay.get(i..).and_then(|rest| rest.find(word)) {
-        let s = i + p;
+    while let Some(s) = find_from(hay, word, i) {
         let e = s + word.len();
         let left = s == 0 || !is_ident(hb[s - 1]);
         let right = e >= hb.len() || !is_ident(hb[e]);
@@ -1271,8 +1270,7 @@ pub(crate) fn find_word(hay: &str, word: &str) -> Option<usize> {
 pub(crate) fn find_call(hay: &str, name: &str, member: bool) -> Option<usize> {
     let hb = hay.as_bytes();
     let mut i = 0;
-    while let Some(p) = hay.get(i..).and_then(|rest| rest.find(name)) {
-        let s = i + p;
+    while let Some(s) = find_from(hay, name, i) {
         let e = s + name.len();
         let left = s == 0 || {
             let prev = hb[s - 1];
@@ -1387,7 +1385,26 @@ pub(crate) fn floor_char_boundary(s: &str, i: usize) -> usize {
 
 /// First offset of any of `needles` in `hay`.
 pub(crate) fn find_any(hay: &str, needles: &[&str]) -> Option<usize> {
-    needles.iter().filter_map(|n| hay.find(n)).min()
+    needles.iter().filter_map(|n| find_from(hay, n, 0)).min()
+}
+
+/// Haystacks up to this long are searched with a plain byte loop: building a Two-Way searcher
+/// per needle cost more than the search itself on the millions of tiny commands of a dense file.
+const SHORT_HAY: usize = 512;
+
+/// Byte offset of the first `needle` in `hay` at or after `from`. Needles start with an ASCII
+/// byte, so the offset is a char boundary.
+pub(crate) fn find_from(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes().get(from..)?;
+    if h.len() > SHORT_HAY {
+        return hay.get(from..)?.find(needle).map(|p| p + from);
+    }
+    let n = needle.as_bytes();
+    let (&first, rest) = n.split_first()?;
+    let last = h.len().checked_sub(n.len())?;
+    (0..=last)
+        .find(|&k| h[k] == first && &h[k + 1..k + n.len()] == rest)
+        .map(|k| k + from)
 }
 
 /// Shell-style tokens (unquoted whitespace splits; quotes kept in the token) with offsets.
