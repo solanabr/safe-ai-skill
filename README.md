@@ -126,6 +126,7 @@ If the engine can't run on a platform (no prebuilt binary, wrong executable form
 - A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
 - A Solana command wrapped in another command or prefixed with environment assignments may not be gated. Keep the sandbox on.
 - There is no SessionStart notice yet for Claude Code older than 2.1.295.
+- Deleting a parent of the plugin data directory (for example `~/.claude/plugins/data`) resets the daily spend ledger, along with grants and pins. The tripwire doesn't cover removing an ancestor. 1.1.0 fixes this with authenticated state.
 
 **Runtime threats** — agentic workflows drive CLI commands and value-moving MCP calls with no gating. Interactive `read -r` prompts silently fail in hook context (no TTY). safe-ai-skill intercepts every such action before execution.
 

@@ -29,6 +29,7 @@ Security hotfix for #5–#13. Several defaults change; each change is listed bel
 - A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
 - A Solana command wrapped in another command or prefixed with environment assignments may not be gated. Keep the sandbox on.
 - There is no SessionStart notice yet for Claude Code older than 2.1.295.
+- Deleting a parent of the plugin data directory (for example `~/.claude/plugins/data`) resets the daily spend ledger, along with grants and pins. The tripwire doesn't cover removing an ancestor. 1.1.0 fixes this with authenticated state.
 
 ### Documentation
 
