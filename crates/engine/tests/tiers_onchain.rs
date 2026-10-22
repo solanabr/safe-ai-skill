@@ -553,8 +553,8 @@ impl World {
     }
 
     fn bash_env(&self, command: &str, tier: Tier, extra: &[(&str, &str)]) -> String {
-        // `gate-bash` first: a data dir holding an audit log but no spend ledger counts
-        // today's budget as spent (spend.rs), and `gate-bash-secrets` writes the audit log.
+        // Either order works: an audit log written before any state file no longer counts
+        // today's budget as spent (spend.rs; pinned in tiers_matrix.rs).
         let labels = [
             decision_label(&self.run("gate-bash", command, tier, extra)),
             decision_label(&self.run("gate-bash-secrets", command, tier, extra)),

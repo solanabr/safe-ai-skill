@@ -17,7 +17,7 @@
 //! read the index first, so a concurrent store never makes a reader see an old file with a
 //! new index.
 //!
-//! The first store that creates the key also starts the spend ledger
+//! The first store that creates the key also starts the spend ledger at zero
 //! ([`crate::spend::on_key_created`]): a ledger missing once the key exists means deleted.
 //!
 //! This is tamper-evident, not tamper-proof: anything that can read the key can forge a
@@ -157,6 +157,22 @@ fn read_envelope(dir: &Path, name: &str) -> Envelope {
 /// that generation in [`GEN_INDEX`]: a 0600 temp file in the same dir, fsync, rename. Creates
 /// the data dir and the key when missing (and then starts the spend ledger).
 pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), EngineError> {
+    store_inner(dir, name, v, false).map(|_| ())
+}
+
+/// [`store`] only when `${dir}/{name}` does not exist yet, checked under [`STATE_LOCK`], so
+/// two processes creating the same file never overwrite each other's later write. Returns
+/// whether this call wrote it.
+pub fn store_new<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<bool, EngineError> {
+    store_inner(dir, name, v, true)
+}
+
+fn store_inner<T: Serialize>(
+    dir: &DataDir,
+    name: &str,
+    v: &T,
+    only_if_missing: bool,
+) -> Result<bool, EngineError> {
     if dir.is_unresolved() {
         return Err(Error::Other(
             "the plugin data dir is unresolved; nothing is stored".to_string(),
@@ -179,6 +195,9 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
     }
 
     let _lock = FileLock::acquire(&dir.path, STATE_LOCK)?;
+    if only_if_missing && std::fs::symlink_metadata(dir.path.join(name)).is_ok() {
+        return Ok(false);
+    }
     let mut index = match read_envelope(&dir.path, GEN_INDEX) {
         Envelope::Good {
             body: Value::Object(map),
@@ -198,7 +217,8 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
     let gen = floor.max(on_disk).saturating_add(1);
     write_envelope(&dir.path, &key, name, gen, &body)?;
     index.insert(name.to_string(), Value::from(gen));
-    write_envelope(&dir.path, &key, GEN_INDEX, 0, &Value::Object(index))
+    write_envelope(&dir.path, &key, GEN_INDEX, 0, &Value::Object(index))?;
+    Ok(true)
 }
 
 /// Serialize and atomically write one envelope.

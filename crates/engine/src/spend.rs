@@ -13,12 +13,16 @@
 //!   spend.
 //!
 //! `spend.json` is a [`crate::statefile`] envelope. A ledger that fails authentication, or
-//! one missing once the state key or the audit log exists (it was deleted, or this is a 1.0
-//! upgrade), means **today's budget is exhausted**: [`SpendLedger::load`] replaces it with an
-//! exhausted ledger dated today, so the next UTC day starts fresh. Only a brand-new install
-//! (no key, no audit log) starts at zero. [`on_key_created`] applies the same rule when any
-//! other state file creates the key first, so the ledger always exists once the key does. The
-//! data dir's trust does not matter here: a ledger can only tighten.
+//! one missing once the state key exists (it was deleted), means **today's budget is
+//! exhausted**: [`SpendLedger::load`] replaces it with an exhausted ledger dated today, so the
+//! next UTC day starts fresh. With no state key there was never an authenticated ledger, so a
+//! missing one is zero spent and is created then, only if still absent
+//! ([`statefile::store_new`]). The audit log does not count: hooks write it before any state
+//! file exists, and counting it exhausted the budget of every fresh install whose first hook
+//! was not a within-cap transfer. A 1.0 ledger is migrated to an exhausted one
+//! ([`store_exhausted`]). [`on_key_created`] starts the ledger at zero when any other state
+//! file creates the key first, so the ledger always exists once the key does. The data dir's
+//! trust does not matter here: a ledger can only tighten.
 //!
 //! All arithmetic is guarded against `NaN`, negative, and non-finite inputs, and the
 //! running total is accumulated with saturating semantics so a corrupt or adversarial
@@ -51,9 +55,9 @@ pub const EXHAUSTED_SOL: f64 = f64::MAX;
 pub enum LedgerState {
     /// An authenticated ledger.
     Valid,
-    /// No ledger, no state key, no audit log: a brand-new install.
+    /// No ledger and no state key: no authenticated ledger ever existed (a new install).
     Fresh,
-    /// No ledger although the state key or the audit log exists: deleted, or a 1.0 upgrade.
+    /// No ledger although the state key exists: deleted.
     Deleted,
     /// The ledger failed authentication.
     Tampered,
@@ -85,8 +89,17 @@ impl SpendLedger {
                     day: today,
                     total_sol: 0.0,
                 };
-                let _ = fresh.save(plugin_data);
-                fresh
+                match statefile::store_new(&dir, SPEND_FILE, &fresh) {
+                    // Another process created it first: use what it stored.
+                    Ok(false) => match read_ledger(&dir) {
+                        (LedgerState::Valid, Some(l)) => l,
+                        _ => SpendLedger {
+                            day: today,
+                            total_sol: EXHAUSTED_SOL,
+                        },
+                    },
+                    Ok(true) | Err(_) => fresh,
+                }
             }
             (LedgerState::Deleted | LedgerState::Tampered, _) => {
                 let exhausted = SpendLedger {
@@ -295,7 +308,7 @@ fn read_ledger(dir: &DataDir) -> (LedgerState, Option<SpendLedger>) {
         Loaded::Missing if dir.is_unresolved() => (LedgerState::Tampered, None),
         Loaded::Missing => {
             let key = dir.path.join(statefile::KEY_FILE);
-            if std::fs::symlink_metadata(key).is_ok() || has_audit_log(&dir.path) {
+            if std::fs::symlink_metadata(key).is_ok() {
                 (LedgerState::Deleted, None)
             } else {
                 (LedgerState::Fresh, None)
@@ -304,14 +317,9 @@ fn read_ledger(dir: &DataDir) -> (LedgerState, Option<SpendLedger>) {
     }
 }
 
-/// Whether the data dir has an audit log (any version wrote it).
-fn has_audit_log(plugin_data: &Path) -> bool {
-    std::fs::symlink_metadata(plugin_data.join("audit.jsonl")).is_ok()
-}
-
 /// Called by [`statefile::store`] when storing `name` just created the state key: start the
-/// ledger now, fresh on a brand-new install (no audit log), exhausted for today otherwise, so
-/// a ledger missing later always means deleted.
+/// ledger now at zero (no key means no authenticated ledger ever existed), so a ledger missing
+/// later always means deleted.
 pub fn on_key_created(dir: &DataDir, name: &str) {
     if name == SPEND_FILE
         || !matches!(
@@ -321,16 +329,11 @@ pub fn on_key_created(dir: &DataDir, name: &str) {
     {
         return;
     }
-    let total_sol = if has_audit_log(&dir.path) {
-        EXHAUSTED_SOL
-    } else {
-        0.0
-    };
     let ledger = SpendLedger {
         day: current_epoch_day(),
-        total_sol,
+        total_sol: 0.0,
     };
-    let _ = statefile::store(dir, SPEND_FILE, &ledger);
+    let _ = statefile::store_new(dir, SPEND_FILE, &ledger);
 }
 
 /// Store an exhausted ledger dated today (used for a 1.0 ledger at migration).
@@ -542,6 +545,52 @@ mod tests {
         assert!(!ledger.is_exhausted());
         // It was stored (and the key created), so a later deletion is detectable.
         assert_eq!(ledger_state(&dir), LedgerState::Valid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_audit_log_without_a_state_key_is_still_a_fresh_install() {
+        // Hooks write the audit log before any state file: that must not spend the budget.
+        let dir = temp_dir("audit_first");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("audit.jsonl"), "{}\n").unwrap();
+        assert_eq!(ledger_state(&dir), LedgerState::Fresh);
+        let policy = policy_with_caps(1.0, 10.0, 5.0);
+        assert_eq!(record_and_check(&dir, 0.5, &policy), Decision::Allow);
+        let ledger = SpendLedger::load(&dir);
+        assert!(!ledger.is_exhausted());
+        assert_eq!(ledger.total_sol, 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn another_state_file_creating_the_key_starts_the_ledger_at_zero() {
+        let dir = temp_dir("key_first");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("audit.jsonl"), "{}\n").unwrap();
+        statefile::store(&state_dir(&dir), "grants.json", &serde_json::json!({})).unwrap();
+        assert_eq!(ledger_state(&dir), LedgerState::Valid);
+        assert_eq!(SpendLedger::load(&dir).total_sol, 0.0);
+        // Once the key exists, a missing ledger is a deleted one.
+        std::fs::remove_file(dir.join(SPEND_FILE)).unwrap();
+        assert_eq!(ledger_state(&dir), LedgerState::Deleted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creating_a_fresh_ledger_never_overwrites_one_stored_meanwhile() {
+        let dir = temp_dir("store_new");
+        let spent = SpendLedger {
+            day: current_epoch_day(),
+            total_sol: 3.0,
+        };
+        assert!(statefile::store_new(&state_dir(&dir), SPEND_FILE, &spent).unwrap());
+        let zero = SpendLedger {
+            day: current_epoch_day(),
+            total_sol: 0.0,
+        };
+        assert!(!statefile::store_new(&state_dir(&dir), SPEND_FILE, &zero).unwrap());
+        assert_eq!(SpendLedger::load(&dir).total_sol, 3.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
