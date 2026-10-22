@@ -106,19 +106,15 @@ fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The names a `Skill` / slash invocation may refer to: `x`, and `y` for a namespaced `x:y`.
+/// The names a `Skill` / slash invocation may refer to. A plugin-namespaced `plugin:skill` is a
+/// plugin's skill, which no project or user pack provides, so it is never matched by its local
+/// part.
 fn skill_candidates(skill: &str) -> Vec<String> {
     let name = skill.trim().trim_start_matches('/');
     if name.is_empty() {
         return Vec::new();
     }
-    let mut out = vec![name.to_string()];
-    if let Some((_, local)) = name.rsplit_once(':') {
-        if !local.is_empty() {
-            out.push(local.to_string());
-        }
-    }
-    out
+    vec![name.to_string()]
 }
 
 /// PreToolUse `Skill` / slash enforcement: deny when any pack providing `skill` is blocked
@@ -215,12 +211,16 @@ pub(super) fn skill_verdict_in(
         let Some(fingerprint) = fingerprint else {
             if recorded {
                 unverified.get_or_insert_with(|| pack.display.clone());
+            } else if stored.is_none_or(|e| e.names_incomplete || e.unscanned()) {
+                // Its names are unknown or incomplete: it may provide the name. A slower stat
+                // walk must never make the gate more permissive.
+                unsure.get_or_insert_with(|| pack.display.clone());
             }
             continue;
         };
         let same = stored.filter(|e| !e.fingerprint.is_empty() && e.fingerprint == fingerprint);
-        // Unchanged since it was verified: the stored verdict stands (trusted data dir).
-        if let Some(e) = same.filter(|_| dir.trusted) {
+        // Unchanged since it was verified: the stored verdict stands (trusted data dir, unix).
+        if let Some(e) = same.filter(|_| dir.trusted && state::FINGERPRINT_TRUSTED) {
             if let Some(name) = e.escaping.iter().find(|n| is_wanted(n)) {
                 return escaping_denial(skill, name, &pack.display);
             }
@@ -231,8 +231,20 @@ pub(super) fn skill_verdict_in(
                 continue;
             }
             seen.push(key.clone());
+            // A packs.lock committed since the content was scanned can only tighten.
+            let lock_mismatch = env
+                .lock_pins
+                .get(&key)
+                .is_some_and(|pin| *pin != e.last_scanned_hash);
             if e.state == PackStatus::Blocked {
                 blocked.get_or_insert_with(|| (pack.display.clone(), why_label(e.reason)));
+            } else if lock_mismatch {
+                blocked.get_or_insert_with(|| {
+                    (
+                        pack.display.clone(),
+                        why_label(Some(state::Reason::LockMismatch)),
+                    )
+                });
             } else if e.unscanned() {
                 unverified.get_or_insert_with(|| pack.display.clone());
             }
@@ -278,6 +290,7 @@ pub(super) fn skill_verdict_in(
             names: Some(current),
             hash: Some(hash),
             fingerprint: Some(fingerprint),
+            hash_on_trust: false,
             soft_deadline: None,
         };
         let Some(ev) = super::evaluate(&mut st, &pack, env, input) else {

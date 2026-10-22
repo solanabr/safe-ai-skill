@@ -198,6 +198,10 @@ pub struct PackEntry {
     /// without re-hashing. Empty when the content was not fully hashed and scanned.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub fingerprint: String,
+    /// [`State::sweeps`] when the content was last fully hashed (not taken on trust from a
+    /// matching fingerprint). The sweep forces a re-hash once it is [`REHASH_EVERY`] old.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub hashed_sweep: u64,
     /// Where `supply_chain.on_block: move` put the pack (its key stays the origin path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined_to: Option<String>,
@@ -209,6 +213,17 @@ pub struct PackEntry {
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Sweeps after which a pack's content is re-hashed even while its fingerprint matches.
+pub const REHASH_EVERY: u64 = 7;
+
+/// Whether a matching stat fingerprint may stand in for a content hash. Only the unix record
+/// (inode, ctime, mode) is strong enough; elsewhere every check hashes the content.
+pub const FINGERPRINT_TRUSTED: bool = cfg!(unix);
 
 impl PackEntry {
     /// Unreviewed because it was not fully scanned (deferred past the sweep budget, or its hash,
@@ -238,6 +253,9 @@ pub struct State {
     /// name elsewhere is a collision, not drift.
     #[serde(default)]
     pub v1_claims: BTreeMap<String, String>,
+    /// Sweeps run so far (the clock of [`PackEntry::hashed_sweep`]).
+    #[serde(default)]
+    pub sweeps: u64,
 }
 
 /// Outcome of [`load`].
@@ -328,14 +346,14 @@ pub struct Transition {
 /// `pin` is the entry's current pin (`None` on first sight). `floor` raises the state for a v1
 /// re-baseline (`Warned`) or a v1 pin recorded with a HIGH scan (`Unreviewed`).
 ///
-/// In order: a symlink escaping the pack blocks (trust never clears it, spec D2.8); trusted
-/// content is clean and becomes the pin; a combo blocks; content that
+/// In order: a combo, or a symlink escaping the pack, blocks (trust never clears a BLOCK, spec
+/// D2.8); trusted content is clean and becomes the pin; content that
 /// differs from its pin blocks (drift); content that differs from the committed `packs.lock`
 /// blocks; otherwise the grade decides (HIGH → unreviewed, unless `packs.lock` pins this
 /// exact content, which counts as reviewed → warned).
 pub fn decide(pin: Option<&str>, obs: &Observation, floor: Option<PackStatus>) -> Transition {
     let recorded = pin.unwrap_or(&obs.hash).to_string();
-    if obs.escapes {
+    if obs.escapes || obs.grade == Grade::Block {
         return blocked(Reason::Combo, recorded);
     }
     if obs.trusted {
@@ -344,9 +362,6 @@ pub fn decide(pin: Option<&str>, obs: &Observation, floor: Option<PackStatus>) -
             reason: None,
             pin: obs.hash.clone(),
         };
-    }
-    if obs.grade == Grade::Block {
-        return blocked(Reason::Combo, recorded);
     }
     if pin.is_some_and(|p| p != obs.hash) {
         return blocked(Reason::Drift, recorded);
@@ -467,12 +482,23 @@ pub fn tree_hash(root: &Path) -> String {
 thread_local! {
     /// Content hashes computed on this thread (tests assert the gates skip them).
     pub static TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// When set, hashes this thread may still finish before every further one overruns
+    /// (tests fake a hash budget that runs out between packs).
+    pub static HASHES_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`tree_hash`], giving up (`None`) once `deadline` passes.
 pub fn tree_hash_until(root: &Path, deadline: Option<std::time::Instant>) -> Option<String> {
     #[cfg(test)]
-    TREE_HASHES.with(|n| n.set(n.get() + 1));
+    {
+        TREE_HASHES.with(|n| n.set(n.get() + 1));
+        if let Some(left) = HASHES_LEFT.with(|h| h.get()) {
+            if left == 0 {
+                return None;
+            }
+            HASHES_LEFT.with(|h| h.set(Some(left - 1)));
+        }
+    }
     let Ok(meta) = root.symlink_metadata() else {
         return Some(String::new());
     };
@@ -1345,11 +1371,20 @@ mod tests {
     }
 
     #[test]
-    fn decide_trust_clears_and_repins() {
+    fn decide_trust_clears_drift_and_high_and_repins_but_never_a_combo() {
+        for grade in [Grade::Clean, Grade::Warn, Grade::High] {
+            let mut o = obs("new", grade);
+            o.trusted = true;
+            let t = decide(Some("old"), &o, None);
+            assert_eq!((t.state, t.pin.as_str()), (PackStatus::Clean, "new"));
+        }
         let mut o = obs("new", Grade::Block);
         o.trusted = true;
         let t = decide(Some("old"), &o, None);
-        assert_eq!((t.state, t.pin.as_str()), (PackStatus::Clean, "new"));
+        assert_eq!(
+            (t.state, t.reason),
+            (PackStatus::Blocked, Some(Reason::Combo))
+        );
     }
 
     #[test]
@@ -1472,6 +1507,7 @@ mod tests {
                     escaping: vec![],
                     approved: false,
                     fingerprint: String::new(),
+                    hashed_sweep: 0,
                     quarantined_to: None,
                     note: None,
                 },

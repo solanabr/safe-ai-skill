@@ -498,6 +498,8 @@ struct EvalInput {
     hash: Option<String>,
     /// The pack's stat fingerprint, taken before `hash` was computed.
     fingerprint: Option<String>,
+    /// `hash` was taken on trust from a matching fingerprint, not computed from the content.
+    hash_on_trust: bool,
     /// The sweep's overall budget: past it a pack's hash or scan is not started (or a hash in
     /// progress is abandoned) and the pack is recorded unscanned (HIGH `scan_budget_exceeded`),
     /// so the sweep always finishes and stores its state in time.
@@ -510,6 +512,8 @@ const SWEEP_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20
 
 /// Time one pack's skill-name walk may take during a sweep before the pack is graded HIGH.
 const NAME_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// Time the name walk of a pack recorded unscanned may take (its names stay incomplete).
+const UNSCANNED_NAME_WALK: std::time::Duration = std::time::Duration::from_millis(200);
 /// Rule id of the HIGH finding for a pack that was not fully scanned.
 const SCAN_BUDGET_RULE: &str = state::SCAN_BUDGET_RULE;
 
@@ -897,10 +901,12 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
         names,
         hash,
         fingerprint,
+        hash_on_trust,
         soft_deadline,
     } = input;
     let over = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let key = state::key_of(&pack.canonical);
+    let sweeps = st.sweeps;
     // Hashing stops at the hard deadline and at the sweep's soft one.
     let bound = [deadline, soft_deadline].into_iter().flatten().min();
     // The fingerprint is taken before the content is hashed: an edit during hashing then
@@ -1015,6 +1021,10 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
         } else {
             fingerprint.unwrap_or_default()
         },
+        hashed_sweep: match &prev {
+            Some(p) if hash_on_trust => p.hashed_sweep,
+            _ => sweeps,
+        },
         grade,
         state: t.state,
         findings,
@@ -1074,8 +1084,16 @@ fn record_unscanned(
         escaping: Vec::new(),
         approved: false,
         fingerprint: String::new(),
+        hashed_sweep: 0,
         quarantined_to: None,
         note: None,
+    });
+    // A short name walk, so the gates know the names a pack cut by the budget may provide.
+    let names = names.unwrap_or_else(|| {
+        state::skill_names_until(
+            &pack.canonical,
+            Some(std::time::Instant::now() + UNSCANNED_NAME_WALK),
+        )
     });
     if entry.state != PackStatus::Blocked {
         entry.state = PackStatus::Unreviewed;
@@ -1090,16 +1108,14 @@ fn record_unscanned(
         entry.flagged_rules.push(SCAN_BUDGET_RULE.to_string());
         entry.flagged_rules.sort();
     }
-    if let Some(n) = names {
-        for name in n.names {
-            if !entry.names.contains(&name) {
-                entry.names.push(name);
-            }
+    for name in names.names {
+        if !entry.names.contains(&name) {
+            entry.names.push(name);
         }
-        for name in n.escaping {
-            if !entry.escaping.contains(&name) {
-                entry.escaping.push(name);
-            }
+    }
+    for name in names.escaping {
+        if !entry.escaping.contains(&name) {
+            entry.escaping.push(name);
         }
     }
     entry.names_incomplete = true;
@@ -1361,12 +1377,14 @@ fn sweep(
 
 /// [`sweep`] with an explicit hashing and scanning budget.
 ///
-/// Two passes: first every pack's stat fingerprint is taken, and a pack whose fingerprint
-/// still matches the content it was last scanned at (trusted data dir) is re-evaluated from
-/// its stored scan, which costs no hashing. Then the rest are hashed and scanned within the
-/// budget, packs a previous sweep left unscanned first, so successive sweeps make progress
-/// through a set of packs too large for one. The state is stored after each pack of the second
-/// pass, so a sweep killed by the hook timeout keeps what it did.
+/// Every pack's stat fingerprint is taken first. Packs whose fingerprint changed (or that were
+/// never fully scanned, or last fully hashed [`state::REHASH_EVERY`] sweeps ago) are hashed and
+/// scanned within the budget, packs a previous sweep left unscanned first, so successive sweeps
+/// make progress through a set of packs too large for one. Fingerprint-matched packs (trusted
+/// data dir, unix) are then content-hashed with what budget remains, longest-unhashed first,
+/// and re-scanned only when the hash differs; out of budget, the fingerprint stands in for the
+/// hash. The state is stored after each pack, so a sweep killed by the hook timeout keeps what
+/// it did.
 fn sweep_within(
     dir: &DataDir,
     project_dir: &Path,
@@ -1385,27 +1403,31 @@ fn sweep_within(
 
     let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
     let scan_until = std::time::Instant::now() + budget;
-    let mut unchanged: Vec<(Pack, EvalInput)> = Vec::new();
+    st.sweeps = st.sweeps.saturating_add(1);
+    // Fingerprint-matched packs, with the content hash their fingerprint vouches for and the
+    // sweep they were last fully hashed in.
+    let mut matched: Vec<(Pack, EvalInput, String, u64)> = Vec::new();
     let mut changed: Vec<(Pack, EvalInput)> = Vec::new();
     for pack in targets.packs {
         let fingerprint = state::stat_fingerprint_until(&pack.canonical, Some(scan_until));
         let stored = st.packs.get(&state::key_of(&pack.canonical));
         let same = stored.filter(|e| {
-            dir.trusted
+            state::FINGERPRINT_TRUSTED
+                && dir.trusted
                 && !e.fingerprint.is_empty()
                 && !e.last_scanned_hash.is_empty()
                 && fingerprint.as_deref() == Some(e.fingerprint.as_str())
+                && st.sweeps.saturating_sub(e.hashed_sweep) < state::REHASH_EVERY
         });
+        let vouched = same.map(|e| (e.last_scanned_hash.clone(), e.hashed_sweep));
         let input = EvalInput {
-            hash: same.map(|e| e.last_scanned_hash.clone()),
             fingerprint,
             soft_deadline: Some(scan_until),
             ..EvalInput::default()
         };
-        if same.is_some() {
-            unchanged.push((pack, input));
-        } else {
-            changed.push((pack, input));
+        match vouched {
+            Some((hash, at)) => matched.push((pack, input, hash, at)),
+            None => changed.push((pack, input)),
         }
     }
     // Packs a previous sweep could not hash or scan go first (stable otherwise).
@@ -1419,8 +1441,22 @@ fn sweep_within(
     if let Some((_, input)) = changed.first_mut() {
         input.soft_deadline = Some(scan_until.max(std::time::Instant::now() + budget));
     }
-    let first_changed = unchanged.len();
-    for (i, (pack, input)) in unchanged.into_iter().chain(changed).enumerate() {
+    // Matched packs are still content-hashed with what budget is left, the longest unhashed
+    // first (a fingerprint can be preserved by a root clock change or a filesystem without
+    // ctime); only their scan is skipped while the hash matches. Out of budget, the
+    // fingerprint stands in for the hash until a later sweep.
+    matched.sort_by_key(|(_, _, _, at)| *at);
+    let matched = matched.into_iter().map(|(pack, mut input, vouched, _)| {
+        match state::tree_hash_until(&pack.canonical, Some(scan_until)) {
+            Some(h) => input.hash = Some(h),
+            None => {
+                input.hash = Some(vouched);
+                input.hash_on_trust = true;
+            }
+        }
+        (pack, input)
+    });
+    for (pack, input) in changed.into_iter().chain(matched) {
         let Some(ev) = evaluate(&mut st, &pack, &env, input) else {
             continue;
         };
@@ -1445,10 +1481,8 @@ fn sweep_within(
             lines.push(PackReportLine::from_entry(&pack, entry));
         }
         entry.note = None;
-        // The unchanged packs are stored together, each hashed or scanned pack on its own.
-        if i + 1 >= first_changed {
-            let _ = state::store(dir, &st);
-        }
+        // Stored after each pack, so a sweep killed by the hook timeout keeps what it did.
+        let _ = state::store(dir, &st);
     }
 
     // Packs `on_block: move` took out of this project stay listed until approved.
@@ -1740,6 +1774,15 @@ pub fn request_trust(dir: &DataDir, path: &Path) -> Result<PendingRequest, Engin
     }
     let hash = state::tree_hash(&canonical);
     let report = grading::scan_pack(&canonical);
+    if !report.combos.is_empty() {
+        let rules: Vec<&str> = report.combos.iter().map(|c| c.rule).collect();
+        return Err(Error::Other(format!(
+            "{} fires combination rule(s) {}; trust never clears a BLOCK, so fix or remove the \
+             pack; nothing was requested",
+            escape_for_report(&canonical.display().to_string()),
+            rules.join(", ")
+        )));
+    }
     let flagged = state::flagged_rules(&report);
     let acks = if flagged.is_empty() {
         "no flagged rules".to_string()
@@ -2005,10 +2048,15 @@ fn apply_trust(dir: &DataDir, payload: &serde_json::Value) -> Result<String, Eng
     let path = payload_str(payload, "path")?;
     let hash = payload_str(payload, "hash")?;
     let rules = payload_rules(payload);
-    if rules.iter().any(|r| r == state::SYMLINK_ESCAPE_RULE) {
+    let combo = state::load(dir)
+        .state
+        .packs
+        .get(path)
+        .is_some_and(|e| e.last_scanned_hash == hash && e.grade == grading::Grade::Block);
+    if combo || rules.iter().any(|r| r == state::SYMLINK_ESCAPE_RULE) {
         return Err(Error::Other(format!(
-            "safe-ai-skill: NOT trusted: a symlink in {} resolves outside the pack, which trust \
-             never clears; remove the link",
+            "safe-ai-skill: NOT trusted: a combination rule fires in {} (e.g. a symlink \
+             resolving outside the pack), and trust never clears a BLOCK; fix or remove the pack",
             escape_for_report(path)
         )));
     }
@@ -2016,7 +2064,7 @@ fn apply_trust(dir: &DataDir, payload: &serde_json::Value) -> Result<String, Eng
     let mut st = state::load(dir).state;
     let mut cleared = false;
     if let Some(e) = st.packs.get_mut(path) {
-        if e.last_scanned_hash == hash && !e.escapes() {
+        if e.last_scanned_hash == hash && !e.escapes() && e.grade != grading::Grade::Block {
             accept(e, hash);
             cleared = true;
         }
@@ -2138,8 +2186,8 @@ fn apply_approve(dir: &DataDir, payload: &serde_json::Value) -> Result<String, E
     if !refused.is_empty() {
         let shown: Vec<String> = refused.iter().map(|d| escape_for_report(d)).collect();
         msg.push(format!(
-            "safe-ai-skill: NOT approved (a symlink resolves outside the pack, which no approval \
-             clears; remove the link): {}",
+            "safe-ai-skill: NOT approved (a combination rule fires, e.g. a symlink resolving \
+             outside the pack; no approval clears a BLOCK, so fix or remove the pack): {}",
             shown.join(", ")
         ));
     }
@@ -2157,8 +2205,9 @@ fn kind_of(payload: &serde_json::Value) -> PackKind {
 /// a hash-bound trust entry when the data dir is trusted. `fingerprint` was taken before `hash`
 /// was verified.
 ///
-/// Refused (`false`, the entry left blocked) when the content holds a symlink resolving outside
-/// the pack: what it reaches was never reviewed, so no approval clears it (spec D2.8).
+/// Refused (`false`, the entry left blocked) when the content fires a combination rule (a
+/// symlink resolving outside the pack among them): approval clears drift, `unreviewed` and a
+/// reviewed `packs.lock` mismatch, never a BLOCK combo (spec D2.8).
 fn approve_entry(
     dir: &DataDir,
     st: &mut State,
@@ -2170,6 +2219,7 @@ fn approve_entry(
 ) -> bool {
     let key = state::key_of(path);
     let now = now_secs();
+    let sweeps = st.sweeps;
     let walked = state::skill_names_until(path, Some(std::time::Instant::now() + NAME_WALK_BUDGET));
     let entry = st.packs.entry(key.clone()).or_insert_with(|| PackEntry {
         kind,
@@ -2188,6 +2238,7 @@ fn approve_entry(
         escaping: Vec::new(),
         approved: false,
         fingerprint: String::new(),
+        hashed_sweep: 0,
         quarantined_to: None,
         note: None,
     });
@@ -2205,7 +2256,11 @@ fn approve_entry(
     entry.names_incomplete = walked.unparseable;
     entry.escaping = walked.escaping;
     entry.fingerprint = fingerprint.unwrap_or_default();
-    if entry.escapes() || rules.iter().any(|r| r == state::SYMLINK_ESCAPE_RULE) {
+    entry.hashed_sweep = sweeps;
+    if entry.grade == grading::Grade::Block
+        || entry.escapes()
+        || rules.iter().any(|r| r == state::SYMLINK_ESCAPE_RULE)
+    {
         entry.state = PackStatus::Blocked;
         entry.reason = Some(Reason::Combo);
         entry.approved = false;
@@ -2558,30 +2613,75 @@ mod orchestration_tests {
         let untrusted = data("trust-no", false);
         let project = tempdir("trust-proj");
         let pack = seed_skill(&skills(&project), "evil", "# evil");
-        fs::write(pack.join("COMBO"), "x").unwrap();
+        fs::write(pack.join("HIGH"), "x").unwrap();
         assert!(request_trust(&untrusted, &pack).is_err());
 
         let d = data("trust-yes", true);
-        let r = sweep(&d, &project, &no_user_skills(), &policy(), combo_scanner);
-        assert_eq!(r.blocked.len(), 1);
-        // The real scanner sees no combo here; acknowledge the injected one by hand.
+        sweep(&d, &project, &no_user_skills(), &policy(), high_scanner);
+        let st = state::load(&d).state;
+        assert_eq!(entry(&st, &pack).state, PackStatus::Unreviewed);
+        // The real scanner sees no HIGH here; acknowledge the injected one by hand.
         let req = request_trust(&d, &pack).unwrap();
         let mut c = confirm(&d, &req);
-        c.payload["acked_rules"] = serde_json::json!(["padding_sink"]);
+        c.payload["acked_rules"] = serde_json::json!(["curl_pipe_sh"]);
         apply_confirmed(&d, &c).unwrap();
-        let r = sweep(&d, &project, &no_user_skills(), &policy(), combo_scanner);
-        assert!(r.blocked.is_empty(), "{r:?}");
+        sweep(&d, &project, &no_user_skills(), &policy(), high_scanner);
+        assert_eq!(
+            entry(&state::load(&d).state, &pack).state,
+            PackStatus::Clean
+        );
 
         // A worktree / clone holding the same content needs no re-trust.
         let other = tempdir("trust-other");
         let copy = seed_skill(&skills(&other), "evil", "# evil");
-        fs::write(copy.join("COMBO"), "x").unwrap();
-        let r = sweep(&d, &other, &no_user_skills(), &policy(), combo_scanner);
-        assert!(r.blocked.is_empty(), "{r:?}");
+        fs::write(copy.join("HIGH"), "x").unwrap();
+        sweep(&d, &other, &no_user_skills(), &policy(), high_scanner);
+        assert_eq!(
+            entry(&state::load(&d).state, &copy).state,
+            PackStatus::Clean
+        );
         // Changed content is not covered.
         fs::write(copy.join("SKILL.md"), "# evil v2").unwrap();
-        let r = sweep(&d, &other, &no_user_skills(), &policy(), combo_scanner);
+        let r = sweep(&d, &other, &no_user_skills(), &policy(), high_scanner);
+        assert_eq!(r.blocked.len(), 1, "drift from the trusted pin");
+    }
+
+    fn high_scanner(path: &Path) -> grading::PackReport {
+        let mut report = grading::scan_pack(path);
+        if path.join("HIGH").exists() {
+            report.findings.push(grading::Finding {
+                rule: "curl_pipe_sh",
+                sev: grading::Severity::High,
+                path: PathBuf::from("HIGH"),
+                line: Some(1),
+                ctx: grading::Ctx::Code,
+            });
+        }
+        report
+    }
+
+    #[test]
+    fn approve_and_trust_never_clear_a_combo() {
+        let d = data("combo-approve", true);
+        let project = tempdir("combo-approve-proj");
+        let pack = seed_skill(&skills(&project), "evil", "# evil");
+        fs::write(pack.join("COMBO"), "x").unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &policy(), combo_scanner);
         assert_eq!(r.blocked.len(), 1);
+        // A trust entry acknowledging the combo (written as a confirmed trust would) is ignored.
+        let hash = state::tree_hash(&pack.canonicalize().unwrap());
+        trust::add(&d, &hash, &["padding_sink".to_string()], "x", now_secs()).unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &policy(), combo_scanner);
+        assert_eq!(r.blocked.len(), 1, "trust never clears a combo");
+        // A confirmed trust request is refused once the stored scan shows the combo.
+        let req = request_trust(&d, &pack).unwrap();
+        let mut c = confirm(&d, &req);
+        c.payload["acked_rules"] = serde_json::json!(["padding_sink"]);
+        assert!(apply_confirmed(&d, &c).is_err());
+        assert_eq!(
+            entry(&state::load(&d).state, &pack).state,
+            PackStatus::Blocked
+        );
     }
 
     #[test]
@@ -2673,9 +2773,14 @@ mod orchestration_tests {
         // Approve restores it to its origin.
         let req = request_approve_in(&d, &project, &no_user_skills(), "evil", &p).unwrap();
         assert!(req.summary.contains("restore"), "{}", req.summary);
-        apply_confirmed(&d, &confirm(&d, &req)).unwrap();
+        let msg = apply_confirmed(&d, &confirm(&d, &req)).unwrap();
         assert!(pack.join("COMBO").exists());
         assert!(!moved.exists());
+        // Restored in place, but a combo is never approved: it stays blocked there.
+        assert!(msg.contains("NOT approved"), "{msg}");
+        let st = state::load(&d).state;
+        assert_eq!(st.packs[&key].state, PackStatus::Blocked);
+        assert_eq!(st.packs[&key].quarantined_to, None);
     }
 
     #[test]
@@ -3293,10 +3398,15 @@ mod enforce_tests {
     #[test]
     fn skill_of_a_blocked_pack_is_denied_by_any_of_its_names() {
         let (d, project) = blocked_project("skill-names");
-        for name in ["evil", "evil-tool", "plugin:evil-tool", "/evil", "EVIL"] {
+        for name in ["evil", "evil-tool", "/evil", "EVIL"] {
             let v = skill(&d, &project, name);
             assert!(is_deny(&v), "{name}: {v:?}");
         }
+        // A plugin's skill is not a project pack, whatever its local part.
+        assert_eq!(
+            skill(&d, &project, "plugin:evil-tool"),
+            GateVerdict::NoOpinion
+        );
         let GateVerdict::Deny(reason) = skill(&d, &project, "evil") else {
             unreachable!()
         };
@@ -4177,9 +4287,11 @@ mod enforce_tests {
             ..small
         };
         let starved = |name: &str| skill_limits(&d, &project, name, none);
+        // A stat walk that cannot finish denies the names each pack may provide, and, since
+        // `many`'s names are incomplete, any unresolved non-plugin name.
         assert!(is_deny(&starved("many")));
         assert!(is_deny(&starved("benign")));
-        assert_eq!(starved("absent"), GateVerdict::NoOpinion);
+        assert!(is_deny(&starved("absent")));
         assert_eq!(starved(PLUGIN_SKILL), GateVerdict::NoOpinion);
         // An edit is drift for that pack's names until a sweep re-hashes it.
         fs::write(many.join("s0/extra.md"), "x").unwrap();
@@ -4188,6 +4300,7 @@ mod enforce_tests {
     }
 
     fn slow_scan(path: &Path) -> grading::PackReport {
+        SCANS.with(|n| n.set(n.get() + 1));
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("slow") || name.starts_with("aaa") && name != "aaa0" {
             std::thread::sleep(Duration::from_millis(if name.starts_with("slow") {
@@ -4257,13 +4370,10 @@ mod enforce_tests {
                 "{n}"
             );
         }
-        let started = std::time::Instant::now();
+        // Nothing changed: the last sweep re-hashes but scans nothing.
+        let scans = SCANS.with(|n| n.get());
         sweep_scanned(&d, &project, slow_scan, budget);
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!(SCANS.with(|n| n.get()), scans);
     }
 
     static HANG_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4425,14 +4535,9 @@ mod enforce_tests {
             let msg = approve(&d, &project, target);
             assert!(msg.contains("NOT approved"), "{msg}");
         }
-        let req = request_trust(&d, &p9).unwrap();
-        let c = confirm::confirm_from_prompt(
-            &d,
-            &format!("safe-ai-skill confirm {}", req.nonce),
-            now_secs(),
-        )
-        .unwrap();
-        assert!(apply_confirmed(&d, &c).is_err());
+        // Trust is refused up front: the scan shows the symlink_escape combo.
+        let err = request_trust(&d, &p9).unwrap_err().to_string();
+        assert!(err.contains("symlink_escape"), "{err}");
         let check = |phase: &str| {
             let st = state::load(&d).state;
             for dir in [&pack, &p9] {
@@ -4459,6 +4564,269 @@ mod enforce_tests {
         check("after an outside edit");
         sweep_it(&d, &project);
         check("after a sweep");
+    }
+
+    // ---- fix round 5 ----------------------------------------------------------------------
+
+    fn copy_data(from: &DataDir, tag: &str) -> DataDir {
+        let to = from.path.with_file_name(format!("{tag}-copy"));
+        let _ = fs::remove_dir_all(&to);
+        fs::create_dir_all(&to).unwrap();
+        for e in fs::read_dir(&from.path).unwrap().flatten() {
+            if e.path().is_file() {
+                fs::copy(e.path(), to.join(e.file_name())).unwrap();
+            }
+        }
+        DataDir {
+            path: to,
+            trusted: from.trusted,
+        }
+    }
+
+    fn gate_with(d: &DataDir, project: &Path, name: &str, budget: Duration) -> GateVerdict {
+        enforce::skill_verdict_in(
+            d,
+            project,
+            &no_user_skills(),
+            &policy(),
+            name,
+            slow_scan,
+            enforce::Limits {
+                budget,
+                ..enforce::Limits::default()
+            },
+        )
+    }
+
+    /// zzz (frontmatter `evilname`, a combo) left unscanned by a starved sweep, `newbie`
+    /// (frontmatter `freshname`) never swept, `calm` clean.
+    fn budget_cut_project(tag: &str) -> (DataDir, PathBuf) {
+        let (d, project) = fresh_trusted(tag);
+        md(&skills_of(&project).join("calm"), "calm");
+        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        // zzz arrives and the sweep's hash budget is gone: it is left unscanned (names walked
+        // briefly), while calm stands on its fingerprint.
+        md(&skills_of(&project).join("zzz"), "evilname");
+        state::HASHES_LEFT.with(|h| h.set(Some(0)));
+        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        state::HASHES_LEFT.with(|h| h.set(None));
+        let st = state::load(&d).state;
+        assert!(entry_of(&st, &skills_of(&project).join("zzz")).unscanned());
+        assert_eq!(
+            entry_of(&st, &skills_of(&project).join("calm")).state,
+            PackStatus::Clean
+        );
+        md(&skills_of(&project).join("newbie"), "freshname");
+        (d, project)
+    }
+
+    #[test]
+    fn rr7_a_budget_cut_pack_keeps_its_frontmatter_names() {
+        let (d, project) = fresh_trusted("rr7-cut");
+        md(&skills_of(&project).join("calm"), "calm");
+        md(&skills_of(&project).join("zzz"), "evilname");
+        sweep_scanned(&d, &project, slow_scan, Duration::ZERO);
+        let e = entry_of(&state::load(&d).state, &skills_of(&project).join("zzz")).clone();
+        assert!(
+            e.unscanned() && e.names.contains(&"evilname".to_string()),
+            "{e:?}"
+        );
+        // Skipped stat walk: the recorded frontmatter name is denied, as with a full budget.
+        let starved = copy_data(&d, "rr7-cut-starved");
+        assert!(is_deny(&gate_with(
+            &starved,
+            &project,
+            "evilname",
+            Duration::ZERO
+        )));
+        assert!(is_deny(&gate_with(
+            &d,
+            &project,
+            "evilname",
+            Duration::from_secs(5)
+        )));
+        // A never-swept pack's names are unknown: unresolved names are denied when its stat
+        // walk is cut, plugin names are not.
+        md(&skills_of(&project).join("newbie"), "freshname");
+        assert!(is_deny(&gate_with(
+            &starved,
+            &project,
+            "freshname",
+            Duration::ZERO
+        )));
+        assert_eq!(
+            gate_with(&starved, &project, PLUGIN_SKILL, Duration::ZERO),
+            GateVerdict::NoOpinion
+        );
+    }
+
+    #[test]
+    fn rr7_a_slower_stat_walk_never_makes_the_gate_more_permissive() {
+        let (d, project) = budget_cut_project("rr7-mono");
+        let names = [
+            "calm",
+            "zzz",
+            "evilname",
+            "newbie",
+            "freshname",
+            "absent",
+            PLUGIN_SKILL,
+        ];
+        for budget in [Duration::ZERO, Duration::from_nanos(1)] {
+            for name in names {
+                let full = gate_with(
+                    &copy_data(&d, "rr7-mono-f"),
+                    &project,
+                    name,
+                    Duration::from_secs(5),
+                );
+                let cut = gate_with(&copy_data(&d, "rr7-mono-c"), &project, name, budget);
+                assert!(
+                    !is_deny(&full) || is_deny(&cut),
+                    "{name}: full budget {full:?}, cut {cut:?}"
+                );
+            }
+        }
+    }
+
+    fn rewrite_entry(d: &DataDir, dir: &Path, f: impl FnOnce(&mut State, &str)) {
+        let mut st = state::load(d).state;
+        let key = state::key_of(&dir.canonicalize().unwrap());
+        f(&mut st, &key);
+        state::store(d, &st).unwrap();
+    }
+
+    #[test]
+    fn rr7_the_sweep_rehashes_fingerprint_matched_packs_and_skips_only_the_scan() {
+        let (d, project) = fresh_trusted("rr7-rehash");
+        let pack = skills_of(&project).join("calm");
+        md(&pack, "calm");
+        fs::write(pack.join("run.sh"), "echo a").unwrap();
+        sweep_it(&d, &project);
+        // A change that preserves the fingerprint (root clock games, no ctime on the
+        // filesystem): faked by recording the new content's fingerprint.
+        fs::write(pack.join("run.sh"), "echo b").unwrap();
+        let fp = state::stat_fingerprint_until(&pack, None).unwrap();
+        rewrite_entry(&d, &pack, |st, k| {
+            st.packs.get_mut(k).unwrap().fingerprint = fp
+        });
+        let r = sweep_it(&d, &project);
+        assert_eq!(
+            r.blocked,
+            vec![".claude/skills/calm".to_string()],
+            "drift caught"
+        );
+        // An unchanged matched pack is hashed but not re-scanned.
+        let (d, project) = fresh_trusted("rr7-noscan");
+        md(&skills_of(&project).join("calm"), "calm");
+        sweep_scanned(&d, &project, counting_scan, Duration::from_secs(5));
+        let (scans, hashes_before) = (SCANS.with(|n| n.get()), hashes());
+        sweep_scanned(&d, &project, counting_scan, Duration::from_secs(5));
+        assert_eq!(SCANS.with(|n| n.get()), scans, "no re-scan");
+        assert!(hashes() > hashes_before, "re-hashed");
+    }
+
+    thread_local! {
+        static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counting_scan(path: &Path) -> grading::PackReport {
+        SCANS.with(|n| n.set(n.get() + 1));
+        grading::scan_pack(path)
+    }
+
+    #[test]
+    fn rr7_matched_packs_hash_oldest_first_and_a_stale_full_hash_is_forced() {
+        let (d, project) = fresh_trusted("rr7-oldest");
+        let (a, b) = (skills_of(&project).join("a"), skills_of(&project).join("b"));
+        md(&a, "a");
+        md(&b, "b");
+        sweep_it(&d, &project);
+        // `b` was fully hashed longer ago; one hash fits the budget.
+        rewrite_entry(&d, &b, |st, k| {
+            st.sweeps = 5;
+            st.packs.get_mut(k).unwrap().hashed_sweep = 1;
+        });
+        rewrite_entry(&d, &a, |st, k| {
+            st.packs.get_mut(k).unwrap().hashed_sweep = 4
+        });
+        state::HASHES_LEFT.with(|h| h.set(Some(1)));
+        sweep_it(&d, &project);
+        let st = state::load(&d).state;
+        assert_eq!(entry_of(&st, &b).hashed_sweep, 6, "the oldest is hashed");
+        assert_eq!(
+            entry_of(&st, &a).hashed_sweep,
+            4,
+            "the fingerprint stood in"
+        );
+        assert_eq!(entry_of(&st, &a).state, PackStatus::Clean);
+        // With no hash budget at all, a pack whose last full hash is REHASH_EVERY sweeps old
+        // is forced: it cannot stand on its fingerprint, so it is left unscanned.
+        state::HASHES_LEFT.with(|h| h.set(Some(0)));
+        for _ in 0..state::REHASH_EVERY {
+            sweep_it(&d, &project);
+        }
+        let st = state::load(&d).state;
+        assert!(entry_of(&st, &a).unscanned(), "forced re-hash");
+        state::HASHES_LEFT.with(|h| h.set(None));
+        sweep_it(&d, &project);
+        let st = state::load(&d).state;
+        assert_eq!(entry_of(&st, &a).state, PackStatus::Clean);
+        assert_eq!(entry_of(&st, &a).hashed_sweep, st.sweeps);
+    }
+
+    #[test]
+    fn rr7_approval_never_clears_a_combo_but_clears_drift() {
+        let (d, project) = fresh_trusted("rr7-combo");
+        md(&skills_of(&project).join("zzz"), "zzz");
+        md(&skills_of(&project).join("calm"), "calm");
+        let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        assert_eq!(r.blocked, vec![".claude/skills/zzz".to_string()]);
+        // The approval request scans with the real scanner; the stored scan holds the combo.
+        let msg = approve(&d, &project, "zzz");
+        assert!(msg.contains("NOT approved"), "{msg}");
+        let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        assert_eq!(r.blocked, vec![".claude/skills/zzz".to_string()]);
+        fs::write(skills_of(&project).join("calm/x.md"), "x").unwrap();
+        let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        assert_eq!(r.blocked.len(), 2);
+        assert!(approve(&d, &project, "calm").contains("safe-ai-skill: approved"));
+        let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(5));
+        assert_eq!(
+            r.blocked,
+            vec![".claude/skills/zzz".to_string()],
+            "drift cleared"
+        );
+    }
+
+    #[test]
+    fn rr7_plugin_names_never_match_a_project_pack_by_their_local_part() {
+        let (d, project) = blocked_project("rr7-local");
+        assert!(is_deny(&skill(&d, &project, "evil")));
+        for name in ["plugin:evil", "superpowers:evil-tool"] {
+            assert_eq!(skill(&d, &project, name), GateVerdict::NoOpinion, "{name}");
+        }
+    }
+
+    #[test]
+    fn rr7_a_packs_lock_committed_later_tightens_a_fingerprint_matched_pack() {
+        let (d, project) = fresh_trusted("rr7-lock");
+        md(&skills_of(&project).join("calm"), "calm");
+        sweep_it(&d, &project);
+        assert_eq!(skill(&d, &project, "calm"), GateVerdict::NoOpinion);
+        fs::create_dir_all(project.join(".safe-ai-skill")).unwrap();
+        fs::write(
+            project.join(state::PACKS_LOCK),
+            r#"{"packs":[{"path":".claude/skills/calm","tree_hash":"0000"}]}"#,
+        )
+        .unwrap();
+        let before = hashes();
+        let v = skill(&d, &project, "calm");
+        let GateVerdict::Deny(reason) = v else {
+            panic!("{v:?}")
+        };
+        assert!(reason.contains("packs.lock"), "{reason}");
+        assert_eq!(hashes(), before);
     }
 
     #[test]
