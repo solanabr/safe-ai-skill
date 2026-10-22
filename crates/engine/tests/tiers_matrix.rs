@@ -1067,6 +1067,38 @@ fn no_search_returns_the_state_key() {
 }
 
 #[test]
+fn any_command_naming_a_project_env_file_denies_at_every_tier() {
+    let w = env_world("env-generic");
+    w.put("README.md", "# readme\n");
+    w.put(".gitignore", ".env\n");
+    for cmd in [
+        "paste .env",
+        "tar cf - .env",
+        "perl -ne print .env",
+        "find . -name .env -exec cat {} \\;",
+        "cat .e*",
+        "cat .en?",
+        "vim -c \":%p\" -c \":q\" .env",
+        "python3 -c 'print(1)' apps/web/.env.local",
+        "node --env-file=.env -e 'console.log(process.env)'",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+    for cmd in [
+        "ls -la .env",
+        "stat .env",
+        "cat .env.example",
+        "grep -q .env .gitignore",
+        "find . -name .env",
+        "safe-ai-skill env keys .env",
+        "cat *",
+        "echo .env >> .gitignore",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), NO4);
+    }
+}
+
+#[test]
 fn raw_env_reads_behind_wrappers_and_shell_strings_deny_at_every_tier() {
     let w = env_world("env-wrapped");
     for cmd in [

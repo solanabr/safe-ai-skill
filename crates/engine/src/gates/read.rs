@@ -140,6 +140,12 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     Decision::Defer
 }
 
+/// Whether the absolute `candidate` names a project env file whose raw read the env gate
+/// decides: env class and not allow-listed (`.env.example`, `.env.schema` stay readable).
+pub(crate) fn is_env_file(candidate: &str, homes: &[String], policy: &Policy) -> bool {
+    name_verdict(candidate, homes, policy) == Verdict::Env
+}
+
 /// Name-level verdict for one candidate path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {

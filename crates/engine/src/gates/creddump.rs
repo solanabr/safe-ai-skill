@@ -41,7 +41,8 @@ use std::path::{Path, PathBuf};
 
 use crate::context::shell::{self, SimpleCommand};
 use crate::gate::Verdict;
-use crate::gates::credpaths;
+use crate::gates::{credpaths, read};
+use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
 
@@ -102,9 +103,170 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     if matches!(known, crate::io::Decision::Deny { .. }) {
         return None;
     }
-    path_check(&parsed.commands, cwd)
-        .or_else(|| assigned_hit(&parsed.assigned_values, cwd))
-        .map(|what| Verdict::Deny(path_reason(&what)))
+    if let Some(what) =
+        path_check(&parsed.commands, cwd).or_else(|| assigned_hit(&parsed.assigned_values, cwd))
+    {
+        return Some(Verdict::Deny(path_reason(&what)));
+    }
+    let file = env_check(&parsed.commands, cwd, policy)?;
+    let hint = read::varlock_hint(cwd, &cwd.join(&file));
+    match read::env_verdict(&file, policy, hint) {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Project env files
+// ---------------------------------------------------------------------------------------
+
+/// Programs whose words naming an env file are not a raw read: the env CLI itself and
+/// varlock (the secrets gate decides varlock's printers).
+const ENV_TOOLS: &[&str] = &["safe-ai-skill", "varlock"];
+
+/// Env file names a wildcard word is tried against lexically.
+const ENV_PROBES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".envrc",
+    ".dev.vars",
+    "prod.env",
+];
+
+/// The first word of a non-metadata command that names a project env file (the env gate's
+/// definition, [`read::is_env_file`]): any program, the word resolved like a credential path
+/// (pieces after `=`/`:`, braces, `~`, every cwd), a wildcard expanded against the filesystem
+/// (dotfiles only by a literal leading dot, as the shell does) and matched lexically against
+/// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
+fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Option<String> {
+    let homes = crate::gates::secretpath::homes_resolved();
+    let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
+    let mut budget = MAX_WORDS;
+    for cmd in commands {
+        let program = cmd.program();
+        if matches!(program.as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut cwds);
+        }
+        if METADATA.contains(&program.as_str()) || ENV_TOOLS.contains(&program.as_str()) {
+            continue;
+        }
+        let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+        if program == "find"
+            && !words
+                .iter()
+                .any(|w| matches!(*w, "-exec" | "-execdir" | "-ok" | "-okdir"))
+        {
+            continue;
+        }
+        let pattern_first = matches!(
+            program.as_str(),
+            "grep" | "egrep" | "fgrep" | "zgrep" | "rg" | "ag" | "ack" | "sed" | "awk" | "jq"
+        ) && !words
+            .iter()
+            .any(|w| matches!(*w, "-e" | "-f" | "--regexp" | "--file"));
+        let mut skip_pattern = pattern_first;
+        let mut skip_value = false;
+        let program_path = words.first().is_some_and(|w| w.contains(['/', '\\']));
+        for word in words.iter().skip(usize::from(!program_path)) {
+            budget = budget.checked_sub(1)?;
+            if std::mem::take(&mut skip_value) {
+                continue;
+            }
+            if word.starts_with('-') && !word.contains('=') {
+                skip_value = pattern_first && VALUE_FLAGS.contains(word);
+                continue;
+            }
+            if std::mem::take(&mut skip_pattern) {
+                continue;
+            }
+            if let Some(hit) = env_word_hit(word, &cwds, &homes, policy) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// Whether `word` names a project env file; the file as written.
+fn env_word_hit(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy) -> Option<String> {
+    if word.len() > 4096 {
+        return None;
+    }
+    for piece in pieces(word) {
+        if piece.starts_with('-') && !piece.contains('=') {
+            continue;
+        }
+        for variant in expand_braces(&piece) {
+            for expanded in expand_vars(&variant) {
+                if env_candidate(&expanded, cwds, homes, policy) {
+                    return Some(expanded);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn env_candidate(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let is_env = |path: &Path| read::is_env_file(&path.to_string_lossy(), homes, policy);
+    let wild = word.contains(['*', '?', '[']);
+    let bare = is_bare(word);
+    for path in resolve_all(word, cwds) {
+        if !wild {
+            if is_env(&path) || std::fs::canonicalize(&path).is_ok_and(|real| is_env(&real)) {
+                return true;
+            }
+            continue;
+        }
+        let pattern = path.to_string_lossy().into_owned();
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: true,
+        };
+        let expanded = glob::glob_with(&pattern, options)
+            .map(|g| {
+                g.filter_map(Result::ok)
+                    .take(MAX_GLOB_MATCHES)
+                    .any(|m| is_env(&m))
+            })
+            .unwrap_or(false);
+        if expanded {
+            return true;
+        }
+        if bare {
+            continue;
+        }
+        // Lexically: the last component, as a shell pattern, could name an env file.
+        let (dir, last) = match pattern.rsplit_once('/') {
+            Some((dir, last)) => (dir.to_string(), last.to_string()),
+            None => (String::new(), pattern.clone()),
+        };
+        if dir.contains(['*', '?', '[']) {
+            continue;
+        }
+        // As the shell expands, a leading dot only matches a literal one; a pattern for a
+        // name without one (`*.env`) must spell `env` (a bare `*` names any file).
+        let spelled = last.to_ascii_lowercase().contains("env");
+        let lexical = ENV_PROBES.iter().any(|probe| {
+            (if probe.starts_with('.') {
+                last.starts_with('.')
+            } else {
+                spelled
+            }) && crate::gates::bash::glob_match(&last, probe)
+                && is_env(&Path::new(&dir).join(probe))
+        });
+        if lexical {
+            return true;
+        }
+    }
+    false
 }
 
 /// A `NAME=<credential path>` prefix assignment: the variable then names the store
