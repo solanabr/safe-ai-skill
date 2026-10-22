@@ -151,54 +151,33 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
     once the file is scanned, so flooding a file with thousands of sinks or padded lines hides
     nothing.
   * Stored findings stay capped at five per rule and severity.
-* **Per pack and per sweep.** `rules::scan_pack_within` takes a `ScanBudget`: 2 s per pack, and
-  4 s for every pack of one SessionStart sweep (`ScanBudget::session`, used by the verify
-  sweep). The clock is checked between files, every 256 lines, statements or commands.
+* **Per pack and per sweep.** `rules::scan_pack_within` takes a `ScanBudget` (2 s per pack, 4 s
+  per sweep), and `rules::scan_pack_until` an explicit deadline, which the verify sweep passes. The clock is checked between files, every 256 lines, statements or commands.
 * **When the budget runs out.** The pack stops with `scan_budget_exceeded` HIGH: never clean,
   graded with the findings and combos found so far. A payload found before the cut still
   blocks.
-* **In the SessionStart sweep.**
-  * A cut pack is **unreviewed**: never pinned, and never recorded as scanned.
-  * It is quarantined only for what was found before the cut, or for drift.
-  * The session context lists it as "not fully scanned — rerun `safe-ai-skill verify check
-    <dir>`" (`verify check` scans without a budget).
-  * Once the sweep's budget is spent, nothing new is started. The remaining unpinned packs are
-    **deferred** (not scanned, not pinned); the remaining pinned packs are listed **"drift not
-    checked this session"**. Both keep their place at the front of the next sweep's queue.
-    The pack in progress at the deadline may finish its drift check, up to one per-pack
-    allowance, so a sweep never runs past its deadline plus one allowance, however many
-    packs are pinned.
-  * **Drift checks.** A pinned pack's shape is checked first, from metadata only: file count,
-    total bytes and the sorted top-level names (`lockfile::shape_until`, stored in the pin). A
-    changed shape is drift, so the pack is quarantined without a full hash, and a pack cannot
-    dodge its drift check by growing past the hash budget. If the shape matches, the content
-    hash decides. If that hash runs out of its per-pack allowance, the pin loses its clean
-    status (`drift_unchecked` in the lockfile), the pack is listed "drift not checked this
-    session", and it goes first in the next sweep. A high finding from the scan still
-    quarantines it. Git-pinned ext submodules are compared by commit SHA and need no shape.
-    Pins made before shapes existed get one at their next verified drift check.
-  * **Age-ordered queue.** The lockfile counts sweeps (`sweep_session`) and records, per pack,
-    the last sweep that worked on it (`sweep_marks`). Each sweep takes packs least recently
-    worked on first: a pack never worked on goes first, then the oldest, in walk order within
-    the same age (roots in order, skill directories and ext submodules sorted by name). A
-    pack scanned or cut this session goes behind every pack that was not.
-  * **Guarantee.** Each sweep starts its first pack with the full per-pack allowance (2 s is
-    within the 4 s sweep). Each sweep moves every pack it worked on behind the rest, so a pack
-    gains at least one place per session and reaches the front within N sessions, N being the
-    number of packs (skill directories plus ext submodules) the sweep covers. So **a pack
-    whose scan and hash each fit within the per-pack allowance on its own is fully scanned
-    within N sessions**, however many budget-hungry packs share the sweep. The one exception
-    is a pinned pack whose drift check overran. It jumps to the front once, and a second
-    overrun in a row sends it back by age. With such packs present the bound is 2N sessions
-    (each pack ahead can be worked on at most twice before it goes behind). Packs added
-    between sessions are not counted; a new pack starts at the front.
-    In practice most sessions cover more than one pack.
-  * **Limit.** A pack that does not fit the per-pack allowance on its own is cut every time
-    it reaches the front. It stays unreviewed (never pinned) until `safe-ai-skill verify check
-    <dir>` scans it without a budget. A pinned pack whose hash never fits stays "drift not
-    checked" and untrusted, and is retried by age like any cut pack.
-  * The v1 shim reports a cut scan as incomplete rather than as a finding (the marker maps to
-    High wherever it appears).
+* **In the SessionStart sweep** (the verify state machine, `verify/state.rs`, stores one entry per
+  pack in `state.json`):
+  * Each pack's **content hash runs before its scan**, under the same deadlines. A pinned pack is
+    therefore judged for drift on its full hash; an equal-size, equal-name payload swap is drift
+    (BLOCK) whatever the scan budget. There is no metadata-only shape shortcut.
+  * Each scan stops at the earliest of: the pack's own allowance (`rules::PACK_BUDGET`, 2 s), the
+    sweep's budget, and the hook's hard deadline. A scan the budget cut, or a pack the sweep had
+    no time left to hash or scan, is recorded **unscanned**: `unreviewed` with the HIGH
+    `scan_budget_exceeded`. It is never clean, never pinned on that content, and never reused as
+    a scan result: the next sweep scans it again, unscanned packs first.
+  * **Unscanned packs are denied like blocked ones** until a sweep scans them in full: Read,
+    Grep and Bash access inside them, and the Skill / slash names they may provide. A pack seen
+    only for a first-sight HIGH finding is `unreviewed` and warned, not denied.
+  * A pack the sweep has not reached yet (new mid-session) is hashed and graded on the spot the
+    first time the Skill or slash gate needs it, within that gate's 5 s budget; out of budget,
+    the names it may provide are denied.
+  * The session context lists unscanned packs as "not fully scanned — rerun `safe-ai-skill
+    verify check <dir>`" (`verify check` scans without a budget).
+  * **Limit.** A pack whose hash or scan never fits its allowance stays unscanned, and so denied,
+    until the user scans it with `verify check` and approves it (`verify approve`).
+  * The v1 compatibility view (`heuristics::scan_within`) reports a cut scan as incomplete rather
+    than as a finding.
 
 `tests/rules_perf.rs` replays the 23 performance probes from the round-2 review, at 16 MiB each in
 release builds and 256 KiB in debug builds. Each must return within the pack budget plus 3 s of
