@@ -23,11 +23,14 @@ function detectPlatform() {
   if (os === "darwin" && arch === "x64")  return "darwin-x64";
   if (os === "linux"  && arch === "x64")  return "linux-x64";
   if (os === "linux"  && arch === "arm64") return "linux-arm64";
+  // Windows on ARM runs the x64 build under emulation.
+  if (os === "win32"  && (arch === "x64" || arch === "arm64")) return "windows-x64";
   return null;
 }
 
 const plat = detectPlatform();
-const binaryPath = plat ? path.join(ACTUAL_BIN_DIR, `safe-ai-skill-${plat}`) : null;
+const exe = process.platform === "win32" ? ".exe" : "";
+const binaryPath = plat ? path.join(ACTUAL_BIN_DIR, `safe-ai-skill-${plat}${exe}`) : null;
 
 if (!binaryPath || !fs.existsSync(binaryPath)) {
   process.stderr.write(

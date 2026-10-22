@@ -22,7 +22,7 @@ safe-ai-skill has two layers. The **plugin** is the always-on runtime firewall (
 
 ### Plugin (runtime firewall)
 
-Requires Claude Code 2.1.295 or newer. Older versions still run the hooks but ignore their `onFailure` setting, so a hook that can't start never blocks anything. The prebuilt engine covers macOS (arm64, x64) and Linux (x64, arm64). The Linux builds are static (musl), so they run on any distribution, Alpine included.
+Requires Claude Code 2.1.295 or newer. Older versions still run the hooks but ignore their `onFailure` setting, so a hook that can't start never blocks anything. The prebuilt engine covers macOS (arm64, x64), Linux (x64, arm64) and Windows (x64, also used on ARM). The Linux builds are static (musl), so they run on any distribution, Alpine included. On Windows, Claude Code must use Git Bash: the shell gates cover the `Bash` tool only, `PowerShell` tool calls are not gated, and PowerShell-only setups fail open with a notice. SessionStart warns when the plugin is installed from more than one marketplace (only one copy's hooks run) and when it can tell Claude Code is older than 2.1.295.
 
 ```bash
 claude plugin marketplace add solanabr/safe-ai-skill

@@ -10,6 +10,17 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 - **The CLI uses the hooks' data directory.** `safe-ai-skill allow`, `mode`, `status` and the other commands now find state where the hooks keep it: `CLAUDE_PLUGIN_DATA`, else the `safe-ai-skill-*` directory under `~/.claude/plugins/data` (or `$CLAUDE_CONFIG_DIR/plugins/data`). The `~/.safe-ai-skill` and `./.safe-ai-skill` fallbacks are gone; state written there by 1.0.x was never read by the hooks.
 - **New hooks:** PreToolUse `Skill`, `UserPromptExpansion`, and SessionStart on `clear` and `compact`. All fail open (`onFailure: continue`).
+- **The shim checks the engine binary's sha256.** Each release stamps the prebuilts' sha256 into the shim. A binary that doesn't match is treated as tampered and never runs: `gate-bash` and `gate-mcp` block, the other PreToolUse gates ask, SessionStart reports the firewall TAMPERED and CLI commands exit 2. A locally built engine copied into `bin/` must be stamped with `scripts/stamp-shim.sh`. If neither `sha256sum` nor `shasum` exists, the shim fails open with a notice like any other environment failure (`SAFE_AI_SKILL_STRICT=1` blocks).
+- **Windows (Git Bash) is supported.** Releases ship `safe-ai-skill-windows-x64.exe`, statically linked against the C runtime; Windows on ARM runs it under emulation. The shell gates cover the `Bash` tool only, and SessionStart says so: `PowerShell` tool calls are not gated, and PowerShell-only Windows fails open with a notice. `install.sh` and the npm package install the Windows binary too.
+- **SessionStart warns about a duplicate install** (more than one `safe-ai-skill@*` in `~/.claude/plugins/installed_plugins.json`: Claude Code runs only one copy's hooks) **and about Claude Code older than 2.1.295.** The version is read from `CLAUDE_CODE_VERSION`, else from the version in `CLAUDE_CODE_EXECPATH`; when neither gives one there is no warning (no `claude --version` per session).
+- **Shim hardening.** Hooks run the engine as a background child, so Claude Code's timeout SIGTERM reaches it. A Linux binary for the wrong ELF class or machine is an environment failure, not an exec attempt. `SAFE_AI_SKILL_DISABLE` is ignored when the committed `.claude/settings.json` contains any `SAFE_AI_SKILL` text or any `\u` escape (a JSON-escaped key), and the ignored-DISABLE notice now also shows when the session check exits 2 or 3.
+
+### Release process
+
+- The build and attest jobs are split: only the attest job holds `id-token`/`attestations` write, checks out nothing, and runs two actions pinned by commit SHA. The vendor job stamps the shim with the binaries' sha256 before regenerating `SHA256SUMS`.
+- The musl and Windows binaries are built twice from clean and must be byte-identical; every build remaps the workspace and cargo home paths.
+- Publish checks the stamped shim and that the committed `linux-x64` binary's `--version` matches the tag.
+- CI fails once no committed binary matches the `legacy_1_0_0` hash list, so the attestation exemption can't outlive the 1.0.0 binaries; checks the shim's stamped constants; runs a `windows-latest` build and engine tests; and enforces the latency budget (cold `gate-read` through the shim under 50 ms on musl, the SessionStart sweep at most 2x the shipped binary's).
 
 ---
 
