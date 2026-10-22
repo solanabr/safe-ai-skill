@@ -20,7 +20,9 @@ use safe_ai_skill::context::{self, Context};
 use safe_ai_skill::gate::{GateMeta, Scope};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::Policy;
-use safe_ai_skill::{grants, mode, promptguard, redact, registry, relax, session, verify};
+use safe_ai_skill::{
+    grants, mode, platform, promptguard, redact, registry, relax, session, verify,
+};
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
 const EXIT_USAGE: u8 = 3;
@@ -402,9 +404,14 @@ fn cmd_verify_session() -> ExitCode {
 
     let mut res = verify::run_session(&plugin_data, &cwd, &effective);
 
-    // Overrides the policy ratchet refused (project overlay, looser profile env var): shown to
-    // the user and given to the model.
-    if let Some(notice) = effective.ignored_notice() {
+    // Overrides the policy ratchet refused (project overlay, looser profile env var), then
+    // install and platform notices (duplicate install, old Claude Code, Windows scope): shown
+    // to the user and given to the model.
+    let notices = effective
+        .ignored_notice()
+        .into_iter()
+        .chain(platform::session_notices());
+    for notice in notices {
         for field in [&mut res.system_message, &mut res.additional_context] {
             if !field.is_empty() {
                 field.push('\n');

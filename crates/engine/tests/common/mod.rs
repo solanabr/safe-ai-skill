@@ -154,6 +154,8 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("SAFE_AI_SKILL_PROFILE");
         cmd.env_remove("ANCHOR_PROVIDER_URL");
         cmd.env_remove("SAFE_AI_SKILL_HOME");
+        cmd.env_remove("CLAUDE_CODE_VERSION");
+        cmd.env_remove("CLAUDE_CODE_EXECPATH");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);
