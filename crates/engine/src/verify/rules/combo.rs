@@ -21,12 +21,12 @@ pub(super) fn evaluate(outs: &[FileOut], facts: &PackFacts) -> Vec<ComboHit> {
                 Signal::Sink(l) => sinks.push(l),
                 Signal::PadH(l) => pads_h.push(l),
                 Signal::PadV(l) => pads_v.push(l),
-                // Build output concatenates unrelated modules, so it never feeds the cross-file
+                // A bundle concatenates unrelated modules, so it never feeds the cross-file
                 // split-payload rule (in-statement combos still apply to it).
-                Signal::Eval(l) if !bundled(&out.path) => {
+                Signal::Eval(l) if !generated(out) => {
                     first_eval.get_or_insert((&out.path, l));
                 }
-                Signal::Decoder(_) if !bundled(&out.path) => any_decoder = true,
+                Signal::Decoder(_) if !generated(out) => any_decoder = true,
                 Signal::Eval(_) | Signal::Decoder(_) => {}
                 Signal::ExecB64(l) => push(
                     &mut hits,
@@ -154,23 +154,20 @@ fn push(
     });
 }
 
-/// Generated build output: a `dist/`, `build/`, `out/`, `.next/` or `node_modules/` path, or a
-/// minified / bundled file name.
-fn bundled(path: &Path) -> bool {
-    let generated_dir = path.components().any(|c| {
-        matches!(
-            c.as_os_str().to_str(),
-            Some("dist" | "build" | "out" | ".next" | "node_modules")
-        )
-    });
-    let name = path
+/// Minified or bundled output: a bundler/minifier signature in the file (see
+/// [`super::FileOut::generated`]), a `*.min.js` name or a `node_modules/` path. A `dist/` or
+/// `build/` directory alone proves nothing.
+fn generated(out: &FileOut) -> bool {
+    let name = out
+        .path
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    generated_dir
-        || [".min.js", ".min.mjs", ".bundle.js", "-bundle.js"]
+    out.generated
+        || [".min.js", ".min.mjs", ".min.cjs"]
             .iter()
             .any(|s| name.ends_with(s))
+        || out.path.iter().any(|c| c == "node_modules")
 }
 
 /// The `.py` a compiled file was built from (`__pycache__/x.cpython-311.pyc` or legacy `x.pyc`).
@@ -262,18 +259,35 @@ mod tests {
     }
 
     #[test]
-    fn bundled_build_output_does_not_feed_the_split_payload_rule() {
+    fn bundles_and_minified_files_do_not_feed_the_split_payload_rule() {
         let pack = TempPack::new("bundle");
         pack.file(
             "mcp/dist/index.js",
-            "const v = new Function(a, b, sourceCode);\n",
+            "var __commonJS = (cb, mod) => function __require() { return mod; };\nconst v = new Function(a, b, sourceCode);\n",
         );
-        pack.file("mcp/dist/chunk.min.js", "const d = atob(p);\n");
+        pack.file("mcp/chunk.min.js", "const d = atob(p);\n");
+        pack.file("vendor/node_modules/x/i.js", "eval(code);\n");
+        pack.file(
+            "web/app.js",
+            &format!("const v = eval(s);{}\n", "a=1;".repeat(400)),
+        );
         pack.file("src/util.js", "export const d = (p) => atob(p);\n");
         let r = pack.scan();
         assert!(combo(&r, "eval_decoder").is_none(), "{r:?}");
         assert!(has(&r, "eval"), "{r:?}");
         assert_eq!(grade(&r), Grade::High);
+    }
+
+    #[test]
+    fn build_and_out_dirs_alone_are_not_exempt() {
+        for dir in ["build", "out", "dist"] {
+            let pack = TempPack::new("build-dir");
+            pack.file(&format!("{dir}/a.js"), "module.exports = (s) => eval(s);\n");
+            pack.file("b.js", "const d = atob(p);\n");
+            let r = pack.scan();
+            assert!(combo(&r, "eval_decoder").is_some(), "{dir}: {r:?}");
+            assert_eq!(grade(&r), Grade::Block);
+        }
     }
 
     #[test]

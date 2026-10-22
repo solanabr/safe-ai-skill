@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use binary_magic::Content;
-use context::{Document, FileClass};
+use context::{Document, FileClass, Lang};
 
 /// Bytes scanned per file. A code file larger than this is itself a HIGH finding.
 pub const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -326,6 +326,8 @@ pub(crate) struct FileOut {
     pub(crate) path: PathBuf,
     pub(crate) findings: Vec<Finding>,
     pub(crate) signals: Vec<Signal>,
+    /// Bundler or minifier output (decided only when the file has an eval or decoder signal).
+    pub(crate) generated: bool,
     counts: Vec<(&'static str, Severity, u16)>,
 }
 
@@ -335,6 +337,7 @@ impl FileOut {
             path: path.to_path_buf(),
             findings: Vec::new(),
             signals: Vec::new(),
+            generated: false,
             counts: Vec::new(),
         }
     }
@@ -407,11 +410,17 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
     let mut outs: Vec<FileOut> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
 
+    let base = if root.is_dir() {
+        root
+    } else {
+        root.parent().unwrap_or(root)
+    };
+    // Only the pack's own top-level `.git` is git metadata; a nested one is pack content.
     let walker = WalkDir::new(root)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || e.file_name() != ".git");
+        .filter_entry(|e| e.depth() != 1 || e.file_name() != ".git");
     for entry in walker.flatten() {
         let rel = match entry.path().strip_prefix(root) {
             Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
@@ -423,7 +432,7 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
         };
         let file_type = entry.file_type();
         if file_type.is_symlink() {
-            outs.push(symlink::scan(entry.path(), &rel));
+            outs.push(symlink::scan(base, entry.path(), &rel));
         } else if file_type.is_dir() {
             if entry.depth() > 0 {
                 if let Some(out) = harness_config::scan_dir(&rel) {
@@ -613,15 +622,60 @@ fn scan_text(
     if settings {
         harness_config::scan_settings(doc, out);
     }
+    if doc.class == FileClass::Code(Lang::Js)
+        && out
+            .signals
+            .iter()
+            .any(|s| matches!(s, Signal::Eval(_) | Signal::Decoder(_)))
+    {
+        out.generated = generated_js(doc);
+    }
+}
+
+/// Runtime helpers that only bundler output defines (esbuild, webpack, Rollup, Parcel).
+const BUNDLER_MARKERS: &[&str] = &[
+    "__webpack_require__",
+    "__commonjs",
+    "__toesm",
+    "commonjsglobal",
+    "getdefaultexportfromcjs",
+    "parcelrequire",
+];
+/// A minified file: lines this long on average, over at least [`MINIFIED_MIN_BYTES`].
+const MINIFIED_AVG_LINE: usize = 1000;
+const MINIFIED_MIN_BYTES: usize = 1024;
+
+/// JavaScript emitted by a bundler or a minifier (see [`BUNDLER_MARKERS`]).
+fn generated_js(doc: &Document<'_>) -> bool {
+    let bytes = doc.lower.len();
+    let minified = bytes >= MINIFIED_MIN_BYTES && bytes / doc.len().max(1) >= MINIFIED_AVG_LINE;
+    minified || BUNDLER_MARKERS.iter().any(|m| doc.lower.contains(m))
 }
 
 /// Package-manager lockfiles (machine-generated, never executed).
 fn is_lockfile(name: &str) -> bool {
-    name.ends_with(".lock")
-        || matches!(
-            name,
-            "package-lock.json" | "npm-shrinkwrap.json" | "pnpm-lock.yaml" | "bun.lockb"
-        )
+    matches!(
+        name,
+        "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.lock"
+            | "cargo.lock"
+            | "poetry.lock"
+            | "pipfile.lock"
+            | "pdm.lock"
+            | "uv.lock"
+            | "gemfile.lock"
+            | "composer.lock"
+            | "podfile.lock"
+            | "pubspec.lock"
+            | "mix.lock"
+            | "flake.lock"
+            | "packages.lock.json"
+    )
 }
 
 /// Run the command-level rules over every command of one statement.
