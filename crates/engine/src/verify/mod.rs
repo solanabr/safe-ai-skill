@@ -1899,6 +1899,16 @@ fn request_approve_in(
     });
     if let Some((key, e)) = moved {
         let from = PathBuf::from(e.quarantined_to.clone().unwrap_or_default());
+        // A combination rule is never approved (spec D2.8), so moving the pack back would only
+        // put blocked content where it runs: refuse now, before anything is restored.
+        if e.reason == Some(state::Reason::Combo) || e.escapes() {
+            return Err(Error::Other(format!(
+                "{} is blocked by a combination rule ({}), which approval never clears; it                  stays in quarantine at {}. Remove or fix it instead.",
+                escape_for_report(target),
+                e.flagged_rules.join(", "),
+                escape_for_report(&from.display().to_string())
+            )));
+        }
         return restore_request(dir, &from, &state::path_of(key), e.kind);
     }
 
@@ -1945,7 +1955,17 @@ fn restore_request(
     kind: PackKind,
 ) -> Result<PendingRequest, EngineError> {
     let hash = state::tree_hash(from);
-    let flagged = state::flagged_rules(&grading::scan_pack(from));
+    let report = grading::scan_pack(from);
+    if !report.combos.is_empty() {
+        let rules: Vec<&str> = report.combos.iter().map(|c| c.rule).collect();
+        return Err(Error::Other(format!(
+            "the quarantined {} {} fires a combination rule ({}), which approval never clears;              it is not restored",
+            kind.label(),
+            escape_for_report(&from.display().to_string()),
+            rules.join(", ")
+        )));
+    }
+    let flagged = state::flagged_rules(&report);
     let summary = format!(
         "restore the quarantined {} {} to {} and approve it at content {}{}",
         kind.label(),
@@ -2793,17 +2813,31 @@ mod orchestration_tests {
         let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
         assert_eq!(r.blocked, vec![".claude/skills/evil".to_string()]);
 
-        // Approve restores it to its origin.
-        let req = request_approve_in(&d, &project, &no_user_skills(), "evil", &p).unwrap();
-        assert!(req.summary.contains("restore"), "{}", req.summary);
-        let msg = apply_confirmed(&d, &confirm(&d, &req)).unwrap();
-        assert!(pack.join("COMBO").exists());
-        assert!(!moved.exists());
-        // Restored in place, but a combo is never approved: it stays blocked there.
-        assert!(msg.contains("NOT approved"), "{msg}");
+        // A combo is never approved, so the restore is refused at request time: nothing moves.
+        let err = request_approve_in(&d, &project, &no_user_skills(), "evil", &p).unwrap_err();
+        assert!(err.to_string().contains("combination rule"), "{err}");
+        assert!(!pack.exists());
+        assert!(moved.join("COMBO").exists());
         let st = state::load(&d).state;
         assert_eq!(st.packs[&key].state, PackStatus::Blocked);
-        assert_eq!(st.packs[&key].quarantined_to, None);
+        assert_eq!(st.packs[&key].quarantined_to.as_deref(), moved.to_str());
+    }
+
+    #[test]
+    fn on_block_move_restores_a_drifted_pack_on_approval() {
+        let d = data("move-drift", false);
+        let project = tempdir("move-drift-proj");
+        let pack = seed_skill(&skills(&project), "tool", "# tool");
+        let mut p = policy();
+        p.supply_chain.on_block = "move".into();
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        fs::write(pack.join("extra.md"), "changed").unwrap();
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!pack.exists(), "drift moved it");
+        let req = request_approve_in(&d, &project, &no_user_skills(), "tool", &p).unwrap();
+        assert!(req.summary.contains("restore"), "{}", req.summary);
+        apply_confirmed(&d, &confirm(&d, &req)).unwrap();
+        assert!(pack.join("extra.md").exists());
     }
 
     #[test]
