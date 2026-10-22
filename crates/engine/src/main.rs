@@ -56,6 +56,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("mode", cmd_mode),
     ("revoke", |_| cmd_revoke()),
     ("status", |_| cmd_status()),
+    ("env", safe_ai_skill::env::main),
     ("--version", |_| cmd_version()),
 ];
 
