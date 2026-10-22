@@ -212,7 +212,7 @@ pub fn decide_file(
     let path = resolve(raw, cwd, &homes)?;
     wallets.hit(&path).map(|target| {
         Verdict::Deny(format!(
-            "Writing {target} would destroy the default Solana wallet (spec §3.1: denied on \
+            "Writing {target} would destroy the default Solana wallet (denied on \
              every cluster at every tier). Edit it yourself outside the agent if you intend to."
         ))
     })
@@ -220,7 +220,7 @@ pub fn decide_file(
 
 fn deny(what: String, command: &str) -> Verdict {
     Verdict::Deny(format!(
-        "Default-wallet destruction: {what} (spec §3.1: denied on every cluster at every \
+        "Default-wallet destruction: {what} (denied on every cluster at every \
          tier). Run it yourself outside the agent if you intend it: `{}`",
         command.trim()
     ))
