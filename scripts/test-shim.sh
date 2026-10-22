@@ -12,6 +12,7 @@ set -u
 
 cd "$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)" || exit 1
 shim_src=$PWD/plugins/safe-ai-skill/bin/safe-ai-skill
+stamp_src=$PWD/scripts/stamp-shim.sh
 hooks_json=$PWD/plugins/safe-ai-skill/hooks/hooks.json
 
 py=$(python3 -I -c 'import sys; print(sys.executable)' 2>/dev/null) || {
@@ -25,7 +26,7 @@ trap 'exit 1' HUP INT TERM
 
 # The shim and the fakes read these; the caller's own values must not leak into the cases.
 unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE CLAUDE_PROJECT_DIR FAKE_UNAME_S \
-  FAKE_UNAME_M FAKE_MARKS
+  FAKE_UNAME_M FAKE_MARKS FAKE_REAL_SHA
 
 # The real platform, for the cases that run a native executable as the engine.
 host_s=$(uname -s)
@@ -65,6 +66,28 @@ exit 1
 EOF
 chmod +x "$fakebin/uname" "$fakebin/cargo"
 
+# PATH dirs for the sha256-tool cases: the tools the shim needs except any sha256 tool, a
+# shasum that records it ran (and hashes with the host's tool), and a sha256sum that fails.
+minbin=$work/minbin
+mkdir "$minbin"
+for tool in od mktemp rm cat grep sleep; do
+  tool_path=$(command -v "$tool") && ln -s "$tool_path" "$minbin/$tool"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  FAKE_REAL_SHA="$(command -v sha256sum)"
+else
+  FAKE_REAL_SHA="$(command -v shasum) -a 256"
+fi
+export FAKE_REAL_SHA
+shasum_dir=$work/shasum-only
+broken_sha_dir=$work/broken-sha
+mkdir "$shasum_dir" "$broken_sha_dir"
+# shellcheck disable=SC2016 # expands when the fake runs
+printf '#!/bin/sh\n: >"$FAKE_MARKS/shasum"\n[ "$*" = "-a 256" ] || exit 1\nexec $FAKE_REAL_SHA\n' \
+  >"$shasum_dir/shasum"
+printf '#!/bin/sh\nexit 1\n' >"$broken_sha_dir/sha256sum"
+chmod +x "$shasum_dir/shasum" "$broken_sha_dir/sha256sum"
+
 # mk <path> <body>: write an executable fake engine that records it ran, then runs <body>.
 # The fakes' $-expressions are meant to expand when they run, not here.
 # shellcheck disable=SC2016
@@ -76,6 +99,7 @@ mk() {
 # engine <path> <behaviour>: write one fake engine variant.
 # shellcheck disable=SC2016
 engine() {
+  stale=1
   case $2 in
     ok) mk "$1" 'printf "ran=%s args=%s stdin=%s" "${0##*/}" "$*" "$(cat)"' ;;
     silent) mk "$1" ':' ;;
@@ -92,7 +116,28 @@ engine() {
     garbage) printf '\001\002\003\004\necho %s\n' "'$ALLOW'" >"$1" && chmod +x "$1" ;;
     empty) : >"$1" && chmod +x "$1" ;;
     noexec) mk "$1" 'echo ran' && chmod -x "$1" ;;
+    # Runs until SIGTERM, which it records.
+    sleepy) mk "$1" 'trap '"'"': >"$FAKE_MARKS/termed"; kill $! 2>/dev/null; exit 0'"'"' TERM
+sleep 10 &
+wait $!' ;;
+    # An ELF header, elf:<EI_CLASS>:<e_machine lo>:<e_machine hi> in octal, whose body, if a
+    # shell ever ran the file as a script, would leave a mark.
+    elf:*)
+      IFS=: read -r _ cls m1 m2 <<EOT
+$2
+EOT
+      # shellcheck disable=SC2059 # the format carries the header bytes
+      printf "\\177ELF\\$cls\\001\\001\\000\\000\\000\\000\\000\\000\\000\\000\\000\\002\\000\\$m1\\$m2\\001\\000\\000\\000\\n" >"$1"
+      printf '%s\n' ': >"$FAKE_MARKS/${0##*/}"' >>"$1"
+      chmod +x "$1"
+      ;;
   esac
+}
+
+# stamp: write the case's prebuilt hashes into its shim, as release.yml does.
+stamp() {
+  sh "$stamp_src" "$bin_dir" >/dev/null || fail "stamp-shim.sh failed"
+  stale=
 }
 
 # fresh [<suffix>]: a new plugin layout with a planted data-dir engine, a crates/engine dir
@@ -118,33 +163,49 @@ fresh() {
   e_disable=
   bare=
   payload_f=$payload
+  no_stamp=
+  e_path=
+  e_tmpdir=
+  stale=1
 }
 
-# run <args...>: run the case's shim under $sh_cmd with $payload_f on stdin (by bare name
-# from its own directory when $bare is set). Sets rc; stdout and stderr land in
-# $case_dir/out and $case_dir/err. The outer 2>/dev/null only swallows this shell's own
-# "Killed" job notices.
+# launch <args...>: exec the case's shim under $sh_cmd in the case environment (by bare name
+# from its own directory when $bare is set). Called in a subshell.
+launch() {
+  PATH=$fakebin:${e_path:-$PATH}
+  FAKE_MARKS=$marks
+  CLAUDE_PLUGIN_DATA=$data_dir
+  CLAUDE_PROJECT_DIR=$project_dir
+  FAKE_UNAME_M=$u_m
+  export PATH FAKE_MARKS CLAUDE_PLUGIN_DATA CLAUDE_PROJECT_DIR FAKE_UNAME_M
+  if [ -z "$u_fail" ]; then FAKE_UNAME_S=$u_s && export FAKE_UNAME_S; fi
+  if [ -n "$e_strict" ]; then SAFE_AI_SKILL_STRICT=$e_strict && export SAFE_AI_SKILL_STRICT; fi
+  if [ -n "$e_disable" ]; then SAFE_AI_SKILL_DISABLE=$e_disable && export SAFE_AI_SKILL_DISABLE; fi
+  if [ -n "$e_tmpdir" ]; then TMPDIR=$e_tmpdir && export TMPDIR; fi
+  if [ "$sh_cmd" = direct ]; then exec "$bin_dir/safe-ai-skill" "$@"; fi
+  # shellcheck disable=SC2086 # sh_cmd is one shell or two words, e.g. "bash --posix"
+  if [ -n "$bare" ]; then cd "$bin_dir" && exec $sh_cmd safe-ai-skill "$@"; fi
+  # shellcheck disable=SC2086 # as above
+  exec $sh_cmd "$bin_dir/safe-ai-skill" "$@"
+}
+
+# run <args...>: run the case's shim with $payload_f on stdin, stamping it first unless
+# $no_stamp. Sets rc; stdout and stderr land in $case_dir/out and $case_dir/err. The outer
+# 2>/dev/null only swallows this shell's own "Killed" job notices.
 run() {
+  if [ -n "$stale" ] && [ -z "$no_stamp" ]; then stamp; fi
   (
-    (
-      PATH=$fakebin:$PATH
-      FAKE_MARKS=$marks
-      CLAUDE_PLUGIN_DATA=$data_dir
-      CLAUDE_PROJECT_DIR=$project_dir
-      FAKE_UNAME_M=$u_m
-      export PATH FAKE_MARKS CLAUDE_PLUGIN_DATA CLAUDE_PROJECT_DIR FAKE_UNAME_M
-      if [ -z "$u_fail" ]; then FAKE_UNAME_S=$u_s && export FAKE_UNAME_S; fi
-      if [ -n "$e_strict" ]; then SAFE_AI_SKILL_STRICT=$e_strict && export SAFE_AI_SKILL_STRICT; fi
-      if [ -n "$e_disable" ]; then SAFE_AI_SKILL_DISABLE=$e_disable && export SAFE_AI_SKILL_DISABLE; fi
-      if [ "$sh_cmd" = direct ]; then exec "$bin_dir/safe-ai-skill" "$@"; fi
-      # shellcheck disable=SC2086 # sh_cmd is one shell or two words, e.g. "bash --posix"
-      if [ -n "$bare" ]; then cd "$bin_dir" && exec $sh_cmd safe-ai-skill "$@"; fi
-      # shellcheck disable=SC2086 # as above
-      exec $sh_cmd "$bin_dir/safe-ai-skill" "$@"
-    ) <"$payload_f" >"$case_dir/out" 2>"$case_dir/err"
+    (launch "$@") <"$payload_f" >"$case_dir/out" 2>"$case_dir/err"
     exit $?
   ) 2>/dev/null
   rc=$?
+}
+
+# start <args...>: like run, in the background; sets bgpid to the shim's pid.
+start() {
+  if [ -n "$stale" ] && [ -z "$no_stamp" ]; then stamp; fi
+  (launch "$@") <"$payload_f" >"$case_dir/out" 2>"$case_dir/err" &
+  bgpid=$!
 }
 
 checks=0
@@ -216,6 +277,11 @@ expect_notice() {
     and d['hookSpecificOutput']['hookEventName'] == 'SessionStart'
     and '$1' in d['hookSpecificOutput']['additionalContext']"
 }
+expect_tamper_ask() {
+  expect_json 'list(d) == ["hookSpecificOutput"]
+    and d["hookSpecificOutput"]["permissionDecision"] == "ask"
+    and "sha256" in d["hookSpecificOutput"]["permissionDecisionReason"]'
+}
 expect_repo_note() {
   expect_json '"SAFE_AI_SKILL_DISABLE set by project settings" in d["systemMessage"]
     and "ignored" in d["systemMessage"]'
@@ -274,6 +340,7 @@ matrix() {
     for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
       cp "$native_true" "$bin_dir/safe-ai-skill-$p"
     done
+    stale=1
     t "a native $host_s/$host_m executable passes the format check and runs"
     check
     case $(od -A n -t x1 -N 2 "$native_true") in
@@ -570,6 +637,209 @@ matrix() {
   expect_ran safe-ai-skill-linux-x64
   expect_not_ran safe-ai-skill
 
+  # The prebuilt must match the sha256 stamped into the shim at release (D6.1). A mismatch
+  # is tamper: the Solana and MCP gates block, PreToolUse gates ask, the rest continue.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  stamp
+  engine "$bin_dir/safe-ai-skill-linux-x64" planted
+  no_stamp=1
+  t "tamper: gate-bash blocks a prebuilt that fails its sha256 check"
+  run gate-bash
+  expect_rc 2
+  expect_no_out
+  expect_err_has sha256
+  t "tamper: gate-mcp blocks"
+  run gate-mcp
+  expect_rc 2
+  expect_no_out
+  t "tamper: the other PreToolUse gates ask"
+  for args in gate-read gate-bash-secrets gate-skill; do
+    run "$args"
+    expect_rc 0
+    expect_tamper_ask
+  done
+  t "tamper: non-PreToolUse hooks continue with one stderr line"
+  for args in redact prompt-guard gate-prompt-expansion; do
+    run "$args"
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
+  done
+  t "tamper: SessionStart reports the firewall TAMPERED"
+  run verify session
+  expect_rc 0
+  expect_notice TAMPERED
+  t "tamper: a CLI command refuses to run"
+  run status
+  expect_rc 2
+  expect_err_has sha256
+  t "tamper: SAFE_AI_SKILL_STRICT=1 blocks every hook"
+  e_strict=1
+  for args in gate-read redact 'verify session'; do
+    # shellcheck disable=SC2086 # 'verify session' is two arguments
+    run $args
+    expect_rc 2
+    expect_no_out
+  done
+  e_strict=
+  t "tamper: the mismatched prebuilt never runs"
+  expect_not_ran safe-ai-skill-linux-x64
+
+  fresh
+  stamp
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  no_stamp=1
+  t "a prebuilt planted where the release shipped none fails the sha256 check"
+  run gate-bash
+  expect_rc 2
+  expect_not_ran safe-ai-skill-linux-x64
+
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  e_path=$shasum_dir:$minbin
+  t "shasum -a 256 verifies the prebuilt when sha256sum is missing"
+  run gate-read
+  expect_rc 0
+  expect_ran shasum
+  expect_ran safe-ai-skill-linux-x64
+  engine "$bin_dir/safe-ai-skill-linux-x64" planted
+  no_stamp=1
+  rm -f "$marks/safe-ai-skill-linux-x64"
+  t "shasum also catches a mismatch"
+  run gate-bash
+  expect_rc 2
+  expect_not_ran safe-ai-skill-linux-x64
+
+  for tools in none broken; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    case $tools in
+      none) e_path=$minbin ;;
+      broken) e_path=$broken_sha_dir:$minbin ;;
+    esac
+    t "sha256 tool $tools: gate-read fails open with one stderr line"
+    run gate-read
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
+    expect_err_has sha256
+    t "sha256 tool $tools: gate-bash answers ask"
+    run gate-bash
+    expect_rc 0
+    expect_ask
+    t "sha256 tool $tools: SessionStart reports the firewall INACTIVE"
+    run verify session
+    expect_rc 0
+    expect_notice INACTIVE
+    t "sha256 tool $tools: SAFE_AI_SKILL_STRICT=1 fails closed"
+    e_strict=1
+    run gate-read
+    expect_rc 2
+    e_strict=
+    t "sha256 tool $tools: the unverified prebuilt never runs"
+    expect_not_ran safe-ai-skill-linux-x64
+  done
+
+  # A Linux prebuilt must be a 64-bit ELF for this machine (EI_CLASS 2, e_machine
+  # 0x3e x86-64 / 0xb7 aarch64), else it is an environment failure.
+  for spec in x86_64/linux-x64/elf:001:076:000 x86_64/linux-x64/elf:002:267:000 \
+    aarch64/linux-arm64/elf:002:076:000; do
+    fresh
+    u_m=${spec%%/*}
+    rest=${spec#*/}
+    target=${rest%%/*}
+    engine "$bin_dir/safe-ai-skill-$target" "${rest#*/}"
+    t "$u_m: an ELF prebuilt with ${rest#*/} is an environment failure"
+    run gate-bash
+    expect_rc 0
+    expect_ask
+    run gate-read
+    expect_rc 0
+    expect_err_lines 1
+    expect_not_ran "safe-ai-skill-$target"
+  done
+
+  # Claude Code's hook timeout sends SIGTERM to the shim; the engine child must get it too.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" sleepy
+  t "SIGTERM to the shim is forwarded to the engine"
+  start gate-bash
+  i=0
+  while [ ! -e "$marks/safe-ai-skill-linux-x64" ] && [ "$i" -lt 100 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  sleep 0.3
+  kill -TERM "$bgpid" 2>/dev/null
+  rc=0
+  wait "$bgpid" || rc=$?
+  expect_rc 143
+  i=0
+  while [ ! -e "$marks/termed" ] && [ "$i" -lt 20 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  expect_ran termed
+
+  # Without a usable temp dir the shim captures in memory, with the same contract.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" bytes
+  e_tmpdir=$case_dir/no/such/dir
+  t "no temp dir: exit 0 passes stdout through byte for byte"
+  run gate-read
+  expect_rc 0
+  check
+  printf 'line1\n\nline3\n\n' | cmp -s - "$case_dir/out" ||
+    fail "stdout <$(snippet "$case_dir/out")> is not byte-identical"
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" exit:2
+  e_tmpdir=$case_dir/no/such/dir
+  t "no temp dir: exit 2 passes through"
+  run gate-bash
+  expect_rc 2
+  expect_out "$ALLOW"
+  expect_err_has 'engine stderr'
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" exit:127
+  e_tmpdir=$case_dir/no/such/dir
+  t "no temp dir: exit 127 is an environment failure"
+  run gate-bash
+  expect_rc 0
+  expect_ask
+  expect_err_lines 1
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" kill
+  e_tmpdir=$case_dir/no/such/dir
+  t "no temp dir: a crash blocks gate-bash"
+  run gate-bash
+  expect_rc 2
+  expect_no_out
+
+  # The ignored repo DISABLE is reported whatever the session check's exit code.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" exit:2
+  e_disable=1
+  printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.json"
+  t "SessionStart adds the ignored-DISABLE notice when the engine exits 2"
+  run verify session
+  expect_rc 2
+  expect_repo_note
+
+  # JSON escapes can spell the key without its plain text: any \u escape or SAFE_AI_SKILL
+  # mention in the committed settings counts as the repo setting DISABLE.
+  for body in '{"env":{"SAFE_AI_SKILL_DIS\u0041BLE":"1"}}' \
+    '{"env":{"\u0053AFE_AI_SKILL_DISABLE":"1"}}' '{"env":{"SAFE_AI_SKILL_STRICT":"0"}}'; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    e_disable=1
+    printf '%s\n' "$body" >"$project_dir/.claude/settings.json"
+    t "committed settings $body: SAFE_AI_SKILL_DISABLE is ignored"
+    run gate-read
+    expect_rc 0
+    expect_ran safe-ai-skill-linux-x64
+  done
+
   # Every subcommand hooks.json wires up gets hook semantics, not CLI semantics.
   while IFS= read -r args; do
     fresh
@@ -627,15 +897,33 @@ for sh_name in sh dash bash busybox; do
     echo "skip: $sh_name not installed"
     continue
   fi
+  # By absolute path: some cases run the shim with a PATH that lacks the shell.
+  sh_path=$(command -v "$sh_name")
   case $sh_name in
-    bash) sh_cmd='bash --posix' ;;
-    busybox) sh_cmd='busybox sh' ;;
-    *) sh_cmd=$sh_name ;;
+    bash) sh_cmd="$sh_path --posix" ;;
+    busybox) sh_cmd="$sh_path sh" ;;
+    *) sh_cmd=$sh_path ;;
   esac
   before=$fails
   matrix
   echo "$sh_cmd: $((fails - before)) failed"
 done
+
+sh_name=stamp
+t "the committed shim's sha256 constants match the committed prebuilts"
+check
+sh "$stamp_src" --check plugins/safe-ai-skill/bin >/dev/null 2>"$work/stamp-err" ||
+  fail "$(cat "$work/stamp-err")"
+fresh
+engine "$bin_dir/safe-ai-skill-linux-x64" ok
+stamp
+t "stamp-shim.sh --check passes on a freshly stamped layout"
+check
+sh "$stamp_src" --check "$bin_dir" >/dev/null 2>&1 || fail "check failed"
+engine "$bin_dir/safe-ai-skill-linux-x64" planted
+t "stamp-shim.sh --check fails once a prebuilt changes"
+check
+if sh "$stamp_src" --check "$bin_dir" >/dev/null 2>&1; then fail "check passed"; fi
 
 sh_name=direct
 sh_cmd=direct
