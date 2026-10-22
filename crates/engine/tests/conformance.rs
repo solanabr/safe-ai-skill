@@ -221,17 +221,20 @@ fn entries(event: &str) -> Vec<(String, Value)> {
 
 #[test]
 fn hooks_json_wires_the_shared_contract_hooks() {
-    let runs = |event: &str, matcher: &str, sub: &str| {
+    let wired = |event: &str, matcher: &str, sub: &str, on_failure: &str| {
         entries(event).into_iter().any(|(m, h)| {
             m == matcher
                 && h["command"]
                     .as_str()
                     .unwrap_or("")
                     .ends_with(&format!(" {sub}"))
-                && h["onFailure"] == "continue"
+                && h["onFailure"] == on_failure
         })
     };
-    assert!(runs("PreToolUse", "Skill", "gate-skill"));
+    let runs = |event: &str, matcher: &str, sub: &str| wired(event, matcher, sub, "continue");
+    // The Skill gate fails closed: failing open would run a blocked pack's !`cmd` (D6.2 as
+    // amended for WS-D1).
+    assert!(wired("PreToolUse", "Skill", "gate-skill", "block"));
     assert!(runs("UserPromptExpansion", "", "gate-prompt-expansion"));
     // A typed `/name` is also checked at UserPromptSubmit, for versions without the event.
     assert!(runs("UserPromptSubmit", "", "gate-prompt-expansion"));

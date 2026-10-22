@@ -231,3 +231,101 @@ fn nothing_blocked_means_the_gates_stay_silent() {
         assert_eq!((run.code, run.stdout.trim()), (Some(0), ""), "{sub}");
     }
 }
+
+#[test]
+fn a_project_wide_grep_reaching_a_blocked_pack_is_denied() {
+    let f = Fixture::new("sg-grep");
+    std::fs::create_dir_all(f.project.path().join("src")).unwrap();
+    assert_denied_naming_the_pack(&f.pretool(
+        "gate-read",
+        "Grep",
+        serde_json::json!({"pattern": "echo"}),
+    ));
+    let (d, _) = decision(&f.pretool(
+        "gate-read",
+        "Grep",
+        serde_json::json!({"pattern": "echo", "path": "src"}),
+    ));
+    assert_eq!(d, "");
+}
+
+#[test]
+fn an_oversized_slash_prompt_for_a_blocked_pack_is_blocked() {
+    let f = Fixture::new("sg-big");
+    let mut prompt = String::from("/evil ");
+    prompt.push_str(&"x".repeat(1024 * 1024 + 16));
+    let body = serde_json::json!({"hook_event_name": "UserPromptSubmit", "prompt": prompt});
+    let run = Invocation::new(&["gate-prompt-expansion"])
+        .plugin_data(f.data.path())
+        .home(f.home.path())
+        .cwd(f.project.path())
+        .stdin(body.to_string())
+        .run();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let v = run.json();
+    assert_eq!(v["decision"], "block", "{v}");
+    // An oversized ordinary prompt is not.
+    let body = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "x".repeat(1024 * 1024 + 16),
+    });
+    let run = Invocation::new(&["gate-prompt-expansion"])
+        .plugin_data(f.data.path())
+        .home(f.home.path())
+        .cwd(f.project.path())
+        .stdin(body.to_string())
+        .run();
+    assert!(run.stdout.trim().is_empty(), "{}", run.stdout);
+}
+
+#[test]
+fn home_relative_paths_into_a_blocked_user_pack_are_denied() {
+    let project = TempDir::new("sg-home-proj");
+    let home = TempDir::new("sg-home-home");
+    let data = TempDir::new("sg-home-data");
+    let plugin = TempDir::new("sg-home-plugin");
+    std::fs::create_dir_all(plugin.join("policy")).unwrap();
+    std::fs::write(
+        plugin.join("policy").join("default.policy.yaml"),
+        "version: 1\nsupply_chain:\n  verify_skills_dirs: [ \"~/.claude/skills\", \".claude/skills\" ]\n",
+    )
+    .unwrap();
+    let pack = home.path().join(".claude/skills/hpack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(pack.join("SKILL.md"), "# hpack\n").unwrap();
+    let cwd = project.path().to_str().unwrap();
+    let run = |args: &[&str], stdin: serde_json::Value| {
+        Invocation::new(args)
+            .plugin_data(data.path())
+            .home(home.path())
+            .env("CLAUDE_PLUGIN_ROOT", plugin.path().to_str().unwrap())
+            .stdin(stdin.to_string())
+            .run()
+    };
+    let session = serde_json::json!({"hook_event_name": "SessionStart", "cwd": cwd});
+    assert!(run(&["verify", "session"], session.clone())
+        .stdout
+        .trim()
+        .is_empty());
+    std::fs::write(pack.join("SKILL.md"), "# hpack, edited\n").unwrap();
+    assert!(run(&["verify", "session"], session)
+        .stdout
+        .contains("BLOCK"));
+    for cmd in [
+        "cat $HOME/.claude/skills/hpack/SKILL.md",
+        "cat ${HOME}/.claude/skills/hpack/SKILL.md",
+        "cat ~/.claude/skills/hpack/SKILL.md",
+        "cd; cd .claude/skills/hpack",
+    ] {
+        let out = run(
+            &["gate-bash-secrets"],
+            serde_json::json!({
+                "hook_event_name": "PreToolUse", "cwd": cwd, "tool_name": "Bash",
+                "tool_input": {"command": cmd},
+            }),
+        );
+        let (d, reason) = decision(&out);
+        assert_eq!(d, "deny", "{cmd}: {}", out.stdout);
+        assert!(reason.contains("hpack"), "{reason}");
+    }
+}

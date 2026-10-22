@@ -587,7 +587,7 @@ matrix() {
 }
 
 sh_name=hooks.json
-t "hooks.json wires onFailure: block on the Solana entries, continue elsewhere"
+t "hooks.json wires onFailure: block on the Solana entries and the Skill gate, continue elsewhere"
 check
 "$py" -I - "$hooks_json" "$work/hook-commands" <<'EOF' || fail "see above"
 import json, re, sys
@@ -604,9 +604,15 @@ for event, groups in cfg["hooks"].items():
                 problems.append(f"{event}: unexpected command {cmd!r}")
                 continue
             commands.add(cmd[len(prefix):])
-            want = "block" if solana.fullmatch(hook.get("if", "")) else "continue"
-            blocking += want == "block"
-            if want == "block" and cmd[len(prefix):] != "gate-bash":
+            sub = cmd[len(prefix):]
+            # The Skill gate fails closed too: failing open would run a blocked pack's !`cmd`.
+            skill = event == "PreToolUse" and group.get("matcher") == "Skill"
+            if skill and sub != "gate-skill":
+                problems.append(f"{event}: the Skill matcher must run gate-skill, runs {cmd!r}")
+            solana_entry = bool(solana.fullmatch(hook.get("if", "")))
+            want = "block" if solana_entry or skill else "continue"
+            blocking += solana_entry
+            if solana_entry and sub != "gate-bash":
                 problems.append(f"{event}: {hook['if']} must run gate-bash, runs {cmd!r}")
             if hook.get("onFailure") != want:
                 problems.append(

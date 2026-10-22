@@ -312,9 +312,10 @@ fn cmd_gate_read() -> ExitCode {
     let cwd = cwd_of(&input);
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
+    let tool_name = input.tool_name.clone().unwrap_or_default();
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let deny @ Verdict::Deny(_) =
-            verify::enforce::read_verdict(&verify_dir(&cwd), tool_input, &cwd)
+            verify::enforce::read_verdict(&verify_dir(&cwd), &tool_name, tool_input, &cwd)
         {
             return finish_blocked_pack(deny, &effective, &plugin_data, &input, &raw);
         }
@@ -381,11 +382,19 @@ fn cmd_gate_skill() -> ExitCode {
 /// command whose skill pack is blocked. A typed `/name` never reaches the Skill tool.
 fn cmd_gate_prompt_expansion() -> ExitCode {
     let (raw, parsed) = read_input();
-    if parsed.is_err() {
-        return ExitCode::SUCCESS;
-    }
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return ExitCode::SUCCESS;
+    let payload = match (&parsed, serde_json::from_slice::<serde_json::Value>(&raw)) {
+        (Ok(_), Ok(payload)) => payload,
+        (Err(Unreadable::Empty), _) => return ExitCode::SUCCESS,
+        // Oversized or malformed: judge the raw head (a blocked slash command, or one whose
+        // name cannot be read while a pack in scope is blocked, is blocked).
+        _ => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let dir = verify_dir(&cwd);
+            let effective = load_effective_policy(&cwd, &dir.path);
+            let block = verify::enforce::unreadable_prompt_verdict(&dir, &cwd, &effective, &raw);
+            let _ = io::emit_userpromptsubmit(block.as_deref());
+            return ExitCode::SUCCESS;
+        }
     };
     if verify::enforce::slash_skill_name(&payload).is_none() {
         return ExitCode::SUCCESS;

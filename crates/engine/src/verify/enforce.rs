@@ -5,7 +5,10 @@
 //!   name or a `SKILL.md` name), each is re-hashed and re-graded on the spot (a mid-session
 //!   edit is drift), and the call is denied when any of them is blocked. A typed `/name`
 //!   never reaches the Skill tool, so both prompt-time events are needed.
-//! - Read/Grep/Glob: denied when a target path resolves inside a blocked pack.
+//! - Read: denied when the file resolves inside a blocked pack. Grep/Glob: denied when the
+//!   search root lies inside a blocked pack or contains one.
+//! - Verifying a skill's packs is bounded by [`SKILL_BUDGET`]; an overrun denies, and the
+//!   Skill hook is wired `onFailure: block`, so a crash or timeout never fails open.
 //! - Bash (best effort): every word of every command segment is resolved against the hook
 //!   `cwd`, following each `cd`/`pushd` in order and expanding globs; denied when one lands
 //!   inside a blocked pack, or when a command runs with its working dir inside one.
@@ -13,6 +16,7 @@
 //! The read and Bash checks only consult the stored state (no hashing), so they stay cheap.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -22,6 +26,10 @@ use crate::datadir::DataDir;
 use crate::gate::Verdict;
 use crate::policy::Policy;
 
+/// Time the Skill and slash gates may spend re-hashing packs before denying.
+const SKILL_BUDGET: Duration = Duration::from_secs(5);
+/// Bytes of an unreadable prompt payload searched for a slash command.
+const RAW_HEAD_BYTES: usize = 64 * 1024;
 /// Glob matches examined per word.
 const MAX_GLOB_MATCHES: usize = 512;
 /// Words examined per command.
@@ -113,10 +121,11 @@ pub fn skill_verdict(dir: &DataDir, cwd: &Path, policy: &Policy, skill: &str) ->
         policy,
         skill,
         grading::scan_pack,
+        SKILL_BUDGET,
     )
 }
 
-/// [`skill_verdict`] with an explicit user skills dir and scanner.
+/// [`skill_verdict`] with an explicit user skills dir, scanner and time budget.
 pub(super) fn skill_verdict_in(
     dir: &DataDir,
     cwd: &Path,
@@ -124,34 +133,48 @@ pub(super) fn skill_verdict_in(
     policy: &Policy,
     skill: &str,
     scanner: Scanner,
+    budget: Duration,
 ) -> Verdict {
     let wanted = skill_candidates(skill);
     if wanted.is_empty() {
         return Verdict::NoOpinion;
     }
     let is_wanted = |n: &str| wanted.iter().any(|w| w.eq_ignore_ascii_case(n));
+    let deadline = Instant::now() + budget;
     let mut st = state::load(dir).state;
     let mut seen: Vec<String> = Vec::new();
     let mut blocked: Option<(String, &'static str)> = None;
+    // Blocked packs whose names may be incomplete (unparseable frontmatter).
+    let mut unsure_blocked: Option<String> = None;
     for project in project_dirs(cwd) {
         let env = Env::new(dir, &project, user_skills, scanner);
         for pack in swept_packs(&project, user_skills, policy, &env.v1) {
+            if Instant::now() >= deadline {
+                return over_budget(skill);
+            }
             let key = state::key_of(&pack.canonical);
             if seen.contains(&key) {
                 continue;
             }
+            // Current names (a mid-session rename counts) united with the recorded ones.
+            let current = state::skill_names_checked(&pack.canonical);
+            let stored = st.packs.get(&key);
             let provides = is_wanted(&pack.name)
-                || match st.packs.get(&key) {
-                    Some(e) => e.names.iter().any(|n| is_wanted(n)),
-                    None => state::skill_names(&pack.canonical)
-                        .iter()
-                        .any(|n| is_wanted(n)),
-                };
+                || current.names.iter().any(|n| is_wanted(n))
+                || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
             if !provides {
+                if current.unparseable
+                    && stored.is_some_and(|e| e.state == PackStatus::Blocked)
+                    && unsure_blocked.is_none()
+                {
+                    unsure_blocked = Some(pack.display.clone());
+                }
                 continue;
             }
             seen.push(key.clone());
-            let ev = super::evaluate(&mut st, &pack, &env);
+            let Some(ev) = super::evaluate(&mut st, &pack, &env, Some(deadline)) else {
+                return over_budget(skill);
+            };
             if let Some(e) = st.packs.get(&ev.key) {
                 if e.state == PackStatus::Blocked && blocked.is_none() {
                     blocked = Some((pack.display.clone(), why_label(e.reason)));
@@ -162,9 +185,81 @@ pub(super) fn skill_verdict_in(
     if !seen.is_empty() {
         let _ = state::store(dir, &st);
     }
-    match blocked {
-        Some((shown, why)) => denial(&format!("skill `{skill}` comes from"), &shown, why),
-        None => Verdict::NoOpinion,
+    match (blocked, unsure_blocked) {
+        (Some((shown, why)), _) => denial(&format!("skill `{skill}` comes from"), &shown, why),
+        (None, Some(shown)) if seen.is_empty() => denial(
+            &format!("skill `{skill}` matches no verified pack, and it may come from"),
+            &shown,
+            "its SKILL.md frontmatter does not parse, so its skill names are unknown",
+        ),
+        _ => Verdict::NoOpinion,
+    }
+}
+
+/// The denial when verifying a skill's packs overran [`SKILL_BUDGET`].
+fn over_budget(skill: &str) -> Verdict {
+    Verdict::Deny(format!(
+        "safe-ai-skill: the packs providing skill `{skill}` could not be verified within {} s; \
+         the call is denied. Run `safe-ai-skill verify session` to inspect them.",
+        SKILL_BUDGET.as_secs()
+    ))
+}
+
+/// The raw head of an unreadable prompt-time payload: the slash command it names, if any.
+///
+/// `Some(Some(name))` when a `command_name` or a prompt starting with `/` is found,
+/// `Some(None)` when the payload may be a slash command whose name cannot be read, and `None`
+/// when it is plainly not one.
+pub fn slash_name_from_raw(raw: &[u8]) -> Option<Option<String>> {
+    let head = String::from_utf8_lossy(&raw[..raw.len().min(RAW_HEAD_BYTES)]);
+    // The string value of `key`, up to its closing quote or the end of what was read.
+    let value_of = |key: &str| -> Option<String> {
+        let at = head.find(key)? + key.len();
+        let rest = head[at..].trim_start().strip_prefix(':')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        Some(rest.split('"').next().unwrap_or("").to_string())
+    };
+    if let Some(name) = value_of("\"command_name\"") {
+        let name = name.trim();
+        return Some((!name.is_empty()).then(|| name.to_string()));
+    }
+    match value_of("\"prompt\"") {
+        Some(prompt) => {
+            let rest = prompt.trim_start().strip_prefix('/')?;
+            Some(rest.split_whitespace().next().map(String::from))
+        }
+        None => Some(None),
+    }
+}
+
+/// Block reason for a prompt-time payload the engine could not parse: block a slash command
+/// whose skill is blocked, and one whose name cannot be read while any pack in scope is blocked.
+pub fn unreadable_prompt_verdict(
+    dir: &DataDir,
+    cwd: &Path,
+    policy: &Policy,
+    raw: &[u8],
+) -> Option<String> {
+    let reason = |v: Verdict| match v {
+        Verdict::Deny(r) | Verdict::Ask(r) => Some(r),
+        _ => None,
+    };
+    match slash_name_from_raw(raw)? {
+        Some(name) => reason(skill_verdict(dir, cwd, policy, &name)),
+        None => {
+            let st = state::load(dir).state;
+            let scope = project_dirs(cwd);
+            let blocked = blocked_packs(&st).into_iter().find(|b| {
+                b.roots
+                    .iter()
+                    .any(|r| scope.iter().any(|p| r.starts_with(p)))
+            })?;
+            Some(format!(
+                "safe-ai-skill: this prompt could not be read, and the skill pack {} is \
+                 blocked ({}); retry with a shorter prompt.",
+                blocked.shown, blocked.why
+            ))
+        }
     }
 }
 
@@ -189,38 +284,68 @@ pub fn slash_skill_name(payload: &Value) -> Option<String> {
     }
 }
 
-/// Read/Grep/Glob enforcement: deny when a target path resolves inside a blocked pack.
-pub fn read_verdict(dir: &DataDir, tool_input: &Value, cwd: &Path) -> Verdict {
+/// Read/Grep/Glob enforcement: deny a Read whose file resolves inside a blocked pack, and a
+/// Grep or Glob whose search root (`path`, else the hook `cwd`, narrowed by the literal prefix
+/// of a Glob `pattern` or a Grep `glob`) lies inside a blocked pack or contains one.
+pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Path) -> Verdict {
     let st = state::load(dir).state;
     let blocked = blocked_packs(&st);
     if blocked.is_empty() {
         return Verdict::NoOpinion;
     }
     let field = |k: &str| tool_input.get(k).and_then(Value::as_str);
-    let base = field("path")
-        .map(|p| absolute(cwd, p))
-        .unwrap_or_else(|| cwd.to_path_buf());
-    let mut targets: Vec<PathBuf> = ["file_path", "notebook_path", "path"]
+    for target in ["file_path", "notebook_path"]
         .iter()
         .filter_map(|k| field(k))
         .map(|p| absolute(cwd, p))
-        .collect();
-    if let Some(pattern) = field("pattern") {
-        // A Glob pattern's literal prefix (up to the first glob character).
+    {
+        if let Some(b) = inside_blocked(&target, &blocked) {
+            return denial(&format!("{} is inside", target.display()), &b.shown, b.why);
+        }
+    }
+    let search = match tool_name {
+        "Glob" => Some(field("pattern")),
+        "Grep" => Some(field("glob").filter(|g| g.contains('/'))),
+        "Read" | "NotebookRead" => None,
+        // Anything else that names a path is checked like a search.
+        _ => field("path").map(|_| None),
+    };
+    let Some(narrow) = search else {
+        return Verdict::NoOpinion;
+    };
+    let mut root = field("path")
+        .map(|p| absolute(cwd, p))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    if let Some(pattern) = narrow.filter(|p| !p.starts_with(['!', '*'])) {
         let literal: Vec<&str> = pattern
             .split('/')
             .take_while(|c| !c.contains(['*', '?', '[', '{']))
             .collect();
         if !literal.is_empty() {
-            targets.push(absolute(&base, &literal.join("/")));
+            root = absolute(&root, &literal.join("/"));
         }
     }
-    for target in &targets {
-        if let Some(b) = inside_blocked(target, &blocked) {
-            return denial(&format!("{} is inside", target.display()), &b.shown, b.why);
-        }
+    if let Some(b) = inside_blocked(&root, &blocked).or_else(|| contains_blocked(&root, &blocked)) {
+        return denial(
+            &format!("this search of {} reaches", root.display()),
+            &b.shown,
+            b.why,
+        );
     }
     Verdict::NoOpinion
+}
+
+/// The blocked pack that lies inside the directory `root`.
+fn contains_blocked<'a>(root: &Path, blocked: &'a [BlockedPack]) -> Option<&'a BlockedPack> {
+    let mut forms = vec![lenient_canonical(root)];
+    if let Ok(real) = root.canonicalize() {
+        forms.push(real);
+    }
+    blocked.iter().find(|b| {
+        b.roots
+            .iter()
+            .any(|r| forms.iter().any(|f| r.starts_with(f)))
+    })
 }
 
 /// Bash enforcement (best effort): deny when a word of the command resolves inside a blocked
@@ -240,10 +365,7 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
         let words: Vec<String> = crate::context::tokenize(&segment)
             .iter()
             .flat_map(|w| w.split_whitespace().map(String::from).collect::<Vec<_>>())
-            .map(|w| {
-                w.trim_matches(|c| matches!(c, '(' | ')' | '{' | '}' | '`' | '$' | '\'' | '"'))
-                    .to_string()
-            })
+            .map(|w| clean_word(&w))
             .filter(|w| !w.is_empty())
             .collect();
         if words.is_empty() {
@@ -261,6 +383,10 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
                 return Verdict::NoOpinion;
             }
             if matches!(word.as_str(), "cd" | "pushd") {
+                // Options (`-P`, `-L`, `--`, …) come before the target; `-` alone is one.
+                while words.get(i).is_some_and(|w| w.starts_with('-') && w != "-") {
+                    i += 1;
+                }
                 let target = words.get(i).map(String::as_str);
                 wd = match target {
                     None => home.clone().unwrap_or(wd),
@@ -293,6 +419,27 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
         }
     }
     Verdict::NoOpinion
+}
+
+/// A shell word with grouping and quoting characters removed (`$`, `{`, `}` are kept, so
+/// `$HOME` and `${HOME}` still expand) and a leading redirection operator dropped.
+fn clean_word(word: &str) -> String {
+    let w: String = word
+        .chars()
+        .filter(|c| !matches!(c, '(' | ')' | '`' | '\'' | '"'))
+        .collect();
+    let ops = w
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+        .trim_start_matches(['<', '>']);
+    // Only a real redirection (`<f`, `>f`, `2>f`, `&>f`) loses its prefix.
+    if ops.len()
+        < w.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+            .len()
+    {
+        ops.to_string()
+    } else {
+        w
+    }
 }
 
 /// Command segments, split on newlines, `;`, `&`, `|` (so `&&` and `||` too), anywhere: a
