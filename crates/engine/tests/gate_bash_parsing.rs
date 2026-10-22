@@ -641,6 +641,15 @@ fn round4_ask_rows() -> Vec<String> {
         format!("$(printf %s ./solana) transfer -um {DEST} 1"),
         format!("${{S}}olana transfer -um {DEST} 1"),
         format!("$X transfer -um {DEST} 1"),
+        // Fix round 5: dynamic programs and printf formats inside emitted scripts.
+        format!("echo 'X=solana; $X transfer -um {DEST} 1' > x.sh; bash x.sh"),
+        format!("echo 'for p in solana; do $p transfer -um {DEST} 1; done' > x.sh; bash x.sh"),
+        format!("printf '%s' '{t}' > x.sh; bash x.sh"),
+        format!("printf '%s ' solana transfer -um {DEST} 1 > x.sh; bash x.sh"),
+        format!("echo '$(echo sol)ana transfer -um {DEST} 1' > x.sh; bash x.sh"),
+        format!("tee x.sh <<< '{t}'; bash x.sh"),
+        format!("tee x.sh <<EOF\n{t}\nEOF\nbash x.sh"),
+        format!("printf 'solana %s -um %s %d' transfer {DEST} 1 > x.sh; bash x.sh"),
     ]
 }
 

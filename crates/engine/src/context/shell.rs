@@ -187,6 +187,31 @@ pub fn could_spell_family(word: &str) -> bool {
             })
 }
 
+/// Whether `cmd` runs an expansion as its program that could be a solana-family program:
+/// the program word could spell one (`$(echo sol)ana`, `${S}olana`), the command line assigns
+/// a family name (`X=solana; $X …`, `for p in solana; do $p …`), or its first argument is a
+/// value-moving solana verb with no flag or file before it (`$X transfer …`).
+/// `$EDITOR close-notes.md`, `$PKG run deploy` and `$(npm bin)/hardhat deploy` are not.
+pub fn dynamic_family_program(cmd: &SimpleCommand, parsed: &Parsed) -> bool {
+    let Some(program) = cmd.words.first().filter(|w| w.dynamic) else {
+        return false;
+    };
+    if program
+        .text
+        .rsplit_once('/')
+        .is_some_and(|(_, last)| !last.is_empty() && !last.contains(['$', '`', ')', '}']))
+    {
+        // A literal last path segment fixes the program, and it is not a family one.
+        return false;
+    }
+    let verb = cmd.words.get(1).is_some_and(|w| {
+        !w.dynamic
+            && !w.text.contains(['.', '/'])
+            && FAMILY_VERBS.contains(&w.text.to_ascii_lowercase().as_str())
+    });
+    could_spell_family(&program.text) || parsed.assigns_family || verb
+}
+
 /// Whether the text a command writes is a script that runs a value-moving solana-family
 /// command: parsed as shell, a family program in command position with a value-moving or
 /// expanded word; else, as interpreter code, a quoted string that is such a script
@@ -205,11 +230,12 @@ fn script_runs_family(text: &str, depth: usize) -> bool {
         || parsed.write_then_run
         || (parsed.unparseable && mentions_family(text) && quoted_segments(text).is_empty())
         || parsed.commands.iter().any(|c| {
-            c.is_family()
+            (c.is_family()
                 && c.words
                     .iter()
                     .skip(1)
-                    .any(|w| w.dynamic || is_gated_word(&w.text))
+                    .any(|w| w.dynamic || is_gated_word(&w.text)))
+                || dynamic_family_program(c, &parsed)
         });
     if runs {
         return true;
@@ -241,12 +267,15 @@ fn quoted_segments(text: &str) -> Vec<&str> {
 /// The text an emitter writes (`echo`/`printf` arguments, a here-string), with `\n` read as a
 /// newline. `None` for any other program: what it writes is its output, not its words.
 fn emitted_text(program: &str, args: &[Word], herestrings: &[Word]) -> Option<String> {
+    if program == "printf" {
+        let args: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+        return Some(printf_text(&args).replace("\\n", "\n"));
+    }
     let words: Vec<&str> = if EMITTERS.contains(&program) {
         args.iter()
             .map(|w| w.text.as_str())
             .skip_while(|t| {
-                program != "printf"
-                    && t.len() > 1
+                t.len() > 1
                     && t.starts_with('-')
                     && t[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E' | 'r'))
             })
@@ -257,6 +286,68 @@ fn emitted_text(program: &str, args: &[Word], herestrings: &[Word]) -> Option<St
         return None;
     };
     Some(words.join(" ").replace("\\n", "\n"))
+}
+
+/// What `printf FORMAT ARGS…` writes, best effort: each conversion (`%s`, `%b`, `%5d`, …)
+/// takes the next argument verbatim, and the format repeats while arguments remain (as printf
+/// does). A format it cannot follow (`%*d`, a trailing `%`): the format, then all its
+/// arguments, on separate lines.
+fn printf_text(args: &[&str]) -> String {
+    let mut args = args;
+    if args.first() == Some(&"-v") {
+        args = args.get(2..).unwrap_or_default();
+    }
+    if args.first() == Some(&"--") {
+        args = args.get(1..).unwrap_or_default();
+    }
+    let Some((format, rest)) = args.split_first() else {
+        return String::new();
+    };
+    let format: Vec<char> = format.chars().collect();
+    let mut values = rest.iter();
+    let mut out = String::new();
+    loop {
+        let mut conversions = 0;
+        let mut i = 0;
+        while let Some(&c) = format.get(i) {
+            i += 1;
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            if format.get(i) == Some(&'%') {
+                i += 1;
+                out.push('%');
+                continue;
+            }
+            while format
+                .get(i)
+                .is_some_and(|c| matches!(c, '-' | '+' | ' ' | '#' | '0'..='9' | '.'))
+            {
+                i += 1;
+            }
+            if !format.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
+                let format: String = format.iter().collect();
+                return format!("{format}\n{}", rest.join(" "));
+            }
+            i += 1;
+            conversions += 1;
+            out.push_str(values.next().copied().unwrap_or_default());
+        }
+        if conversions == 0 || values.len() == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether a command's words make it `tee` writing a file (`tee x.sh`, not `tee` or
+/// `tee /dev/null`).
+fn tee_writes(program: &str, args: &[Word]) -> bool {
+    program == "tee"
+        && args
+            .iter()
+            .any(|w| !w.text.starts_with('-') && !is_harmless_target(&w.text))
 }
 
 /// Reserved words stripped from the head of a simple command.
@@ -724,7 +815,18 @@ impl Lexer<'_> {
             cmd.upstream = format!("{} {}", pending.upstream, words.join(" "));
             cmd.upstream_emits = pipe_emits(&pending);
         }
-        self.line_writes |= pending.writes_file;
+        self.line_writes |= pending.writes_file || {
+            // `tee x.sh <<EOF`: the here-document is the file's content.
+            let skip = pending
+                .words
+                .iter()
+                .take_while(|w| assignment_name(w).is_some())
+                .count();
+            match pending.words.get(skip..).unwrap_or_default() {
+                [first, args @ ..] => tee_writes(&base_name(&first.text), args),
+                [] => false,
+            }
+        };
         if pending.words.is_empty() {
             return Reads::Data;
         }
@@ -1397,14 +1499,18 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
     // `tee x.sh`, `dd of=x.sh`: they write what the pipe carries, script text only when an
     // emitter upstream wrote it.
     let writes_pipe = match program.as_str() {
-        "tee" => args
-            .iter()
-            .any(|w| !w.text.starts_with('-') && !is_harmless_target(&w.text)),
+        "tee" => tee_writes(&program, args),
         "dd" => args.iter().any(|w| w.text.starts_with("of=")),
         _ => false,
     };
     if writes_pipe && piped_in {
         out.writes_family_text |= script_runs_family(&upstream_emits, depth);
+    }
+    if writes_pipe && !herestrings.is_empty() {
+        // `tee x.sh <<< 'solana …'`: the here-string is the file's content.
+        if let Some(text) = emitted_text(&program, args, &herestrings) {
+            out.writes_family_text |= script_runs_family(&text, depth);
+        }
     }
     let family_program = FAMILY.contains(&program.as_str());
     if !family_program && (first.text.contains('/') || program.ends_with(".sh")) {
@@ -2166,6 +2272,25 @@ mod tests {
         ] {
             assert!(!parse(command).write_then_run, "{command}");
         }
+    }
+
+    #[test]
+    fn printf_formats_take_their_arguments() {
+        assert_eq!(
+            printf_text(&["%s", "solana transfer X 1"]),
+            "solana transfer X 1"
+        );
+        assert_eq!(
+            printf_text(&["%s ", "solana", "transfer", "X"]),
+            "solana transfer X "
+        );
+        assert_eq!(
+            printf_text(&["solana %s -um %5d", "transfer", "1"]),
+            "solana transfer -um 1"
+        );
+        assert_eq!(printf_text(&["-v", "v", "--", "100%% %b", "x"]), "100% x");
+        assert_eq!(printf_text(&["a %*d", "transfer"]), "a %*d\ntransfer");
+        assert_eq!(printf_text(&["plain", "ignored"]), "plain");
     }
 
     #[test]

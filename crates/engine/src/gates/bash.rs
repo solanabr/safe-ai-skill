@@ -137,7 +137,7 @@ fn decide_parsed(
                 decision
             };
             (mainnet_policy(decision, segment_ctx.network, policy), meta)
-        } else if dynamic_family_program(cmd, parsed) {
+        } else if shell::dynamic_family_program(cmd, parsed) {
             ask_dynamic_program()
         } else {
             unvetted = true;
@@ -180,31 +180,6 @@ fn decide_parsed(
         }
         other => (other, meta),
     }
-}
-
-/// Whether `cmd` runs an expansion as its program that could be a solana-family program:
-/// the program word could spell one (`$(echo sol)ana`, `${S}olana`), the command assigns a
-/// family name (`X=solana; $X …`), or its first argument is a value-moving solana verb with
-/// no flag or file before it (`$X transfer …`). `$EDITOR close-notes.md`, `$PKG run deploy`
-/// and `$(npm bin)/hardhat deploy` are not.
-fn dynamic_family_program(cmd: &shell::SimpleCommand, parsed: &Parsed) -> bool {
-    let Some(program) = cmd.words.first().filter(|w| w.dynamic) else {
-        return false;
-    };
-    if program
-        .text
-        .rsplit_once('/')
-        .is_some_and(|(_, last)| !last.is_empty() && !last.contains(['$', '`', ')', '}']))
-    {
-        // A literal last path segment fixes the program, and it is not a family one.
-        return false;
-    }
-    let verb = cmd.words.get(1).is_some_and(|w| {
-        !w.dynamic
-            && !w.text.contains(['.', '/'])
-            && shell::FAMILY_VERBS.contains(&w.text.to_ascii_lowercase().as_str())
-    });
-    shell::could_spell_family(&program.text) || parsed.assigns_family || verb
 }
 
 /// The cluster one solana-family command runs on: its own flags, else the default for its
