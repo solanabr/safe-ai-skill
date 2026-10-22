@@ -7,7 +7,7 @@
 //! Pure, hermetic helpers ([`hash_tree`], [`detect_drift`], the (de)serialization round-trip)
 //! are unit-tested against tempdir fixtures; the only side effects are the atomic [`save`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -30,6 +30,13 @@ pub struct SkillPin {
     /// Highest severity observed at pin time (`"low"`/`"medium"`/`"high"`/`""`).
     #[serde(default)]
     pub scan: String,
+    /// Cheap shape fingerprint of the pinned tree ([`shape_until`]); empty on pins made before
+    /// it existed (filled in at the next verified drift check).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shape: String,
+    /// The last drift check did not finish: the pin is not trusted as clean until one does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drift_unchecked: bool,
 }
 
 /// A pinned MCP server entry.
@@ -67,6 +74,13 @@ pub struct ExtPin {
     /// Highest severity observed at pin time (`"low"`/`"medium"`/`"high"`/`""`).
     #[serde(default)]
     pub scan: String,
+    /// Cheap shape fingerprint of the pinned tree ([`shape_until`]); empty on pins made before
+    /// it existed (filled in at the next verified drift check).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shape: String,
+    /// The last drift check did not finish: the pin is not trusted as clean until one does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drift_unchecked: bool,
 }
 
 /// The TOFU lockfile contents.
@@ -81,14 +95,32 @@ pub struct Lockfile {
     /// Pinned `ext/<name>` git submodules, keyed by submodule name.
     #[serde(default)]
     pub ext: BTreeMap<String, ExtPin>,
-    /// Packs the last SessionStart sweep deferred (`skill:<name>` / `ext:<name>`): scanned
-    /// first by the next sweep, so a budget-hungry pack cannot starve the ones after it.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub sweep_deferred: BTreeSet<String>,
-    /// Packs the last sweep left unreviewed (scan or drift hash cut by the time budget):
-    /// retried right after [`Lockfile::sweep_deferred`].
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub sweep_unreviewed: BTreeSet<String>,
+    /// SessionStart sweeps run so far (the age clock of [`Lockfile::sweep_marks`]).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sweep_session: u64,
+    /// Per pack (`skill:<name>` / `ext:<name>`), when the sweep last worked on it. The next
+    /// sweep takes the least recently attempted packs first; a pack never attempted has no mark.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sweep_marks: BTreeMap<String, SweepMark>,
+}
+
+/// When the SessionStart sweep last worked on one pack (sweep numbers, see
+/// [`Lockfile::sweep_session`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepMark {
+    /// Last sweep that started scanning or drift-checking the pack (finished or cut).
+    pub attempted: u64,
+    /// Last sweep that scanned and verified the pack in full (0: never).
+    #[serde(default)]
+    pub scanned: u64,
+    /// The pack's drift check overran and it was put at the front of the next sweep. If it
+    /// overruns again it goes back by age, so packs that never fit cannot hold the front.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requeued: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Result of comparing a current hash against the lockfile.
@@ -255,6 +287,64 @@ pub fn hash_tree_until(path: &Path, deadline: Option<Instant>) -> Option<String>
         out.push_str(&format!("{byte:02x}"));
     }
     Some(out)
+}
+
+/// Entries walked between clock reads in [`shape_until`].
+const SHAPE_CLOCK_EVERY: usize = 256;
+
+/// [`shape_until`] without a deadline (empty when `path` does not exist).
+pub fn shape(path: &Path) -> String {
+    shape_until(path, None).unwrap_or_default()
+}
+
+/// A cheap fingerprint of a tree's shape, from metadata only: the number of files, their total
+/// size, and a digest of the sorted top-level entry names. A pinned pack whose shape changed has
+/// drifted, whatever its full hash would say, so a pack cannot dodge its drift check by growing
+/// past the hash budget. `None` when `deadline` passed first; symlinks are never followed.
+pub fn shape_until(path: &Path, deadline: Option<Instant>) -> Option<String> {
+    if !path.exists() {
+        return Some(String::new());
+    }
+    let (mut files, mut bytes) = (0u64, 0u64);
+    let mut top: Vec<Vec<u8>> = Vec::new();
+    for (k, entry) in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if k % SHAPE_CLOCK_EVERY == SHAPE_CLOCK_EVERY - 1
+            && deadline.is_some_and(|d| Instant::now() >= d)
+        {
+            return None;
+        }
+        if entry.depth() == 1 {
+            top.push(
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_bytes(),
+            );
+        }
+        if entry.file_type().is_file() {
+            files = files.saturating_add(1);
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            bytes = bytes.saturating_add(len);
+        }
+    }
+    top.sort();
+    let mut hasher = Sha256::new();
+    for name in &top {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name);
+    }
+    let digest = hasher.finalize();
+    let mut names = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        names.push_str(&format!("{byte:02x}"));
+    }
+    Some(format!("{files}:{bytes}:{names}"))
 }
 
 /// Detect drift for a skill directory at `dir` (name `name`) against `lockfile`.
@@ -491,6 +581,7 @@ mod tests {
                 source: "local".into(),
                 verified_at: 1,
                 scan: "low".into(),
+                ..Default::default()
             },
         );
         assert_eq!(detect_drift(&lock, "my-skill", &skill), DriftStatus::Clean);
@@ -516,6 +607,7 @@ mod tests {
                 source: "gh".into(),
                 verified_at: 42,
                 scan: "high".into(),
+                ..Default::default()
             },
         );
         lock.pin_mcp(
@@ -635,6 +727,7 @@ mod tests {
                 kind: id1.kind.into(),
                 verified_at: 1,
                 scan: String::new(),
+                ..Default::default()
             },
         );
         assert_eq!(lock.ext_drift("trailofbits", &id1.sha), DriftStatus::Clean);
@@ -668,6 +761,7 @@ mod tests {
                 kind: id.kind.into(),
                 verified_at: 1,
                 scan: String::new(),
+                ..Default::default()
             },
         );
         assert_eq!(lock.ext_drift("sendai", &id.sha), DriftStatus::Clean);
@@ -690,6 +784,7 @@ mod tests {
                 kind: "git".into(),
                 verified_at: 9,
                 scan: "low".into(),
+                ..Default::default()
             },
         );
         save(&data, &lock).unwrap();

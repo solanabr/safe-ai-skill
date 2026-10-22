@@ -162,18 +162,41 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
   * It is quarantined only for what was found before the cut, or for drift.
   * The session context lists it as "not fully scanned — rerun `safe-ai-skill verify check
     <dir>`" (`verify check` scans without a budget).
-  * Once the sweep's budget is spent, the remaining unpinned packs are **deferred**: not
-    scanned, not pinned, and listed in the session context. They are scanned first at the
-    next session (see Rotation).
-  * Pinned packs still get their drift check when deferred. Hashing a pack (drift check or the
-    hash a new pin records) is bounded by the per-pack allowance; a hash that runs out leaves
-    the pack unreviewed, never passed. A high finding from the scan still quarantines it.
-  * **Rotation.** The lockfile records which packs the sweep deferred (`sweep_deferred`) and
-    left unreviewed (`sweep_unreviewed`). The next sweep scans the deferred packs first, then
-    the unreviewed ones, then the rest, each group in walk order (roots in order, skill
-    directories and ext submodules sorted by name). A pack that spends the whole budget every
-    session cannot starve the packs after it: a deferred pack is scanned at the next session
-    unless other deferred packs ahead of it spend that session's budget too.
+  * Once the sweep's budget is spent, nothing new is started. The remaining unpinned packs are
+    **deferred** (not scanned, not pinned); the remaining pinned packs are listed **"drift not
+    checked this session"**. Both keep their place at the front of the next sweep's queue.
+    The pack in progress at the deadline may finish its drift check, up to one per-pack
+    allowance, so a sweep never runs past its deadline plus one allowance, however many
+    packs are pinned.
+  * **Drift checks.** A pinned pack's shape is checked first, from metadata only: file count,
+    total bytes and the sorted top-level names (`lockfile::shape_until`, stored in the pin). A
+    changed shape is drift, so the pack is quarantined without a full hash, and a pack cannot
+    dodge its drift check by growing past the hash budget. If the shape matches, the content
+    hash decides. If that hash runs out of its per-pack allowance, the pin loses its clean
+    status (`drift_unchecked` in the lockfile), the pack is listed "drift not checked this
+    session", and it goes first in the next sweep. A high finding from the scan still
+    quarantines it. Git-pinned ext submodules are compared by commit SHA and need no shape.
+    Pins made before shapes existed get one at their next verified drift check.
+  * **Age-ordered queue.** The lockfile counts sweeps (`sweep_session`) and records, per pack,
+    the last sweep that worked on it (`sweep_marks`). Each sweep takes packs least recently
+    worked on first: a pack never worked on goes first, then the oldest, in walk order within
+    the same age (roots in order, skill directories and ext submodules sorted by name). A
+    pack scanned or cut this session goes behind every pack that was not.
+  * **Guarantee.** Each sweep starts its first pack with the full per-pack allowance (2 s is
+    within the 4 s sweep). Each sweep moves every pack it worked on behind the rest, so a pack
+    gains at least one place per session and reaches the front within N sessions, N being the
+    number of packs (skill directories plus ext submodules) the sweep covers. So **a pack
+    whose scan and hash each fit within the per-pack allowance on its own is fully scanned
+    within N sessions**, however many budget-hungry packs share the sweep. The one exception
+    is a pinned pack whose drift check overran. It jumps to the front once, and a second
+    overrun in a row sends it back by age. With such packs present the bound is 2N sessions
+    (each pack ahead can be worked on at most twice before it goes behind). Packs added
+    between sessions are not counted; a new pack starts at the front.
+    In practice most sessions cover more than one pack.
+  * **Limit.** A pack that does not fit the per-pack allowance on its own is cut every time
+    it reaches the front. It stays unreviewed (never pinned) until `safe-ai-skill verify check
+    <dir>` scans it without a budget. A pinned pack whose hash never fits stays "drift not
+    checked" and untrusted, and is retried by age like any cut pack.
   * The v1 shim reports a cut scan as incomplete rather than as a finding (the marker maps to
     High wherever it appears).
 
@@ -257,8 +280,12 @@ rule ideas were reimplemented here; no rule lists were copied.
 * **Hit-cap escalation.** A WARN or HIGH rule with more than 50 live hits in one file makes the
   pack HIGH. None of the ai-kit packs reaches the cap. Capped INFO rules do not escalate.
 * **Packs that never fit the budget.** A pack too large to scan within the per-pack allowance
-  stays unreviewed every session (retried right after the deferred packs) until `verify check`
-  scans it in full.
+  stays unreviewed every session, retried whenever it is the oldest in the queue, until
+  `verify check` scans it in full. A pinned pack with an unchanged shape whose hash never fits
+  stays "drift not checked" (its pin is untrusted): it goes to the front after its first
+  overrun, then rotates by age.
+* **Shape fingerprint.** An edit that keeps the file count, the total bytes and the top-level
+  names is caught only by the content hash, not by the shape.
 * **Indirect load-time commands.** A `` !`cmd` `` is followed into a pack script one level deep,
   and only when the script is named directly (an interpreter and a path, or a path).
 * **Descriptions.** Only `SKILL.md` frontmatter is checked, not the frontmatter of agent or

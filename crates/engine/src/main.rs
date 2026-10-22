@@ -342,6 +342,8 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
                     source: String::new(),
                     verified_at: now_secs(),
                     scan: "approved".to_string(),
+                    shape: verify::lockfile::shape(&restore_to),
+                    drift_unchecked: false,
                 },
             );
             let _ = verify::lockfile::save(&plugin_data, &lock);
@@ -739,6 +741,8 @@ fn cmd_install(rest: &[String]) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                shape: verify::lockfile::shape(&dest),
+                drift_unchecked: false,
             },
         );
         installed.push(name);
@@ -848,6 +852,8 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
                     .map(verify::severity_label)
                     .unwrap_or("")
                     .to_string(),
+                shape: verify::lockfile::shape(&dir),
+                drift_unchecked: false,
             },
         );
         verified.push(name);

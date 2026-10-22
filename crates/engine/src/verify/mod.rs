@@ -437,6 +437,9 @@ pub struct SessionResult {
     /// Names not scanned because the sweep's time budget was spent: never pinned, scanned next
     /// session.
     pub deferred: Vec<String>,
+    /// Pinned names whose drift check did not finish this session (the sweep's time ran out
+    /// before it, or its hash overran): no longer trusted as clean, checked first next session.
+    pub drift_unchecked: Vec<String>,
     /// `additionalContext` warning to inject (empty when nothing to warn about).
     pub additional_context: String,
     /// Whether skills should be reloaded (true if anything was quarantined).
@@ -483,10 +486,12 @@ pub fn run_session_with_policy(
 
 /// [`run_session_with_policy`] under an explicit scan budget.
 ///
+/// Packs are taken least recently attempted first (see [`lockfile::SweepMark`]); a pack never
+/// attempted goes first, and a pack worked on this session goes behind every pack that was not.
 /// A pack whose scan the budget cuts short is unreviewed: quarantined only for what was found
 /// before the cut (or drift), otherwise never pinned and surfaced in `additional_context`. Once
-/// the sweep's budget is spent, unpinned packs are deferred (never pinned, scanned next
-/// session); pinned ones still get their drift check.
+/// the sweep's budget is spent, unpinned packs are deferred and pinned ones are listed "drift
+/// not checked this session"; both keep their place at the front of the next sweep.
 pub fn run_session_with_budget(
     plugin_data: &Path,
     skill_dirs: &[String],
@@ -544,38 +549,52 @@ pub fn run_session_with_budget(
         }
     }
 
-    // Packs the last sweep deferred go first, then the ones it left unreviewed, so a pack that
-    // spends the whole budget every session cannot starve the packs after it. Stable sort:
-    // within each group the walk order above holds.
-    let previous_deferred = std::mem::take(&mut lock.sweep_deferred);
-    let previous_unreviewed = std::mem::take(&mut lock.sweep_unreviewed);
+    // Age order: least recently attempted first (never attempted before anything), walk order
+    // within the same age. Every session works on at least its oldest pack and moves each pack
+    // it worked on behind the rest, so no pack waits behind budget-hungry ones forever.
+    let session = lock.sweep_session.saturating_add(1);
+    lock.sweep_session = session;
+    let present: std::collections::BTreeSet<String> = units.iter().map(Unit::key).collect();
+    lock.sweep_marks.retain(|k, _| present.contains(k));
     units.sort_by_key(|u| {
-        let key = u.key();
-        if previous_deferred.contains(&key) {
-            0
-        } else if previous_unreviewed.contains(&key) {
-            1
-        } else {
-            2
-        }
+        let mark = lock.sweep_marks.get(&u.key()).copied().unwrap_or_default();
+        (mark.attempted, mark.scanned)
     });
 
     for unit in &units {
-        match process_unit(
+        let outcome = process_unit(
             plugin_data,
             unit,
             budget,
             &mut lock,
             &mut result,
             &mut warnings,
-        ) {
-            Outcome::Deferred => {
-                lock.sweep_deferred.insert(unit.key());
+        );
+        let key = unit.key();
+        match outcome {
+            Outcome::Untouched => {}
+            Outcome::Attempted { scanned } => {
+                let mark = lock.sweep_marks.entry(key).or_default();
+                mark.attempted = session;
+                mark.requeued = false;
+                if scanned {
+                    mark.scanned = session;
+                }
             }
-            Outcome::Unreviewed => {
-                lock.sweep_unreviewed.insert(unit.key());
+            Outcome::First => {
+                // To the front once; a second overrun in a row goes back by age.
+                let mark = lock.sweep_marks.entry(key).or_default();
+                if mark.requeued {
+                    mark.attempted = session;
+                    mark.requeued = false;
+                } else {
+                    mark.attempted = 0;
+                    mark.requeued = true;
+                }
             }
-            Outcome::Done => {}
+            Outcome::Removed => {
+                lock.sweep_marks.remove(&key);
+            }
         }
     }
 
@@ -626,18 +645,97 @@ impl Unit {
 
 /// How one unit left the sweep (for the next sweep's order).
 enum Outcome {
-    Deferred,
-    Unreviewed,
-    Done,
+    /// Not worked on this session (deferred, or drift not checked): keeps its place.
+    Untouched,
+    /// Scanned or drift-checked this session (`scanned`: in full): goes behind the rest.
+    Attempted { scanned: bool },
+    /// Its drift check overran: first next session (once in a row, see
+    /// [`lockfile::SweepMark::requeued`]).
+    First,
+    /// Quarantined: no longer a pack of the sweep.
+    Removed,
 }
 
-/// Verify one unit: identity and drift vs the lockfile, then the heuristic scan.
+/// The pin of a unit, as far as the drift check needs it.
+struct PinView {
+    /// Shape fingerprint to compare, when the pin has one and is content-hashed (a git-SHA ext
+    /// pin is exact and cheap, so it needs none).
+    shape: Option<String>,
+}
+
+fn pin_view(lock: &lockfile::Lockfile, unit: &Unit) -> Option<PinView> {
+    let usable = |s: &String| (!s.is_empty()).then(|| s.clone());
+    match unit.kind {
+        UnitKind::Skill => lock.skills.get(&unit.name).map(|p| PinView {
+            shape: usable(&p.shape),
+        }),
+        UnitKind::Ext => lock.ext.get(&unit.name).map(|p| PinView {
+            shape: if p.kind == "git" {
+                None
+            } else {
+                usable(&p.shape)
+            },
+        }),
+    }
+}
+
+/// After a finished drift check that found no drift: trust the pin again, record its shape.
+fn refresh_pin(lock: &mut lockfile::Lockfile, unit: &Unit, shape: Option<String>) {
+    let (flag, slot) = match unit.kind {
+        UnitKind::Skill => match lock.skills.get_mut(&unit.name) {
+            Some(p) => (&mut p.drift_unchecked, &mut p.shape),
+            None => return,
+        },
+        UnitKind::Ext => match lock.ext.get_mut(&unit.name) {
+            Some(p) => (&mut p.drift_unchecked, &mut p.shape),
+            None => return,
+        },
+    };
+    *flag = false;
+    if let Some(shape) = shape {
+        *slot = shape;
+    }
+}
+
+/// A drift check that could not finish: the pin loses its clean status and is surfaced.
+fn drift_unchecked(
+    lock: &mut lockfile::Lockfile,
+    unit: &Unit,
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+    why: &str,
+) {
+    match unit.kind {
+        UnitKind::Skill => {
+            if let Some(p) = lock.skills.get_mut(&unit.name) {
+                p.drift_unchecked = true;
+            }
+        }
+        UnitKind::Ext => {
+            if let Some(p) = lock.ext.get_mut(&unit.name) {
+                p.drift_unchecked = true;
+            }
+        }
+    }
+    warnings.push(format!(
+        "{} `{}` drift not checked this session ({why}); not trusted as clean until a check \
+         finishes — checked first next session (now: `safe-ai-skill verify check {}`)",
+        unit.label(),
+        unit.name,
+        unit.dir.display()
+    ));
+    result.drift_unchecked.push(unit.name.clone());
+}
+
+/// Verify one unit: drift vs its pin (shape, then hash) and the heuristic scan.
 ///
 /// Quarantines on a High finding or drift; TOFU-pins a complete, clean, unpinned pack. Once the
-/// sweep's budget is spent an unpinned pack is deferred; a pinned one still gets its drift
-/// check, bounded by the per-pack allowance. A drift hash or scan cut by the budget leaves the
-/// pack unreviewed (never pinned, never passed). Mutates `lock`/`result`/`warnings`; never
-/// panics.
+/// sweep's budget is spent nothing more is started: an unpinned pack is deferred and a pinned
+/// one is listed "drift not checked". The pack in progress may run its drift check up to the
+/// per-pack allowance past the sweep's deadline (at most one such overrun per sweep). A pinned
+/// pack whose shape changed is drift without a full hash; one whose shape matches but whose
+/// hash overruns loses its clean status. A scan or pin hash cut by the budget leaves the pack
+/// unreviewed (never pinned, never passed). Mutates `lock`/`result`/`warnings`; never panics.
 fn process_unit(
     plugin_data: &Path,
     unit: &Unit,
@@ -647,51 +745,87 @@ fn process_unit(
     warnings: &mut Vec<String>,
 ) -> Outcome {
     let (name, dir, what) = (unit.name.as_str(), unit.dir.as_path(), unit.label());
-    let pinned = match unit.kind {
-        UnitKind::Skill => lock.skills.contains_key(name),
-        UnitKind::Ext => lock.ext.contains_key(name),
-    };
-    if budget.exhausted() && !pinned {
-        defer(result, warnings, what, name, dir);
-        return Outcome::Deferred;
+    let pin = pin_view(lock, unit);
+    if budget.exhausted() {
+        if pin.is_some() {
+            drift_not_checked(result, warnings, what, name, dir);
+        } else {
+            defer(result, warnings, what, name, dir);
+        }
+        return Outcome::Untouched;
+    }
+    let drift_deadline = budget.drift_deadline();
+    // A pinned pack's shape first: metadata only, and a changed shape is drift outright, so a
+    // pack cannot dodge its drift check by growing past the hash budget.
+    let mut shape: Option<String> = None;
+    if let Some(pinned_shape) = pin.as_ref().and_then(|p| p.shape.as_ref()) {
+        match lockfile::shape_until(dir, drift_deadline) {
+            None => {
+                drift_unchecked(
+                    lock,
+                    unit,
+                    result,
+                    warnings,
+                    "its shape check ran out of time",
+                );
+                return Outcome::First;
+            }
+            Some(now) if &now != pinned_shape => {
+                quarantine_unit(plugin_data, unit, true, lock, result, warnings);
+                return Outcome::Removed;
+            }
+            Some(now) => shape = Some(now),
+        }
     }
     let scan = (!budget.exhausted()).then(|| heuristics::scan_until(dir, budget.pack_deadline()));
     let unscanned = Report::default();
     let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
-    // The identity hash gets its own per-pack allowance, even past the sweep's deadline (every
-    // pinned pack gets its drift check); an overrun leaves the pack unverified, never passed.
-    let deadline = budget.drift_deadline();
     let identity = match unit.kind {
-        UnitKind::Skill => lockfile::hash_tree_until(dir, deadline).map(|sha| (sha, "")),
+        UnitKind::Skill => lockfile::hash_tree_until(dir, drift_deadline).map(|sha| (sha, "")),
         UnitKind::Ext => {
-            lockfile::resolve_ext_identity_until(dir, deadline).map(|i| (i.sha, i.kind))
+            lockfile::resolve_ext_identity_until(dir, drift_deadline).map(|i| (i.sha, i.kind))
         }
     };
     let Some((sha, id_kind)) = identity else {
         if report.max_severity() == Some(Severity::High) {
             quarantine_unit(plugin_data, unit, false, lock, result, warnings);
-            return Outcome::Done;
+            return Outcome::Removed;
+        }
+        if pin.is_some() {
+            drift_unchecked(lock, unit, result, warnings, "hashing it ran out of time");
+            return Outcome::First;
         }
         unreviewed(result, warnings, what, name, dir);
-        return Outcome::Unreviewed;
+        return Outcome::Attempted { scanned: false };
     };
     let drift = match unit.kind {
         UnitKind::Skill => lock.skill_drift(name, &sha),
         UnitKind::Ext => lock.ext_drift(name, &sha),
     };
     let eval = eval_skill(name, sha.clone(), drift, report);
+    let complete = scan.as_ref().is_some_and(|s| s.complete);
 
-    let mut outcome = Outcome::Done;
-    if eval.quarantine {
+    let outcome = if eval.quarantine {
         let drifted = drift == lockfile::DriftStatus::Drifted;
         quarantine_unit(plugin_data, unit, drifted, lock, result, warnings);
+        Outcome::Removed
+    } else if drift == lockfile::DriftStatus::Clean {
+        // Drift verified: the pin is trusted again (and gains a shape if it had none).
+        let shape = shape.or_else(|| lockfile::shape_until(dir, drift_deadline));
+        refresh_pin(lock, unit, shape);
+        if scan.is_none() {
+            defer(result, warnings, what, name, dir);
+        } else if !complete {
+            unreviewed(result, warnings, what, name, dir);
+        }
+        Outcome::Attempted { scanned: complete }
     } else if scan.is_none() {
         defer(result, warnings, what, name, dir);
-        outcome = Outcome::Deferred;
-    } else if scan.as_ref().is_some_and(|s| !s.complete) {
+        Outcome::Untouched
+    } else if !complete {
         unreviewed(result, warnings, what, name, dir);
-        outcome = Outcome::Unreviewed;
-    } else if drift == lockfile::DriftStatus::Unpinned {
+        Outcome::Attempted { scanned: false }
+    } else if let Some(shape) = lockfile::shape_until(dir, drift_deadline) {
         let scan_label = eval
             .max_severity
             .map(severity_label)
@@ -705,6 +839,8 @@ fn process_unit(
                     source: String::new(),
                     verified_at: now_secs(),
                     scan: scan_label,
+                    shape,
+                    drift_unchecked: false,
                 },
             ),
             UnitKind::Ext => lock.pin_ext(
@@ -714,11 +850,17 @@ fn process_unit(
                     kind: id_kind.to_string(),
                     verified_at: now_secs(),
                     scan: scan_label,
+                    shape,
+                    drift_unchecked: false,
                 },
             ),
         }
         result.pinned.push(name.to_string());
-    }
+        Outcome::Attempted { scanned: true }
+    } else {
+        unreviewed(result, warnings, what, name, dir);
+        Outcome::Attempted { scanned: false }
+    };
 
     result.evals.push(eval);
     outcome
@@ -760,6 +902,23 @@ fn quarantine_unit(
             warnings.push(format!("failed to quarantine {short}`{name}`: {e}"));
         }
     }
+}
+
+/// A pinned pack the sweep had no time for: its drift was not checked this session; it keeps
+/// its place at the front of the next sweep.
+fn drift_not_checked(
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+    what: &str,
+    name: &str,
+    dir: &Path,
+) {
+    warnings.push(format!(
+        "{what} `{name}` drift not checked this session: the SessionStart time budget ran out \
+         before it; checked first next session (now: `safe-ai-skill verify check {}`)",
+        dir.display()
+    ));
+    result.drift_unchecked.push(name.to_string());
 }
 
 /// A pack the sweep did not scan this session: never pinned, surfaced, scanned first next
@@ -1160,27 +1319,6 @@ mod orchestration_tests {
     }
 
     #[test]
-    fn a_pinned_pack_deferred_by_the_budget_still_gets_its_drift_check() {
-        let data = tempdir("defer-drift-data");
-        let root = seed_packs(
-            "defer-drift-skills",
-            &[("clean", vec![("SKILL.md", "# Clean\n".to_string())])],
-        );
-        let dirs = vec![root.to_string_lossy().into_owned()];
-        let first = run_session_with_policy(&data, &dirs, &ext_policy(false));
-        assert!(first.pinned.contains(&"clean".to_string()));
-        fs::write(root.join("clean").join("run.sh"), "echo changed\n").unwrap();
-        let spent = rules::ScanBudget::new(secs(60), std::time::Duration::ZERO);
-        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &spent);
-        assert!(
-            second.quarantined.contains(&"clean".to_string()),
-            "{second:?}"
-        );
-        fs::remove_dir_all(&data).ok();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn a_payload_found_before_the_cut_still_quarantines() {
         let data = tempdir("cut-mal-data");
         // `a.js` is scanned first; the dense file after it runs out of time.
@@ -1296,43 +1434,103 @@ mod orchestration_tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    fn dense(mib: usize) -> String {
+        "curl x;".repeat(mib * 1024 * 1024 / 7)
+    }
+
+    /// Dense pack size: far past a 300 ms allowance in either build.
+    fn big_mib() -> usize {
+        if cfg!(debug_assertions) {
+            2
+        } else {
+            8
+        }
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
     #[test]
-    fn packs_left_unreviewed_go_before_packs_scanned_in_full() {
-        // A cut pack is retried ahead of the packs that were fully scanned last session.
-        let data = tempdir("rotate-data");
-        let mib = if cfg!(debug_assertions) { 2 } else { 8 };
-        let root = seed_packs(
-            "rotate-skills",
-            &[
-                ("aaa", vec![("SKILL.md", "# a\n".to_string())]),
-                (
-                    "zzz-big",
-                    vec![("a.sh", "curl x;".repeat(mib * 1024 * 1024 / 7))],
-                ),
-            ],
-        );
+    fn the_age_queue_reaches_every_pack_with_many_hungry_packs() {
+        // `starve2.rs`: six packs that never fit the allowance, then the malicious one. Every
+        // session fully scans at least its oldest pack, so all 7 are reached within 7 sessions.
+        let data = tempdir("starve2-data");
+        let body = dense(big_mib());
+        let mut packs: Vec<(String, Vec<(&str, String)>)> = (0..6)
+            .map(|i| (format!("aaa-big{i}"), vec![("a.sh", body.clone())]))
+            .collect();
+        packs.push(("zzz-mal".to_string(), vec![("z.js", mal_js())]));
+        let refs: Vec<(&str, Vec<(&str, String)>)> =
+            packs.iter().map(|(n, f)| (n.as_str(), f.clone())).collect();
+        let root = seed_packs("starve2-skills", &refs);
         let dirs = vec![root.to_string_lossy().into_owned()];
-        let budget = rules::ScanBudget::new(std::time::Duration::from_millis(300), secs(60));
-        let first = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget);
-        assert_eq!(first.unreviewed, ["zzz-big"], "{first:?}");
-        assert!(first.pinned.contains(&"aaa".to_string()), "{first:?}");
-        fs::create_dir_all(root.join("bbb-new")).unwrap();
-        fs::write(root.join("bbb-new").join("SKILL.md"), "# b\n").unwrap();
-        // Room for one pack only: the retried `zzz-big` goes first and the new pack waits.
-        let first_pack_only = rules::ScanBudget::new(
-            std::time::Duration::from_millis(300),
-            std::time::Duration::from_millis(300),
-        );
-        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &first_pack_only);
-        assert_eq!(second.unreviewed, ["zzz-big"], "{second:?}");
-        // Fully scanned last time (`aaa`) or new (`bbb-new`): both wait for the next session.
-        assert_eq!(second.deferred, ["aaa", "bbb-new"], "{second:?}");
+        let mut reached = None;
+        for session in 1..=7 {
+            let budget = rules::ScanBudget::new(ms(300), ms(600));
+            let r = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget);
+            assert!(r.pinned.is_empty(), "session {session}: {r:?}");
+            if r.quarantined.contains(&"zzz-mal".to_string()) {
+                reached = Some(session);
+                break;
+            }
+        }
+        assert!(reached.is_some(), "zzz-mal never scanned in 7 sessions");
         fs::remove_dir_all(&data).ok();
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn a_pinned_pack_whose_drift_hash_overruns_is_unreviewed() {
+    fn a_pack_cut_this_session_goes_behind_packs_not_yet_scanned() {
+        let data = tempdir("age-data");
+        let root = seed_packs(
+            "age-skills",
+            &[
+                ("aaa-big", vec![("a.sh", dense(big_mib()))]),
+                ("bbb", vec![("SKILL.md", "# b\n".to_string())]),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        // Room for one pack per session.
+        let one = || rules::ScanBudget::new(ms(300), ms(300));
+        let first = run_session_with_budget(&data, &dirs, &ext_policy(false), &one());
+        assert_eq!(first.unreviewed, ["aaa-big"], "{first:?}");
+        assert_eq!(first.deferred, ["bbb"], "{first:?}");
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &one());
+        assert_eq!(second.pinned, ["bbb"], "{second:?}");
+        assert_eq!(second.unreviewed, ["aaa-big"], "{second:?}");
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pinned_pack_that_grows_past_the_hash_budget_is_quarantined_by_its_shape() {
+        // `driftbig.rs`: the drifted pack adds a payload behind enough data that neither the
+        // scan nor the hash can finish; its shape no longer matches the pin.
+        let data = tempdir("driftbig-data");
+        let root = seed_packs(
+            "driftbig-skills",
+            &[("good", vec![("SKILL.md", "# good\n".to_string())])],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let budget = || rules::ScanBudget::new(ms(150), ms(400));
+        let first = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget());
+        assert_eq!(first.pinned, ["good"], "{first:?}");
+        fs::write(root.join("good/z.js"), mal_js()).unwrap();
+        let blob = vec![b'A'; big_mib() * 1024 * 1024];
+        for i in 0..4 {
+            fs::write(root.join(format!("good/a{i:02}.dat")), &blob).unwrap();
+        }
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget());
+        assert_eq!(second.quarantined, ["good"], "{second:?}");
+        assert!(second.additional_context.contains("drifted"), "{second:?}");
+        assert!(!lockfile::load(&data).skills.contains_key("good"));
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_same_shape_pin_whose_hash_overruns_loses_its_clean_status() {
         let data = tempdir("hash-overrun-data");
         let root = seed_packs(
             "hash-overrun-skills",
@@ -1341,18 +1539,65 @@ mod orchestration_tests {
         let dirs = vec![root.to_string_lossy().into_owned()];
         let first = run_session_with_policy(&data, &dirs, &ext_policy(false));
         assert!(first.pinned.contains(&"clean".to_string()));
-        fs::write(root.join("clean").join("run.sh"), "echo changed\n").unwrap();
-        // No time to hash at all: the drift check cannot finish, so the pack never passes.
-        let none = rules::ScanBudget::new(std::time::Duration::ZERO, std::time::Duration::ZERO);
-        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &none);
-        assert_eq!(second.unreviewed, ["clean"], "{second:?}");
-        assert!(second.quarantined.is_empty() && second.deferred.is_empty());
+        // Same size, same names: the shape matches, only the hash can tell.
+        fs::write(root.join("clean").join("SKILL.md"), "# Dirty\n").unwrap();
+        let no_time = rules::ScanBudget::new(std::time::Duration::ZERO, secs(60));
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &no_time);
+        assert_eq!(second.drift_unchecked, ["clean"], "{second:?}");
+        assert!(second.quarantined.is_empty() && second.pinned.is_empty());
+        assert!(
+            second.additional_context.contains("drift not checked"),
+            "{second:?}"
+        );
+        let lock = lockfile::load(&data);
+        assert!(lock.skills["clean"].drift_unchecked, "{lock:?}");
+        // To the front of the next sweep once; a second overrun in a row goes back by age.
+        let mark = lock.sweep_marks["skill:clean"];
+        assert_eq!((mark.attempted, mark.requeued), (0, true), "{lock:?}");
+        let again = run_session_with_budget(&data, &dirs, &ext_policy(false), &no_time);
+        assert_eq!(again.drift_unchecked, ["clean"], "{again:?}");
+        let lock = lockfile::load(&data);
+        let mark = lock.sweep_marks["skill:clean"];
+        assert_eq!(
+            (mark.attempted, mark.requeued),
+            (lock.sweep_session, false),
+            "{lock:?}"
+        );
         // With time again, the drift is found.
         let third = run_session_with_policy(&data, &dirs, &ext_policy(false));
         assert!(
             third.quarantined.contains(&"clean".to_string()),
             "{third:?}"
         );
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn pinned_packs_past_the_sweep_deadline_are_listed_drift_not_checked() {
+        let data = tempdir("unchecked-data");
+        let root = seed_packs(
+            "unchecked-skills",
+            &[
+                ("a", vec![("SKILL.md", "# a\n".to_string())]),
+                ("b", vec![("SKILL.md", "# b\n".to_string())]),
+                ("c", vec![("SKILL.md", "# c\n".to_string())]),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let first = run_session_with_policy(&data, &dirs, &ext_policy(false));
+        assert_eq!(first.pinned.len(), 3, "{first:?}");
+        fs::write(root.join("c").join("run.sh"), "echo changed\n").unwrap();
+        // The sweep's time is spent before the first pack: no drift check runs at all.
+        let spent = rules::ScanBudget::new(secs(60), std::time::Duration::ZERO);
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &spent);
+        assert_eq!(second.drift_unchecked, ["a", "b", "c"], "{second:?}");
+        assert!(second.quarantined.is_empty(), "{second:?}");
+        assert!(second.additional_context.contains("drift not checked"));
+        assert_eq!(lockfile::load(&data).skills.len(), 3);
+        // Next session they are checked, and the drift is found.
+        let third = run_session_with_policy(&data, &dirs, &ext_policy(false));
+        assert_eq!(third.quarantined, ["c"], "{third:?}");
         fs::remove_dir_all(&data).ok();
         fs::remove_dir_all(&root).ok();
     }
