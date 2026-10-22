@@ -1,0 +1,97 @@
+# exfil-hosts.list — known exfiltration sinks, tunnels and paste/drop hosts (contract §1.2).
+#
+# Columns: tier host. tier = lowest tier where the host applies (cumulative: 70 relaxed,
+# 79 medium, 84 high at contract 1.0.0). host is lowercase with no scheme, port or trailing
+# dot; *.x matches any subdomain of x and not x itself (x is listed separately).
+# Records are sorted (LC_ALL=C) and unique.
+#
+# Seeded once (contract 1.0.0) from solanabr/solana-ai-kit .claude/bin/firewall.sh at kit
+# commit 42755ab (the file last changed in 0ffd72b; RULE_SET_VERSION 7). From now on this file
+# is the source: the kit vendors it (scripts/vendor-shared.sh) and deletes its own arrays.
+# relaxed = DOMAINS_EXFIL_SINKS + DOMAINS_TUNNELS + DOMAINS_PASTE_AND_DROPS;
+# medium = DOMAINS_MEDIUM; high = DOMAINS_HIGH.
+
+high *.fly.dev
+high *.netlify.app
+high *.ngrok.dev
+high *.onrender.com
+high *.vercel.app
+medium *.deno.dev
+medium *.glitch.me
+medium *.repl.co
+medium *.replit.dev
+medium *.workers.dev
+medium api.pushover.net
+medium api.telegram.org
+medium hooks.zapier.com
+medium maker.ifttt.com
+relaxed *.beeceptor.com
+relaxed *.burpcollaborator.net
+relaxed *.canarytokens.com
+relaxed *.catbox.moe
+relaxed *.dnslog.cn
+relaxed *.gofile.io
+relaxed *.hookb.in
+relaxed *.interact.sh
+relaxed *.loca.lt
+relaxed *.localtunnel.me
+relaxed *.ngrok-free.app
+relaxed *.ngrok.app
+relaxed *.ngrok.io
+relaxed *.oast.fun
+relaxed *.oastify.com
+relaxed *.pagekite.me
+relaxed *.pastebin.com
+relaxed *.pipedream.net
+relaxed *.requestbin.com
+relaxed *.requestcatcher.com
+relaxed *.serveo.net
+relaxed *.tmpfiles.org
+relaxed *.trycloudflare.com
+relaxed *.tunnelmole.net
+relaxed *.webhook.site
+relaxed 0x0.st
+relaxed anonfiles.com
+relaxed bashupload.com
+relaxed beeceptor.com
+relaxed burpcollaborator.net
+relaxed canarytokens.com
+relaxed catbox.moe
+relaxed dnslog.cn
+relaxed dpaste.com
+relaxed dpaste.org
+relaxed envs.sh
+relaxed file.io
+relaxed glot.io
+relaxed gofile.io
+relaxed hastebin.com
+relaxed hookb.in
+relaxed interact.sh
+relaxed ix.io
+relaxed keep.sh
+relaxed loca.lt
+relaxed localtunnel.me
+relaxed ngrok-free.app
+relaxed ngrok.app
+relaxed ngrok.io
+relaxed oast.fun
+relaxed oastify.com
+relaxed oshi.at
+relaxed pagekite.me
+relaxed paste.ee
+relaxed pastebin.com
+relaxed pipedream.net
+relaxed requestbin.com
+relaxed requestcatcher.com
+relaxed serveo.net
+relaxed sprunge.us
+relaxed temp.sh
+relaxed termbin.com
+relaxed tmpfiles.org
+relaxed transfer.sh
+relaxed trycloudflare.com
+relaxed tunnelmole.net
+relaxed typedwebhook.tools
+relaxed uguu.se
+relaxed webhook.site
+relaxed x0.at

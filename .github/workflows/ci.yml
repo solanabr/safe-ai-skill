@@ -426,5 +426,11 @@ jobs:
       - name: smoke-static-linux.sh logic (stubbed readelf + docker)
         run: sh scripts/test-smoke-static-linux.sh
 
+      - name: Shared lists (policy/shared lint, MANIFEST counts and hashes)
+        run: |
+          sh -n scripts/shared-manifest.sh
+          sh -n scripts/check-shared-lists.sh
+          sh scripts/check-shared-lists.sh
+
       - name: Version consistency across manifests
         run: sh scripts/check-versions.sh

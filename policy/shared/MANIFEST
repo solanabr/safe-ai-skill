@@ -1,0 +1,4 @@
+contract 1.0.0
+credentials.list 57 sha256:2e6582e4661b3cf3aaba3a8ed236260d4aef5f5e7a3f5b4eff1e56906a8e0f45
+exfil-hosts.list 84 sha256:23422d6b7cff2d0cea3f807b896c2a0c58b50616fc89eb8c8634ba0c4a2f7615
+onchain-verbs.list 43 sha256:1f2e9f05c4a89d8da5f268a8535e43cbde7158a453bcfc62578128f2983bcfbf
