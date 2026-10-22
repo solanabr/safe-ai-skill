@@ -95,7 +95,11 @@ fn lists_kit_derived_credentials_are_pinned() {
         "~/.vault-token",
     ] {
         let c = find(g);
-        assert_eq!((c.class, c.sb, c.exception), (CredClass::HostToken, SbTier::Medium, false), "{g}");
+        assert_eq!(
+            (c.class, c.sb, c.exception),
+            (CredClass::HostToken, SbTier::Medium, false),
+            "{g}"
+        );
     }
     let chrome = find("~/AppData/Local/Google/Chrome/User Data/");
     assert_eq!(
