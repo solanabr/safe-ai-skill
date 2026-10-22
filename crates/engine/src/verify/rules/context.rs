@@ -6,6 +6,7 @@
 //! bits, shell-style tokens and base64 decoding.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::path::Path;
 
 use super::lexer::{self, Carry};
@@ -507,8 +508,9 @@ pub(crate) struct Stmt<'d> {
     first_line: u32,
     /// `(byte offset, line)` where each joined line after the first begins.
     breaks: Vec<(usize, u32)>,
-    /// Sorted byte ranges of string/regex literals and comments (everything else is code).
-    regions: Vec<(usize, usize)>,
+    /// Sorted byte ranges of string/regex literals and comments (everything else is code);
+    /// computed on first use for statements that were not lexed line by line.
+    regions: OnceCell<Vec<(usize, usize)>>,
     pub(crate) lang: Lang,
     pub(crate) ctx: Ctx,
     /// Trigger bits of the joined lines.
@@ -520,14 +522,12 @@ impl<'d> Stmt<'d> {
     pub(crate) fn owned(text: &str, line: u32, lang: Lang, ctx: Ctx) -> Stmt<'static> {
         let lower = text.to_ascii_lowercase();
         let bits = line_bits(&lower, text);
-        let mut regions = Vec::new();
-        lexer::lex(&lower, lang, Carry::Code, 0, &mut regions);
         Stmt {
             lower: Cow::Owned(lower),
             orig: Cow::Owned(text.to_string()),
             first_line: line,
             breaks: Vec::new(),
-            regions,
+            regions: OnceCell::new(),
             lang,
             ctx,
             bits,
@@ -536,18 +536,24 @@ impl<'d> Stmt<'d> {
 
     /// A one-line statement borrowed from a document line or span.
     fn borrowed(lower: &'d str, orig: &'d str, line: u32, lang: Lang, ctx: Ctx, bits: u32) -> Self {
-        let mut regions = Vec::new();
-        lexer::lex(lower, lang, Carry::Code, 0, &mut regions);
         Stmt {
             lower: Cow::Borrowed(lower),
             orig: Cow::Borrowed(orig),
             first_line: line,
             breaks: Vec::new(),
-            regions,
+            regions: OnceCell::new(),
             lang,
             ctx,
             bits,
         }
+    }
+
+    fn regions(&self) -> &[(usize, usize)] {
+        self.regions.get_or_init(|| {
+            let mut regions = Vec::new();
+            lexer::lex(&self.lower, self.lang, Carry::Code, 0, &mut regions);
+            regions
+        })
     }
 
     /// 1-based line of byte `off` in the joined text.
@@ -562,13 +568,15 @@ impl<'d> Stmt<'d> {
 
     /// True when byte `off` is inside a string/regex literal or a comment.
     pub(crate) fn is_quoted(&self, off: usize) -> bool {
-        lexer::in_regions(&self.regions, off)
+        lexer::in_regions(self.regions(), off)
     }
 
     /// The statement split into commands on `;`, `&&` and `||` outside literals and comments.
     /// Commands carry the statement's trigger bits (a superset; every rule re-checks its words).
     pub(crate) fn commands(&self) -> impl Iterator<Item = Cmd<'_>> + '_ {
-        split_commands(&self.lower, &self.regions).map(move |(start, end)| Cmd {
+        let separated = self.lower.bytes().any(|b| matches!(b, b';' | b'&' | b'|'));
+        let regions = if separated { self.regions() } else { &[] };
+        split_commands(&self.lower, regions).map(move |(start, end)| Cmd {
             stmt: self,
             start,
             end,
@@ -736,7 +744,7 @@ fn emit_stmt<'d>(
             orig: Cow::Borrowed(piece(doc.line(*i), prompt)),
             first_line: line_no(*i),
             breaks: Vec::new(),
-            regions: regions.iter().map(|&(_, a, z)| (a, z)).collect(),
+            regions: OnceCell::from(regions.iter().map(|&(_, a, z)| (a, z)).collect::<Vec<_>>()),
             lang: unit.lang,
             ctx: unit.ctx,
             bits,
@@ -762,10 +770,12 @@ fn emit_stmt<'d>(
         orig: Cow::Owned(orig),
         first_line: line_no(lines[0]),
         breaks,
-        regions: regions
-            .iter()
-            .map(|&(k, a, z)| (starts[k] + a, starts[k] + z))
-            .collect(),
+        regions: OnceCell::from(
+            regions
+                .iter()
+                .map(|&(k, a, z)| (starts[k] + a, starts[k] + z))
+                .collect::<Vec<_>>(),
+        ),
         lang: unit.lang,
         ctx: unit.ctx,
         bits,

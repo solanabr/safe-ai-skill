@@ -63,12 +63,43 @@ struct Frame {
     close: u8,
 }
 
-/// What the previous significant code token allows next (JS regex vs division).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Prev {
-    Start,
-    Operand,
-    Operator,
+/// Bytes that can change the lexer state in code, per language (everything else is skipped).
+const fn special(bytes: &[u8]) -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut k = 0;
+    while k < bytes.len() {
+        table[bytes[k] as usize] = true;
+        k += 1;
+    }
+    table
+}
+const SPECIAL_SLASH: [bool; 256] = special(b"'\"`/(){}[]");
+const SPECIAL_PYTHON: [bool; 256] = special(b"'\"`#(){}[]");
+const SPECIAL_HASH: [bool; 256] = special(b"'\"`#(){}[]\\");
+
+fn is_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
+}
+
+/// True when the `/` at `i` starts a JS regex literal rather than a division: it follows an
+/// operator, an opening bracket, a keyword such as `return`, or nothing — not a name, a number,
+/// `)`, `]` or a string.
+fn regex_starts(b: &[u8], s: &str, i: usize) -> bool {
+    let mut k = i;
+    while k > 0 && b[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    let Some(&p) = k.checked_sub(1).and_then(|j| b.get(j)) else {
+        return true;
+    };
+    if is_word_byte(p) {
+        let mut w = k - 1;
+        while w > 0 && is_word_byte(b[w - 1]) {
+            w -= 1;
+        }
+        return REGEX_KEYWORDS.contains(&&s[w..k]);
+    }
+    !matches!(p, b')' | b']' | b'\'' | b'"' | b'`')
 }
 
 /// Keywords after which `/` starts a regex literal.
@@ -185,251 +216,270 @@ pub(crate) fn lex(
     };
     let mut frames: Vec<Frame> = Vec::new();
     let mut depth = 0i32;
-    let mut prev = Prev::Start;
-    let mut word_start: Option<usize> = None;
+    let special = match lang {
+        Lang::Js | Lang::Rust => &SPECIAL_SLASH,
+        Lang::Python => &SPECIAL_PYTHON,
+        Lang::Shell | Lang::Other => &SPECIAL_HASH,
+    };
+    // Cleared after an unterminated regex: that `/` was a division, and re-lexing from every
+    // later `/` could go quadratic on one long line.
+    let mut regex_ok = lang == Lang::Js;
     let mut i = 0;
-    while i < n {
-        let c = b[i];
-        match mode {
-            Mode::Code => {
-                // Identifier tracking for the regex heuristic.
-                let ident = c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-                if ident {
-                    word_start.get_or_insert(i);
-                    i += 1;
-                    continue;
-                }
-                if let Some(ws) = word_start.take() {
-                    let word = &s[ws..i];
-                    prev = if REGEX_KEYWORDS.contains(&word) {
-                        Prev::Operator
-                    } else {
-                        Prev::Operand
-                    };
-                }
-                if let Some(top) = frames.last() {
-                    if c == top.close && depth == top.depth + 1 {
-                        depth = top.depth;
-                        mode = restart(top.resume, i + 1);
-                        frames.pop();
+    loop {
+        while i < n {
+            let c = b[i];
+            match mode {
+                Mode::Code => {
+                    if !special[usize::from(c)] {
                         i += 1;
+                        while i < n && !special[usize::from(b[i])] {
+                            i += 1;
+                        }
                         continue;
                     }
-                }
-                match c {
-                    b'(' | b'[' | b'{' => {
-                        depth += 1;
-                        prev = Prev::Operator;
-                    }
-                    b')' | b']' => {
-                        depth -= 1;
-                        prev = Prev::Operand;
-                    }
-                    b'}' => {
-                        depth -= 1;
-                        prev = Prev::Operator;
-                    }
-                    b'\'' if lang == Lang::Rust => match rust_char_end(b, i) {
-                        Some(end) => {
-                            push(regions, base, i, end + 1);
-                            prev = Prev::Operand;
-                            i = end + 1;
-                            continue;
-                        }
-                        None => prev = Prev::Operand,
-                    },
-                    b'"' | b'\'' => {
-                        let triple = lang == Lang::Python
-                            && b.get(i + 1) == Some(&c)
-                            && b.get(i + 2) == Some(&c);
-                        let (fstring, raw) = if lang == Lang::Python {
-                            python_prefix(b, i)
-                        } else {
-                            (false, false)
-                        };
-                        mode = Mode::Str {
-                            quote: c,
-                            start: i,
-                            triple,
-                            fstring,
-                            raw: raw || (lang == Lang::Shell && c == b'\''),
-                            shell_dq: lang == Lang::Shell && c == b'"',
-                        };
-                        if triple {
-                            i += 3;
+                    if let Some(top) = frames.last() {
+                        if c == top.close && depth == top.depth + 1 {
+                            depth = top.depth;
+                            mode = restart(top.resume, i + 1);
+                            frames.pop();
+                            i += 1;
                             continue;
                         }
                     }
-                    b'`' => match lang {
-                        Lang::Js => mode = Mode::Template { start: i },
-                        // Shell backticks are command substitution: code.
-                        Lang::Shell => {}
-                        _ => {
+                    match c {
+                        b'(' | b'[' | b'{' => depth += 1,
+                        b')' | b']' | b'}' => depth -= 1,
+                        // Shell and other text: an escaped byte is not syntax (`it\'s`).
+                        b'\\' => {
+                            i += 2;
+                            continue;
+                        }
+                        b'\'' if lang == Lang::Rust => {
+                            if let Some(end) = rust_char_end(b, i) {
+                                push(regions, base, i, end + 1);
+                                i = end + 1;
+                                continue;
+                            }
+                        }
+                        b'"' | b'\'' => {
+                            let triple = lang == Lang::Python
+                                && b.get(i + 1) == Some(&c)
+                                && b.get(i + 2) == Some(&c);
+                            let (fstring, raw) = if lang == Lang::Python {
+                                python_prefix(b, i)
+                            } else {
+                                (false, false)
+                            };
                             mode = Mode::Str {
                                 quote: c,
                                 start: i,
-                                triple: false,
-                                fstring: false,
-                                raw: false,
-                                shell_dq: false,
+                                triple,
+                                fstring,
+                                raw: raw || (lang == Lang::Shell && c == b'\''),
+                                shell_dq: lang == Lang::Shell && c == b'"',
+                            };
+                            if triple {
+                                i += 3;
+                                continue;
                             }
                         }
-                    },
-                    b'/' if slash_comments && b.get(i + 1) == Some(&b'/') => {
-                        mode = Mode::Line { start: i }
-                    }
-                    b'/' if slash_comments && b.get(i + 1) == Some(&b'*') => {
-                        mode = Mode::Block { start: i };
-                        i += 2;
-                        continue;
-                    }
-                    b'/' if lang == Lang::Js && prev != Prev::Operand => {
-                        mode = Mode::Regex {
-                            start: i,
-                            class: false,
+                        b'`' => match lang {
+                            Lang::Js => mode = Mode::Template { start: i },
+                            // Shell backticks are command substitution: code.
+                            Lang::Shell => {}
+                            _ => {
+                                mode = Mode::Str {
+                                    quote: c,
+                                    start: i,
+                                    triple: false,
+                                    fstring: false,
+                                    raw: false,
+                                    shell_dq: false,
+                                }
+                            }
+                        },
+                        b'/' if slash_comments && b.get(i + 1) == Some(&b'/') => {
+                            mode = Mode::Line { start: i }
                         }
+                        b'/' if slash_comments && b.get(i + 1) == Some(&b'*') => {
+                            mode = Mode::Block { start: i };
+                            i += 2;
+                            continue;
+                        }
+                        b'/' if regex_ok && regex_starts(b, s, i) => {
+                            mode = Mode::Regex {
+                                start: i,
+                                class: false,
+                            }
+                        }
+                        b'#' if lang == Lang::Python => mode = Mode::Line { start: i },
+                        b'#' if matches!(lang, Lang::Shell | Lang::Other)
+                            && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
+                        {
+                            mode = Mode::Line { start: i }
+                        }
+                        _ => {}
                     }
-                    b'#' if lang == Lang::Python => mode = Mode::Line { start: i },
-                    b'#' if matches!(lang, Lang::Shell | Lang::Other)
-                        && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
-                    {
-                        mode = Mode::Line { start: i }
+                }
+                Mode::Str {
+                    quote,
+                    start,
+                    triple,
+                    fstring,
+                    raw,
+                    shell_dq,
+                } => {
+                    let stop = |c: u8| {
+                        c == quote
+                            || c == b'\n'
+                            || (c == b'\\' && !raw)
+                            || (fstring && c == b'{')
+                            || (shell_dq && c == b'$')
+                    };
+                    if !stop(c) {
+                        i += 1;
+                        while i < n && !stop(b[i]) {
+                            i += 1;
+                        }
+                        continue;
                     }
-                    c if c.is_ascii_whitespace() => {}
-                    _ => prev = Prev::Operator,
-                }
-            }
-            Mode::Str {
-                quote,
-                start,
-                triple,
-                fstring,
-                raw,
-                shell_dq,
-            } => {
-                if c == b'\\' && !raw {
-                    i += 2;
-                    continue;
-                }
-                if fstring && c == b'{' {
-                    if b.get(i + 1) == Some(&b'{') {
+                    if c == b'\\' {
                         i += 2;
                         continue;
                     }
-                    push(regions, base, start, i);
-                    frames.push(Frame {
-                        resume: mode,
-                        depth,
-                        close: b'}',
-                    });
-                    depth += 1;
-                    mode = Mode::Code;
-                    prev = Prev::Start;
-                    i += 1;
-                    continue;
+                    if fstring && c == b'{' {
+                        if b.get(i + 1) == Some(&b'{') {
+                            i += 2;
+                            continue;
+                        }
+                        push(regions, base, start, i);
+                        frames.push(Frame {
+                            resume: mode,
+                            depth,
+                            close: b'}',
+                        });
+                        depth += 1;
+                        mode = Mode::Code;
+                        i += 1;
+                        continue;
+                    }
+                    if shell_dq && c == b'$' {
+                        if b.get(i + 1) == Some(&b'(') {
+                            push(regions, base, start, i);
+                            frames.push(Frame {
+                                resume: mode,
+                                depth,
+                                close: b')',
+                            });
+                            depth += 1;
+                            mode = Mode::Code;
+                            i += 2;
+                            continue;
+                        }
+                    } else if c == quote {
+                        if !triple {
+                            push(regions, base, start, i + 1);
+                            mode = Mode::Code;
+                        } else if b.get(i + 1) == Some(&quote) && b.get(i + 2) == Some(&quote) {
+                            push(regions, base, start, i + 3);
+                            mode = Mode::Code;
+                            i += 3;
+                            continue;
+                        }
+                    } else if c == b'\n' && !triple && lang != Lang::Shell {
+                        // A single-line string ends at the line end.
+                        push(regions, base, start, i);
+                        mode = Mode::Code;
+                    }
                 }
-                if shell_dq && c == b'$' && b.get(i + 1) == Some(&b'(') {
-                    push(regions, base, start, i);
-                    frames.push(Frame {
-                        resume: mode,
-                        depth,
-                        close: b')',
-                    });
-                    depth += 1;
-                    mode = Mode::Code;
-                    prev = Prev::Start;
-                    i += 2;
-                    continue;
-                }
-                if c == quote {
-                    if !triple {
+                Mode::Template { start } => {
+                    if !matches!(c, b'\\' | b'`' | b'$') {
+                        i += 1;
+                        while i < n && !matches!(b[i], b'\\' | b'`' | b'$') {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'`' {
                         push(regions, base, start, i + 1);
                         mode = Mode::Code;
-                        prev = Prev::Operand;
-                    } else if b.get(i + 1) == Some(&quote) && b.get(i + 2) == Some(&quote) {
-                        push(regions, base, start, i + 3);
+                    } else if b.get(i + 1) == Some(&b'{') {
+                        push(regions, base, start, i);
+                        frames.push(Frame {
+                            resume: mode,
+                            depth,
+                            close: b'}',
+                        });
+                        depth += 1;
                         mode = Mode::Code;
-                        prev = Prev::Operand;
-                        i += 3;
+                        i += 2;
                         continue;
                     }
-                } else if c == b'\n' && !triple && lang != Lang::Shell {
-                    // A single-line string ends at the line end.
-                    push(regions, base, start, i);
-                    mode = Mode::Code;
-                    prev = Prev::Start;
                 }
-            }
-            Mode::Template { start } => {
-                if c == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if c == b'`' {
-                    push(regions, base, start, i + 1);
-                    mode = Mode::Code;
-                    prev = Prev::Operand;
-                } else if c == b'$' && b.get(i + 1) == Some(&b'{') {
-                    push(regions, base, start, i);
-                    frames.push(Frame {
-                        resume: mode,
-                        depth,
-                        close: b'}',
-                    });
-                    depth += 1;
-                    mode = Mode::Code;
-                    prev = Prev::Start;
-                    i += 2;
-                    continue;
-                }
-            }
-            Mode::Line { start } => {
-                if c == b'\n' {
-                    push(regions, base, start, i);
-                    mode = Mode::Code;
-                    prev = Prev::Start;
-                }
-            }
-            Mode::Block { start } => {
-                if c == b'*' && b.get(i + 1) == Some(&b'/') {
-                    push(regions, base, start, i + 2);
-                    mode = Mode::Code;
-                    i += 2;
-                    continue;
-                }
-            }
-            Mode::Regex { start, class } => {
-                if c == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if c == b'[' {
-                    mode = Mode::Regex { start, class: true };
-                } else if c == b']' {
-                    mode = Mode::Regex {
-                        start,
-                        class: false,
-                    };
-                } else if c == b'/' && !class {
-                    let mut j = i + 1;
-                    while j < n && b[j].is_ascii_alphabetic() {
-                        j += 1;
+                Mode::Line { start } => match b[i..].iter().position(|&c| c == b'\n') {
+                    Some(k) => {
+                        push(regions, base, start, i + k);
+                        mode = Mode::Code;
+                        i += k + 1;
+                        continue;
                     }
-                    push(regions, base, start, j);
-                    mode = Mode::Code;
-                    prev = Prev::Operand;
-                    i = j;
-                    continue;
-                } else if c == b'\n' {
-                    // Unterminated: it was a division. Resume as code after the `/`.
-                    mode = Mode::Code;
-                    prev = Prev::Operand;
-                    i = start + 1;
-                    continue;
+                    None => {
+                        i = n;
+                        continue;
+                    }
+                },
+                Mode::Block { start } => match b[i..].windows(2).position(|w| w == b"*/") {
+                    Some(k) => {
+                        push(regions, base, start, i + k + 2);
+                        mode = Mode::Code;
+                        i += k + 2;
+                        continue;
+                    }
+                    None => {
+                        i = n;
+                        continue;
+                    }
+                },
+                Mode::Regex { start, class } => {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'[' {
+                        mode = Mode::Regex { start, class: true };
+                    } else if c == b']' {
+                        mode = Mode::Regex {
+                            start,
+                            class: false,
+                        };
+                    } else if c == b'/' && !class {
+                        let mut j = i + 1;
+                        while j < n && b[j].is_ascii_alphabetic() {
+                            j += 1;
+                        }
+                        push(regions, base, start, j);
+                        mode = Mode::Code;
+                        i = j;
+                        continue;
+                    } else if c == b'\n' {
+                        break;
+                    }
                 }
             }
+            i += 1;
         }
-        i += 1;
+        // An unterminated regex was a division: resume as code after its `/`.
+        if let Mode::Regex { start, .. } = mode {
+            mode = Mode::Code;
+            regex_ok = false;
+            i = start + 1;
+            continue;
+        }
+        break;
     }
     let carry = match mode {
         Mode::Code | Mode::Regex { .. } => Carry::Code,
@@ -540,6 +590,19 @@ mod tests {
         assert!(regions.is_empty());
         let doc = lex("x = '''start", Lang::Python, Carry::Code, 0, &mut regions);
         assert_eq!(doc.carry, Carry::Triple(b'\''));
+    }
+
+    #[test]
+    fn escapes_and_unterminated_regexes() {
+        assert!(!quoted("echo it\\'s; eval x", Lang::Shell, "eval"));
+        // `/ 2` opening a line is a division: the quote after it still opens a string.
+        assert!(quoted("/ 2; x = 'eval(y)'", Lang::Js, "eval"));
+        assert!(!quoted("/[x; eval(y)", Lang::Js, "eval"));
+        let line = "(/[".repeat(100_000);
+        let mut regions = Vec::new();
+        let started = std::time::Instant::now();
+        lex(&line, Lang::Js, Carry::Code, 0, &mut regions);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
