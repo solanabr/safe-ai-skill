@@ -4884,6 +4884,24 @@ mod enforce_tests {
     }
 
     #[test]
+    fn an_approved_lock_mismatch_is_allowed_on_the_fingerprint_path() {
+        let (d, project) = fresh_trusted("rr7-lock-ok");
+        md(&skills_of(&project).join("calm"), "calm");
+        fs::create_dir_all(project.join(".safe-ai-skill")).unwrap();
+        fs::write(
+            project.join(state::PACKS_LOCK),
+            r#"{"packs":[{"path":".claude/skills/calm","tree_hash":"0000"}]}"#,
+        )
+        .unwrap();
+        sweep_it(&d, &project);
+        assert!(is_deny(&skill(&d, &project, "calm")));
+        assert!(approve(&d, &project, "calm").contains("safe-ai-skill: approved"));
+        sweep_it(&d, &project);
+        // Fingerprint unchanged since the approved scan: the reviewed mismatch stays cleared.
+        assert_eq!(skill(&d, &project, "calm"), GateVerdict::NoOpinion);
+    }
+
+    #[test]
     fn nothing_blocked_means_no_opinion_everywhere() {
         let project = tempdir("none");
         let d = DataDir {

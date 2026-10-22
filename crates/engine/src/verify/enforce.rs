@@ -233,11 +233,15 @@ pub(super) fn skill_verdict_in(
                 continue;
             }
             seen.push(key.clone());
-            // A packs.lock committed since the content was scanned can only tighten.
-            let lock_mismatch = env
-                .lock_pins
-                .get(&key)
-                .is_some_and(|pin| *pin != e.last_scanned_hash);
+            // A packs.lock committed since the content was scanned can only tighten, unless the
+            // user approved or trusted exactly this content.
+            let cleared = e.approved
+                || super::trust::covers(&env.trust, &e.last_scanned_hash, &e.flagged_rules);
+            let lock_mismatch = !cleared
+                && env
+                    .lock_pins
+                    .get(&key)
+                    .is_some_and(|pin| *pin != e.last_scanned_hash);
             if e.state == PackStatus::Blocked {
                 blocked.get_or_insert_with(|| (pack.display.clone(), why_label(e.reason)));
             } else if lock_mismatch {
