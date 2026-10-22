@@ -187,7 +187,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
-    let decision = safe_ai_skill::gates::secrets::decide(command, &effective);
+    let decision = safe_ai_skill::gates::secrets::decide(command, &cwd, &effective);
     // Secret reads are always a hard guard.
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)

@@ -427,6 +427,53 @@ fn project_root_named_like_the_live_data_dir_has_no_opinion() {
 }
 
 #[test]
+fn bash_brace_alternatives_deny() {
+    let sb = Sandbox::new("tw-brace");
+    for cmd in [
+        "echo x > ~/.claude/plugins/{data,}/safe-ai-skill-stbr/mode.json",
+        "echo x > ~/.claude/plugins/da{t,}a/safe-ai-skill-stbr/mode.json",
+        "echo x > ~/.claude/{plugins,x}/data/safe-ai-skill-stbr/mode.json",
+        "ls /tmp/{d,e}/safe-ai-skill-stbr/x",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+    for cmd in [
+        "mkdir -p src/{bin,lib} && cp main.{rs,bak}",
+        "find . -name x -exec grep -l y {} +",
+    ] {
+        assert_no_opinion(&sb.bash(cmd), cmd);
+    }
+}
+
+#[test]
+fn bash_dir_tools_and_tracked_dirs_deny() {
+    let sb = Sandbox::new("tw-tracked");
+    for cmd in [
+        "env -C ~/.claude/plugins/data rm -rf sa*",
+        "git -C ~/.claude/plugins/data clean -fdx -- *-stbr",
+        "cd ~/.claude/plugins && rm -rf data/*",
+        "cd ~/.claude && rm -rf plugins/data/safe-ai-skill-stbr",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+    // A session sitting in the data dir: bare file names are inside it.
+    let data = sb.data();
+    let run = |cmd: &str| {
+        sb.run_at(
+            &data,
+            "gate-bash-secrets",
+            "Bash",
+            json!({ "command": cmd }),
+        )
+    };
+    assert_deny(
+        &run("echo x > grants.json"),
+        "echo x > grants.json in the data dir",
+    );
+    assert_no_opinion(&run("ls -la"), "ls -la in the data dir");
+}
+
+#[test]
 fn bash_near_misses_have_no_opinion() {
     // A glob inside another plugin's cache dir, `.safe-ai-skill` named without a `cd` into it, a
     // glob that cannot reach a dotfile, a read-only computed binary, and a release tag name.
