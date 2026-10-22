@@ -227,9 +227,16 @@ fn write_opinion(value: Option<Value>) -> std::io::Result<()> {
     }
 }
 
-/// Serialize `value` as a single line to stdout and flush.
+/// Set once a decision has been written: a process writes at most one.
+static WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serialize `value` as a single line to stdout and flush. Only the first call in a process
+/// writes (a gate and its deadline may race to answer); later calls are no-ops.
 fn write_json(value: &Value) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
+    if WRITTEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
     let s = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     out.write_all(s.as_bytes())?;
     out.flush()

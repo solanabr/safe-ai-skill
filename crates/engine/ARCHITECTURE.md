@@ -165,7 +165,7 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | File | Producer | Purpose |
 |---|---|---|
 | `audit.jsonl` | `audit::append` | append-only decision log |
-| `netcache.json` | `context` | cached `solana config get` RPC URL (60s TTL) |
+| `netcache.json` | `context` | cached `solana config get` RPC URL (60s TTL, authenticated state file, bound to the CLI config's size+mtime; future `ts` ignored) |
 | `spend.json` | `spend` (round-2) | daily spend ledger |
 | `grants.json` | `grants` (round-2) | active scoped grants |
 | `mode.json` | `mode` (round-2) | runtime active-profile override |
@@ -333,10 +333,18 @@ both together.
 pub enum Network { Mainnet, Devnet, Testnet, Localnet, Unknown }
 impl Network { pub fn label(&self) -> &'static str; }
 
-pub struct Context { pub network: Network, pub plugin_data: PathBuf, pub project_dir: PathBuf }
-impl Context { pub fn build(command: &str, cwd: &Path) -> Context; }
+pub struct Context {
+    pub network: Network,         // default for solana/spl-token: CLI config
+    pub anchor_network: Network,  // default for anchor: Anchor.toml (upward), else CLI config
+    pub plugin_data: PathBuf, pub project_dir: PathBuf,
+}
+impl Context { pub fn build(command: &str, cwd: &Path) -> Context; } // lazy: resolves only what the command needs
 
-pub fn resolve_network(command: &str, cwd: &Path) -> Network;  // flag>env>Anchor.toml>cached solana config
+pub fn resolve_network(command: &str, cwd: &Path) -> Network;   // first solana-family command
+pub fn explicit_network(argv: &Argv, base: Option<&Path>) -> Option<Network>; // -u/--url, -C file
+pub fn cli_network(cwd: &Path) -> Network;                      // `solana config get`, 2 s timeout
+pub fn anchor_network(cwd: &Path, cli: impl FnOnce() -> Network) -> Network; // ANCHOR_PROVIDER_URL only tightens
+pub mod shell;  // parse(): quote-aware split, prefix/wrapper strip, recursion (D1.8)
 pub fn plugin_data_dir() -> PathBuf;                            // datadir::data_dir().path
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```

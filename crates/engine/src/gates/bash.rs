@@ -1,24 +1,33 @@
 //! Bash command gate.
 //!
 //! Classifies `solana` / `spl-token` / `anchor` commands and decides whether to allow, ask,
-//! deny, or defer (no opinion). A command is split on `&&`, `||`, `;`, and `|`; each segment is
-//! classified and decided independently, and the whole command takes the *most
-//! restrictive* segment's decision (`Deny` > `Ask` > `Allow` > `Defer`). The returned
-//! [`GateMeta`] describes the most significant gated segment so the relaxation layer and
-//! grants can reason about it.
+//! deny, or defer (no opinion). The command is parsed like a shell would
+//! ([`crate::context::shell`]): split on newline, `;`, `&`, `&&`, `||` and `|`, prefixes and
+//! wrappers stripped, substitutions, subshells, `-c` scripts and `eval` followed. Each solana
+//! command is classified on its own and the whole command takes the *most restrictive*
+//! decision (`Deny` > `Ask` > `Allow` > `Defer`). The returned [`GateMeta`] describes the most
+//! significant gated command so the relaxation layer and grants can reason about it.
 //!
 //! `Allow` comes only from a within-cap transfer on a positively identified
-//! devnet/testnet/localnet, and only when every segment is a solana-family command: an allow
-//! vouches for the whole tool call. Read-only commands and deploys to such a network get no
-//! opinion, so the normal permission flow applies. Irreversible actions (`--final`, authority
-//! changes, closes) are hard-guard asks on every cluster, and `--final` on mainnet is denied.
+//! devnet/testnet/localnet, and only when every command is a direct solana-family command: an
+//! allow vouches for the whole tool call. Read-only commands and deploys to such a network get
+//! no opinion, so the normal permission flow applies. Irreversible actions (`--final`,
+//! authority changes, closes) are hard-guard asks on every cluster, and `--final` on mainnet
+//! is denied. A command naming a solana-family program that cannot be parsed, or that runs
+//! code the command line does not spell out, asks as a hard guard.
 //!
-//! This gate is pure: it consults the resolved [`Context`] (network already determined by
-//! `main.rs`) and the effective [`Policy`], but performs no process or network I/O. A segment
-//! that names its own cluster (`-um`, `--url …`) is judged on that cluster. The only
-//! filesystem touch is the spend ledger, which is read (not committed) here to predict a
-//! transfer decision; `main.rs` commits the debit on an actual allow.
+//! A command that names its own cluster (`-um`, `--url …`, `-C file`) is judged on it;
+//! otherwise `solana`/`spl-token` use [`Context::network`] and `anchor`
+//! [`Context::anchor_network`], unless the command changes directory or the CLI config's
+//! environment first. With policy `network.mainnet: deny`, every mainnet ask is a deny.
+//!
+//! The gate performs no process or network I/O: `main.rs` resolved the defaults. It reads a
+//! `-C` config file when one is named, and the spend ledger, which is read (not committed)
+//! here to predict a transfer decision; `main.rs` commits the debit on an actual allow.
 
+use std::path::Path;
+
+use crate::context::shell::{self, Parsed};
 use crate::context::{self, Argv, Context, Network};
 use crate::gate::{GateMeta, Scope};
 use crate::io::Decision;
@@ -30,38 +39,128 @@ use crate::spend::{self, SpendLedger};
 /// Returns the natural decision (before relaxation) and a [`GateMeta`] describing the
 /// action. The caller (`main.rs`) applies the relaxation layer to the result.
 pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
-    // `ctx.network` comes from the command's cluster flags whenever it names one anywhere,
-    // even in another segment (`echo -ud; solana transfer …`), so it vouches for a segment
-    // naming none only when the whole command names none.
-    let names_cluster = context::network_from_flags(command).is_some();
+    decide_parsed(command, &shell::parse(command), ctx, policy)
+}
+
+/// The indirection prefilter of the unconditional Bash hook (spec D6.3, default-route).
+///
+/// Claude Code runs `gate-bash` only for commands its case-sensitive `if: Bash(solana *)`
+/// filters match: a command spelled exactly `solana …`, `spl-token …` or `anchor …` at top
+/// level (after `;` or `&&` too). When every solana-family command in `command` has that
+/// shape, `gate-bash` decides and this returns `None`. Otherwise — a family command behind a
+/// wrapper, in a script, after a pipe, spelled differently, or one the parser cannot read —
+/// this returns the gate's own decision, resolved like `gate-bash` resolves it (defaults from
+/// `cwd`) and with its own meta, so grants and profiles relax it the same way. It never
+/// returns an allow or no opinion: those are left to the normal permission flow.
+pub fn indirection_prefilter(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+) -> Option<(Decision, GateMeta)> {
+    // The parse is pure and fast; a substring pre-check would miss `$(echo sol)ana`.
+    let parsed = shell::parse(command);
+    let routed = parsed.unparseable
+        || parsed.opaque_mention
+        || parsed.write_then_run
+        || parsed.commands.iter().any(|c| {
+            let dynamic_program = c.words.first().is_some_and(|w| w.dynamic);
+            let dynamic_words = c.is_family() && c.words.iter().any(|w| w.dynamic);
+            dynamic_program || dynamic_words || (c.is_family() && !c.canonical)
+        });
+    if !routed {
+        return None;
+    }
+    let ctx = Context::build(command, cwd);
+    match decide_parsed(command, &parsed, &ctx, policy) {
+        (decision @ (Decision::Ask { .. } | Decision::Deny { .. }), meta) => Some((decision, meta)),
+        _ => None,
+    }
+}
+
+/// Fold the [`indirection_prefilter`] verdict for `command` into `decision` (the secret
+/// gate's, with `meta`), keeping the more restrictive one and the meta of the winner.
+pub fn with_indirection_prefilter(
+    decision: Decision,
+    meta: GateMeta,
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+) -> (Decision, GateMeta) {
+    match indirection_prefilter(command, cwd, policy) {
+        Some((routed, routed_meta)) => {
+            if severity(&routed) > severity(&decision) {
+                (routed, routed_meta)
+            } else {
+                (decision, meta)
+            }
+        }
+        None => (decision, meta),
+    }
+}
+
+fn decide_parsed(
+    command: &str,
+    parsed: &Parsed,
+    ctx: &Context,
+    policy: &Policy,
+) -> (Decision, GateMeta) {
+    // A solana-family program named where the parser cannot follow: unparseable text, or an
+    // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
+    // one. It could be any command at all: a hard-guard ask, whatever its words.
+    let named = shell::mentions_family(command);
+    if (parsed.unparseable && named) || parsed.opaque_mention {
+        return ask_unparseable();
+    }
+
     let mut best: Option<(Decision, GateMeta)> = None;
     // Command or process substitution runs code the gate never sees, quoted or not.
-    let mut unvetted = ["$(", "`", "<(", ">("].iter().any(|s| command.contains(s));
+    let mut unvetted = parsed.substitution;
 
-    for segment in context::split_segments(command) {
-        let tokens = context::tokenize(segment);
-        let argv = Argv::parse(&tokens);
-        let network = argv.network().unwrap_or(if names_cluster {
-            Network::Unknown
+    for cmd in &parsed.commands {
+        let candidate = if cmd.is_family() {
+            let program = cmd.program();
+            let argv = Argv::from_shell(&cmd.words);
+            let segment_ctx = Context {
+                network: command_network(&argv, &program, ctx, parsed),
+                ..ctx.clone()
+            };
+            let (decision, meta) = classify(&program, &argv, &segment_ctx, policy);
+            let decision = if cmd.writes_file && decision == Decision::Allow {
+                // A redirection writes a file: never part of an allowed transfer.
+                unvetted = true;
+                Decision::Ask {
+                    reason: format!(
+                        "{program} command redirects output to a file — approve to proceed"
+                    ),
+                }
+            } else {
+                decision
+            };
+            (mainnet_policy(decision, segment_ctx.network, policy), meta)
+        } else if shell::dynamic_family_program(cmd, parsed) {
+            ask_dynamic_program()
         } else {
-            ctx.network
-        });
-        let segment_ctx = Context {
-            network,
-            ..ctx.clone()
-        };
-        let Some((decision, meta)) = decide_segment(&tokens, &argv, &segment_ctx, policy) else {
             unvetted = true;
             continue;
         };
-        // Keep the most restrictive segment; on a tie the first one wins.
-        match &best {
-            None => best = Some((decision, meta)),
-            Some((cur_decision, _)) => {
-                if severity(&decision) > severity(cur_decision) {
-                    best = Some((decision, meta));
-                }
-            }
+        // Keep the most restrictive command; on a tie the first one wins.
+        let replace = match &best {
+            None => true,
+            Some((cur, _)) => severity(&candidate.0) > severity(cur),
+        };
+        if replace {
+            best = Some(candidate);
+        }
+    }
+
+    // Solana text written to a file, then a file or stdin run as code.
+    if parsed.write_then_run {
+        let unaccounted = ask_unaccounted();
+        let keep = best
+            .as_ref()
+            .is_some_and(|(d, _)| severity(d) >= severity(&unaccounted.0));
+        if !keep {
+            best = Some(unaccounted);
         }
     }
 
@@ -83,20 +182,48 @@ pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateM
     }
 }
 
-/// Decide a single command segment; `None` when it is not a solana-family command (this gate
-/// has no opinion on it).
-fn decide_segment(
-    tokens: &[String],
-    argv: &Argv,
-    ctx: &Context,
-    policy: &Policy,
-) -> Option<(Decision, GateMeta)> {
-    let program = base_program(tokens.first()?);
-    match program.as_str() {
-        "solana" => Some(classify_solana(argv, ctx, policy)),
-        "spl-token" => Some(classify_spl_token(argv, ctx, policy)),
-        "anchor" => Some(classify_anchor(argv, ctx, policy)),
-        _ => None,
+/// The cluster one solana-family command runs on: its own flags, else the default for its
+/// program — unknown when the command changes directory (for `anchor`, and for a relative
+/// `-C`) or the variables the CLIs read their config through.
+fn command_network(argv: &Argv, program: &str, ctx: &Context, parsed: &Parsed) -> Network {
+    let base = (!parsed.cwd_changed).then_some(ctx.project_dir.as_path());
+    if let Some(net) = context::explicit_network(argv, base) {
+        return net;
+    }
+    if parsed.env_changed {
+        return Network::Unknown;
+    }
+    if program == "anchor" {
+        if parsed.cwd_changed {
+            Network::Unknown
+        } else {
+            ctx.anchor_network
+        }
+    } else {
+        ctx.network
+    }
+}
+
+/// Policy `network.mainnet: deny` turns every mainnet ask into a deny (it can only tighten).
+fn mainnet_policy(decision: Decision, network: Network, policy: &Policy) -> Decision {
+    match decision {
+        Decision::Ask { reason }
+            if network == Network::Mainnet && policy.network.mainnet == "deny" =>
+        {
+            Decision::Deny {
+                reason: format!("{reason} — denied: policy network.mainnet is `deny`"),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Classify one solana-family command.
+fn classify(program: &str, argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
+    match program {
+        "solana" => classify_solana(argv, ctx, policy),
+        "spl-token" => classify_spl_token(argv, ctx, policy),
+        _ => classify_anchor(argv, ctx, policy),
     }
 }
 
@@ -395,8 +522,45 @@ fn ask_unknown(program: &str) -> (Decision, GateMeta) {
     )
 }
 
+/// A command naming a solana-family program that cannot be parsed, runs code the command line
+/// does not spell out (a shell reading a pipe, `eval "$x"`), or runs an expansion as its
+/// program. It could be anything, so it asks as a hard guard.
+fn ask_unparseable() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "Could not parse this command, and it names a solana-family program — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
+/// A solana-family command is written to a script that is then run: the gate cannot fully see
+/// its words. A hard-guard ask.
+fn ask_unaccounted() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "This command runs a solana-family command the gate cannot fully see — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
+/// The program is an expansion that could be a solana-family program (`$(echo sol)ana`,
+/// `X=solana; $X …`, `$X transfer …`). A hard-guard ask.
+fn ask_dynamic_program() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "This command runs an expansion as its program, and it may be a solana-family program — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
 /// A solana-family command whose words cannot be identified unambiguously (a flag of unknown
-/// arity precedes them). It could be anything, so it asks as a hard guard.
+/// arity or a shell expansion precedes them). It could be anything, so it asks as a hard guard.
 fn ask_ambiguous(program: &str) -> (Decision, GateMeta) {
     let mut meta = GateMeta::new(Scope::Other, true);
     meta.program = Some(program.to_string());
@@ -527,10 +691,24 @@ fn parse_transfer(argv: &Argv, program: &str) -> (Amount, Option<String>) {
     (amount, destination)
 }
 
-/// Parse one amount word: `ALL`, or a finite, non-negative number.
+/// Longest amount word accepted; longer is unclear (and could not be a real balance).
+const MAX_AMOUNT_LEN: usize = 32;
+
+/// Parse one amount word: `ALL`, or a plain decimal (`500`, `0.5`, `.5`). Exponents, signs,
+/// hex, separators, `inf`/`NaN` and overlong words are [`Amount::Unclear`]: a CLI might read
+/// them differently.
 fn parse_amount(raw: &str) -> Amount {
     if raw.eq_ignore_ascii_case("ALL") {
         return Amount::All;
+    }
+    let digits = raw.chars().filter(char::is_ascii_digit).count();
+    let dots = raw.chars().filter(|&c| c == '.').count();
+    let plain = digits > 0
+        && dots <= 1
+        && raw.len() <= MAX_AMOUNT_LEN
+        && raw.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if !plain {
+        return Amount::Unclear;
     }
     match raw.parse::<f64>() {
         Ok(v) if v.is_finite() && v >= 0.0 => Amount::Value(v),
@@ -556,16 +734,6 @@ fn looks_like_pubkey(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l'))
 }
 
-/// The base program name of a token (strips any directory prefix).
-fn base_program(tok: &str) -> String {
-    let cleaned = tok.trim_matches(|c| c == '"' || c == '\'');
-    cleaned
-        .rsplit('/')
-        .next()
-        .unwrap_or(cleaned)
-        .to_ascii_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +746,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Context {
             network,
+            anchor_network: network,
             plugin_data: dir.clone(),
             project_dir: PathBuf::from("/tmp"),
         }
