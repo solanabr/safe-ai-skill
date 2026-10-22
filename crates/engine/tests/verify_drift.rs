@@ -1,24 +1,24 @@
-//! Sandboxed `verify session` sweep: TOFU drift, swept roots, and `verify approve`.
+//! Sandboxed `verify session` sweep: state v2 drift, swept roots, and `verify approve`.
 //!
-//! Places a clean fixture skill under a sandbox project's `.claude/skills`, pins it with a first
-//! `verify session` sweep, tampers one byte, then re-runs `verify session` and asserts the drift
-//! is reported (a WARN in the SessionStart `systemMessage` + `additionalContext`) on every
-//! session, the skill staying where it is, until `verify approve` re-pins it. Also covers which
-//! roots are swept (the user-scope `~/.claude/skills` only when the policy lists it, or for packs
-//! `install --from` put there), `.mcp.json` findings, and `verify approve` restoring packs that an
-//! earlier version moved into `quarantine/`.
+//! Places a clean fixture skill under a sandbox project's `.claude/skills`, records it with a
+//! first `verify session` sweep, tampers one byte, then re-runs `verify session` and asserts the
+//! drift is a BLOCK (in the SessionStart `systemMessage` + `additionalContext`) on every session,
+//! the skill staying where it is. `verify approve` only creates a pending request: nothing
+//! changes until the user confirms its nonce (the confirmation itself is covered by the
+//! library tests). Also covers which roots are swept (the user-scope `~/.claude/skills` only
+//! when the policy lists it, or for packs `install --from` put there), `.mcp.json` findings, and
+//! `verify approve` of packs that an earlier version moved into `quarantine/`.
 //!
 //! Fully hermetic: the project, HOME and CLAUDE_PLUGIN_DATA are sandbox temp dirs, so the sweep
-//! scans only the fixtures and writes lockfile/quarantine only inside the sandbox.
+//! scans only the fixtures and writes state only inside the sandbox.
 
 mod common;
 
 use common::{Invocation, Run, TempDir};
 use std::path::{Path, PathBuf};
 
-/// A telemetry preamble (outbound POST): a High finding wherever it is swept.
-const TELEMETRY_SKILL_MD: &str = "# Personal\n\n\
-```bash\ncurl -s -X POST \"$U/api/mutation\" -d '{}'\n```\n";
+/// A script reading the default keypair: a code-context High finding wherever it is swept.
+const KEYPAIR_SCRIPT: &str = "#!/bin/sh\n\ncat ~/.config/solana/id.json\n";
 
 /// `<project>/.claude/skills` — the default (project-scope) skills root.
 fn skills_root(project: &Path) -> PathBuf {
@@ -83,11 +83,22 @@ fn messages(v: &serde_json::Value) -> (String, String) {
     (sys, ctx)
 }
 
-/// The sandbox lockfile, parsed (`{}` when no sweep has written one).
+/// The sandbox lockfile, parsed (`{}` when nothing has written one).
 fn lockfile(data: &Path) -> serde_json::Value {
     std::fs::read_to_string(data.join("lockfile.json"))
         .map(|body| serde_json::from_str(&body).unwrap())
         .unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// The state v2 entry whose key ends with `suffix` (the body of the MAC'd `state.json`).
+fn state_entry(data: &Path, suffix: &str) -> Option<serde_json::Value> {
+    let body = std::fs::read_to_string(data.join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["body"]["packs"]
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with(suffix))
+        .map(|(_, e)| e.clone())
 }
 
 /// Seed a pack that an earlier version moved to `<data>/quarantine/<name>`.
@@ -97,7 +108,7 @@ fn seed_quarantined(data: &Path, name: &str) {
     std::fs::write(dir.join("SKILL.md"), format!("# {name}\n")).unwrap();
 }
 
-/// Run `verify approve <name>` from `cwd` (as a user would in a terminal).
+/// Run `verify approve <name>` from `cwd` (as a user would in a terminal): a pending request.
 fn approve_from(cwd: &Path, home: &Path, data: &Path, name: &str) -> serde_json::Value {
     let run = Invocation::new(&["verify", "approve", name])
         .plugin_data(data)
@@ -106,7 +117,16 @@ fn approve_from(cwd: &Path, home: &Path, data: &Path, name: &str) -> serde_json:
         .stdin("{}")
         .run();
     let v = run.json();
-    assert_eq!(v["status"], "approved", "approve failed: {}", run.stdout);
+    assert_eq!(v["status"], "pending", "approve failed: {}", run.stdout);
+    // A request id only: the confirmation code never reaches the agent (WS-B).
+    let id = v["request"].as_str().unwrap_or_default();
+    assert!(id.starts_with('r'), "{v}");
+    assert!(v.get("nonce").is_none(), "{v}");
+    assert!(
+        !run.stdout.contains("safe-ai-skill confirm ") && !run.stderr.contains("confirm 0"),
+        "{}",
+        run.stdout
+    );
     v
 }
 
@@ -122,21 +142,21 @@ fn tamper(file: &Path) {
     std::fs::write(file, body).unwrap();
 }
 
-/// Assert `run` reports a drift WARN for `name`, to both the user and the model.
-fn assert_drift_reported(run: &Run, name: &str) {
+/// Assert `run` reports a drift BLOCK for `name`, to both the user and the model.
+fn assert_drift_blocked(run: &Run, name: &str) {
     let v = emit(run).unwrap_or_else(|| panic!("drift of {name} not reported"));
     let (sys, ctx) = messages(&v);
     for (field, text) in [("systemMessage", &sys), ("additionalContext", &ctx)] {
         let lower = text.to_lowercase();
         assert!(
-            lower.contains("warn") && lower.contains(name) && lower.contains("drift"),
+            lower.contains("block") && lower.contains(name) && lower.contains("drift"),
             "{field} did not report the drifted {name}: {text:?}"
         );
     }
 }
 
 #[test]
-fn drift_warns_every_session_until_approved() {
+fn drift_blocks_every_session_and_approve_only_requests() {
     let project = TempDir::new("drift-proj");
     let home = TempDir::new("drift-home");
     let data = TempDir::new("drift-data");
@@ -150,58 +170,54 @@ fn drift_warns_every_session_until_approved() {
     )
     .unwrap();
 
-    // 1. First sweep pins the clean skill (TOFU) and has nothing to report.
+    // 1. First sweep records the clean skill (TOFU) and has nothing to report.
     let first = verify_session(project.path(), home.path(), data.path());
     assert!(
         emit(&first).is_none(),
         "clean first sweep must emit nothing: {}",
         first.stdout
     );
-    let pinned = lockfile(data.path())["skills"]["address-formatter"]["sha256"].clone();
+    let pinned =
+        state_entry(data.path(), "/address-formatter").expect("recorded")["tree_hash"].clone();
     assert!(pinned.is_string(), "skill not pinned after the first sweep");
 
-    // 2. Tamper one byte in the pinned skill: every following session reports the drift.
+    // 2. Tamper one byte in the pinned skill: every following session blocks it.
     let md_path = skill.join("SKILL.md");
     tamper(&md_path);
     for _ in 0..2 {
-        assert_drift_reported(
+        assert_drift_blocked(
             &verify_session(project.path(), home.path(), data.path()),
             "address-formatter",
         );
     }
     // The pin is kept, the skill stays in the skills root, nothing is quarantined.
-    assert_eq!(
-        lockfile(data.path())["skills"]["address-formatter"]["sha256"],
-        pinned,
-        "a drifted pack must keep its pin until approved"
-    );
+    let e = state_entry(data.path(), "/address-formatter").unwrap();
+    assert_eq!(e["tree_hash"], pinned, "a drifted pack must keep its pin");
+    assert_eq!(e["state"], "blocked");
+    assert_eq!(e["reason"], "drift");
     assert!(md_path.exists(), "drifted skill was moved");
     assert!(
         !data.path().join("quarantine").exists(),
         "nothing may be moved to quarantine"
     );
 
-    // 3. Approving re-pins the skill where it is; the next session is clean.
+    // 3. `verify approve` (which the agent could run) only creates a pending request.
     let v = approve(
         project.path(),
         home.path(),
         data.path(),
         "address-formatter",
     );
-    let in_place = v["pinned_in_place"][0].as_str().unwrap_or_default();
     assert!(
-        Path::new(in_place).ends_with(".claude/skills/address-formatter"),
+        v["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("approve in place"),
         "{v}"
     );
-    assert_eq!(
-        lockfile(data.path())["skills"]["address-formatter"]["scan"],
-        "approved"
-    );
-    let last = verify_session(project.path(), home.path(), data.path());
-    assert!(
-        emit(&last).is_none(),
-        "approved content re-reported: {}",
-        last.stdout
+    assert_drift_blocked(
+        &verify_session(project.path(), home.path(), data.path()),
+        "address-formatter",
     );
 }
 
@@ -240,13 +256,14 @@ fn install_managed_user_skills_swept_personal_ones_not() {
     tamper(&user_skills.join("managed").join("SKILL.md"));
     tamper(&user_skills.join("personal").join("SKILL.md"));
     let second = verify_session(project.path(), home.path(), data.path());
-    assert_drift_reported(&second, "managed");
+    assert_drift_blocked(&second, "managed");
     let (sys, ctx) = messages(&emit(&second).unwrap());
     assert!(ctx.contains("~/.claude/skills/managed"), "{ctx:?}");
     for text in [&sys, &ctx] {
         assert!(!text.contains("personal"), "personal skill swept: {text:?}");
     }
     assert!(lockfile(data.path())["skills"].get("personal").is_none());
+    assert!(state_entry(data.path(), "/personal").is_none());
 }
 
 #[test]
@@ -288,7 +305,7 @@ fn install_from_an_absolute_claude_skills_dir_is_swept() {
             .join("managed")
             .join("SKILL.md"),
     );
-    assert_drift_reported(
+    assert_drift_blocked(
         &verify_session(project.path(), home.path(), data.path()),
         "managed",
     );
@@ -356,7 +373,8 @@ fn user_scope_skills_not_swept_by_default() {
     let data = TempDir::new("scope-data");
     let personal = home.path().join(".claude").join("skills").join("personal");
     std::fs::create_dir_all(&personal).unwrap();
-    std::fs::write(personal.join("SKILL.md"), TELEMETRY_SKILL_MD).unwrap();
+    std::fs::write(personal.join("SKILL.md"), "# Personal\n").unwrap();
+    std::fs::write(personal.join("load.sh"), KEYPAIR_SCRIPT).unwrap();
 
     // Both the embedded default (plugin root without a policy file) and the shipped
     // `default.policy.yaml` sweep only the project's `.claude/skills`.
@@ -376,8 +394,8 @@ fn user_scope_skills_not_swept_by_default() {
     }
     assert!(personal.join("SKILL.md").exists());
     assert!(
-        lockfile(data.path())["skills"].get("personal").is_none(),
-        "a user-scope skill was pinned"
+        state_entry(data.path(), "/personal").is_none(),
+        "a user-scope skill was recorded"
     );
 }
 
@@ -395,7 +413,8 @@ fn user_scope_skills_swept_when_listed_in_policy() {
     .unwrap();
     let personal = home.path().join(".claude").join("skills").join("personal");
     std::fs::create_dir_all(&personal).unwrap();
-    std::fs::write(personal.join("SKILL.md"), TELEMETRY_SKILL_MD).unwrap();
+    std::fs::write(personal.join("SKILL.md"), "# Personal\n").unwrap();
+    std::fs::write(personal.join("load.sh"), KEYPAIR_SCRIPT).unwrap();
 
     let run = Invocation::new(&["verify", "session"])
         .plugin_data(data.path())
@@ -405,7 +424,7 @@ fn user_scope_skills_swept_when_listed_in_policy() {
         .run();
     let v = emit(&run).expect("a listed user-scope root must be swept");
     let (sys, ctx) = messages(&v);
-    let at = "~/.claude/skills/personal/SKILL.md:4";
+    let at = "~/.claude/skills/personal/load.sh:3";
     for text in [&sys, &ctx] {
         assert!(
             text.contains("WARN") && text.contains(at),
@@ -416,12 +435,16 @@ fn user_scope_skills_swept_when_listed_in_policy() {
         personal.join("SKILL.md").exists(),
         "user-scope skill was moved"
     );
+    assert_eq!(
+        state_entry(data.path(), "/personal").unwrap()["state"],
+        "unreviewed"
+    );
 }
 
 #[test]
-fn approve_restores_quarantined_skill_to_user_skills() {
-    // Without a `.gitmodules` entry, a pack an earlier version moved to quarantine/ goes back to
-    // `~/.claude/skills`, where 1.0.0 swept (and moved) it from.
+fn approve_of_a_quarantined_skill_requests_a_restore_to_user_skills() {
+    // Without a `.gitmodules` entry, a pack an earlier version moved to quarantine/ would go back
+    // to `~/.claude/skills`, where 1.0.0 swept (and moved) it from, once the user confirms.
     let project = TempDir::new("approve-proj");
     let home = TempDir::new("approve-home");
     let data = TempDir::new("approve-data");
@@ -429,29 +452,18 @@ fn approve_restores_quarantined_skill_to_user_skills() {
 
     let v = approve(project.path(), home.path(), data.path(), "pda-helper");
 
-    let restored = home
-        .path()
-        .join(".claude")
-        .join("skills")
-        .join("pda-helper");
+    let summary = v["summary"].as_str().unwrap_or_default();
     assert!(
-        restored.join("SKILL.md").exists(),
-        "approve did not restore under {}: {v}",
-        restored.display()
+        summary.contains("restore") && summary.contains(".claude/skills/pda-helper"),
+        "{v}"
     );
-    assert!(!skills_root(project.path()).join("pda-helper").exists());
-    assert!(
-        !data.path().join("quarantine").join("pda-helper").exists(),
-        "quarantine entry should be consumed on approve"
-    );
-    assert_eq!(
-        lockfile(data.path())["skills"]["pda-helper"]["scan"],
-        "approved"
-    );
+    // Nothing moved yet.
+    assert!(data.path().join("quarantine").join("pda-helper").exists());
+    assert!(!home.path().join(".claude/skills/pda-helper").exists());
 }
 
 #[test]
-fn approve_restores_gitmodules_ext_pack_to_its_submodule_path() {
+fn approve_of_a_quarantined_submodule_targets_its_gitmodules_path() {
     // A quarantined `ext/` submodule goes back to the path `.gitmodules` declares for it, even
     // when approve runs from a subdirectory of the repo.
     let project = TempDir::new("approve-ext-proj");
@@ -471,14 +483,50 @@ fn approve_restores_gitmodules_ext_pack_to_its_submodule_path() {
 
     let v = approve_from(&nested, home.path(), data.path(), "solana-dev");
 
-    let restored = skills_root(project.path()).join("ext").join("solana-dev");
+    let summary = v["summary"].as_str().unwrap_or_default();
     assert!(
-        restored.join("SKILL.md").exists(),
-        "approve did not restore the submodule to {}: {v}",
-        restored.display()
+        summary.contains("restore the quarantined ext")
+            && summary.contains(".claude/skills/ext/solana-dev"),
+        "{v}"
     );
-    assert!(!data.path().join("quarantine").join("solana-dev").exists());
-    let lock = lockfile(data.path());
-    assert_eq!(lock["ext"]["solana-dev"]["scan"], "approved", "{lock}");
-    assert!(lock["skills"].get("solana-dev").is_none(), "{lock}");
+    assert!(data.path().join("quarantine").join("solana-dev").exists());
+}
+
+#[test]
+fn approve_of_an_unknown_pack_is_an_error() {
+    let project = TempDir::new("approve-none-proj");
+    let home = TempDir::new("approve-none-home");
+    let data = TempDir::new("approve-none-data");
+    let run = Invocation::new(&["verify", "approve", "ghost"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(project.path())
+        .stdin("{}")
+        .run();
+    let v = run.json();
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(v.get("nonce").is_none());
+}
+
+#[test]
+fn trust_is_refused_for_an_untrusted_data_dir() {
+    // A CLAUDE_PLUGIN_DATA outside the Claude Code plugin data root: trust would be ignored.
+    let project = TempDir::new("trust-proj");
+    let home = TempDir::new("trust-home");
+    let data = TempDir::new("trust-data");
+    let pack = skills_root(project.path()).join("p");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(pack.join("SKILL.md"), "# p\n").unwrap();
+    let run = Invocation::new(&["verify", "trust", pack.to_str().unwrap()])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(project.path())
+        .stdin("{}")
+        .run();
+    let v = run.json();
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("ignored"),
+        "{v}"
+    );
 }

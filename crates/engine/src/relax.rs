@@ -154,9 +154,7 @@ pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOu
                     .to_string(),
             ))
         }
-        Attempt::Confirmed(confirmed) => {
-            Some(activate(dir, confirmed.kind, &confirmed.payload, now))
-        }
+        Attempt::Confirmed(confirmed) => Some(activate(dir, &confirmed, now)),
     }
 }
 
@@ -166,12 +164,14 @@ pub fn announce(dir: &DataDir, now: u64) -> Option<String> {
 }
 
 /// Perform a confirmed pending entry and describe the result.
-fn activate(dir: &DataDir, kind: PendingKind, payload: &Value, now: u64) -> ConfirmOutcome {
+fn activate(dir: &DataDir, confirmed: &confirm::Confirmed, now: u64) -> ConfirmOutcome {
+    let (kind, payload) = (confirmed.kind, &confirmed.payload);
     let result = match kind {
         PendingKind::Grant => activate_grant(dir, payload, now),
         PendingKind::Mode => activate_mode(dir, payload, now),
+        // `verify trust` / `verify approve`: performed (and audited) by the supply-chain state.
         PendingKind::Trust | PendingKind::Approve => {
-            Err("this build cannot perform that confirmation".to_string())
+            crate::verify::apply_confirmed(dir, confirmed).map_err(|e| e.to_string())
         }
     };
     let untrusted = if dir.trusted {

@@ -97,6 +97,7 @@ supply_chain:
   verify_ext_submodules: true
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask
+  on_block: deny
 profiles:
   strict: {}
   autopilot:
@@ -248,6 +249,10 @@ pub struct SupplyChainPolicy {
     /// Runtime gate for `curl … | sh/bash` installer execution: `allow` | `ask` | `deny`.
     #[serde(default = "default_exec_install_scripts")]
     pub exec_install_scripts: String,
+    /// What a blocked skill pack gets: `deny` (enforced in place by the gates, the default) or
+    /// `move` (also moved into `${DATA}/quarantine/`, origin recorded, never overwriting).
+    #[serde(default = "default_on_block")]
+    pub on_block: String,
 }
 
 /// Opt-in skill-registry catalog gating.
@@ -291,6 +296,10 @@ fn default_ext_dir() -> String {
 }
 fn default_exec_install_scripts() -> String {
     "ask".to_string()
+}
+
+fn default_on_block() -> String {
+    "deny".to_string()
 }
 
 /// A profile overlay applied onto the base policy by [`Policy::effective`].
@@ -406,6 +415,7 @@ impl Default for SupplyChainPolicy {
             verify_ext_submodules: true,
             ext_dir: default_ext_dir(),
             exec_install_scripts: default_exec_install_scripts(),
+            on_block: default_on_block(),
         }
     }
 }
@@ -864,6 +874,7 @@ mod tests {
             disk.supply_chain.exec_install_scripts,
             embedded.supply_chain.exec_install_scripts
         );
+        assert_eq!(disk.supply_chain.on_block, embedded.supply_chain.on_block);
         // Profiles parity.
         assert_eq!(
             disk.profiles.keys().collect::<Vec<_>>(),

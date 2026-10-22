@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"additionalContext":"safe-ai-skill supply-chain sweep:\n - quarantined skill `shared` (content drifted from its pinned hash)\n - quarantined ext submodule `head-equal` (submodule SHA drifted from its pin)","hookEventName":"SessionStart","reloadSkills":true}}

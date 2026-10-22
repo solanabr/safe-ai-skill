@@ -65,6 +65,7 @@ supply_chain:
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny
+  on_block: deny                    # blocked skill packs: deny in place | move to quarantine
 # Hard guards (mainnet deploy, authority changes, account close, secret reads, irreversible
 # flags) are built into the gates: no profile, grant or policy relaxes them. To turn the
 # hooks off, set SAFE_AI_SKILL_DISABLE=1 (reported at SessionStart).

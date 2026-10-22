@@ -21,6 +21,7 @@ use safe_ai_skill::audit::{self, AuditEntry};
 use safe_ai_skill::confirm::{self, PendingKind};
 use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
+use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
 use safe_ai_skill::gates::read;
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
@@ -95,8 +96,8 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-read", |_| cmd_gate_read()),
     ("gate-mcp", |_| cmd_gate_mcp()),
     ("gate-tamper", |_| cmd_gate_tamper()),
-    ("gate-skill", |_| cmd_no_opinion()),
-    ("gate-prompt-expansion", |_| cmd_no_opinion()),
+    ("gate-skill", |_| cmd_gate_skill()),
+    ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
     ("redact", |_| cmd_redact()),
     ("prompt-guard", |_| cmd_prompt_guard()),
     ("pending-notice", |_| cmd_pending_notice()),
@@ -220,12 +221,6 @@ fn within<T: Send + 'static>(
         return Err(mpsc::RecvTimeoutError::Disconnected);
     }
     rx.recv_timeout(budget)
-}
-
-/// A wired hook whose gate is not implemented yet: drain the payload, no opinion.
-fn cmd_no_opinion() -> ExitCode {
-    let _ = read_input();
-    ExitCode::SUCCESS
 }
 
 /// What `--version` prints. One literal, so the release's binary version check
@@ -486,6 +481,9 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let command = input.bash_command().unwrap_or("");
+    if let deny @ Verdict::Deny(_) = verify::enforce::bash_verdict(&dir, command, &cwd) {
+        return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
+    }
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
     let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
@@ -509,6 +507,12 @@ fn cmd_gate_read() -> ExitCode {
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let tool = input.tool_name.as_deref().unwrap_or("Read");
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        if let deny @ Verdict::Deny(_) = verify::enforce::read_verdict(&dir, tool, tool_input, &cwd)
+        {
+            return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
+        }
+    }
     let verdict = read::decide_tool(tool, input.tool_input.as_ref(), &cwd, &effective);
     let decision = match verdict {
         read::ReadVerdict::Decide(decision) => decision,
@@ -550,6 +554,65 @@ fn cmd_gate_mcp() -> ExitCode {
     let ctx = Context::build("", &cwd);
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// Emit a blocked-pack denial (a hard guard: no grant relaxes it).
+fn finish_blocked_pack(
+    verdict: Verdict,
+    effective: &Policy,
+    dir: &DataDir,
+    input: &HookInput,
+    raw: &[u8],
+) -> ExitCode {
+    let meta = GateMeta::new(Scope::Other, true);
+    finish_pretooluse(verdict.into(), &meta, effective, dir, input, raw)
+}
+
+/// PreToolUse `Skill`: deny a skill whose pack is blocked (re-hashed on the spot).
+fn cmd_gate_skill() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let input = match parsed {
+        Ok(input) => input,
+        Err(Unreadable::Empty) => return ExitCode::SUCCESS,
+        Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
+    };
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let verdict =
+        safe_ai_skill::gates::skill::decide(input.tool_input.as_ref(), &cwd, &dir, &effective);
+    let meta = GateMeta::new(Scope::Other, true);
+    finish_pretooluse(verdict.into(), &meta, &effective, &dir, &input, &raw)
+}
+
+/// `UserPromptExpansion` (and a raw `/name` in `UserPromptSubmit`): block a typed slash
+/// command whose skill pack is blocked. A typed `/name` never reaches the Skill tool.
+fn cmd_gate_prompt_expansion() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let payload = match (&parsed, serde_json::from_slice::<serde_json::Value>(&raw)) {
+        (Ok(_), Ok(payload)) => payload,
+        (Err(Unreadable::Empty), _) => return ExitCode::SUCCESS,
+        // Oversized or malformed: judge the raw head (a blocked slash command, or one whose
+        // name cannot be read while a pack in scope is blocked, is blocked).
+        _ => {
+            let cwd = verify::enforce::raw_cwd(&raw).unwrap_or_else(process_cwd);
+            let dir = state_dir(&cwd);
+            let effective = load_effective_policy(&cwd, &dir);
+            let block = verify::enforce::unreadable_prompt_verdict(&dir, &cwd, &effective, &raw);
+            let _ = io::emit_userpromptsubmit(block.as_deref());
+            return ExitCode::SUCCESS;
+        }
+    };
+    if verify::enforce::slash_skill_name(&payload).is_none() {
+        return ExitCode::SUCCESS;
+    }
+    let input = parsed.unwrap_or_default();
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let block = safe_ai_skill::gates::skill::decide_prompt(&payload, &cwd, &dir, &effective);
+    let _ = io::emit_userpromptsubmit(block.as_deref());
+    ExitCode::SUCCESS
 }
 
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
@@ -640,15 +703,16 @@ fn cmd_pending_notice() -> ExitCode {
 
 fn cmd_verify(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("session");
+    let arg = rest.get(1).map(String::as_str).unwrap_or("");
     match action {
         "session" => cmd_verify_session(),
-        "approve" => cmd_verify_approve(rest.get(1).map(String::as_str).unwrap_or("")),
+        "approve" => cmd_verify_request("approve", arg),
+        "trust" => cmd_verify_request("trust", arg),
         "check" => {
-            let target = rest.get(1).map(String::as_str).unwrap_or("");
-            let report = verify::pipeline_dir(Path::new(target), None);
+            let report = verify::pipeline_dir(Path::new(arg), None);
             print_json(&serde_json::json!({
                 "command": "verify check",
-                "target": target,
+                "target": arg,
                 "verdict": verify::verdict(&report).label(),
                 "findings": report.findings,
             }));
@@ -661,7 +725,8 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `verify session` — the SessionStart supply-chain sweep (report-only, nothing is moved).
+/// `verify session` — the SessionStart supply-chain sweep (state v2; blocked packs are denied
+/// in place by the gates, nothing moves unless `supply_chain.on_block: move`).
 ///
 /// Runs [`verify::run_session`] (skill packs + the project `.mcp.json`) and emits the
 /// SessionStart report (`systemMessage` for the user + `additionalContext` for the model) — or
@@ -681,7 +746,7 @@ fn cmd_verify_session() -> ExitCode {
     let _ = SpendLedger::load(&plugin_data);
 
     let effective = load_effective_policy(&cwd, &dir);
-    let mut res = verify::run_session(&plugin_data, &cwd, &effective);
+    let mut res = verify::run_session(&dir, &cwd, &effective);
 
     // Overrides the policy ratchet refused (project overlay, looser profile env var, removed
     // settings), then the active loosenings (spec D4.4): shown to the user and given to the
@@ -733,61 +798,69 @@ fn cmd_verify_session() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `verify approve <name>` — accept a pack: restore one an earlier version quarantined, or
-/// re-pin a drifted one where it is.
-fn cmd_verify_approve(name: &str) -> ExitCode {
-    if name.is_empty() {
+/// `verify approve <name|path>` / `verify trust <path>`: create a pending request and print its
+/// id, never a code. Nothing changes until the user types the code safe-ai-skill shows them as
+/// their next prompt (spec D4.1); the UserPromptSubmit hook then applies it
+/// ([`verify::apply_confirmed`]).
+fn cmd_verify_request(action: &str, target: &str) -> ExitCode {
+    let command = format!("verify {action}");
+    if target.is_empty() {
+        let usage = if action == "trust" {
+            "usage: verify trust <pack dir>"
+        } else {
+            "usage: verify approve <skill-name | pack dir>"
+        };
         print_json(&serde_json::json!({
-            "command": "verify approve",
+            "command": command,
             "status": "error",
-            "error": "usage: verify approve <skill-name>",
+            "error": usage,
         }));
         return ExitCode::SUCCESS;
     }
     let cwd = process_cwd();
-    let Some(dir) = cli_state_dir("verify approve", &cwd) else {
+    let Some(dir) = cli_state_dir(&command, &cwd) else {
         return ExitCode::FAILURE;
     };
-    let plugin_data = dir.path.clone();
-    // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
-    let project = verify::project_root(&cwd);
-    let effective = load_effective_policy(&project, &dir);
-
-    match verify::approve(&plugin_data, &project, name, &effective) {
-        Ok(approval) => {
+    let request = if action == "trust" {
+        verify::request_trust(&dir, Path::new(target))
+    } else {
+        let project = verify::project_root(&cwd);
+        let effective = load_effective_policy(&project, &dir);
+        verify::request_approve(&dir, &cwd, target, &effective)
+    };
+    match request {
+        Ok(req) => {
             audit_event(
-                &plugin_data,
-                "verify_approve",
-                "approve",
-                &format!("skill={name}"),
+                &dir.path,
+                &format!("verify_{action}_requested"),
+                "pending",
+                &format!("target={target}"),
             );
-            let (key, value) = match approval {
-                verify::Approval::Restored(path) => {
-                    ("restored_to", serde_json::json!(path.display().to_string()))
-                }
-                verify::Approval::PinnedInPlace(paths) => (
-                    "pinned_in_place",
-                    serde_json::json!(paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()),
-                ),
-            };
-            let mut out = serde_json::json!({
-                "command": "verify approve",
-                "status": "approved",
-                "skill": name,
-            });
-            if let Some(map) = out.as_object_mut() {
-                map.insert(key.to_string(), value);
-            }
-            print_json(&out);
+            // The request id only: the code reaches the user alone, in a hook `systemMessage`.
+            let message = format!(
+                "Pending request {} created: {}. Nothing has changed yet. safe-ai-skill will show \
+                 YOU (not the agent) a confirmation code; type it as your entire next prompt in \
+                 Claude Code to approve (valid {} minutes after it is shown).",
+                req.id,
+                req.summary,
+                confirm::TTL_SECS / 60
+            );
+            let _ = writeln!(std::io::stderr(), "{message}");
+            print_json(&serde_json::json!({
+                "command": command,
+                "status": "pending",
+                "target": target,
+                "request": req.id,
+                "summary": req.summary,
+                "data_dir_trusted": dir.trusted,
+                "message": message,
+            }));
         }
         Err(e) => {
             print_json(&serde_json::json!({
-                "command": "verify approve",
+                "command": command,
                 "status": "error",
-                "skill": name,
+                "target": target,
                 "error": e.to_string(),
             }));
         }
