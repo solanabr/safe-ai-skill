@@ -13,6 +13,7 @@ pub mod heuristics;
 pub mod lockfile;
 pub mod osv;
 pub mod provenance;
+pub mod rules;
 pub mod state;
 pub mod trust;
 
@@ -518,7 +519,8 @@ const UNSCANNED_NAME_WALK: std::time::Duration = std::time::Duration::from_milli
 const SCAN_BUDGET_RULE: &str = state::SCAN_BUDGET_RULE;
 
 /// The pack scanner the state machine grades with (see [`grading`]).
-pub type Scanner = fn(&Path) -> grading::PackReport;
+/// It gets the deadline its scan must stop by (`None`: unbounded).
+pub type Scanner = fn(&Path, Option<std::time::Instant>) -> grading::PackReport;
 
 /// Move `src` to `restore_to`, never overwriting a pack.
 ///
@@ -933,7 +935,7 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
         .filter(|p| env.dir.trusted && p.last_scanned_hash == hash);
     // Past the sweep's overall budget a pack is recorded unscanned (and rescanned next time).
     let skipped = cached.is_none() && soft_deadline.is_some_and(|d| std::time::Instant::now() >= d);
-    let (grade, findings, more_findings, flagged_rules, walked) = match cached {
+    let (grade, findings, more_findings, flagged_rules, walked, scan_cut) = match cached {
         Some(p) => (
             p.grade,
             p.findings.clone(),
@@ -945,6 +947,7 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
                 escaping: p.escaping.clone(),
                 over_budget: false,
             },
+            false,
         ),
         None => {
             let walked = names.unwrap_or_else(|| {
@@ -957,8 +960,16 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
             let mut report = if skipped {
                 grading::PackReport::default()
             } else {
-                (env.scanner)(&pack.canonical)
+                // One pack never scans past its allowance, the hard deadline or the sweep's.
+                let pack_until = std::time::Instant::now().checked_add(rules::PACK_BUDGET);
+                let until = [deadline, soft_deadline, pack_until]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                (env.scanner)(&pack.canonical, until)
             };
+            // A scan the deadline cut short is not reused: the pack is scanned again next time.
+            let scan_cut = report.findings.iter().any(|f| f.rule == SCAN_BUDGET_RULE);
             if walked.over_budget || skipped {
                 report.findings.push(grading::Finding {
                     rule: SCAN_BUDGET_RULE,
@@ -985,9 +996,11 @@ fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<
                 more,
                 state::flagged_rules(&report),
                 walked,
+                scan_cut,
             )
         }
     };
+    let skipped = skipped || scan_cut;
     if over() {
         return None;
     }
@@ -1353,7 +1366,7 @@ pub fn run_session(
         project_dir,
         &expand_home(USER_SKILLS_DIR),
         policy,
-        grading::scan_pack,
+        grading::scan_pack_until,
     )
 }
 
@@ -2379,11 +2392,17 @@ mod orchestration_tests {
 
     /// [`sweep`] with no user-scope skills and the heuristic scanner.
     fn sweep_in(dir: &DataDir, project: &Path, policy: &crate::policy::Policy) -> SessionResult {
-        sweep(dir, project, &no_user_skills(), policy, grading::scan_pack)
+        sweep(
+            dir,
+            project,
+            &no_user_skills(),
+            policy,
+            grading::scan_pack_until,
+        )
     }
 
     /// The heuristic scanner, plus a combo hit for any pack holding a `COMBO` file.
-    fn combo_scanner(path: &Path) -> grading::PackReport {
+    fn combo_scanner(path: &Path, _deadline: Option<std::time::Instant>) -> grading::PackReport {
         let mut report = grading::scan_pack(path);
         if path.join("COMBO").exists() {
             report.combos.push(grading::ComboHit {
@@ -2491,7 +2510,7 @@ mod orchestration_tests {
         let pack = seed_skill(
             &skills(&project),
             "docs",
-            "# docs\nLoad `~/.config/solana/id.json` with signerFromFile.",
+            "# docs\n\n```bash\ncat ~/.config/solana/id.json\n```\n",
         );
 
         let result = sweep_in(&d, &project, &policy());
@@ -2657,7 +2676,7 @@ mod orchestration_tests {
         assert_eq!(r.blocked.len(), 1, "drift from the trusted pin");
     }
 
-    fn high_scanner(path: &Path) -> grading::PackReport {
+    fn high_scanner(path: &Path, _deadline: Option<std::time::Instant>) -> grading::PackReport {
         let mut report = grading::scan_pack(path);
         if path.join("HIGH").exists() {
             report.findings.push(grading::Finding {
@@ -3344,7 +3363,13 @@ mod enforce_tests {
     }
 
     fn sweep_it(d: &DataDir, project: &Path) -> SessionResult {
-        sweep(d, project, &no_user_skills(), &policy(), grading::scan_pack)
+        sweep(
+            d,
+            project,
+            &no_user_skills(),
+            &policy(),
+            grading::scan_pack_until,
+        )
     }
 
     /// A project with `.claude/skills/ext/evil` (SKILL.md `skill_md`) blocked by drift and
@@ -3381,7 +3406,7 @@ mod enforce_tests {
             &no_user_skills(),
             &policy(),
             name,
-            grading::scan_pack,
+            grading::scan_pack_until,
             limits,
         )
     }
@@ -3574,7 +3599,7 @@ mod enforce_tests {
             canonical: dir.clone(),
             display: ".claude/skills/big".into(),
         };
-        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack);
+        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack_until);
         let mut st = State::default();
         let names = state::SkillNames {
             names: vec!["big".into()],
@@ -3611,7 +3636,7 @@ mod enforce_tests {
             canonical: dir.canonicalize().unwrap(),
             display: ".claude/skills/late".into(),
         };
-        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack);
+        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack_until);
         let mut st = State::default();
         let input = EvalInput {
             soft_deadline: Some(std::time::Instant::now()),
@@ -4316,7 +4341,7 @@ mod enforce_tests {
         assert_eq!(gate("benign"), GateVerdict::NoOpinion);
     }
 
-    fn slow_scan(path: &Path) -> grading::PackReport {
+    fn slow_scan(path: &Path, _deadline: Option<std::time::Instant>) -> grading::PackReport {
         SCANS.with(|n| n.set(n.get() + 1));
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.starts_with("slow") || name.starts_with("aaa") && name != "aaa0" {
@@ -4396,7 +4421,7 @@ mod enforce_tests {
     static HANG_ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static HANG_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn hanging_scan(path: &Path) -> grading::PackReport {
+    fn hanging_scan(path: &Path, _deadline: Option<std::time::Instant>) -> grading::PackReport {
         if path.file_name().and_then(|n| n.to_str()) == Some("hang") {
             HANG_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
             let until = std::time::Instant::now() + Duration::from_secs(20);
@@ -4514,7 +4539,7 @@ mod enforce_tests {
         let (d, project) = fresh_trusted("rr6-zero");
         md(&skills_of(&project).join("one"), "one");
         md(&skills_of(&project).join("two"), "two");
-        sweep_scanned(&d, &project, grading::scan_pack, Duration::ZERO);
+        sweep_scanned(&d, &project, grading::scan_pack_until, Duration::ZERO);
         let st = state::load(&d).state;
         for n in ["one", "two"] {
             let e = entry_of(&st, &skills_of(&project).join(n));
@@ -4747,7 +4772,7 @@ mod enforce_tests {
         static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
-    fn counting_scan(path: &Path) -> grading::PackReport {
+    fn counting_scan(path: &Path, _deadline: Option<std::time::Instant>) -> grading::PackReport {
         SCANS.with(|n| n.set(n.get() + 1));
         grading::scan_pack(path)
     }

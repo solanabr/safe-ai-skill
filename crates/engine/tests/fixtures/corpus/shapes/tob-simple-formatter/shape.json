@@ -1,0 +1,17 @@
+{
+  "source": "Trail of Bits overtly-malicious-skills simple-formatter, re-synthesised",
+  "expect": "block",
+  "combos": [
+    "pyc_beside_py"
+  ],
+  "binaries": [
+    {
+      "path": "scripts/__pycache__/formatter.cpython-311.pyc",
+      "magic": "pyc"
+    },
+    {
+      "path": "scripts/__pycache__/utils.cpython-311.pyc",
+      "magic": "pyc"
+    }
+  ]
+}

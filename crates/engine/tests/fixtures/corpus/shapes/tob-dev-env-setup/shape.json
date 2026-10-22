@@ -1,0 +1,10 @@
+{
+  "source": "Trail of Bits overtly-malicious-skills dev-env-setup, re-synthesised",
+  "expect": "block",
+  "combos": [
+    "registry_hijack"
+  ],
+  "exec": [
+    "scripts/bootstrap.sh"
+  ]
+}

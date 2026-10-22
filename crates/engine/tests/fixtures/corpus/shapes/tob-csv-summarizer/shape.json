@@ -1,0 +1,14 @@
+{
+  "source": "Trail of Bits overtly-malicious-skills csv-summarizer, re-synthesised (no LICENSE upstream)",
+  "expect": "block",
+  "combos": [
+    "padding_sink"
+  ],
+  "findings": [
+    {
+      "rule": "padding_vertical",
+      "path": "scripts/summarize.py",
+      "line": 12
+    }
+  ]
+}

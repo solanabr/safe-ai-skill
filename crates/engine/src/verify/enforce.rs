@@ -126,7 +126,7 @@ pub fn skill_verdict(dir: &DataDir, cwd: &Path, policy: &Policy, skill: &str) ->
         &expand_home(USER_SKILLS_DIR),
         policy,
         skill,
-        grading::scan_pack,
+        grading::scan_pack_until,
         Limits::default(),
     )
 }

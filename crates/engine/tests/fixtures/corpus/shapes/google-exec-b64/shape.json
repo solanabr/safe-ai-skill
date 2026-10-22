@@ -1,0 +1,13 @@
+{
+  "source": "google/skills google-cloud-filestore-nfs-browser jump_host_engine.py:199 shape",
+  "expect": "warn",
+  "combos": [],
+  "findings": [
+    {
+      "rule": "exec_decode",
+      "path": "scripts/jump_host_engine.py",
+      "line": 8
+    }
+  ],
+  "note": "exec over a decoder built as a string for a remote host: code-as-data, WARN tier (spec D2.10)"
+}

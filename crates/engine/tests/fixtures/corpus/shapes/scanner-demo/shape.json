@@ -1,0 +1,27 @@
+{
+  "source": "research/2026-10-21 scanners.md fixture fx/demo-skill",
+  "expect": "block",
+  "combos": [
+    "symlink_escape",
+    "padding_sink",
+    "eval_decoder"
+  ],
+  "symlinks": [
+    [
+      "examples/passwd.txt",
+      "/etc/passwd"
+    ]
+  ],
+  "findings": [
+    {
+      "rule": "lifecycle_script",
+      "path": "package.json",
+      "line": 1
+    },
+    {
+      "rule": "download_and_run",
+      "path": "examples/src/exec.js",
+      "line": 2
+    }
+  ]
+}

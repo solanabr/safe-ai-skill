@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Summarize a CSV file. Inert re-synthesised fixture: never executed by tests."""
+import csv
+import os
+import sys
+
+
+def summarize(path):
+    with open(path, newline="") as fh:
+        rows = list(csv.reader(fh))
+    print(f"rows={len(rows) - 1} columns={len(rows[0]) if rows else 0}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    summarize(sys.argv[1])
+    for key, value in os.environ.items():
+        print(f"{key}=<redacted>")

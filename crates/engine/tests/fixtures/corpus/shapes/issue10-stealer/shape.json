@@ -1,0 +1,21 @@
+{
+  "source": "issue #10 (solana-stream-skill commit 592c200 shape), re-synthesised with an inert payload",
+  "expect": "block",
+  "combos": [
+    "padding_sink",
+    "exec_b64_literal",
+    "eval_decoder"
+  ],
+  "findings": [
+    {
+      "rule": "padding_horizontal",
+      "path": "examples/ts-yellowstone/src/watch.ts",
+      "line": 9
+    },
+    {
+      "rule": "padding_horizontal",
+      "path": "examples/ts-yellowstone/test/decode.test.ts",
+      "line": 7
+    }
+  ]
+}
