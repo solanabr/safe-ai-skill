@@ -36,6 +36,16 @@ pub const KEY_FILE: &str = "key";
 /// Key length in bytes.
 const KEY_LEN: usize = 32;
 
+/// Largest state file [`load`] reads; anything bigger is `Tampered`.
+pub const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Age after which a lock file counts as stale (the non-unix pending lock).
+#[cfg(any(test, not(unix)))]
+pub(crate) const STALE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Age after which `.<name>.stale.*` debris from an interrupted break is swept.
+const DEBRIS_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Domain-separation prefix of the MAC input.
 const MAC_DOMAIN: &[u8] = b"safe-ai-skill/state/v1\0";
 
@@ -62,7 +72,7 @@ pub fn load<T: DeserializeOwned + Default>(dir: &DataDir, name: &str) -> Loaded<
     if !valid_name(name) {
         return Loaded::Tampered;
     }
-    let text = match std::fs::read(dir.path.join(name)) {
+    let text = match read_regular(&dir.path.join(name), MAX_STATE_BYTES) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Missing,
         Err(_) => return Loaded::Tampered,
@@ -109,6 +119,7 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
         )));
     }
     create_dir_private(&dir.path)?;
+    sweep_debris(&dir.path, KEY_FILE);
     let key = load_or_create_key(&dir.path)?;
     let body = serde_json::to_value(v).map_err(|e| Error::Parse(e.to_string()))?;
     let mac = hex_encode(&state_mac(&key, name, &body));
@@ -246,24 +257,12 @@ const STALE_EMPTY_KEY_SECS: u64 = 60;
 /// file reached without following a symlink, holds exactly [`KEY_LEN`] bytes and, on unix,
 /// has no group/other permission bits and is owned by the effective user.
 fn read_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
-    use std::io::Read;
     let bad = |why: &str| Error::Other(format!("state key refused: {why}"));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NONBLOCK: a planted FIFO must not hang the hook in open(); regular files ignore it.
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let f = opts.open(dir.join(KEY_FILE))?;
-    let meta = f.metadata()?;
-    if !meta.is_file() {
-        return Err(bad("not a regular file"));
-    }
+    let f = open_regular(&dir.join(KEY_FILE))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let meta = f.metadata()?;
         if meta.mode() & 0o077 != 0 {
             return Err(bad("group or other permission bits set"));
         }
@@ -272,12 +271,44 @@ fn read_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
             return Err(bad("not owned by the current user"));
         }
     }
-    let mut key = Vec::with_capacity(KEY_LEN);
-    f.take(KEY_LEN as u64 + 1).read_to_end(&mut key)?;
+    let key = read_capped(f, KEY_LEN)?;
     if key.len() != KEY_LEN {
         return Err(bad("wrong length"));
     }
     Ok(key)
+}
+
+/// Open `path` for reading only if it is a regular file reached without following a symlink.
+/// `O_NONBLOCK` keeps a planted FIFO from hanging `open()`; regular files ignore it.
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let f = opts.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
+/// Read at most `max` bytes; more is an error.
+fn read_capped(f: std::fs::File, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    f.take(max as u64 + 1).read_to_end(&mut buf)?;
+    if buf.len() > max {
+        return Err(std::io::Error::other("file too large"));
+    }
+    Ok(buf)
+}
+
+/// [`open_regular`] + [`read_capped`].
+fn read_regular(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    read_capped(open_regular(path)?, max)
 }
 
 /// Read the key, creating it with `O_EXCL` (mode 0600) when absent. Losing a creation race
@@ -303,7 +334,7 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !replaced_stale && is_stale_empty_key(&path) {
                     replaced_stale = true;
-                    break_stale_with(&path, |moved| moved.is_file() && moved.len() == 0)?;
+                    break_stale_with(&path, is_stale_empty_meta)?;
                     continue;
                 }
                 let mut last = Error::Other("state key refused: wrong length".to_string());
@@ -326,12 +357,13 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
     }
 }
 
-/// Break a stale lock-like file without racing whoever replaced it meanwhile: rename it to a
-/// unique name (atomic, so exactly one breaker gets it), then remove that name. A path that
-/// is already gone is not an error.
+/// Break a lock-like file older than `min_age` without racing whoever replaced it meanwhile:
+/// rename it to a unique name (atomic, so exactly one breaker gets it), re-check the age of
+/// what moved, and remove that name, or link it back if it turned out fresh. A path that is
+/// already gone is not an error.
 #[cfg(any(test, not(unix)))]
-pub(crate) fn break_stale(path: &Path) -> std::io::Result<()> {
-    break_stale_with(path, |_| true)
+pub(crate) fn break_stale(path: &Path, min_age: std::time::Duration) -> std::io::Result<()> {
+    break_stale_with(path, |moved| older_than(moved, min_age))
 }
 
 /// [`break_stale`], re-checking the file actually moved with `still_stale`: if a fresh file
@@ -349,6 +381,9 @@ fn break_stale_with(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if let Some(dir) = path.parent() {
+        sweep_debris(dir, &name);
+    }
     let aside = path.with_file_name(format!(".{name}.stale.{}.{nanos}", std::process::id()));
     match std::fs::rename(path, &aside) {
         Ok(()) => {}
@@ -366,17 +401,43 @@ fn break_stale_with(
     }
 }
 
-/// An empty regular `key` (not a symlink) last modified over [`STALE_EMPTY_KEY_SECS`] ago.
-fn is_stale_empty_key(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
+/// Remove `.<name>.stale.*` debris in `dir` older than [`DEBRIS_AGE`] (left when a break was
+/// interrupted between its rename and its remove). Best-effort.
+pub(crate) fn sweep_debris(dir: &Path, name: &str) {
+    let prefix = format!(".{name}.stale.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
-    let age = meta
-        .modified()
+    for entry in entries.flatten() {
+        let is_debris = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&prefix));
+        let old = std::fs::symlink_metadata(entry.path()).is_ok_and(|m| older_than(&m, DEBRIS_AGE));
+        if is_debris && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Last modified more than `age` ago.
+fn older_than(meta: &std::fs::Metadata, age: std::time::Duration) -> bool {
+    meta.modified()
         .ok()
         .and_then(|m| m.elapsed().ok())
-        .map(|d| d.as_secs());
-    meta.is_file() && meta.len() == 0 && age.is_some_and(|a| a > STALE_EMPTY_KEY_SECS)
+        .is_some_and(|elapsed| elapsed > age)
+}
+
+/// An empty regular file last modified over [`STALE_EMPTY_KEY_SECS`] ago.
+fn is_stale_empty_meta(meta: &std::fs::Metadata) -> bool {
+    meta.is_file()
+        && meta.len() == 0
+        && older_than(meta, std::time::Duration::from_secs(STALE_EMPTY_KEY_SECS))
+}
+
+/// `key` is an empty regular file (not a symlink) older than [`STALE_EMPTY_KEY_SECS`].
+fn is_stale_empty_key(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| is_stale_empty_meta(&m))
 }
 
 /// `create_new` with mode 0600 on unix.
@@ -727,7 +788,124 @@ pub(crate) mod tests {
         names.sort();
         assert_eq!(names, ["grants.json", "key"]);
         // Breaking a stale file someone else already removed is not an error.
-        assert!(break_stale(&dir.path.join("gone")).is_ok());
+        assert!(break_stale(&dir.path.join("gone"), STALE_LOCK_AGE).is_ok());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    fn set_age(path: &Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn break_relinks_a_file_that_turned_fresh() {
+        // The caller saw a stale lock; by the rename a fresh one had replaced it.
+        let dir = tmp_data("relink");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        let lock = dir.path.join("pending.lock");
+        std::fs::write(&lock, b"fresh").unwrap();
+        break_stale(&lock, STALE_LOCK_AGE).unwrap();
+        assert_eq!(std::fs::read(&lock).unwrap(), b"fresh");
+        assert_eq!(names_in(&dir.path), ["pending.lock"]);
+        // A genuinely old one is broken.
+        set_age(&lock, STALE_LOCK_AGE.as_secs() + 5);
+        break_stale(&lock, STALE_LOCK_AGE).unwrap();
+        assert!(names_in(&dir.path).is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn key_break_requires_age_as_well_as_emptiness() {
+        let dir = tmp_data("keyage");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        let key = dir.path.join(KEY_FILE);
+        drop(open_new_private(&key).unwrap()); // empty but fresh
+        break_stale_with(&key, is_stale_empty_meta).unwrap();
+        assert!(key.exists(), "a fresh empty key is linked back");
+        set_age(&key, STALE_EMPTY_KEY_SECS + 5);
+        break_stale_with(&key, is_stale_empty_meta).unwrap();
+        assert!(!key.exists());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn old_break_debris_is_swept() {
+        let dir = tmp_data("debris");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        for name in [
+            ".key.stale.1.2",
+            ".pending.lock.stale.3.4",
+            ".key.stale.5.6",
+        ] {
+            std::fs::write(dir.path.join(name), b"").unwrap();
+        }
+        set_age(&dir.path.join(".key.stale.1.2"), DEBRIS_AGE.as_secs() + 5);
+        set_age(
+            &dir.path.join(".pending.lock.stale.3.4"),
+            DEBRIS_AGE.as_secs() + 5,
+        );
+        store(&dir, "grants.json", &demo()).unwrap();
+        assert!(!dir.path.join(".key.stale.1.2").exists());
+        assert!(
+            dir.path.join(".key.stale.5.6").exists(),
+            "fresh debris is kept"
+        );
+        crate::confirm::create_pending(
+            &dir,
+            crate::confirm::PendingKind::Mode,
+            "m",
+            serde_json::Value::Null,
+        )
+        .unwrap();
+        assert!(!dir.path.join(".pending.lock.stale.3.4").exists());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_state_file_is_tampered_without_hanging() {
+        let dir = tmp_data("statefifo");
+        store(&dir, "other.json", &demo()).unwrap();
+        mkfifo(&dir.path.join("grants.json"));
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_file_is_tampered() {
+        // A genuine grants.json moved aside and reached through a symlink: following it would
+        // verify (the MAC binds the name, not the inode), so only O_NOFOLLOW refuses it.
+        let dir = tmp_data("statelink");
+        store(&dir, "grants.json", &demo()).unwrap();
+        std::fs::rename(dir.path.join("grants.json"), dir.path.join("stash")).unwrap();
+        std::os::unix::fs::symlink(dir.path.join("stash"), dir.path.join("grants.json")).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn directory_or_oversized_state_file_is_tampered() {
+        let dir = tmp_data("statesize");
+        store(&dir, "other.json", &demo()).unwrap();
+        std::fs::create_dir(dir.path.join("grants.json")).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        // A genuine envelope padded past the cap with whitespace (still valid JSON).
+        store(&dir, "big.json", &demo()).unwrap();
+        let mut bytes = std::fs::read(dir.path.join("big.json")).unwrap();
+        bytes.resize(MAX_STATE_BYTES + 1, b' ');
+        std::fs::write(dir.path.join("big.json"), bytes).unwrap();
+        assert_eq!(load::<Demo>(&dir, "big.json"), Loaded::Tampered);
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

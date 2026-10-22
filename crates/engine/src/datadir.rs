@@ -224,6 +224,10 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
     let (Some(cfg), Some(home)) = (canonical_lenient(cfg), canonical_lenient(home)) else {
         return false;
     };
+    // A home of `/` (no parent) would put every config dir "under the home".
+    if home.parent().is_none() {
+        return false;
+    }
     let session_dirs: Vec<PathBuf> = env
         .project_dir
         .iter()
@@ -506,6 +510,20 @@ mod tests {
         assert!(!resolve(&env, None).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn config_root_is_never_trusted_when_the_passwd_home_is_the_filesystem_root() {
+        let base = tmp("cfgslash");
+        let cfg = base.join("cfg");
+        let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
+        let env = Env {
+            config_dir: Some(cfg),
+            passwd_home: Some(PathBuf::from("/")),
+            ..with_plugin_data(Env::default(), pd)
+        };
+        assert!(!resolve(&env, None).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

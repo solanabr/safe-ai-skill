@@ -115,6 +115,7 @@ pub fn create_pending(
     payload: Value,
 ) -> Result<Nonce, EngineError> {
     statefile::create_dir_private(&dir.path)?;
+    statefile::sweep_debris(&dir.path, LOCK_FILE);
     let _lock = PendingLock::acquire(dir)?;
     // Read the clock under the lock: an earlier reading would prune entries stamped by
     // whoever held the lock meanwhile as "from the future".
@@ -259,13 +260,14 @@ impl PendingLock {
             match statefile::open_new_private(&path) {
                 Ok(_) => return Ok(PendingLock { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
+                    let stale = std::fs::symlink_metadata(&path)
                         .and_then(|m| m.modified())
                         .ok()
                         .and_then(|m| m.elapsed().ok())
-                        .is_some_and(|age| age.as_secs() > 10);
+                        .is_some_and(|age| age > statefile::STALE_LOCK_AGE);
                     if stale {
-                        statefile::break_stale(&path)?;
+                        // Re-checks the age of what it moved and links a fresh lock back.
+                        statefile::break_stale(&path, statefile::STALE_LOCK_AGE)?;
                         continue;
                     }
                 }
