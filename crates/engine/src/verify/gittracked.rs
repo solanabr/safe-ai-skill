@@ -118,12 +118,34 @@ enum Slurp {
     Data(Vec<u8>),
 }
 
+/// Open flags that keep `open` from blocking on a FIFO or taking a terminal as the controlling
+/// one (the file type is checked on the open handle afterwards).
+#[cfg(unix)]
+fn safe_open_flags() -> i32 {
+    libc::O_NONBLOCK | libc::O_NOCTTY
+}
+
+/// `path` read in full when it is a regular file of at most [`MAX_READ`] bytes. A FIFO, a
+/// device (a tty, `/dev/zero`), a directory, or a symlink to one is [`Slurp::Unreadable`]: it is
+/// opened without blocking and its type is taken from the open handle, so nothing swapped in
+/// after a check can stall the sweep, and the caller treats it as tracked.
 fn read_bounded(path: &Path) -> Slurp {
-    let file = match std::fs::File::open(path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(safe_open_flags());
+    }
+    let file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Slurp::Missing,
         Err(_) => return Slurp::Unreadable,
     };
+    match file.metadata() {
+        Ok(m) if m.is_file() && m.len() <= MAX_READ => {}
+        _ => return Slurp::Unreadable,
+    }
     let mut bytes = Vec::new();
     match file.take(MAX_READ + 1).read_to_end(&mut bytes) {
         Ok(n) if (n as u64) <= MAX_READ => Slurp::Data(bytes),
@@ -198,8 +220,60 @@ fn varint(bytes: &[u8], at: &mut usize) -> Option<usize> {
     Some(value)
 }
 
+/// Longest path an index entry may have (`PATH_MAX`; git's own name-length field is 12 bits).
+/// A longer one is not parsed further: the index is treated as unreadable.
+const MAX_NAME: usize = 4096;
+
+/// How an index path relates to the (folded) target.
+#[derive(PartialEq, Eq)]
+enum Rel {
+    Equal,
+    /// The target is a directory prefix of the path (the path lies inside the target).
+    Inside,
+    /// The path is a directory prefix of the target (the target lies inside the path).
+    Contains,
+    Apart,
+}
+
+/// `path` against `target` (already [`fold`]ed), ASCII-case-insensitively and without
+/// allocating; a path with non-ASCII bytes is lower-cased as text first.
+fn relation(path: &[u8], target: &[u8]) -> Rel {
+    if !path.is_ascii() {
+        let lowered = String::from_utf8_lossy(path).to_lowercase();
+        return relation_ascii(lowered.as_bytes(), target);
+    }
+    relation_ascii(path, target)
+}
+
+fn relation_ascii(path: &[u8], target: &[u8]) -> Rel {
+    let mut end = path.len();
+    while end > 0 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let path = &path[..end];
+    let n = path.len().min(target.len());
+    if !path[..n].eq_ignore_ascii_case(&target[..n]) {
+        return Rel::Apart;
+    }
+    match path.len().cmp(&target.len()) {
+        std::cmp::Ordering::Equal => Rel::Equal,
+        std::cmp::Ordering::Greater if path[target.len()] == b'/' => Rel::Inside,
+        std::cmp::Ordering::Less if target[path.len()] == b'/' => Rel::Contains,
+        _ => Rel::Apart,
+    }
+}
+
+fn at(base: usize, add: usize) -> Result<usize, ()> {
+    base.checked_add(add).ok_or(())
+}
+
 /// `Ok(true)` when an index entry is, lies inside or (for a submodule or a sparse directory)
-/// contains `target`; `Err` for anything this parser does not fully understand.
+/// contains `target`; `Err` for anything this parser does not fully understand (an unknown
+/// version, a truncated or split index, a path over [`MAX_NAME`]).
+///
+/// Work is linear in the index size: a version-4 path is rebuilt in one reused buffer (the
+/// previous path truncated, the new suffix appended), and the comparison allocates nothing for
+/// ASCII paths.
 fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
     if bytes.get(..4) != Some(b"DIRC") {
         return Err(());
@@ -209,77 +283,75 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
         return Err(());
     }
     let count = be32(bytes, 8).ok_or(())? as usize;
+    // Every entry takes more than one byte.
+    if count > bytes.len() {
+        return Err(());
+    }
     let target = fold(target);
-    let mut at = 12usize;
-    let mut previous = String::new();
+    let target = target.as_bytes();
+    let mut cursor = 12usize;
+    let mut name: Vec<u8> = Vec::new();
     for _ in 0..count {
-        let start = at;
-        let mode = be32(bytes, start.checked_add(24).ok_or(())?).ok_or(())?;
-        let flags = bytes
-            .get(start + 60..start + 62)
-            .ok_or(())
-            .map(|b| u16::from_be_bytes([b[0], b[1]]))?;
-        let mut name_at = start.checked_add(ENTRY_FIXED).ok_or(())?;
+        let start = cursor;
+        let mode = be32(bytes, at(start, 24)?).ok_or(())?;
+        let flag_bytes = bytes.get(at(start, 60)?..at(start, 62)?).ok_or(())?;
+        let flags = u16::from_be_bytes([flag_bytes[0], flag_bytes[1]]);
+        let mut name_at = at(start, ENTRY_FIXED)?;
         if version >= 3 && flags & 0x4000 != 0 {
-            name_at = name_at.checked_add(2).ok_or(())?;
+            name_at = at(name_at, 2)?;
         }
-        let path = if version == 4 {
-            let mut cursor = name_at;
-            let strip = varint(bytes, &mut cursor).ok_or(())?;
-            let rest = bytes.get(cursor..).ok_or(())?;
-            let nul = rest.iter().position(|b| *b == 0).ok_or(())?;
-            let keep = previous.len().checked_sub(strip).ok_or(())?;
-            let mut name = previous.as_bytes().get(..keep).ok_or(())?.to_vec();
-            name.extend_from_slice(&rest[..nul]);
-            at = cursor
-                .checked_add(nul)
-                .and_then(|n| n.checked_add(1))
+        if version == 4 {
+            let mut c = name_at;
+            let strip = varint(bytes, &mut c).ok_or(())?;
+            let rest = bytes.get(c..).ok_or(())?;
+            let nul = rest
+                .iter()
+                .take(MAX_NAME.saturating_add(1))
+                .position(|b| *b == 0)
                 .ok_or(())?;
-            String::from_utf8_lossy(&name).into_owned()
+            let keep = name.len().checked_sub(strip).ok_or(())?;
+            name.truncate(keep);
+            name.extend_from_slice(&rest[..nul]);
+            if name.len() > MAX_NAME {
+                return Err(());
+            }
+            cursor = at(at(c, nul)?, 1)?;
         } else {
             let rest = bytes.get(name_at..).ok_or(())?;
-            let nul = rest.iter().position(|b| *b == 0).ok_or(())?;
+            let nul = rest
+                .iter()
+                .take(MAX_NAME.saturating_add(1))
+                .position(|b| *b == 0)
+                .ok_or(())?;
+            name.clear();
+            name.extend_from_slice(&rest[..nul]);
             // Entries are padded with 1 to 8 NULs to a multiple of 8 bytes.
-            let size = name_at
-                .checked_sub(start)
-                .and_then(|n| n.checked_add(nul))
-                .and_then(|n| n.checked_add(8))
-                .ok_or(())?
-                & !7;
-            at = start.checked_add(size).ok_or(())?;
-            String::from_utf8_lossy(&rest[..nul]).into_owned()
-        };
-        if at > bytes.len() {
+            let size = at(at(name_at.checked_sub(start).ok_or(())?, nul)?, 8)? & !7;
+            cursor = at(start, size)?;
+        }
+        if cursor > bytes.len() {
             return Err(());
         }
-        let folded = fold(&path);
         let kind = mode & MODE_TYPE;
-        let container = kind == MODE_GITLINK || kind == MODE_DIR || path.ends_with('/');
-        let hit = if container {
-            related(&folded, &target)
-        } else {
-            folded == target
-                || folded
-                    .strip_prefix(target.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
+        let container = kind == MODE_GITLINK || kind == MODE_DIR || name.ends_with(b"/");
+        let hit = match relation(&name, target) {
+            Rel::Equal | Rel::Inside => true,
+            Rel::Contains => container,
+            Rel::Apart => false,
         };
         if hit {
             return Ok(true);
         }
-        previous = path;
     }
     // Extensions follow the entries. A split index keeps its entries in another file.
-    let mut ext = at;
+    let mut ext = cursor;
     while bytes.len().saturating_sub(ext) > 20 + 8 {
-        let sig = bytes.get(ext..ext + 4).ok_or(())?;
+        let sig = bytes.get(ext..at(ext, 4)?).ok_or(())?;
         if sig == b"link" {
             return Err(());
         }
-        let size = be32(bytes, ext + 4).ok_or(())? as usize;
-        ext = ext
-            .checked_add(8)
-            .and_then(|n| n.checked_add(size))
-            .ok_or(())?;
+        let size = be32(bytes, at(ext, 4)?).ok_or(())? as usize;
+        ext = at(at(ext, 8)?, size)?;
     }
     Ok(false)
 }
@@ -505,5 +577,128 @@ mod tests {
         let p = pack(&root, "s/p");
         let _ = tracking(&p);
         assert!(!marker.exists());
+    }
+
+    /// A hand-built index (version 4): `(strip, suffix, mode)` per entry.
+    fn v4_index(entries: &[(usize, Vec<u8>, u32)]) -> Vec<u8> {
+        let mut out = b"DIRC".to_vec();
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+        for (strip, suffix, mode) in entries {
+            let mut fixed = vec![0u8; ENTRY_FIXED];
+            fixed[24..28].copy_from_slice(&mode.to_be_bytes());
+            out.extend_from_slice(&fixed);
+            // Git's offset encoding of the strip count.
+            let mut v = *strip;
+            let mut enc = vec![(v & 0x7f) as u8];
+            while v >> 7 > 0 {
+                v = (v >> 7) - 1;
+                enc.push(0x80 | (v & 0x7f) as u8);
+            }
+            enc.reverse();
+            out.extend_from_slice(&enc);
+            out.extend_from_slice(suffix);
+            out.push(0);
+        }
+        out.extend_from_slice(&[0u8; 20]);
+        out
+    }
+
+    #[test]
+    fn version_4_prefixes_are_stripped_on_raw_bytes() {
+        // A non-UTF-8 byte would grow to three bytes in a lossy copy and shift the strip.
+        let idx = v4_index(&[
+            (0, b"s/\xff1/aa".to_vec(), 0o100644),
+            (5, b"k".to_vec(), 0o100644),
+        ]);
+        assert_eq!(index_covers(&idx, "s/k"), Ok(true));
+        assert_eq!(index_covers(&idx, "s/other"), Ok(false));
+    }
+
+    #[test]
+    fn an_index_path_over_4096_bytes_is_refused() {
+        let long = vec![b'a'; MAX_NAME + 1];
+        let idx = v4_index(&[(0, long, 0o100644)]);
+        assert_eq!(index_covers(&idx, "x/y"), Err(()));
+        let ok = v4_index(&[(0, vec![b'a'; MAX_NAME], 0o100644)]);
+        assert_eq!(index_covers(&ok, "x/y"), Ok(false));
+    }
+
+    #[test]
+    fn a_hostile_index_costs_linear_time() {
+        use std::time::Instant;
+        // Each entry keeps the whole previous path and adds one byte: refused at 4096 bytes,
+        // long before the entry count could make a quadratic rebuild matter.
+        let growing: Vec<(usize, Vec<u8>, u32)> = std::iter::once((0, b"a".to_vec(), 0o100644))
+            .chain((0..100_000).map(|_| (0, b"a".to_vec(), 0o100644)))
+            .collect();
+        let started = Instant::now();
+        assert_eq!(index_covers(&v4_index(&growing), "x/y"), Err(()));
+        assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+        // Names that stay at 4000 bytes for 150k entries (strip one byte, add one): linear.
+        let mut steady = vec![(0, vec![b'a'; 4000], 0o100644)];
+        steady.extend((0..150_000).map(|_| (1, b"b".to_vec(), 0o100644)));
+        let idx = v4_index(&steady);
+        let started = Instant::now();
+        assert_eq!(index_covers(&idx, "x/y"), Ok(false));
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// `tracking(pack)` with a deadline: a read that blocks fails the test instead of hanging it.
+    #[cfg(unix)]
+    fn tracking_within(pack: &Path) -> Tracking {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pack = pack.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(tracking(&pack));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("tracking() blocked on a special file")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_index_or_gitmodules_counts_as_tracked_without_blocking() {
+        let root = temp("fifo-index");
+        git(&root, &["init", "-q"]);
+        let p = pack(&root, "s/p");
+        fs::remove_file(root.join(".git/index")).ok();
+        mkfifo(&root.join(".git/index"));
+        assert_eq!(
+            tracking_within(&p),
+            Tracking::Tracked("the git index cannot be read")
+        );
+
+        let root = temp("fifo-gm");
+        let p = pack(&root, ".claude/skills/evil");
+        mkfifo(&root.join(".claude/skills/.gitmodules"));
+        assert_eq!(
+            tracking_within(&p),
+            Tracking::Tracked("its .gitmodules cannot be read")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_device_counts_as_tracked_without_blocking() {
+        let root = temp("dev-link");
+        git(&root, &["init", "-q"]);
+        let p = pack(&root, "s/p");
+        fs::remove_file(root.join(".git/index")).ok();
+        for device in ["/dev/null", "/dev/zero"] {
+            let _ = fs::remove_file(root.join(".git/index"));
+            std::os::unix::fs::symlink(device, root.join(".git/index")).unwrap();
+            assert!(tracking_within(&p).is_tracked(), "{device}");
+        }
+        let root = temp("dev-link-gm");
+        let p = pack(&root, ".claude/skills/evil");
+        std::os::unix::fs::symlink("/dev/zero", root.join(".claude/skills/.gitmodules")).unwrap();
+        assert!(tracking_within(&p).is_tracked());
     }
 }

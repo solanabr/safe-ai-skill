@@ -1214,6 +1214,27 @@ fn migrate_v1(
     (Some(hash.to_string()), high, None)
 }
 
+/// Why `on_block: move` must leave `pack` where it is, or `None` when it may be moved: a
+/// symlinked pack directory (the rename would move the link, not the content, and the printed
+/// restore would be wrong), or a pack a repository tracks (read from the repository files; git
+/// never runs on the pack tree).
+fn not_moved_reason(pack: &Pack) -> Option<String> {
+    let is_link = pack
+        .dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true);
+    if is_link {
+        return Some("the pack directory is a symlink or cannot be inspected".to_string());
+    }
+    [&pack.dir, &pack.canonical]
+        .into_iter()
+        .find_map(|p| match gittracked::tracking(p) {
+            gittracked::Tracking::Tracked(why) => Some(format!("tracked by git ({why})")),
+            gittracked::Tracking::Untracked => None,
+        })
+}
+
 /// Move a blocked pack into `${DATA}/quarantine/` (`supply_chain.on_block: move`), never
 /// overwriting an existing entry: the name gets a `-<n>` suffix when taken. Returns where it went.
 fn move_blocked(plugin_data: &Path, pack: &Pack) -> Option<PathBuf> {
@@ -1290,8 +1311,8 @@ struct PackReportLine {
     moved_to: Option<String>,
     /// Where the pack lives (or lived, when moved).
     origin: String,
-    /// `on_block: move` left it in place, for this reason (see [`gittracked`]).
-    not_moved: Option<&'static str>,
+    /// `on_block: move` left it in place, for this reason.
+    not_moved: Option<String>,
 }
 
 impl PackReportLine {
@@ -1366,8 +1387,8 @@ impl PackReportLine {
                 sh_quote(&origin)
             );
         }
-        match self.not_moved {
-            Some(why) => format!("; not moved: tracked by git ({why}); denied in place"),
+        match &self.not_moved {
+            Some(why) => format!("; not moved: {why}; denied in place"),
             None => String::new(),
         }
     }
@@ -1516,25 +1537,29 @@ fn sweep_within(
             continue;
         };
         swept_keys.push(ev.key.clone());
-        let Some(entry) = st.packs.get_mut(&ev.key) else {
-            continue;
-        };
+        let wants_move = move_on_block
+            && st
+                .packs
+                .get(&ev.key)
+                .is_some_and(|e| e.state == PackStatus::Blocked && e.quarantined_to.is_none());
         let mut not_moved = None;
-        if move_on_block && entry.state == PackStatus::Blocked && entry.quarantined_to.is_none() {
-            // Read from the repository files; git never runs on the pack tree.
-            let tracked = [&pack.dir, &pack.canonical]
-                .into_iter()
-                .map(|p| gittracked::tracking(p))
-                .find(|t| t.is_tracked());
-            match tracked {
-                Some(gittracked::Tracking::Tracked(why)) => not_moved = Some(why),
-                _ => {
-                    if let Some(to) = move_blocked(&dir.path, &pack) {
-                        entry.quarantined_to = Some(to.to_string_lossy().into_owned());
+        if wants_move {
+            // The BLOCK is stored before the tracking check and the move, so a stall or a
+            // crash there never leaves the pack unrecorded (the gates read the stored state).
+            let _ = state::store(dir, &st);
+            not_moved = not_moved_reason(&pack);
+            if not_moved.is_none() {
+                if let Some(to) = move_blocked(&dir.path, &pack) {
+                    if let Some(e) = st.packs.get_mut(&ev.key) {
+                        e.quarantined_to = Some(to.to_string_lossy().into_owned());
                     }
+                    let _ = state::store(dir, &st);
                 }
             }
         }
+        let Some(entry) = st.packs.get_mut(&ev.key) else {
+            continue;
+        };
         if enforce::high_pending(entry, &env.trust) {
             high_denied.push(pack.display.clone());
         }
@@ -4708,6 +4733,35 @@ mod enforce_tests {
         }
         HANG_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_naming_a_high_pack_first_and_a_hard_pack_second_is_denied_hard() {
+        let (d, project) = fresh_trusted("rr6-fields");
+        for n in ["aaa0", "aaa1", "aaa2", "aaa3", "zzz"] {
+            md(&skills_of(&project).join(n), n);
+            fs::write(skills_of(&project).join(n).join("run.sh"), "id").unwrap();
+        }
+        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(1));
+        let st = state::load(&d).state;
+        assert!(entry_of(&st, &skills_of(&project).join("zzz")).unscanned());
+        assert_eq!(
+            entry_of(&st, &skills_of(&project).join("aaa0")).state,
+            PackStatus::Unreviewed
+        );
+        let input = serde_json::json!({
+            "file_path": ".claude/skills/aaa0/run.sh",
+            "notebook_path": ".claude/skills/zzz/run.sh",
+        });
+        // The hard pack in the second field wins, so Relaxed and Medium still deny.
+        let v = enforce::read_verdict(&d, "Read", &input, &project);
+        assert!(is_deny(&v), "{v:?}");
+        assert!(is_deny(&tier_action(v, Tier::Relaxed)));
+        // Alone, the high-only pack is the `Ask` marker: n/o below High.
+        let only = serde_json::json!({"file_path": ".claude/skills/aaa0/run.sh"});
+        let v = enforce::read_verdict(&d, "Read", &only, &project);
+        assert!(matches!(v, GateVerdict::Ask(_)), "{v:?}");
+        assert_eq!(tier_action(v, Tier::Relaxed), GateVerdict::NoOpinion);
     }
 
     #[test]

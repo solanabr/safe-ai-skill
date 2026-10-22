@@ -46,24 +46,32 @@ struct World {
     plugin: TempDir,
 }
 
-/// The five ways a pack can be reached: `true` = denied.
+/// The five ways a pack can be reached, each the exact outcome: `"deny"` / `"block"`, or `""`
+/// for no opinion (empty stdout). Any other decision (an `ask`, an `allow`) fails a comparison.
 #[derive(Debug, PartialEq, Eq)]
 struct Reach {
-    skill: bool,
-    slash: bool,
-    read: bool,
-    grep: bool,
-    bash: bool,
+    skill: String,
+    slash: String,
+    read: String,
+    grep: String,
+    bash: String,
 }
 
 impl Reach {
     fn all(denied: bool) -> Reach {
+        let say = |word: &str| {
+            if denied {
+                word.to_string()
+            } else {
+                String::new()
+            }
+        };
         Reach {
-            skill: denied,
-            slash: denied,
-            read: denied,
-            grep: denied,
-            bash: denied,
+            skill: say("deny"),
+            slash: say("block"),
+            read: say("deny"),
+            grep: say("deny"),
+            bash: say("deny"),
         }
     }
 }
@@ -174,8 +182,19 @@ impl World {
             return (String::new(), String::new());
         }
         let v = run.json();
+        // A Grep with no pack opinion still gets the secret-file exclusion glob (an
+        // `updatedInput` with no decision): that is the only output besides a decision.
+        let decision = permission_decision(&v).unwrap_or_else(|| {
+            assert!(
+                v["hookSpecificOutput"].get("updatedInput").is_some()
+                    && v["hookSpecificOutput"].get("permissionDecision").is_none(),
+                "output without a decision: {}",
+                run.stdout
+            );
+            String::new()
+        });
         (
-            permission_decision(&v).unwrap_or_default(),
+            decision,
             v["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
                 .unwrap_or_default()
@@ -183,7 +202,7 @@ impl World {
         )
     }
 
-    fn slash_blocked(&self, name: &str, tier: Tier) -> bool {
+    fn slash_outcome(&self, name: &str, tier: Tier) -> String {
         let run = self
             .inv(&["gate-prompt-expansion"], tier)
             .stdin(
@@ -197,34 +216,37 @@ impl World {
             )
             .run();
         assert_eq!(run.code, Some(0), "{}", run.stderr);
-        !run.stdout.trim().is_empty() && run.json()["decision"] == "block"
+        if run.stdout.trim().is_empty() {
+            return String::new();
+        }
+        run.json()["decision"].as_str().unwrap_or("?").to_string()
     }
 
     /// Probe `<skills>/<dir>` (whose skill is `name`) every way.
     fn reach(&self, dir: &str, name: &str, tier: Tier) -> Reach {
         let pack = self.skills().join(dir);
-        let denied = |(d, _): (String, String)| d == "deny";
+        let outcome = |(d, _): (String, String)| d;
         Reach {
-            skill: denied(self.pre(
+            skill: outcome(self.pre(
                 "gate-skill",
                 "Skill",
                 serde_json::json!({"skill": name}),
                 tier,
             )),
-            slash: self.slash_blocked(name, tier),
-            read: denied(self.pre(
+            slash: self.slash_outcome(name, tier),
+            read: outcome(self.pre(
                 "gate-read",
                 "Read",
                 serde_json::json!({"file_path": pack.join("SKILL.md")}),
                 tier,
             )),
-            grep: denied(self.pre(
+            grep: outcome(self.pre(
                 "gate-read",
                 "Grep",
                 serde_json::json!({"pattern": "x", "path": pack}),
                 tier,
             )),
-            bash: denied(self.pre(
+            bash: outcome(self.pre(
                 "gate-bash-secrets",
                 "Bash",
                 serde_json::json!({"command": format!("cat {}/SKILL.md", pack.display())}),
@@ -356,17 +378,15 @@ fn an_unscanned_pack_is_denied_from_stored_state_like_a_block() {
     );
     state::store(&dir, &st).unwrap();
     for tier in tiers() {
-        let read = |tool: &str, input: serde_json::Value| {
-            w.pre("gate-read", tool, input, tier).0 == "deny"
-        };
-        let bash =
-            w.pre(
+        let read = |tool: &str, input: serde_json::Value| w.pre("gate-read", tool, input, tier).0;
+        let bash = w
+            .pre(
                 "gate-bash-secrets",
                 "Bash",
                 serde_json::json!({"command": format!("cat {}/SKILL.md", pack.display())}),
                 tier,
             )
-            .0 == "deny";
+            .0;
         let got = (
             read(
                 "Read",
@@ -375,8 +395,12 @@ fn an_unscanned_pack_is_denied_from_stored_state_like_a_block() {
             read("Grep", serde_json::json!({"pattern": "x", "path": pack})),
             bash,
         );
-        let want = hard(tier);
-        assert_eq!(got, (want, want, want), "unscanned at {tier:?}");
+        let want = if hard(tier) { "deny" } else { "" }.to_string();
+        assert_eq!(
+            got,
+            (want.clone(), want.clone(), want),
+            "unscanned at {tier:?}"
+        );
     }
 }
 
@@ -514,7 +538,7 @@ fn after_verify_trust_a_high_pack_has_no_opinion_even_at_high() {
     // Edited content is new content: untrusted again.
     std::fs::write(pack.join("load.sh"), format!("{KEYPAIR_SCRIPT}# edited\n")).unwrap();
     let after = w.reach("keys", "keys", Tier::High);
-    assert!(after.skill, "{after:?}");
+    assert_eq!(after.skill, "deny", "{after:?}");
 }
 
 #[cfg(feature = "test-hooks")]
@@ -813,4 +837,76 @@ fn aikit_corpus_relaxed_denies_and_moves_nothing_and_high_denies_the_high_packs(
             ""
         );
     }
+}
+
+#[test]
+fn on_block_move_leaves_a_symlinked_pack_in_place_and_says_why() {
+    let w = World::new("sc-move-link", true);
+    let target = w.project.join("vendor/evil");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/corpus/shapes/issue10-stealer"),
+        &target,
+    );
+    std::fs::create_dir_all(w.skills()).unwrap();
+    let link = w.skills().join("evil");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("../../vendor/evil", &link).unwrap();
+    #[cfg(not(unix))]
+    return;
+    for tier in [Tier::Relaxed, Tier::High] {
+        let (sys, ctx) = w.report(tier);
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "{tier:?}"
+        );
+        assert!(target.join("SKILL.md").exists());
+        assert!(!w.data.join("quarantine").exists(), "{tier:?}");
+        for text in [&sys, &ctx] {
+            assert!(text.contains("BLOCK"), "{text}");
+            assert!(
+                text.contains("not moved: the pack directory is a symlink"),
+                "{text}"
+            );
+            assert!(!text.contains("MOVED"), "{text}");
+        }
+    }
+    assert_eq!(
+        w.pre(
+            "gate-skill",
+            "Skill",
+            serde_json::json!({"skill": "evil"}),
+            Tier::Relaxed
+        )
+        .0,
+        "deny"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_gitmodules_cannot_stall_the_sweep_or_lose_the_block() {
+    let w = World::new("sc-move-fifo", true);
+    let pack = w.put_stealer("stealer");
+    let fifo = w.skills().join(".gitmodules");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let started = std::time::Instant::now();
+    let (sys, ctx) = w.report(Tier::Relaxed);
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    assert!(pack.join("SKILL.md").exists(), "never moved");
+    for text in [&sys, &ctx] {
+        assert!(
+            text.contains("BLOCK") && text.contains("not moved: tracked by git"),
+            "{text}"
+        );
+    }
+    // The BLOCK is in the stored state, so Read, Grep and Bash deny with no Skill call first.
+    assert_eq!(
+        w.reach("stealer", "no-such-skill", Tier::Medium).read,
+        "deny"
+    );
+    assert_eq!(
+        w.reach("stealer", "no-such-skill", Tier::Medium).bash,
+        "deny"
+    );
 }

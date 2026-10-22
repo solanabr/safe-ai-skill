@@ -593,13 +593,16 @@ pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Pa
         return Verdict::NoOpinion;
     }
     let field = |k: &str| tool_input.get(k).and_then(Value::as_str);
+    // Every path field is judged, and the strictest hit wins: a hard pack in any of them is
+    // not lost to a high-only pack named first.
+    let mut hit: Option<(String, &BlockedPack)> = None;
     for target in ["file_path", "notebook_path"]
         .iter()
         .filter_map(|k| field(k))
         .map(|p| absolute(cwd, p))
     {
         if let Some(b) = inside_blocked(&target, &blocked) {
-            return denial_of(&format!("{} is inside", target.display()), b);
+            keep_strictest(&mut hit, format!("{} is inside", target.display()), b);
         }
     }
     let search = match tool_name {
@@ -610,7 +613,7 @@ pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Pa
         _ => field("path").map(|_| None),
     };
     let Some(narrow) = search else {
-        return Verdict::NoOpinion;
+        return hit.map_or(Verdict::NoOpinion, |(subject, b)| denial_of(&subject, b));
     };
     let mut root = field("path")
         .map(|p| absolute(cwd, p))
@@ -624,22 +627,29 @@ pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Pa
             root = absolute(&root, &literal.join("/"));
         }
     }
-    let hit = match (
+    let subject = format!("this search of {} reaches", root.display());
+    for b in [
         inside_blocked(&root, &blocked),
         contains_blocked(&root, &blocked),
-    ) {
-        (Some(inside), Some(contains)) => Some(if inside.class == Class::Hard {
-            inside
-        } else if contains.class == Class::Hard {
-            contains
-        } else {
-            inside
-        }),
-        (inside, contains) => inside.or(contains),
-    };
+    ]
+    .into_iter()
+    .flatten()
+    {
+        keep_strictest(&mut hit, subject.clone(), b);
+    }
+    hit.map_or(Verdict::NoOpinion, |(subject, b)| denial_of(&subject, b))
+}
+
+/// Keep `candidate` in `hit` unless a hard pack is already there (the first hard one, else the
+/// first high one, wins).
+fn keep_strictest<'a>(
+    hit: &mut Option<(String, &'a BlockedPack)>,
+    subject: String,
+    candidate: &'a BlockedPack,
+) {
     match hit {
-        Some(b) => denial_of(&format!("this search of {} reaches", root.display()), b),
-        None => Verdict::NoOpinion,
+        Some((_, current)) if current.class == Class::Hard || candidate.class == Class::High => {}
+        _ => *hit = Some((subject, candidate)),
     }
 }
 
