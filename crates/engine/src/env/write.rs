@@ -364,6 +364,23 @@ pub fn atomic_replace(target: &Path, bytes: &[u8], mode: u32) -> io::Result<()> 
     replace_with(target, bytes, mode, &mut |_| Ok(()))
 }
 
+/// Write `bytes` to a new file `target` atomically, never replacing an existing one: the
+/// content goes to a synced temp file that is then hard-linked into place (`link` fails when
+/// `target` exists, symlinks included). Fails with `AlreadyExists` in that case.
+pub fn create_new_atomic(target: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let (tmp, file) = create_temp(&dir)?;
+    let result =
+        fill(file, bytes, mode, &mut |_| Ok(())).and_then(|()| fs::hard_link(&tmp, target));
+    let _ = fs::remove_file(&tmp);
+    result?;
+    sync_dir(&dir);
+    Ok(())
+}
+
 pub(crate) fn replace_with(
     target: &Path,
     bytes: &[u8],

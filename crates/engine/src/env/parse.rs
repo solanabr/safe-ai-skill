@@ -17,7 +17,15 @@
 //!   trailing blanks trimmed;
 //! - a leading UTF-8 BOM is set aside and restored.
 //!
-//! Duplicate keys are all kept; the last one wins, as with dotenv loaders and `source`.
+//! Duplicate keys are all kept; the last one wins, as with dotenv loaders and `source`
+//! (dotenvy, the Rust loader, keeps the first; `env keys` says so when a file has duplicates).
+//!
+//! Known loader divergences (documented, not emulated):
+//! - `\n` inside double quotes stays the two characters backslash and `n`; Node's `dotenv`
+//!   and `python-dotenv` expand it to a newline. A value read back by those loaders can differ.
+//! - A backtick-quoted value (Node `dotenv` and varlock accept `` `…` `` spanning lines) is
+//!   read here as a bare value, so a multiline backtick value lists as several lines; `env set`
+//!   writes single or double quotes instead.
 
 use std::ops::Range;
 

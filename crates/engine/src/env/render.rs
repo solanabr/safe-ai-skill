@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::audit::sha256_hex;
 use crate::env::parse::{Entry, EnvFile, ItemKind};
+use crate::env::schema::Schema;
 
 /// Values at least this long get a fingerprint.
 const FP_MIN_LEN: usize = 16;
@@ -317,12 +318,74 @@ fn rows(file: &EnvFile) -> (Vec<Row<'_>>, usize) {
     (rows, last.len())
 }
 
+/// A `.env.schema` found beside the listed file, and how messages name it.
+#[derive(Clone, Copy)]
+pub struct SchemaView<'a> {
+    pub label: &'a str,
+    pub schema: &'a Schema,
+}
+
+impl SchemaView<'_> {
+    /// `[sensitive required type=url]`, `[undeclared]`, or empty when there is nothing to say.
+    fn annotation(&self, key: &str) -> String {
+        if self.schema.item(key).is_none() {
+            return "[undeclared]".into();
+        }
+        let mut parts = Vec::new();
+        if self.schema.is_sensitive(key) {
+            parts.push("sensitive".to_string());
+        }
+        if self.schema.is_required(key) == Some(true) {
+            parts.push("required".to_string());
+        }
+        if let Some(ty) = self.schema.item(key).and_then(|i| i.type_name()) {
+            parts.push(format!("type={ty}"));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", parts.join(" "))
+        }
+    }
+
+    /// Declared keys with no assignment in `file`, in schema order.
+    fn declared_unset<'s>(&'s self, file: &EnvFile) -> Vec<&'s str> {
+        self.schema
+            .items
+            .iter()
+            .map(|i| i.key.as_str())
+            .filter(|key| !file.entries().any(|(_, e)| e.key == *key))
+            .collect()
+    }
+
+    fn json(&self, key: &str) -> Value {
+        match self.schema.item(key) {
+            None => json!({ "declared": false }),
+            Some(item) => json!({
+                "declared": true,
+                "sensitive": self.schema.is_sensitive(key),
+                "required": self.schema.is_required(key),
+                "type": item.type_name(),
+            }),
+        }
+    }
+}
+
 /// `env keys` text output: a header, then one aligned row per assignment or commented key.
 pub fn keys_text(label: &str, file: &EnvFile) -> String {
+    keys_text_with(label, file, None)
+}
+
+/// [`keys_text`] with schema annotations: each assigned key gets its `sensitive` / `required`
+/// / `type` tags or `[undeclared]`, and a footer lists declared keys the file does not set.
+pub fn keys_text_with(label: &str, file: &EnvFile, schema: Option<SchemaView<'_>>) -> String {
     let (rows, keys) = rows(file);
     let mut out = format!("# {label} keys={keys} crlf={}", file.crlf().label());
     if file.bom {
         out.push_str(" bom=yes");
+    }
+    if let Some(view) = schema {
+        out.push_str(&format!(" schema={}", view.label));
     }
     out.push('\n');
     let cells: Vec<(String, String, String)> = rows
@@ -348,15 +411,64 @@ pub fn keys_text(label: &str, file: &EnvFile) -> String {
             }
             None => {}
         }
+        if let (Some(view), Some(_)) = (schema, row.entry) {
+            let note = view.annotation(row.key);
+            if !note.is_empty() {
+                out.push_str("   ");
+                out.push_str(&note);
+            }
+        }
         out.push('\n');
+    }
+    if rows.iter().any(|r| r.dup.is_some()) {
+        out.push_str(
+            "# duplicates: dotenv loaders and `source` use the last assignment; dotenvy (Rust) keeps the first\n",
+        );
+    }
+    if let Some(view) = schema {
+        let unset = view.declared_unset(file);
+        if !unset.is_empty() {
+            let list: Vec<String> = unset
+                .iter()
+                .map(|key| match view.schema.is_required(key) {
+                    Some(true) => format!("{key} (required)"),
+                    _ => (*key).to_string(),
+                })
+                .collect();
+            out.push_str(&format!(
+                "# declared in {} but unset: {}\n",
+                view.label,
+                list.join(", ")
+            ));
+        }
     }
     out
 }
 
 /// `env keys --json` output. `require` adds the `--require` verdict.
 pub fn keys_json(label: &str, file: &EnvFile, require: Option<&[(String, Unmet)]>) -> Value {
+    keys_json_with(label, file, require, None)
+}
+
+/// [`keys_json`] with schema fields: `schema` (file label), a `schema` object per assigned key
+/// and `declared_unset`.
+pub fn keys_json_with(
+    label: &str,
+    file: &EnvFile,
+    require: Option<&[(String, Unmet)]>,
+    schema: Option<SchemaView<'_>>,
+) -> Value {
     let (rows, _) = rows(file);
-    let keys: Vec<Value> = rows.iter().map(row_json).collect();
+    let keys: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut v = row_json(row);
+            if let (Some(view), Some(_)) = (schema, row.entry) {
+                v["schema"] = view.json(row.key);
+            }
+            v
+        })
+        .collect();
     let mut out = json!({
         "file": label,
         "format": file.format.label(),
@@ -370,6 +482,21 @@ pub fn keys_json(label: &str, file: &EnvFile, require: Option<&[(String, Unmet)]
             .map(|(key, reason)| json!({ "key": key, "reason": reason.label() }))
             .collect();
         out["require"] = json!({ "ok": unmet.is_empty(), "unmet": unmet });
+    }
+    if let Some(view) = schema {
+        out["schema"] = json!(view.label);
+        let unset: Vec<Value> = view
+            .declared_unset(file)
+            .into_iter()
+            .map(|key| {
+                json!({
+                    "key": key,
+                    "required": view.schema.is_required(key),
+                    "sensitive": view.schema.is_sensitive(key),
+                })
+            })
+            .collect();
+        out["declared_unset"] = Value::Array(unset);
     }
     out
 }
