@@ -18,8 +18,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-All four are green: `cargo test` = **314 passed** as of the solana-ai-kit foundation pass
-(`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean).
+All four must be green before a commit (`cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean, `cargo test` passing).
 
 Dependencies (resolved, FROZEN in `Cargo.toml`): `serde 1`, `serde_json 1`, `serde_yaml
 0.9`, `sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`),
@@ -116,6 +116,28 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 
 ---
 
+## Platform shim (`plugins/safe-ai-skill/bin/safe-ai-skill`)
+
+`hooks.json` runs the POSIX sh shim, which execs the prebuilt `safe-ai-skill-<plat>` beside it
+(never `cargo build`, never a binary outside its own directory) and maps failures onto the hook
+contract:
+
+- **Environment failure** (no prebuilt for the platform, not an executable here, exit 126/127):
+  fail open with a notice. `gate-bash` answers `ask` for the Solana surface, SessionStart reports
+  the firewall INACTIVE, every other hook exits 0 with one stderr line.
+- **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash` and `gate-mcp` exit 2 (block);
+  the rest exit 0 with a stderr line.
+- `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
+  turns the hooks off, but is ignored in strict mode or when the committed project
+  `.claude/settings.json` mentions it; SessionStart reports either way.
+- The Solana `gate-bash` entries set `onFailure: block`, the others `continue`. `onFailure`
+  needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
+  never blocks.
+
+CLI subcommands (not hooks) run the engine with live output and keep its exit status.
+
+---
+
 ## Decision → JSON shapes
 
 - **PreToolUse**:
@@ -140,7 +162,7 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 | `grants.json` | `grants` (round-2) | active scoped grants |
 | `mode.json` | `mode` (round-2) | runtime active-profile override |
 | `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
-| `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
+| `quarantine/<name>` | 1.0.0 `verify` (legacy) | skill dirs 1.0.0 moved; 1.0.1 never writes here. `verify approve <name>` restores one, `verify session` lists leftovers |
 | `session/<id>.json` | `session` (round-2) | ephemeral session keypairs (0600) |
 
 ---
@@ -411,12 +433,21 @@ pub fn verify::provenance::resolve(source: &str) -> Report;    // empty
 pub fn verify::osv::query(pkg: &str, version: &str) -> Report; // empty
 pub fn verify::lockfile::hash_tree(path: &Path) -> String;     // ""
 
-// NEW — per-ext-submodule discovery (STUB; round-2 Agent B implements + integrates).
-// Returns each `ext/<name>` dir under `skills_dir` as an individual verifiable unit. STUB
-// returns an empty vec; `run_session` behavior is UNCHANGED (still treats ext/ as one unit)
-// until Agent B wires this in (per-submodule git-SHA pin/drift).
-pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;  // []
+// Per-ext-submodule discovery: each `ext/<name>` dir under `skills_dir` is its own verifiable
+// unit (git-SHA pin/drift), walked by `run_session`; empty when `verify_ext_submodules` is off.
+pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;
+pub fn verify::run_session(plugin_data: &Path, project_dir: &Path, policy: &Policy) -> SessionResult;
+pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, policy: &Policy) -> std::io::Result<Approval>;
 ```
+
+**`verify session` is report-only.** `run_session` sweeps each root in `supply_chain.verify_skills_dirs`
+(project `.claude/skills`; `~/.claude/skills` only when listed, except packs `install --from`
+put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
+own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
+if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, findings at
+`path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is moved
+or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
+`quarantine/` (never over an existing directory).
 
 ### `registry` (NEW — opt-in catalog; STUBS, round-2 Agent A)
 ```rust
