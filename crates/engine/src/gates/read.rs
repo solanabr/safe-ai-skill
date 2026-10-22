@@ -698,6 +698,7 @@ mod tests {
     fn env_read_ask_policy() {
         let mut p = policy();
         p.runtime.env_read = crate::policy::tier::EnvRead::Ask;
+        p.runtime.sandbox = crate::sandbox::SandboxState::On;
         assert!(matches!(
             decide_path(".env", &here(), &p),
             Decision::Ask { .. }

@@ -29,8 +29,36 @@ use crate::env::values::KnownValue;
 pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
-/// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
+/// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed, and
+/// always for a Read of an env-class file (an opted-in raw read, see [`is_raw_env_read`]).
 pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
+    if is_binary_payload(response) || is_raw_env_read(response) {
+        return None;
+    }
+    scrub_value(response, values)
+}
+
+/// A Read response (`{type:"text", file:{filePath,…}}`) of an env-class file, by name or by
+/// the file it resolves to. It is never rewritten (D8 v2 spec §2): the read gate denies raw env
+/// reads unless the user opted in, so a response that got here is an opted-in read, and a
+/// scrubbed copy would be written back over the real values by the next Edit or Write.
+fn is_raw_env_read(response: &Value) -> bool {
+    if response.get("type").and_then(Value::as_str) != Some("text") {
+        return false;
+    }
+    let Some(file) = response
+        .get("file")
+        .and_then(|f| f.get("filePath"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let is_env =
+        |p: &str| crate::gates::secretpath::classify(p) == crate::gates::secretpath::Class::Env;
+    is_env(file) || std::fs::canonicalize(file).is_ok_and(|real| is_env(&real.to_string_lossy()))
+}
+
+fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
     if is_binary_payload(response) {
         return None;
     }
@@ -46,7 +74,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
         }
         Value::Array(items) => {
             let scrubbed: Vec<Option<Value>> =
-                items.iter().map(|v| scrub_response(v, values)).collect();
+                items.iter().map(|v| scrub_value(v, values)).collect();
             if scrubbed.iter().all(Option::is_none) {
                 return None;
             }
@@ -62,7 +90,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
             let mut changed = false;
             let mut out = map.clone();
             for (key, value) in map {
-                if let Some(new) = scrub_response(value, values) {
+                if let Some(new) = scrub_value(value, values) {
                     out.insert(key.clone(), new);
                     changed = true;
                 }

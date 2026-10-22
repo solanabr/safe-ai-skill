@@ -1213,3 +1213,77 @@ fn never_prints_values() {
     );
     assert_silent(&k, &probes, "final keys");
 }
+
+// ---------------------------------------------------------------------------------------
+// D8 v2 tier check: an agent's `env set|unset` (spec §2)
+// ---------------------------------------------------------------------------------------
+
+/// `safe-ai-skill env <args>` as a Claude Code session runs it (`CLAUDECODE=1`) at `tier`
+/// (raised through the env hint, which needs no trusted data dir), or from the user's own
+/// terminal when `agent` is false.
+fn run_env_at(dir: &Path, args: &[&str], stdin: Option<&str>, tier: &str, agent: bool) -> Run {
+    let mut full = vec!["env"];
+    full.extend_from_slice(args);
+    let mut inv = Invocation::new(&full)
+        .cwd(dir)
+        .home(dir)
+        .env("SAFE_AI_SKILL_TIER", tier)
+        .env("CLAUDECODE", if agent { "1" } else { "" });
+    if let Some(body) = stdin {
+        inv = inv.stdin(body);
+    }
+    inv.run()
+}
+
+#[test]
+fn agent_set_and_unset_are_refused_at_medium_and_high() {
+    let t = TempDir::new("env-tier");
+    let d = t.path();
+    let env = d.join(".env");
+    fs::write(&env, "A=1\nB=2\n").unwrap();
+    for tier in ["medium", "high"] {
+        let r = run_env_at(
+            d,
+            &["set", ".env", "A"],
+            Some("secret_value_123"),
+            tier,
+            true,
+        );
+        assert_eq!(r.code, Some(1), "{tier}: {}", r.stderr);
+        assert!(r.stderr.contains(&format!("tier {tier}")), "{}", r.stderr);
+        assert!(r.stderr.contains("own terminal"), "{}", r.stderr);
+        assert!(!r.stderr.contains("secret_value_123"), "{}", r.stderr);
+        let r = run_env_at(d, &["unset", ".env", "B"], None, tier, true);
+        assert_eq!(r.code, Some(1), "{tier}: {}", r.stderr);
+        assert_eq!(read(&env), "A=1\nB=2\n", "{tier}: file untouched");
+        // `keys` works at every tier.
+        let k = run_env_at(d, &["keys", ".env"], None, tier, true);
+        ok(&k);
+    }
+}
+
+#[test]
+fn set_works_from_the_users_terminal_and_below_medium() {
+    let t = TempDir::new("env-tier-ok");
+    let d = t.path();
+    let env = d.join(".env");
+    fs::write(&env, "A=1\n").unwrap();
+    // The user's own terminal, at high.
+    ok(&run_env_at(
+        d,
+        &["set", ".env", "A"],
+        Some("v2"),
+        "high",
+        false,
+    ));
+    assert_eq!(read(&env), "A=v2\n");
+    // A Claude Code session at relaxed.
+    ok(&run_env_at(
+        d,
+        &["set", ".env", "A"],
+        Some("v3"),
+        "relaxed",
+        true,
+    ));
+    assert_eq!(read(&env), "A=v3\n");
+}
