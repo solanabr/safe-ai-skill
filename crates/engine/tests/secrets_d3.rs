@@ -21,6 +21,8 @@ struct Sandbox {
     path: TempDir,
     /// The user's confirmed `env_read` (`tier.json`), when a test needs one.
     user_env_read: Option<common::EnvRead>,
+    /// The declared sandbox, when a test needs one.
+    sandbox: Option<common::SandboxMode>,
 }
 
 impl Sandbox {
@@ -32,13 +34,23 @@ impl Sandbox {
             root: None,
             path: TempDir::new("d3-path"),
             user_env_read: None,
+            sandbox: None,
         }
     }
 
-    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`).
-    #[cfg(feature = "test-hooks")]
+    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`), with the
+    /// sandbox declared on (the opt-in applies only then, D8 v2 spec §1.4).
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
     fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
         self.user_env_read = Some(env_read);
+        self.sandbox = Some(common::SandboxMode::On);
+        self
+    }
+
+    /// The declared sandbox (with `test-hooks`, the engine override).
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+    fn with_sandbox(mut self, mode: common::SandboxMode) -> Self {
+        self.sandbox = Some(mode);
         self
     }
 
@@ -75,6 +87,9 @@ impl Sandbox {
         }
         if let Some(env_read) = self.user_env_read {
             inv = inv.env_read(env_read);
+        }
+        if let Some(mode) = self.sandbox {
+            inv = inv.cwd(self.project.path()).sandbox(mode);
         }
         inv.run()
     }
@@ -324,7 +339,7 @@ fn the_plugin_policy_cannot_loosen_env_read() {
     assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
     let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
@@ -332,6 +347,19 @@ fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
     assert_eq!(sb.read("~/.config/solana/id.json"), "deny");
     sb.write("k.json", &keypair_json());
     assert_eq!(sb.read("k.json"), "deny");
+}
+
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[test]
+fn the_env_read_opt_in_is_suspended_without_the_sandbox() {
+    let sb = Sandbox::new()
+        .with_user_env_read(common::EnvRead::Ask)
+        .with_sandbox(common::SandboxMode::Off);
+    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
+    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "deny");
+    let why = reason(&sb.bash("cat .env"));
+    assert!(why.contains("opt-in suspended: sandbox not on"), "{why}");
 }
 
 #[test]
@@ -584,7 +612,7 @@ fn bash_varlock_safe_commands_have_no_opinion_or_ask() {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn bash_env_read_ask_applies_to_readers_and_varlock() {
     let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);

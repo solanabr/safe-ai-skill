@@ -748,11 +748,14 @@ fn cmd_redact() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let cwd = cwd_of(&input);
-    if !load_effective_policy(&cwd, &state_dir(&cwd)).redact.enabled {
+    let effective = load_effective_policy(&cwd, &state_dir(&cwd));
+    if !effective.redact.enabled {
         return ExitCode::SUCCESS;
     }
     let values = safe_ai_skill::env::values::load(&cwd);
-    let _ = io::emit_posttooluse_redact(redact::scrub_response(response, &values));
+    let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
+        &input, response, &values, &cwd, &effective,
+    ));
     ExitCode::SUCCESS
 }
 
@@ -1818,6 +1821,9 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         clear,
     };
     let summary = tierstate::summary(&change);
+    if let Some(note) = env_read.and_then(safe_ai_skill::gates::envread::inactive_note) {
+        let _ = writeln!(std::io::stderr(), "safe-ai-skill tier: {note}");
+    }
     match tierstate::plan(&dir, &change) {
         Plan::NeedsConfirm => park_pending(
             "tier",

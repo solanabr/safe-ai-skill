@@ -103,7 +103,7 @@ jobs:
       # this build: the Off / env_read opt-in / grant rows that drive the binary run here. A
       # separate target dir keeps the release-shaped debug binary for the steps below.
       - name: cargo test --features test-hooks
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --target-dir crates/engine/target/test-hooks
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks,env-read-opt-in --target-dir crates/engine/target/test-hooks
 
       # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
       # No network: we use the freshly built binary, not a release download.

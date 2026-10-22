@@ -21,9 +21,15 @@
 //! parsed and passes unchanged. Claude Code already truncates Bash output and pages Read output
 //! well below that, so the bound only matters for unusually large MCP results.
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::env::values::KnownValue;
+use crate::gates::read::{self, ReadVerdict};
+use crate::gates::secretpath::{self, Class};
+use crate::io::{Decision, HookInput};
+use crate::policy::Policy;
 
 /// Largest PostToolUse payload the redact hook parses (8 MiB). Larger payloads pass unscanned.
 pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -31,6 +37,73 @@ pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 /// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
 /// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
 pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
+    scrub_value(response, values)
+}
+
+/// Whether `text` carries a redaction marker this module writes (`***REDACTED:` or
+/// `«redacted:`).
+pub fn contains_marker(text: &str) -> bool {
+    text.contains("***REDACTED:") || text.contains("«redacted:")
+}
+
+/// The PostToolUse redact decision for one hook payload: [`scrub_response`], except that the
+/// response of an opted-in raw env Read skips the value scrub (D8 v2 spec §2), since a
+/// value-scrubbed copy would be written back over the real values by the next Edit or Write.
+/// Pattern redaction (keys, seeds, PEM, vendor tokens) still applies to it at every tier; the
+/// write gate refuses to write a redaction marker back into an env file. The exemption is
+/// verified here, not inferred from the response having arrived: the tool is `Read`, both the
+/// requested file and the response's file are env class (by name or resolved target), and the
+/// read gate, re-run on the request with this `policy` (its runtime tier, `env_read` and
+/// sandbox), lets it through (no opinion, or an ask the user approved). When the read gate
+/// crashed or was bypassed on a read it would deny, the response is scrubbed.
+pub fn scrub_tool_response(
+    input: &HookInput,
+    response: &Value,
+    values: &[KnownValue],
+    cwd: &Path,
+    policy: &Policy,
+) -> Option<Value> {
+    if is_permitted_env_read(input, response, cwd, policy) {
+        return scrub_response(response, &[]);
+    }
+    scrub_response(response, values)
+}
+
+fn is_permitted_env_read(input: &HookInput, response: &Value, cwd: &Path, policy: &Policy) -> bool {
+    if input.tool_name.as_deref() != Some("Read")
+        || response.get("type").and_then(Value::as_str) != Some("text")
+    {
+        return false;
+    }
+    let requested = input
+        .tool_input
+        .as_ref()
+        .and_then(|i| i.get("file_path"))
+        .and_then(Value::as_str);
+    let served = response
+        .get("file")
+        .and_then(|f| f.get("filePath"))
+        .and_then(Value::as_str);
+    let (Some(requested), Some(served)) = (requested, served) else {
+        return false;
+    };
+    if !is_env_file(requested, cwd) || !is_env_file(served, cwd) {
+        return false;
+    }
+    matches!(
+        read::decide_tool("Read", input.tool_input.as_ref(), cwd, policy),
+        ReadVerdict::Decide(Decision::Defer | Decision::Ask { .. })
+    )
+}
+
+/// Whether `file` (absolute or relative to `cwd`) is env class by name or resolved target.
+fn is_env_file(file: &str, cwd: &Path) -> bool {
+    let is_env = |p: &str| secretpath::classify(p) == Class::Env;
+    is_env(file)
+        || std::fs::canonicalize(cwd.join(file)).is_ok_and(|r| is_env(&r.to_string_lossy()))
+}
+
+fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
     if is_binary_payload(response) {
         return None;
     }
@@ -46,7 +119,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
         }
         Value::Array(items) => {
             let scrubbed: Vec<Option<Value>> =
-                items.iter().map(|v| scrub_response(v, values)).collect();
+                items.iter().map(|v| scrub_value(v, values)).collect();
             if scrubbed.iter().all(Option::is_none) {
                 return None;
             }
@@ -62,7 +135,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
             let mut changed = false;
             let mut out = map.clone();
             for (key, value) in map {
-                if let Some(new) = scrub_response(value, values) {
+                if let Some(new) = scrub_value(value, values) {
                     out.insert(key.clone(), new);
                     changed = true;
                 }
