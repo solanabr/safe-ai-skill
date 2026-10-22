@@ -52,6 +52,7 @@ const GREP_EXCLUDED: &[&str] = &[
     "**/.superstack/**",
     "**/.config/varlock/**",
     "**/.varlock/**",
+    "**/.claude/projects/**",
 ];
 
 /// Names a Grep `glob` is tried against: one that matches a secret probe and no benign probe

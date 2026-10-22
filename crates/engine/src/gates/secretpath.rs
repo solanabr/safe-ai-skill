@@ -115,6 +115,7 @@ const HARD_TREES: &[&str] = &[
     ".superstack",
     ".config/varlock",
     ".varlock",
+    ".claude/projects",
 ];
 
 /// Rules for the Solana CLI tree, SSH identities, superstack and the varlock key store.
@@ -143,6 +144,21 @@ fn tree_class(full: &str) -> Option<Class> {
     if tree_rest(&rooted, ".config/varlock").is_some() || tree_rest(&rooted, ".varlock").is_some() {
         return Some(Class::HardDeny("varlock key store"));
     }
+    // Claude Code transcripts record hook `systemMessage`s, which carry safe-ai-skill's
+    // confirmation codes (spec D4.1): the agent must not read them back.
+    if tree_rest(&rooted, ".claude/projects").is_some()
+        || under_env_dir(full, "CLAUDE_CONFIG_DIR", "projects")
+    {
+        return Some(Class::HardDeny("Claude Code transcripts"));
+    }
+    // The state MAC key of a safe-ai-skill data dir.
+    let data_key = tree_rest(&rooted, "plugins/data").is_some_and(|rest| {
+        rest.split_once('/')
+            .is_some_and(|(dir, name)| dir.starts_with("safe-ai-skill-") && name == "key")
+    });
+    if data_key || under_env_dir(full, "CLAUDE_PLUGIN_DATA", "key") {
+        return Some(Class::HardDeny("safe-ai-skill state key"));
+    }
     if let Some(xdg) = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|x| !x.is_empty())
@@ -153,6 +169,17 @@ fn tree_class(full: &str) -> Option<Class> {
         }
     }
     None
+}
+
+/// Whether `full` is `$<var>/<entry>` or lies under it.
+fn under_env_dir(full: &str, var: &str, entry: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| {
+            let dir = format!("{}/{entry}", normalize(&v, None).trim_end_matches('/'));
+            full == dir || full.starts_with(&format!("{dir}/"))
+        })
 }
 
 /// The part of `rooted` after the first `/<dir>/` component sequence, if any (`""` when the
@@ -166,7 +193,7 @@ fn tree_rest<'a>(rooted: &'a str, dir: &str) -> Option<&'a str> {
 }
 
 /// Whether `dir` is, or lies inside, a hard-deny tree (`.config/solana`, `.ssh`,
-/// `.superstack`, the varlock key store). A directory search there cannot be made safe by
+/// `.superstack`, the varlock key store, Claude Code transcripts). A directory search there cannot be made safe by
 /// excluding file names.
 pub fn is_hard_tree(dir: &str, homes: &[String]) -> bool {
     let full = normalize(dir, homes.first().map(String::as_str));
@@ -372,6 +399,26 @@ mod tests {
 
     fn class(path: &str) -> Class {
         classify_with_homes(path, &[HOME.to_string()])
+    }
+
+    #[test]
+    fn transcripts_and_the_state_key_are_hard_denies() {
+        for p in [
+            "/home/u/.claude/projects/-home-u-proj/abc.jsonl",
+            "~/.claude/projects/x/memory/MEMORY.md",
+            "/home/u/.claude/plugins/data/safe-ai-skill-stbr/key",
+            "~/.claude/plugins/data/safe-ai-skill-safe-ai-skill/key",
+        ] {
+            assert!(class(p).is_hard(), "{p}");
+        }
+        for p in [
+            "/home/u/.claude/plugins/data/safe-ai-skill-stbr/audit.jsonl",
+            "/home/u/proj/src/key",
+            "/home/u/.claude/settings.json",
+        ] {
+            assert!(!class(p).is_hard(), "{p}");
+        }
+        assert!(is_hard_tree("~/.claude/projects", &["/home/u".to_string()]));
     }
 
     #[test]

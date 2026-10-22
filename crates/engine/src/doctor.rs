@@ -15,7 +15,11 @@ use serde_json::Value;
 /// Globs recommended for `sandbox.filesystem.denyRead`: the hard-deny and env classes.
 /// `~/.config/solana/*.json` (not `**`) keeps `cli/config.yml` readable for the Solana CLI;
 /// `**/.env.*` also hides `.env.example` from sandboxed commands (the Read tool still sees it).
+/// Claude Code transcripts and the data dir's state key are listed because transcripts record
+/// the hook messages that carry confirmation codes, and the key signs safe-ai-skill's state.
 pub const RECOMMENDED_DENY_READ: &[&str] = &[
+    "~/.claude/projects/**",
+    "~/.claude/plugins/data/safe-ai-skill-*/key",
     "**/*-keypair.json",
     "~/.config/solana/*.json",
     "~/.ssh/id_*",
@@ -135,6 +139,18 @@ pub fn main(_args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcripts_and_state_key_are_recommended() {
+        let out = report(None, std::path::Path::new("/nonexistent"));
+        for glob in [
+            "~/.claude/projects/**",
+            "~/.claude/plugins/data/safe-ai-skill-*/key",
+        ] {
+            assert!(RECOMMENDED_DENY_READ.contains(&glob), "{glob}");
+            assert!(out.contains(glob), "{out}");
+        }
+    }
 
     #[test]
     fn later_files_override_enabled_and_lists_merge() {

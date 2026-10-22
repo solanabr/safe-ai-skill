@@ -1045,6 +1045,18 @@ mod tests {
     }
 
     #[test]
+    fn transcripts_and_the_state_key_deny() {
+        for cmd in [
+            "cat ~/.claude/projects/-x/abc.jsonl",
+            "grep -r code ~/.claude/projects",
+            "base64 ~/.claude/plugins/data/safe-ai-skill-stbr/key",
+        ] {
+            let d = decide(cmd, &policy());
+            assert!(matches!(d, Decision::Deny { .. }), "{cmd}: {d:?}");
+        }
+    }
+
+    #[test]
     fn env_subcommand_defers() {
         let d = decide("safe-ai-skill env keys .env", &policy());
         assert!(matches!(d, Decision::Defer), "{d:?}");
