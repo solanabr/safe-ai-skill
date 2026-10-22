@@ -41,7 +41,7 @@ impl Network {
 pub struct Context {
     /// Resolved network for the action.
     pub network: Network,
-    /// `${CLAUDE_PLUGIN_DATA}` (or `~/.safe-ai-skill`) — where state lives.
+    /// The plugin data dir ([`plugin_data_dir`]) — where state lives.
     pub plugin_data: PathBuf,
     /// Project root for the session.
     pub project_dir: PathBuf,
@@ -542,19 +542,17 @@ fn solana_config_rpc_url() -> Option<String> {
     None
 }
 
-/// `${CLAUDE_PLUGIN_DATA}` if set, else `~/.safe-ai-skill`, else `./.safe-ai-skill`.
+/// The plugin data dir path, resolved by [`crate::datadir::data_dir`] exactly as the hooks
+/// resolve it (never a `./.safe-ai-skill` fallback).
+///
+/// Kept for the call sites that only need a path. When nothing resolves (no
+/// `CLAUDE_PLUGIN_DATA`, `CLAUDE_CONFIG_DIR`, `HOME` or `USERPROFILE`) it returns a
+/// fixed dir under the system temp dir, which [`crate::datadir`] would report untrusted.
 pub fn plugin_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_PLUGIN_DATA") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    match crate::datadir::data_dir() {
+        Ok(dir) => dir.path,
+        Err(_) => std::env::temp_dir().join("safe-ai-skill-unresolved"),
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".safe-ai-skill");
-        }
-    }
-    PathBuf::from(".safe-ai-skill")
 }
 
 /// Project root for a session. Currently the cwd itself (reserved for a future git-root walk).

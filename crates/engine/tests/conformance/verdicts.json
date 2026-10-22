@@ -1,0 +1,138 @@
+{
+  "_doc": "Golden verdicts and invocation errors.",
+  "cases": [
+    {
+      "name": "mainnet transfer asks",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana transfer Abc 1 --url mainnet-beta"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_json": {
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": "Mainnet transfer — approve to proceed"
+          }
+        }
+      }
+    },
+    {
+      "name": "within-cap devnet transfer allows (D1.1 ii)",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana transfer Abc 0.1 --url devnet"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_json": {
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow"
+          }
+        }
+      }
+    },
+    {
+      "name": "keypair read via cat is denied",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "cat ~/.config/solana/id.json"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout_json": {
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Reading secret file `~/.config/solana/id.json` via `cat` is blocked (keypair/.env/config)"
+          }
+        }
+      }
+    },
+    {
+      "name": "gate-bash fails closed on empty stdin",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": "",
+      "expect": {
+        "exit": 0,
+        "stdout_json": {
+          "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
+            "permissionDecisionReason": "safe-ai-skill: hook input is malformed and was not inspected; review this call manually."
+          }
+        }
+      }
+    },
+    {
+      "name": "broad gate has no opinion on empty stdin",
+      "args": [
+        "gate-read"
+      ],
+      "stdin": "",
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "unknown subcommand exits 3 with empty stdout",
+      "args": [
+        "nope"
+      ],
+      "stdin": "",
+      "expect": {
+        "exit": 3,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "missing subcommand exits 3 with empty stdout",
+      "args": [],
+      "stdin": "",
+      "expect": {
+        "exit": 3,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "--version prints one plain line",
+      "args": [
+        "--version"
+      ],
+      "stdin": "",
+      "expect": {
+        "exit": 0,
+        "stdout_prefix": "safe-ai-skill "
+      }
+    }
+  ]
+}

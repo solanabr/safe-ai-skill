@@ -130,7 +130,13 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 
 ---
 
-## State files (under `${CLAUDE_PLUGIN_DATA}`, fallback `~/.safe-ai-skill`)
+## State files (in the data dir: `datadir::data_dir()`)
+
+`datadir::data_dir()` resolves `CLAUDE_PLUGIN_DATA`, else the preferred `safe-ai-skill-*` dir
+under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`; never a relative path.
+`DataDir::trusted` is false under `CLAUDE_PROJECT_DIR` (or the hook cwd) or outside those
+roots. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
+`key`).
 
 | File | Producer | Purpose |
 |---|---|---|
@@ -142,6 +148,8 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 | `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
 | `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
 | `session/<id>.json` | `session` (round-2) | ephemeral session keypairs (0600) |
+| `key` | `statefile` | 32-byte HMAC key for authenticated state (0600) |
+| `pending.json` | `confirm` | prompt-nonce pending entries (authenticated, 600 s TTL) |
 
 ---
 
@@ -305,7 +313,7 @@ pub struct Context { pub network: Network, pub plugin_data: PathBuf, pub project
 impl Context { pub fn build(command: &str, cwd: &Path) -> Context; }
 
 pub fn resolve_network(command: &str, cwd: &Path) -> Network;  // flag>env>Anchor.toml>cached solana config
-pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA} | ~/.safe-ai-skill
+pub fn plugin_data_dir() -> PathBuf;                            // datadir::data_dir().path
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
 Fully implemented (not a stub). Never panics; `Unknown` on failure.

@@ -488,6 +488,7 @@ dependencies = [
  "bs58",
  "ed25519-dalek",
  "glob",
+ "rand_core",
  "serde",
  "serde_json",
  "serde_yaml",

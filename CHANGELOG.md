@@ -4,6 +4,15 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [1.1.0] — Unreleased
+
+### Behaviour changes
+
+- **The CLI uses the hooks' data directory.** `safe-ai-skill allow`, `mode`, `status` and the other commands now find state where the hooks keep it: `CLAUDE_PLUGIN_DATA`, else the `safe-ai-skill-*` directory under `~/.claude/plugins/data` (or `$CLAUDE_CONFIG_DIR/plugins/data`). The `~/.safe-ai-skill` and `./.safe-ai-skill` fallbacks are gone; state written there by 1.0.x was never read by the hooks.
+- **New hooks:** PreToolUse `Skill`, `UserPromptExpansion`, and SessionStart on `clear` and `compact`. All fail open (`onFailure: continue`).
+
+---
+
 ## [1.0.1] — Unreleased
 
 ### Summary

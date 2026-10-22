@@ -21,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::Network;
+use crate::gate::{AllowReason, Verdict};
 use crate::io::Decision;
 use crate::policy::Policy;
 
@@ -119,6 +121,27 @@ pub fn check(amount: f64, ledger: &SpendLedger, policy: &Policy) -> Decision {
     Decision::Allow
 }
 
+/// The gate verdict for a transfer of `amount` SOL on `network` (predict-only, like [`check`]).
+///
+/// Over a cap, [`check`] decides on any cluster. Within the caps this is the only place that
+/// mints [`AllowReason::WithinCapTestnet`] (spec D1.1(ii)), and only for a positively
+/// identified devnet/testnet/localnet; mainnet and an unidentified network ask.
+pub fn verdict(amount: f64, ledger: &SpendLedger, policy: &Policy, network: Network) -> Verdict {
+    match check(amount, ledger, policy) {
+        Decision::Deny { reason } => Verdict::Deny(reason),
+        Decision::Ask { reason } => Verdict::Ask(reason),
+        Decision::Allow | Decision::Defer => match network {
+            Network::Devnet | Network::Testnet | Network::Localnet => {
+                Verdict::Allow(AllowReason::WithinCapTestnet)
+            }
+            Network::Mainnet => Verdict::Ask("Mainnet transfer — approve to proceed".to_string()),
+            Network::Unknown => {
+                Verdict::Ask("Transfer on an unidentified network — approve to proceed".to_string())
+            }
+        },
+    }
+}
+
 /// Record a SOL spend and decide against per-tx / hard / daily caps.
 ///
 /// Loads the ledger (rolling the day over), evaluates the candidate `sol_amount` via
@@ -211,6 +234,40 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn verdict_allows_within_cap_only_on_a_positively_identified_test_cluster() {
+        use crate::context::Network;
+        use crate::gate::{AllowReason, Verdict};
+        let policy = policy_with_caps(1.0, 10.0, 5.0);
+        let ledger = SpendLedger {
+            day: current_epoch_day(),
+            total_sol: 0.0,
+        };
+        for net in [Network::Devnet, Network::Testnet, Network::Localnet] {
+            assert_eq!(
+                verdict(0.5, &ledger, &policy, net),
+                Verdict::Allow(AllowReason::WithinCapTestnet)
+            );
+        }
+        assert_eq!(
+            verdict(0.5, &ledger, &policy, Network::Mainnet),
+            Verdict::Ask("Mainnet transfer — approve to proceed".into())
+        );
+        assert_eq!(
+            verdict(0.5, &ledger, &policy, Network::Unknown),
+            Verdict::Ask("Transfer on an unidentified network — approve to proceed".into())
+        );
+        // Over a cap the cap decides, on any cluster.
+        assert!(matches!(
+            verdict(2.0, &ledger, &policy, Network::Devnet),
+            Verdict::Ask(_)
+        ));
+        assert!(matches!(
+            verdict(20.0, &ledger, &policy, Network::Devnet),
+            Verdict::Deny(_)
+        ));
     }
 
     #[test]

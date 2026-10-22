@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use crate::gate::GateMeta;
+use crate::gate::{AllowReason, GateMeta, GrantId, Verdict};
 use crate::grants;
 use crate::io::Decision;
 use crate::policy::Policy;
@@ -42,10 +42,27 @@ use crate::policy::Policy;
 /// stability and possible future policy-gated grant rules; the grant layer itself reads only
 /// the persisted grants.
 pub fn apply(natural: Decision, meta: &GateMeta, policy: &Policy, plugin_data: &Path) -> Decision {
+    match natural {
+        Decision::Ask { reason } => {
+            apply_verdict(Verdict::Ask(reason), meta, policy, plugin_data).into()
+        }
+        other => other,
+    }
+}
+
+/// [`apply`] over a [`Verdict`]: a relaxed `Ask` becomes
+/// `Allow(`[`AllowReason::Grant`]`)` naming the grant that permitted it. This is the only
+/// place that mints a [`GrantId`].
+pub fn apply_verdict(
+    natural: Verdict,
+    meta: &GateMeta,
+    policy: &Policy,
+    plugin_data: &Path,
+) -> Verdict {
     let _ = policy;
 
     // 1. Only an `Ask` is ever a relaxation candidate.
-    if !matches!(natural, Decision::Ask { .. }) {
+    if !matches!(natural, Verdict::Ask(_)) {
         return natural;
     }
 
@@ -67,7 +84,7 @@ pub fn apply(natural: Decision, meta: &GateMeta, policy: &Policy, plugin_data: &
     let amount = meta.amount_sol.unwrap_or(0.0);
     let _ = grants::debit(plugin_data, &grant_id, amount);
 
-    Decision::Allow
+    Verdict::Allow(AllowReason::Grant(GrantId::new(grant_id)))
 }
 
 #[cfg(test)]
@@ -143,6 +160,44 @@ mod tests {
         // The grant was debited by the action amount.
         let after = grants::load(&dir);
         assert_eq!(after.grants[0].spent_sol, 0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verdict_relaxation_names_the_grant() {
+        use crate::gate::{AllowReason, Verdict};
+        let dir = tmp_dir("verdict");
+        write_transfer_grant(&dir, 5.0);
+        let out = apply_verdict(
+            Verdict::Ask("transfer".into()),
+            &transfer_meta(0.5, false),
+            &effective_policy(),
+            &dir,
+        );
+        match out {
+            Verdict::Allow(AllowReason::Grant(id)) => assert_eq!(id.as_str(), "g1"),
+            other => panic!("expected a grant allow, got {other:?}"),
+        }
+        // Hard guards and non-asks pass through.
+        let ask = Verdict::Ask("secret".into());
+        assert_eq!(
+            apply_verdict(
+                ask.clone(),
+                &transfer_meta(0.5, true),
+                &effective_policy(),
+                &dir
+            ),
+            ask
+        );
+        assert_eq!(
+            apply_verdict(
+                Verdict::NoOpinion,
+                &transfer_meta(0.5, false),
+                &effective_policy(),
+                &dir
+            ),
+            Verdict::NoOpinion
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

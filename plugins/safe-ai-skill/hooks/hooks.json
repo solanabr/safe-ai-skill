@@ -12,6 +12,9 @@
       ]},
       { "matcher": "mcp__.*", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-mcp", "timeout": 15, "onFailure": "continue" }
+      ]},
+      { "matcher": "Skill", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-skill", "timeout": 10, "onFailure": "continue" }
       ]}
     ],
     "PostToolUse": [
@@ -22,8 +25,11 @@
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill prompt-guard", "timeout": 10, "onFailure": "continue" } ] }
     ],
+    "UserPromptExpansion": [
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-prompt-expansion", "timeout": 10, "onFailure": "continue" } ] }
+    ],
     "SessionStart": [
-      { "matcher": "startup|resume", "hooks": [
+      { "matcher": "startup|resume|clear|compact", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill verify session", "timeout": 60, "onFailure": "continue" }
       ]}
     ]

@@ -44,5 +44,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// The engine error under the name the shared contracts (`datadir`, `statefile`, `confirm`) use.
+pub type EngineError = Error;
+
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, Error>;

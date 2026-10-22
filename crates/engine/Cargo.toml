@@ -30,6 +30,9 @@ bs58 = "0.5"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # Ed25519 session keypairs (Phase 3). rand_core for keygen in round-2.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# OS CSPRNG (`OsRng`) for confirmation nonces and the state MAC key. Already in the tree via
+# ed25519-dalek; the `getrandom` feature reuses the getrandom crate rustls/ring already build.
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [profile.release]
 opt-level = "z"

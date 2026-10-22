@@ -248,17 +248,7 @@ fn transfer_decision(
             // Predict the decision against the ledger WITHOUT committing — `main.rs`
             // debits via `spend::commit` only when the action is allowed.
             let ledger = SpendLedger::load(&ctx.plugin_data);
-            let spend_decision = spend::check(sol, &ledger, policy);
-            match ctx.network {
-                Network::Mainnet => {
-                    escalate_to_ask(spend_decision, "Mainnet transfer — approve to proceed")
-                }
-                Network::Unknown => escalate_to_ask(
-                    spend_decision,
-                    "Transfer on an unidentified network — approve to proceed",
-                ),
-                Network::Devnet | Network::Testnet | Network::Localnet => spend_decision,
-            }
+            spend::verdict(sol, &ledger, policy, ctx.network).into()
         }
         Amount::All => Decision::Ask {
             reason: format!("{program} transfer of ALL (the entire balance) — approve to proceed"),
@@ -418,17 +408,6 @@ fn ask_ambiguous(program: &str) -> (Decision, GateMeta) {
         },
         meta,
     )
-}
-
-/// Escalate an `Allow`/`Defer` to `Ask`; keep an existing `Ask`/`Deny` as-is (a deny must
-/// remain a deny; an existing ask reason is preserved).
-fn escalate_to_ask(decision: Decision, reason: &str) -> Decision {
-    match decision {
-        Decision::Allow | Decision::Defer => Decision::Ask {
-            reason: reason.to_string(),
-        },
-        other => other,
-    }
 }
 
 /// Numeric severity used to pick the most-restrictive decision across segments.

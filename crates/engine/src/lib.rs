@@ -12,11 +12,16 @@
 //! - Spend & swap: [`spend`], [`rugcheck`].
 //! - Relaxation layer: [`grants`], [`mode`], [`relax`].
 //! - Supply chain & session: [`verify`], [`registry`], [`squads`], [`session`].
+//! - Shared contracts (1.1.0): [`datadir`] (where state lives, and whether it is trusted),
+//!   [`statefile`] (MAC'd state), [`confirm`] (prompt-nonce confirmation), and
+//!   [`gate::Verdict`].
 //!
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
 pub mod audit;
+pub mod confirm;
 pub mod context;
+pub mod datadir;
 pub mod error;
 pub mod gate;
 pub mod gates;
@@ -32,4 +37,5 @@ pub mod rugcheck;
 pub mod session;
 pub mod spend;
 pub mod squads;
+pub mod statefile;
 pub mod verify;
