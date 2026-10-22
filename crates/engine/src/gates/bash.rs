@@ -29,7 +29,7 @@ use std::path::Path;
 
 use crate::context::shell::{self, Parsed};
 use crate::context::{self, Argv, Context, Network};
-use crate::gate::{GateMeta, Scope, Verdict};
+use crate::gate::{GateMeta, Scope};
 use crate::io::Decision;
 use crate::policy::Policy;
 use crate::spend::{self, SpendLedger};
@@ -45,43 +45,39 @@ pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateM
 /// The indirection prefilter of the unconditional Bash hook (spec D6.3, default-route).
 ///
 /// Claude Code runs `gate-bash` only for commands its case-sensitive `if: Bash(solana *)`
-/// filters match. The one shape they are sure to send is a single top-level command spelled
-/// exactly `solana …`, `spl-token …` or `anchor …`; that is left to `gate-bash` (`None`).
-/// Every other command naming a solana-family program gets the gate's decision here, with
-/// both default networks unknown (no `solana config get` in the always-on hook). A mention
-/// followed by a gated subcommand token that the parse cannot account for asks as a hard
-/// guard; a mention with only read-only words has no opinion. It never allows (this hook
-/// cannot debit a transfer), and its meta is a hard guard, so no grant relaxes it. `cwd`
-/// resolves relative `-C` paths.
+/// filters match: a command spelled exactly `solana …`, `spl-token …` or `anchor …` at top
+/// level (after `;` or `&&` too). When every solana-family command in `command` has that
+/// shape, `gate-bash` decides and this returns `None`. Otherwise — a family command behind a
+/// wrapper, in a script, after a pipe, spelled differently, or one the parser cannot read —
+/// this returns the gate's own decision, resolved like `gate-bash` resolves it (defaults from
+/// `cwd`) and with its own meta, so grants and profiles relax it the same way. It never
+/// returns an allow or no opinion: those are left to the normal permission flow.
 pub fn indirection_prefilter(
     command: &str,
     cwd: &Path,
     policy: &Policy,
-) -> Option<(Verdict, GateMeta)> {
-    if !shell::mentions_family(command) {
+) -> Option<(Decision, GateMeta)> {
+    if !shell::mentions_family(command)
+        && !shell::parse(command).commands.iter().any(|c| c.is_family())
+    {
         return None;
     }
     let parsed = shell::parse(command);
-    let canonical_single = !parsed.unparseable
-        && !parsed.opaque
-        && !parsed.substitution
-        && parsed.commands.len() == 1
-        && parsed.commands.iter().all(|c| c.canonical);
-    if canonical_single {
+    let routed = parsed.unparseable
+        || parsed.opaque_mention
+        || (parsed.writes_family_script && parsed.runs_script_file)
+        || parsed.commands.iter().any(|c| {
+            let dynamic_program = c.words.first().is_some_and(|w| w.dynamic);
+            let dynamic_words = c.is_family() && c.words.iter().any(|w| w.dynamic);
+            dynamic_program || dynamic_words || (c.is_family() && !c.canonical)
+        });
+    if !routed {
         return None;
     }
-    let ctx = Context {
-        network: Network::Unknown,
-        anchor_network: Network::Unknown,
-        plugin_data: context::plugin_data_dir(),
-        project_dir: cwd.to_path_buf(),
-    };
-    let (decision, mut meta) = decide_parsed(command, &parsed, &ctx, policy);
-    meta.hard_guard = true;
-    match decision {
-        Decision::Ask { reason } => Some((Verdict::Ask(reason), meta)),
-        Decision::Deny { reason } => Some((Verdict::Deny(reason), meta)),
-        Decision::Allow | Decision::Defer => None,
+    let ctx = Context::build(command, cwd);
+    match decide_parsed(command, &parsed, &ctx, policy) {
+        (decision @ (Decision::Ask { .. } | Decision::Deny { .. }), meta) => Some((decision, meta)),
+        _ => None,
     }
 }
 
@@ -95,8 +91,7 @@ pub fn with_indirection_prefilter(
     policy: &Policy,
 ) -> (Decision, GateMeta) {
     match indirection_prefilter(command, cwd, policy) {
-        Some((verdict, routed_meta)) => {
-            let routed = Decision::from(verdict);
+        Some((routed, routed_meta)) => {
             if severity(&routed) > severity(&decision) {
                 (routed, routed_meta)
             } else {
@@ -113,9 +108,11 @@ fn decide_parsed(
     ctx: &Context,
     policy: &Policy,
 ) -> (Decision, GateMeta) {
-    // Family mentions followed by a state-changing subcommand word, wherever they appear.
-    let gated = shell::gated_mentions(command);
-    if gated > 0 && (parsed.unparseable || parsed.opaque) {
+    // A solana-family program named where the parser cannot follow: unparseable text, or an
+    // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
+    // one. It could be any command at all: a hard-guard ask, whatever its words.
+    let named = shell::mentions_family(command);
+    if (parsed.unparseable && named) || parsed.opaque_mention {
         return ask_unparseable();
     }
 
@@ -125,8 +122,6 @@ fn decide_parsed(
 
     for cmd in &parsed.commands {
         let candidate = if cmd.is_family() {
-            // A command reached indirectly may run where the hook's own filters do not look.
-            unvetted |= cmd.indirect;
             let program = cmd.program();
             let argv = Argv::from_shell(&cmd.words);
             let segment_ctx = Context {
@@ -146,9 +141,9 @@ fn decide_parsed(
                 decision
             };
             (mainnet_policy(decision, segment_ctx.network, policy), meta)
-        } else if gated > 0 && cmd.words.first().is_some_and(|w| w.dynamic) {
-            // `$S transfer …`: the program is an expansion and could be any of them.
-            ask_unparseable()
+        } else if named && cmd.words.first().is_some_and(|w| w.dynamic) {
+            // `X=solana; $X …`: the program is an expansion and could be any of them.
+            ask_unaccounted()
         } else {
             unvetted = true;
             continue;
@@ -163,11 +158,9 @@ fn decide_parsed(
         }
     }
 
-    // A gated mention the parse found no solana-family command for (a quoted string, a
-    // script written to a file, a launcher it does not know) could run anywhere: ask.
-    let family = parsed.commands.iter().filter(|c| c.is_family()).count();
-    if gated > family {
-        let unaccounted = ask_unparseable();
+    // A value-moving solana command written to a file that a shell then runs.
+    if parsed.writes_family_script && parsed.runs_script_file {
+        let unaccounted = ask_unaccounted();
         let keep = best
             .as_ref()
             .is_some_and(|(d, _)| severity(d) >= severity(&unaccounted.0));
@@ -541,6 +534,18 @@ fn ask_unparseable() -> (Decision, GateMeta) {
     (
         Decision::Ask {
             reason: "Could not parse this command, and it names a solana-family program — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
+/// A solana-family command runs whose words the gate cannot fully see: the program is an
+/// expansion, or the command is written to a script that is then run. A hard-guard ask.
+fn ask_unaccounted() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "This command runs a solana-family command the gate cannot fully see — approve to proceed"
                 .to_string(),
         },
         GateMeta::unreadable(),

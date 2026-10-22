@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::{permission_decision, Invocation, Run, TempDir};
 use safe_ai_skill::context::{Context, Network};
-use safe_ai_skill::gate::{GateMeta, Verdict};
+use safe_ai_skill::gate::GateMeta;
 use safe_ai_skill::gates::bash;
 use safe_ai_skill::io::Decision;
 use safe_ai_skill::policy::Policy;
@@ -97,7 +97,7 @@ fn unparseable_or_opaque_command_naming_solana_asks() {
         "echo \"unterminated solana transfer".to_string(),
         "echo $(solana transfer".to_string(),
         format!("echo 'solana transfer -um {DEST} 1' | bash"),
-        "eval \"$CMD solana transfer\"".to_string(),
+        "eval \"$CMD solana\"".to_string(),
         "S=solana; $S transfer x 1".to_string(),
         format!("python3 -c \"import os; os.system('solana transfer -um {DEST} 1')\""),
     ] {
@@ -133,13 +133,26 @@ fn separators_inside_quotes_do_not_split_a_transfer() {
 }
 
 #[test]
-fn indirect_transfer_is_never_allowed() {
+fn indirect_transfer_follows_spend_rules_but_the_prefilter_never_allows() {
+    // Fully parsed, so the gate's own rules apply (fix round 2); the always-on hook that
+    // routes it never emits the allow itself.
+    let policy = Policy::default();
     for cmd in [
-        format!("bash -c 'solana transfer {DEST} 0.5'"),
-        format!("sudo solana transfer {DEST} 0.5"),
+        format!("bash -c 'solana transfer -ud {DEST} 0.5'"),
+        format!("sudo solana transfer -ud {DEST} 0.5"),
     ] {
-        let (d, _) = decide(&cmd, Network::Devnet);
-        assert_ne!(d, Decision::Allow, "{cmd}");
+        let (d, meta) = decide(&cmd, Network::Devnet);
+        // `bash` itself is code the gate does not classify: no opinion rather than allow.
+        assert!(
+            matches!(d, Decision::Allow | Decision::Defer),
+            "{cmd}: {d:?}"
+        );
+        assert!(!meta.hard_guard, "{cmd}");
+        assert_eq!(
+            bash::indirection_prefilter(&cmd, Path::new("."), &policy),
+            None,
+            "{cmd}"
+        );
     }
 }
 
@@ -375,22 +388,27 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
         format!("bash -c 'solana transfer -um {DEST} 1'"),
         format!("eval \"solana transfer -um {DEST} 1\""),
         format!("echo x\nsolana transfer -um {DEST} 1"),
-        format!("sudo solana transfer {DEST} 0.5"),
-        format!("sol''ana transfer {DEST} 0.5"),
+        format!("sudo solana transfer -um {DEST} 0.5"),
+        format!("sol''ana transfer -um {DEST} 0.5"),
         format!("echo x | solana transfer -um {DEST} 1"),
         format!("false || solana transfer -um {DEST} 1"),
-        "echo \"unterminated solana transfer".to_string(),
-        "bash -c 'anchor deploy'".to_string(),
-        // Default-route: anything but a single canonical command goes through the gate.
+        "echo \"unterminated solana".to_string(),
+        "bash -c 'anchor deploy --provider.cluster mainnet'".to_string(),
         format!("FOO=1 solana transfer -um {DEST} 1"),
-        format!("solana balance && solana transfer -um {DEST} 1"),
-        format!("solana transfer -um {DEST} 1; echo done"),
     ] {
         match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
-            Some((Verdict::Ask(_), meta)) => assert!(meta.hard_guard, "{cmd}"),
+            Some((Decision::Ask { .. }, _)) => {}
             other => panic!("{cmd}: {other:?}"),
         }
     }
+    // A fully parsed routed command keeps the gate's own meta: a grant may relax it.
+    let (_, meta) = bash::indirection_prefilter(
+        &format!("sudo solana transfer -um {DEST} 0.5"),
+        Path::new("."),
+        &policy,
+    )
+    .unwrap();
+    assert!(!meta.hard_guard);
     let (d, _) = decide(
         "bash -c 'solana program deploy -um --final p.so'",
         Network::Devnet,
@@ -402,7 +420,7 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
             Path::new("."),
             &policy
         ),
-        Some((Verdict::Deny(_), _))
+        Some((Decision::Deny { .. }, _))
     ));
 }
 
@@ -412,6 +430,11 @@ fn prefilter_leaves_direct_and_unrelated_commands_alone() {
     for cmd in [
         format!("solana transfer -um {DEST} 1"),
         "anchor deploy".to_string(),
+        // Every family command is one gate-bash sees (`;` and `&&` split): it decides.
+        format!("solana balance && solana transfer -um {DEST} 1"),
+        format!("solana transfer -um {DEST} 1; echo done"),
+        "cd app && anchor test".to_string(),
+        format!("cd x && solana transfer -ud {DEST} 0.5"),
         "ls -la".to_string(),
         // Family mentions with read-only words only.
         "sudo solana balance".to_string(),
@@ -464,9 +487,7 @@ fn probe_rows() -> Vec<String> {
         format!("fakeroot solana {t}"),
         format!("numactl --cpunodebind=0 solana {t}"),
         format!("chpst -u me solana {t}"),
-        format!("C:\\bin\\solana.exe {t}"),
-        format!("git commit -m 'solana {t}'"),
-        "node -e \"require('@coral-xyz/anchor'); x.transfer()\"".to_string(),
+        format!("'C:\\bin\\solana.exe' {t}"),
     ]
 }
 
@@ -475,10 +496,82 @@ fn probe_rows_get_a_verdict_from_the_always_on_hook() {
     let policy = Policy::default();
     for cmd in probe_rows() {
         match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
-            Some((Verdict::Ask(_) | Verdict::Deny(_), meta)) => assert!(meta.hard_guard, "{cmd}"),
+            Some((Decision::Ask { .. } | Decision::Deny { .. }, _)) => {}
             other => panic!("{cmd}: {other:?}"),
         }
     }
+}
+
+/// Commands built from expansions around a family name (fix round 2): a hard-guard ask from
+/// both hooks, whatever their words.
+fn expansion_rows() -> Vec<String> {
+    vec![
+        "bash -c \"solana $X\"".to_string(),
+        "eval \"solana $ARGS\"".to_string(),
+        "sh -c \"spl-token $OP\"".to_string(),
+        "printf 'solana %s' \"$A\" | sh".to_string(),
+        "python3 -c \"import os; os.system('solana ' + os.environ['A'])\"".to_string(),
+        "X=solana; $X $Y".to_string(),
+        "eval \"$CMD solana\"".to_string(),
+        "echo \"unterminated solana".to_string(),
+        format!("S=transfer; solana $S -um {DEST} 1"),
+    ]
+}
+
+#[test]
+fn expansion_built_family_commands_ask_as_hard_guard() {
+    let policy = Policy::default();
+    for cmd in expansion_rows() {
+        let (d, meta) = decide(&cmd, Network::Devnet);
+        assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
+        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+            Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+    // Two reasons: unparseable versus a family command the gate cannot fully see.
+    let (unparsed, _) = decide("eval \"$CMD solana\"", Network::Devnet);
+    let (unseen, _) = decide("X=solana; $X $Y", Network::Devnet);
+    assert!(
+        unparsed.reason().contains("Could not parse"),
+        "{unparsed:?}"
+    );
+    assert!(unseen.reason().contains("cannot fully see"), "{unseen:?}");
+}
+
+#[test]
+fn data_mentions_have_no_opinion() {
+    let policy = Policy::default();
+    for cmd in [
+        "git commit -m \"fix solana transfer bug\"",
+        "grep -r \"solana transfer\" docs/",
+        "rg \"solana program\" src",
+        "git log --grep \"solana config\"",
+        "echo \"run anchor test\" && cargo build",
+        "cd programs/anchor && cargo test",
+        "vim programs/anchor/tests/run.rs",
+        "ls ~/.config/solana && cat config.yml",
+        "yarn add @coral-xyz/anchor && yarn test",
+        "npm i @coral-xyz/anchor && npm run build",
+        "node -e \"require('@coral-xyz/anchor'); x.transfer()\"",
+    ] {
+        let (d, _) = decide(cmd, Network::Devnet);
+        assert_eq!(d, Decision::Defer, "{cmd}");
+        assert_eq!(
+            bash::indirection_prefilter(cmd, Path::new("."), &policy),
+            None,
+            "{cmd}"
+        );
+    }
+    // gate-bash's own rules decide these; the always-on hook defers to it.
+    let (d, _) = decide("cd app && anchor test", Network::Devnet);
+    assert!(is_ask(&d), "{d:?}");
+    let (d, meta) = decide(
+        &format!("cd x && solana transfer -ud {DEST} 0.5"),
+        Network::Devnet,
+    );
+    assert_eq!(d, Decision::Defer);
+    assert_eq!(meta.amount_sol, Some(0.5));
 }
 
 #[test]

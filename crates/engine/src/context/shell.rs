@@ -89,47 +89,25 @@ const LAUNCHERS: &[&str] = &[
     "chpst",
 ];
 
-/// Subcommand words that change state somewhere: a family name followed later by one of
-/// these routes the whole command to the gate (spec D6.3, default-route ruling). A word
-/// starting with `create-`, `stake-` or `vote-` counts too.
+/// Value-moving or irreversible subcommand words. A family mention followed by one of these
+/// in text written to a file that a shell then runs is a solana command the gate cannot see.
+/// A word starting with `create-` counts too.
 pub const GATED_TOKENS: &[&str] = &[
     "transfer",
-    "pay",
-    "program",
     "deploy",
     "upgrade",
-    "migrate",
     "close",
     "close-mint",
-    "close-vote-account",
     "set-authority",
     "set-upgrade-authority",
-    "set-buffer-authority",
     "authorize",
     "withdraw",
     "withdraw-stake",
-    "withdraw-from-vote-account",
     "delegate-stake",
-    "deactivate-stake",
-    "split-stake",
-    "merge-stake",
     "mint",
     "burn",
     "erase-authority",
     "write-buffer",
-    "idl",
-    "wrap",
-    "unwrap",
-    "approve",
-    "revoke",
-    "freeze",
-    "thaw",
-    "gc",
-    "config",
-    "test",
-    "run",
-    "airdrop",
-    "redelegate-stake",
 ];
 
 /// Characters that continue a word for mention and gated-token matching.
@@ -264,6 +242,20 @@ pub struct Parsed {
     pub env_changed: bool,
     /// Changes directory (`cd`, `pushd`, `popd`, `env -C`) before a later command.
     pub cwd_changed: bool,
+    /// An opaque input (see [`Parsed::opaque`]) whose text names a solana-family program: a
+    /// solana command runs that the parser cannot read.
+    pub opaque_mention: bool,
+    /// Writes a file with text naming a solana-family program and a value-moving subcommand
+    /// (`echo 'solana transfer …' > x.sh`, `cat > x.sh <<EOF`).
+    pub writes_family_script: bool,
+    /// Runs a script file (`bash x.sh`, `source x`, `./x.sh`).
+    pub runs_script_file: bool,
+}
+
+/// Mark `out` opaque because of code in `text` it cannot read.
+fn opaque(out: &mut Parsed, text: &str) {
+    out.opaque = true;
+    out.opaque_mention |= mentions_family(text);
 }
 
 /// Parse `command` (see the module docs). Never panics.
@@ -273,69 +265,88 @@ pub fn parse(command: &str) -> Parsed {
     out
 }
 
-/// Whether `command` names a solana-family program on a word boundary (`/usr/bin/solana`,
-/// `solana.exe` and `SOLANA` count; `solana-keygen` and `solana.so` do not), after removing
-/// quotes and backslashes (`sol""ana`, `s\olana`), or holds ANSI-C quoting (`$'\x73olana'`).
-/// The cheap pre-check of the unconditional Bash hook.
-pub fn mentions_family(command: &str) -> bool {
-    command.contains("$'") || !mention_scans(command).iter().all(|s| s.mentions == 0)
+/// Whether `text` names a solana-family program on a word boundary, after removing quotes
+/// (and, in a second reading, backslashes: `s\olana`), or holds ANSI-C quoting
+/// (`$'\x73olana'`). `/usr/bin/solana`, `solana.exe` and `SOLANA` count; `solana-keygen`,
+/// `solana.so` and path segments that are not a program do not (`programs/anchor/x`,
+/// `@coral-xyz/anchor`, `~/.config/solana`).
+pub fn mentions_family(text: &str) -> bool {
+    text.contains("$'") || readings(text).iter().any(|r| scan(r, false))
 }
 
-/// How many family mentions in `command` are followed, somewhere later, by a gated
-/// subcommand token ([`GATED_TOKENS`]). Quoted strings and here-document bodies count.
-pub fn gated_mentions(command: &str) -> usize {
-    mention_scans(command)
-        .iter()
-        .map(|s| s.gated)
-        .max()
-        .unwrap_or(0)
+/// Whether `text` names a solana-family program followed, somewhere later, by a value-moving
+/// subcommand word ([`GATED_TOKENS`]).
+pub fn gated_mention(text: &str) -> bool {
+    readings(text).iter().any(|r| scan(r, true))
 }
 
-/// One way of reading the raw text for mentions.
-struct MentionScan {
-    mentions: usize,
-    gated: usize,
-}
-
-/// Scan `command` twice: quotes removed with backslashes as separators (paths such as
-/// `C:\bin\solana.exe`), and quotes and backslashes both removed (`s\olana`).
-fn mention_scans(command: &str) -> [MentionScan; 2] {
-    let lower = command.to_lowercase();
-    let unquoted: String = lower.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
-    let plain: String = unquoted.chars().filter(|&c| c != '\\').collect();
-    [scan_mentions(&unquoted), scan_mentions(&plain)]
-}
-
-fn scan_mentions(text: &str) -> MentionScan {
-    let words: Vec<&str> = text
-        .split(|c: char| !is_mention_char(c))
-        .filter(|w| !w.is_empty())
+/// `text` lowercased with quotes removed: backslashes kept as separators (`C:\bin\solana`),
+/// then also removed (`s\olana`).
+fn readings(text: &str) -> [String; 2] {
+    let unquoted: String = text
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\''))
         .collect();
+    let plain: String = unquoted.chars().filter(|&c| c != '\\').collect();
+    [unquoted, plain]
+}
+
+/// Scan one reading: any program mention, or (`gated`) one followed by a gated token.
+fn scan(text: &str, gated: bool) -> bool {
+    // (word, counts as a program mention)
+    let mut words: Vec<(&str, bool)> = Vec::new();
+    let is_path_sep = |c: char| matches!(c, '/' | '\\');
+    for token in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|'
+                    | '&'
+                    | '('
+                    | ')'
+                    | '<'
+                    | '>'
+                    | '='
+                    | ','
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '`'
+                    | '$'
+            )
+    }) {
+        let segments: Vec<&str> = token.split(is_path_sep).collect();
+        let pathy = segments.len() > 1;
+        // A program path: no npm scope, home, hidden or relative-dot segment.
+        let program_path = !segments
+            .iter()
+            .any(|s| s.starts_with('@') || s.starts_with('~') || s.starts_with('.'));
+        let last = segments.len().saturating_sub(1);
+        for (i, segment) in segments.iter().enumerate() {
+            let program_position = !pathy || (i == last && program_path);
+            for word in segment.split(|c: char| !is_mention_char(c)) {
+                if !word.is_empty() {
+                    words.push((word, program_position));
+                }
+            }
+        }
+    }
     let is_mention = |w: &str| {
         let w = w.trim_end_matches('.');
         let w = w.strip_suffix(".exe").unwrap_or(w);
         FAMILY.contains(&w)
     };
     let is_gated = |w: &str| {
-        // `x.transfer()`: a method name counts as a token of its own.
-        w.split('.').any(|part| {
-            GATED_TOKENS.contains(&part)
-                || part.starts_with("create-")
-                || part.starts_with("stake-")
-                || part.starts_with("vote-")
-        })
+        w.split('.')
+            .any(|part| GATED_TOKENS.contains(&part) || part.starts_with("create-"))
     };
-    let mut mentions = 0;
-    let mut gated = 0;
-    for (i, word) in words.iter().enumerate() {
-        if is_mention(word) {
-            mentions += 1;
-            if words.iter().skip(i + 1).any(|w| is_gated(w)) {
-                gated += 1;
-            }
-        }
-    }
-    MentionScan { mentions, gated }
+    words.iter().enumerate().any(|(i, &(word, program))| {
+        program
+            && is_mention(word)
+            && (!gated || words.iter().skip(i + 1).any(|&(w, _)| is_gated(w)))
+    })
 }
 
 /// The base name of a program word, lowercased: path (`/` or `\`), a zsh `=` prefix and a
@@ -359,6 +370,8 @@ fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) {
         chars: script.chars().collect(),
         i: 0,
         depth,
+        line_writes: false,
+        compound_seen: false,
         out,
     };
     lx.run(indirect);
@@ -392,12 +405,19 @@ struct Pending {
     piped_in: bool,
     /// Follows `|` or `||`, which Claude Code's `if` filters are not known to split on.
     after_pipe: bool,
+    /// The words of the earlier stages of its pipeline (what a shell reading the pipe runs).
+    upstream: String,
 }
 
 struct Lexer<'p> {
     chars: Vec<char>,
     i: usize,
     depth: usize,
+    /// A command on the current line writes a file (a here-document may be its content).
+    line_writes: bool,
+    /// A compound command (`for`, `case`, `while`, …) or a `case` pattern was seen at this
+    /// level: later commands sit inside it, where the hook's `if` filters may not look.
+    compound_seen: bool,
     out: &'p mut Parsed,
 }
 
@@ -435,12 +455,18 @@ impl Lexer<'_> {
                         match line_reads {
                             Reads::Shell => parse_into(&body, self.depth + 1, true, self.out),
                             // Interpreter code the parser cannot read.
-                            Reads::Interpreter => self.out.opaque = true,
-                            Reads::Data if doc.expands => self.scan_expansions(&body),
-                            Reads::Data => {}
+                            Reads::Interpreter => opaque(self.out, &body),
+                            Reads::Data => {
+                                self.out.writes_family_script |=
+                                    self.line_writes && gated_mention(&body);
+                                if doc.expands {
+                                    self.scan_expansions(&body);
+                                }
+                            }
                         }
                     }
                     line_reads = Reads::Data;
+                    self.line_writes = false;
                     after_break = true;
                 }
                 ';' => {
@@ -510,6 +536,7 @@ impl Lexer<'_> {
                 ')' => {
                     // A `case` pattern or a stray paren ends the command.
                     self.i += 1;
+                    self.compound_seen = true;
                     line_reads =
                         line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                 }
@@ -547,9 +574,22 @@ impl Lexer<'_> {
     fn flush(&mut self, cmd: &mut Pending, indirect: bool, pipe_next: bool) -> Reads {
         let pending = std::mem::take(cmd);
         cmd.piped_in = pipe_next;
+        if pipe_next {
+            let words: Vec<&str> = pending.words.iter().map(|w| w.text.as_str()).collect();
+            cmd.upstream = format!("{} {}", pending.upstream, words.join(" "));
+        }
+        self.line_writes |= pending.writes_file;
         if pending.words.is_empty() {
             return Reads::Data;
         }
+        let indirect = indirect || self.compound_seen;
+        self.compound_seen |= pending.words.first().is_some_and(|w| {
+            !w.quoted
+                && matches!(
+                    w.text.as_str(),
+                    "for" | "select" | "while" | "until" | "if" | "case" | "function" | "repeat"
+                )
+        });
         finish_command(pending, indirect, self.depth, self.out)
     }
 
@@ -774,6 +814,8 @@ impl Lexer<'_> {
             chars: text.chars().collect(),
             i: 0,
             depth: self.depth,
+            line_writes: false,
+            compound_seen: false,
             out: &mut *self.out,
         };
         let mut sink = Word::default();
@@ -1083,6 +1125,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         writes_file,
         piped_in,
         after_pipe,
+        upstream,
     } = pending;
     let mut indirect = indirect || after_pipe;
     let canonical_head = words
@@ -1163,6 +1206,13 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
     }
     let args = words.get(1..).unwrap_or_default();
     let mut reads = Reads::Data;
+    if writes_file {
+        let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+        out.writes_family_script |= gated_mention(&text.join(" "));
+    }
+    if first.text.starts_with("./") || first.text.starts_with("../") || program.ends_with(".sh") {
+        out.runs_script_file = true;
+    }
 
     match program.as_str() {
         "cd" | "pushd" | "popd" => out.cwd_changed = true,
@@ -1171,11 +1221,15 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         }
         "source" | "." => {
             out.env_changed = true;
-            out.opaque |= args.iter().any(|w| w.dynamic);
+            out.runs_script_file = true;
+            for word in args.iter().filter(|w| w.dynamic) {
+                opaque(out, &word.text);
+            }
         }
         "eval" => {
             if args.iter().any(|w| w.dynamic) {
-                out.opaque = true;
+                let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+                opaque(out, &text.join(" "));
             } else {
                 let script: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
                 parse_into(&script.join(" "), depth + 1, true, out);
@@ -1192,21 +1246,30 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 args
             };
             match shell_script(args) {
-                ShellInput::Script(script) if script.dynamic => out.opaque = true,
+                ShellInput::Script(script) if script.dynamic => opaque(out, &script.text),
                 ShellInput::Script(script) => parse_into(&script.text, depth + 1, true, out),
                 ShellInput::File(file) if is_stdin_path(&file.text) => {
                     reads = Reads::Shell;
-                    out.opaque |= piped_in;
+                    if piped_in {
+                        opaque(out, &upstream);
+                    }
                 }
-                ShellInput::File(file) => out.opaque |= file.dynamic,
+                ShellInput::File(file) => {
+                    out.runs_script_file = true;
+                    if file.dynamic {
+                        opaque(out, &file.text);
+                    }
+                }
                 ShellInput::Stdin => {
                     reads = Reads::Shell;
-                    out.opaque |= piped_in;
+                    if piped_in {
+                        opaque(out, &upstream);
+                    }
                 }
             }
             for here in &herestrings {
                 if here.dynamic {
-                    out.opaque = true;
+                    opaque(out, &here.text);
                 } else {
                     parse_into(&here.text, depth + 1, true, out);
                 }
@@ -1218,13 +1281,19 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         {
             let code_flag = |w: &Word| matches!(w.text.as_str(), "-c" | "-e" | "-E" | "--eval");
             let runs_code = args.iter().any(code_flag) || !herestrings.is_empty();
-            let names = args
+            let code: Vec<&str> = args
                 .iter()
                 .chain(herestrings.iter())
-                .any(|w| mentions_family(&w.text) || w.dynamic);
-            // Code piped in is invisible; `-c`/`-e` code is only opaque when it names a
-            // solana-family program or is an expansion.
-            out.opaque |= piped_in || (runs_code && names);
+                .map(|w| w.text.as_str())
+                .collect();
+            // Code piped in is invisible; so is `-c`/`-e` code (it matters when it names a
+            // solana-family program).
+            if piped_in {
+                opaque(out, &upstream);
+            }
+            if runs_code {
+                opaque(out, &code.join(" "));
+            }
             if !args.iter().any(code_flag) && interpreter_reads_stdin(args) {
                 reads = Reads::Interpreter;
             }
@@ -1379,7 +1448,7 @@ fn launch(args: &[Word], program: &str, depth: usize, out: &mut Parsed) {
         {
             if let Some(script) = args.get(pos + 1) {
                 if script.dynamic {
-                    out.opaque = true;
+                    opaque(out, &script.text);
                 } else {
                     parse_into(&script.text, depth + 1, true, out);
                 }
@@ -1389,7 +1458,8 @@ fn launch(args: &[Word], program: &str, depth: usize, out: &mut Parsed) {
     }
     if program == "ssh" {
         // The remote command is the words after the host, joined by the remote shell.
-        out.opaque |= args.iter().any(|w| mentions_family(&w.text));
+        let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+        opaque(out, &text.join(" "));
         return;
     }
     // A literal argument holding a command line (`watch 'solana …'`, `tmux new 'solana …'`,
@@ -1397,7 +1467,7 @@ fn launch(args: &[Word], program: &str, depth: usize, out: &mut Parsed) {
     for word in args {
         if word.text.contains([' ', '\t', '\n', ';']) {
             if word.dynamic {
-                out.opaque = true;
+                opaque(out, &word.text);
             } else {
                 parse_into(&word.text, depth + 1, true, out);
             }
@@ -1608,7 +1678,7 @@ mod tests {
         ] {
             assert!(parse(command).opaque, "{command}");
         }
-        for command in ["bash run.sh", "python3 -c 'print(1)'", "echo hi | grep h"] {
+        for command in ["bash run.sh", "echo hi | grep h"] {
             assert!(!parse(command).opaque, "{command}");
         }
     }
@@ -1767,20 +1837,56 @@ mod tests {
     }
 
     #[test]
-    fn mentions_use_word_boundaries() {
+    fn mentions_use_word_boundaries_and_skip_path_segments() {
         assert!(mentions_family("x | /usr/bin/solana balance"));
         assert!(mentions_family("SOLANA.EXE balance"));
         assert!(mentions_family(r"C:\bin\solana.exe balance"));
-        assert!(!mentions_family("solana-keygen new"));
-        assert!(!mentions_family("cp target/deploy/solana_program.so x"));
-        assert!(!mentions_family("cargo add anchor-lang"));
-        assert_eq!(
-            gated_mentions("node -e \"require('@coral-xyz/anchor')\""),
-            0
-        );
-        assert_eq!(gated_mentions("git commit -m 'solana transfer fix'"), 1);
-        assert_eq!(gated_mentions("x.transfer(); require('anchor')"), 0);
-        assert_eq!(gated_mentions("solana balance; solana transfer X 1"), 2);
+        for text in [
+            "solana-keygen new",
+            "cp target/deploy/solana_program.so x",
+            "cargo add anchor-lang",
+            "vim programs/anchor/tests/run.rs",
+            "yarn add @coral-xyz/anchor",
+            "ls ~/.config/solana",
+            "cat $HOME/.config/solana/cli/config.yml",
+        ] {
+            assert!(!mentions_family(text), "{text}");
+        }
+        assert!(gated_mention("echo 'solana transfer X 1'"));
+        assert!(!gated_mention(
+            "solana config get; anchor test; anchor run x"
+        ));
+        assert!(!gated_mention("require('@coral-xyz/anchor'); x.transfer()"));
+    }
+
+    #[test]
+    fn executed_strings_naming_solana_are_opaque_mentions() {
+        for command in [
+            "bash -c \"solana $X\"",
+            "eval \"$CMD solana\"",
+            "printf 'solana %s' \"$A\" | sh",
+            "python3 -c \"import os; os.system('solana ' + x)\"",
+            "python3 - <<'EOF'\nimport os; os.system('solana transfer')\nEOF",
+        ] {
+            assert!(parse(command).opaque_mention, "{command}");
+        }
+        for command in [
+            "eval \"$CMD\"",
+            "python3 -c 'print(1)'",
+            "echo hi | sh",
+            "node -e \"require('@coral-xyz/anchor')\"",
+        ] {
+            assert!(!parse(command).opaque_mention, "{command}");
+        }
+    }
+
+    #[test]
+    fn scripts_written_then_run_are_noted() {
+        let p = parse("echo 'solana transfer -um X 1' > x.sh; bash x.sh");
+        assert!(p.writes_family_script && p.runs_script_file);
+        let p = parse("cat > x.sh <<EOF\nsolana transfer X 1\nEOF\nchmod +x x.sh && ./x.sh");
+        assert!(p.writes_family_script && p.runs_script_file);
+        assert!(!parse("echo 'solana balance' > notes.txt").writes_family_script);
     }
 
     #[test]

@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "safe_ai_skill"
 path = "src/lib.rs"
 
+[features]
+# Test-only hooks (a crash trigger for the panic-ask path). Never enable for a release.
+test-hooks = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: parsing must return the exact f64 that was serialized, or the state MAC

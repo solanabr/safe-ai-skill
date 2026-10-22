@@ -65,6 +65,17 @@ const DEADLINE_GATES: &[&str] = &[
     "gate-skill",
 ];
 
+/// The PreToolUse gates whose panic writes a hard-guard `ask` before the process ends
+/// (release builds abort on panic, so the deadline path never sees it).
+const PANIC_ASK_GATES: &[&str] = &[
+    "gate-bash",
+    "gate-bash-secrets",
+    "gate-read",
+    "gate-mcp",
+    "gate-tamper",
+    "gate-skill",
+];
+
 /// A subcommand handler: gets the arguments after the subcommand name.
 type Handler = fn(&[String]) -> ExitCode;
 
@@ -96,6 +107,9 @@ fn main() -> ExitCode {
     let sub = args.get(1).map(String::as_str).unwrap_or("");
     let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
 
+    if PANIC_ASK_GATES.contains(&sub) {
+        install_panic_ask();
+    }
     match SUBCOMMANDS.iter().find(|(name, _)| *name == sub) {
         Some((name, handler)) if DEADLINE_GATES.contains(name) => {
             run_with_deadline(gate_deadline(), *handler, rest.to_vec())
@@ -151,13 +165,31 @@ fn deadline_decision(reason: &str) -> Decision {
 /// deny if it already decided one; nothing if it already answered) and exit 0: no gate fails
 /// open.
 fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> ExitCode {
-    let reason = match within(budget, move || handler(&rest)) {
+    let reason = match within(budget, move || {
+        // Test-only crash trigger (the `test-hooks` feature is never built for release).
+        #[cfg(feature = "test-hooks")]
+        if std::env::var_os("SAFE_AI_SKILL_TEST_PANIC").is_some() {
+            panic!("safe-ai-skill test panic");
+        }
+        handler(&rest)
+    }) {
         Ok(code) => return code,
         Err(mpsc::RecvTimeoutError::Timeout) => DEADLINE_REASON,
         Err(mpsc::RecvTimeoutError::Disconnected) => CRASH_REASON,
     };
     let _ = io::emit_pretooluse(&deadline_decision(reason));
     std::process::exit(0)
+}
+
+/// On a panic, write the hard-guard `ask` (the gate's deny if it already reached one) before
+/// the default report and the abort. Best effort: a write error is ignored, and a decision
+/// already written is never followed by a second one.
+fn install_panic_ask() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
+        default(info);
+    }));
 }
 
 /// Run `f` on a worker thread (8 MiB stack) and wait at most `budget` for it: `Timeout`
@@ -407,7 +439,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
-    // is decided here too, audited under its own (hard-guard) meta.
+    // is decided here too, under the bash gate's own meta.
     let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
         safe_ai_skill::gates::secrets::decide(command, &effective),
         GateMeta::new(Scope::SecretRead, true),
