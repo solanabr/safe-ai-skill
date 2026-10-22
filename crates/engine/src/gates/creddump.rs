@@ -27,7 +27,9 @@
 //! `solana-test-validator`) may name a keypair under `~/.config/solana` or `*-keypair.json`:
 //! they use it without printing it, and the on-chain gates own those commands.
 //!
-//! Residual: analysis of argv is incomplete by nature (variables, `eval`, encodings, scripts
+//! A `NAME=value` prefix assignment's value is checked the same way (`S=~/.ssh/id_ed25519;
+//! cat $S`). Residual: analysis of argv is incomplete by nature (variables built from parts,
+//! `eval`, encodings, scripts
 //! that build the path, subprocesses). `safe-ai-skill doctor` prints the sandbox `denyRead`
 //! snippet generated from `credentials.list`; that is the real control. Naming a private key
 //! in argv for a legitimate tool (`ssh -i ~/.ssh/id_ed25519`) is denied too; run it yourself.
@@ -100,7 +102,20 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     if matches!(known, crate::io::Decision::Deny { .. }) {
         return None;
     }
-    path_check(&parsed.commands, cwd).map(|what| Verdict::Deny(path_reason(&what)))
+    path_check(&parsed.commands, cwd)
+        .or_else(|| assigned_hit(&parsed.assigned_values, cwd))
+        .map(|what| Verdict::Deny(path_reason(&what)))
+}
+
+/// A `NAME=<credential path>` prefix assignment: the variable then names the store
+/// (`S=~/.ssh/id_ed25519; cat $S`). Judged like a word of an ordinary command.
+fn assigned_hit(values: &[String], hook_cwd: &Path) -> Option<String> {
+    let cwds = [hook_cwd.to_path_buf()];
+    values
+        .iter()
+        .take(MAX_WORDS)
+        .find_map(|v| word_hit(v, &cwds, Exempt::None))
+        .map(|hit| format!("assignment {hit}"))
 }
 
 fn reason(what: &str) -> String {
@@ -787,6 +802,20 @@ mod tests {
         for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
             let verdict = decide("gh auth token", Path::new("/tmp"), &policy, tier);
             assert!(matches!(verdict, Some(Verdict::Deny(_))), "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_assignment_naming_a_store_denies() {
+        for c in [
+            "S=~/.ssh/id_ed25519; cat $S",
+            "K=$HOME/.aws/credentials python3 x.py",
+            "F=~/.vault-token && cat \"$F\"",
+        ] {
+            assert!(decide_text(c), "{c}");
+        }
+        for c in ["S=~/.ssh/config; cat $S", "FOO=1 ls", "N=build make"] {
+            assert!(!decide_text(c), "{c}");
         }
     }
 
