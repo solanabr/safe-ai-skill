@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         "gate-bash-secrets" => cmd_gate_bash_secrets(),
         "gate-read" => cmd_gate_read(),
         "gate-mcp" => cmd_gate_mcp(),
+        "gate-tamper" => cmd_gate_tamper(),
         "redact" => cmd_redact(),
         "prompt-guard" => cmd_prompt_guard(),
         "verify" => cmd_verify(rest),
@@ -279,7 +280,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
-    let decision = safe_ai_skill::gates::secrets::decide(command, &effective);
+    let decision = safe_ai_skill::gates::secrets::decide(command, &cwd, &effective);
     // Secret reads are always a hard guard.
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
@@ -316,6 +317,26 @@ fn cmd_gate_mcp() -> ExitCode {
     let ctx = Context::build("", &cwd);
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
+}
+
+/// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
+fn cmd_gate_tamper() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let input = match parsed {
+        Ok(input) => input,
+        Err(Unreadable::Empty) => return ExitCode::SUCCESS,
+        Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
+    };
+    let cwd = cwd_of(&input);
+    let plugin_data = context::plugin_data_dir();
+    let effective = load_effective_policy(&cwd, &plugin_data);
+    let protected = safe_ai_skill::gates::tamper::Protected::from_env();
+    let decision =
+        safe_ai_skill::gates::tamper::decide_file(input.tool_input.as_ref(), &cwd, &protected);
+    // A tamper verdict is final: no grant or profile relaxes it, so it skips `relax::apply`.
+    write_audit(&effective, &plugin_data, &input, &raw, "tamper", &decision);
+    let _ = io::emit_pretooluse(&decision);
+    ExitCode::SUCCESS
 }
 
 fn cmd_redact() -> ExitCode {
