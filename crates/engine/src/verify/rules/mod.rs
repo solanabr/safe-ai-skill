@@ -529,60 +529,108 @@ fn scan_file(
         return out;
     }
 
-    let text = decode(buf, content);
-    let first_line = text.lines().next().unwrap_or("");
+    let readings = decode(buf, content);
+    let first_line = |text: &str| text.lines().next().unwrap_or("").to_string();
     let name = rel
         .file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if is_lockfile(&name) && !executable && !first_line.starts_with("#!") {
+    let shebang = readings.iter().any(|t| first_line(t).starts_with("#!"));
+    if is_lockfile(&name) && !executable && !shebang {
         // Generated dependency data: inventoried at `verify add|check` (spec D7.2), never run.
         return out;
     }
-    let class = context::classify(rel, first_line, executable);
-    if size > cap {
-        if matches!(class, FileClass::Code(_)) {
-            out.emit("oversize_file", Severity::High, None, Ctx::Code);
-        } else {
-            out.emit("oversize_file", Severity::Info, None, Ctx::Doc);
+    for (k, text) in readings.iter().enumerate() {
+        let class = context::classify(rel, &first_line(text), executable);
+        if k == 0 && size > cap {
+            if matches!(class, FileClass::Code(_)) {
+                out.emit("oversize_file", Severity::High, None, Ctx::Code);
+            } else {
+                out.emit("oversize_file", Severity::Info, None, Ctx::Doc);
+            }
         }
+        let doc = Document::new(text, class);
+        scan_text(&doc, rel, settings, &mut out, facts);
     }
-    let doc = Document::new(&text, class);
-    scan_text(&doc, rel, settings, &mut out, facts);
     out
 }
 
-/// Decode a text file: UTF-8 (BOM dropped), UTF-16 by its BOM, or NUL-stripped lossy UTF-8.
-fn decode(buf: &[u8], content: Content) -> std::borrow::Cow<'_, str> {
+/// Decode a text file into the readings to scan: UTF-8 (BOM dropped), NUL-stripped lossy UTF-8,
+/// or UTF-16/32 by its byte-order mark. A wide reading that does not look like that encoding
+/// (a forged mark in front of ASCII) is scanned next to the UTF-8 reading of the same bytes, so
+/// the worse of the two counts.
+fn decode(buf: &[u8], content: Content) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match content {
-        Content::Utf16 { little_endian } => {
-            let units = buf
-                .get(2..)
-                .unwrap_or(&[])
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&pair| {
-                    if little_endian {
-                        u16::from_le_bytes(pair)
-                    } else {
-                        u16::from_be_bytes(pair)
-                    }
-                });
-            let text: String = char::decode_utf16(units)
-                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                .filter(|&c| c != '\0')
-                .collect();
-            std::borrow::Cow::Owned(text)
+        Content::Wide {
+            width,
+            little_endian,
+        } => {
+            let body = buf.get(width..).unwrap_or(&[]);
+            let (text, plausible) = decode_wide(body, width, little_endian);
+            let mut readings = vec![Cow::Owned(text)];
+            if !plausible {
+                readings.push(Cow::Owned(String::from_utf8_lossy(body).replace('\0', "")));
+            }
+            readings
         }
         Content::TextWithNul => {
             let body = buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf);
-            std::borrow::Cow::Owned(String::from_utf8_lossy(body).replace('\0', ""))
+            vec![Cow::Owned(String::from_utf8_lossy(body).replace('\0', ""))]
         }
-        Content::Utf8 | Content::Binary => {
-            String::from_utf8_lossy(buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf))
+        Content::Utf8 | Content::Binary => vec![String::from_utf8_lossy(
+            buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf),
+        )],
+    }
+}
+
+/// `(text, plausible)`: UTF-16 or UTF-32 units decoded with NULs dropped, and whether the bytes
+/// look like that encoding — no invalid unit, and at least half the characters ASCII (scripts and
+/// configs saved as UTF-16 are mostly ASCII; ASCII behind a forged mark decodes to CJK-range
+/// noise or to code points past U+10FFFF).
+fn decode_wide(body: &[u8], width: usize, little_endian: bool) -> (String, bool) {
+    let mut text = String::with_capacity(body.len() / width);
+    let (mut total, mut ascii, mut bad) = (0usize, 0usize, 0usize);
+    let mut take = |c: Option<char>| {
+        total += 1;
+        match c {
+            Some(c) => {
+                if c.is_ascii() {
+                    ascii += 1;
+                }
+                if c != '\0' {
+                    text.push(c);
+                }
+            }
+            None => {
+                bad += 1;
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+    };
+    if width == 4 {
+        for &quad in body.as_chunks::<4>().0 {
+            let v = if little_endian {
+                u32::from_le_bytes(quad)
+            } else {
+                u32::from_be_bytes(quad)
+            };
+            take(char::from_u32(v));
+        }
+    } else {
+        let units = body.as_chunks::<2>().0.iter().map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        });
+        for c in char::decode_utf16(units) {
+            take(c.ok());
         }
     }
+    let plausible = bad == 0 && ascii * 2 >= total;
+    (text, plausible)
 }
 
 /// Run every text rule over one decoded file.

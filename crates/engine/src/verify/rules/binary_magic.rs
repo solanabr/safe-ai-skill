@@ -81,10 +81,42 @@ pub(super) enum Content {
     Binary,
     /// UTF-8 text (a leading BOM is dropped).
     Utf8,
-    /// UTF-16 text announced by its byte-order mark.
-    Utf16 { little_endian: bool },
+    /// UTF-16 (`width` 2) or UTF-32 (`width` 4) announced by a byte-order mark.
+    Wide { width: usize, little_endian: bool },
     /// A text or code file carrying NUL bytes: decoded with the NULs stripped.
     TextWithNul,
+}
+
+/// The encoding a byte-order mark announces. UTF-32 marks are checked first: `FF FE 00 00` is
+/// not UTF-16.
+fn bom(head: &[u8]) -> Option<Content> {
+    let (width, little_endian) = if head.starts_with(&[0xFF, 0xFE, 0, 0]) {
+        (4, true)
+    } else if head.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        (4, false)
+    } else if head.starts_with(&[0xFF, 0xFE]) {
+        (2, true)
+    } else if head.starts_with(&[0xFE, 0xFF]) {
+        (2, false)
+    } else {
+        return None;
+    };
+    Some(Content::Wide {
+        width,
+        little_endian,
+    })
+}
+
+/// UTF-16/32 text without a byte-order mark: NULs make up a quarter of the bytes or more, and
+/// nine in ten of the others are printable ASCII.
+fn wide_text(head: &[u8]) -> bool {
+    let nul = head.iter().filter(|&&b| b == 0).count();
+    let other = head.len() - nul;
+    let printable = head
+        .iter()
+        .filter(|&&b| matches!(b, b'\t' | b'\n' | b'\r' | 0x20..=0x7E))
+        .count();
+    nul * 4 >= head.len() && other > 0 && printable * 10 >= other * 9
 }
 
 /// Inspect the head of a file and decide how to read it. A known text/code file (or a BOM)
@@ -99,21 +131,14 @@ pub(super) fn scan(rel: &Path, head: &[u8], out: &mut FileOut, facts: &mut PackF
         facts.pyc.push(rel.to_path_buf());
         return Content::Binary;
     }
-    if head.starts_with(&[0xFF, 0xFE]) {
-        return Content::Utf16 {
-            little_endian: true,
-        };
-    }
-    if head.starts_with(&[0xFE, 0xFF]) {
-        return Content::Utf16 {
-            little_endian: false,
-        };
+    if let Some(wide) = bom(head) {
+        return wide;
     }
     let Some(magic) = sniff(head) else {
         if !head.contains(&0) {
             return Content::Utf8;
         }
-        if context::is_text_like(rel) || head.starts_with(b"#!") {
+        if context::is_text_like(rel) || head.starts_with(b"#!") || wide_text(head) {
             out.emit("nul_bytes", Severity::Warn, None, Ctx::Meta);
             return Content::TextWithNul;
         }
