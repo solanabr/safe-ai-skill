@@ -97,7 +97,7 @@ fn unparseable_or_opaque_command_naming_solana_asks() {
         "echo \"unterminated solana transfer".to_string(),
         "echo $(solana transfer".to_string(),
         format!("echo 'solana transfer -um {DEST} 1' | bash"),
-        "eval \"$CMD solana\"".to_string(),
+        "eval \"$CMD solana transfer\"".to_string(),
         "S=solana; $S transfer x 1".to_string(),
         format!("python3 -c \"import os; os.system('solana transfer -um {DEST} 1')\""),
     ] {
@@ -379,11 +379,15 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
         format!("sol''ana transfer {DEST} 0.5"),
         format!("echo x | solana transfer -um {DEST} 1"),
         format!("false || solana transfer -um {DEST} 1"),
-        "echo \"unterminated solana".to_string(),
+        "echo \"unterminated solana transfer".to_string(),
         "bash -c 'anchor deploy'".to_string(),
+        // Default-route: anything but a single canonical command goes through the gate.
+        format!("FOO=1 solana transfer -um {DEST} 1"),
+        format!("solana balance && solana transfer -um {DEST} 1"),
+        format!("solana transfer -um {DEST} 1; echo done"),
     ] {
         match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
-            Some(Verdict::Ask(_)) => {}
+            Some((Verdict::Ask(_), meta)) => assert!(meta.hard_guard, "{cmd}"),
             other => panic!("{cmd}: {other:?}"),
         }
     }
@@ -398,7 +402,7 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
             Path::new("."),
             &policy
         ),
-        Some(Verdict::Deny(_))
+        Some((Verdict::Deny(_), _))
     ));
 }
 
@@ -407,10 +411,13 @@ fn prefilter_leaves_direct_and_unrelated_commands_alone() {
     let policy = Policy::default();
     for cmd in [
         format!("solana transfer -um {DEST} 1"),
-        format!("FOO=1 solana transfer -um {DEST} 1"),
-        format!("solana balance && solana transfer -um {DEST} 1"),
-        format!("solana transfer -um {DEST} 1; echo done"),
+        "anchor deploy".to_string(),
         "ls -la".to_string(),
+        // Family mentions with read-only words only.
+        "sudo solana balance".to_string(),
+        "echo \"solana --version\"".to_string(),
+        "node -e \"require('@coral-xyz/anchor')\"".to_string(),
+        "cargo add solana-sdk anchor-lang".to_string(),
         "grep -r anchor src".to_string(),
         "bash -c 'solana balance'".to_string(),
         format!("bash -c 'solana transfer -ud {DEST} 0.5'"),
@@ -420,6 +427,65 @@ fn prefilter_leaves_direct_and_unrelated_commands_alone() {
             None,
             "{cmd}"
         );
+    }
+}
+
+/// The review's probe rows (fix round 1): each got no opinion from either hook before.
+fn probe_rows() -> Vec<String> {
+    let t = format!("transfer -um {DEST} 1");
+    vec![
+        format!("command solana {t} -v"),
+        format!("watch -n 100 'solana {t}'"),
+        format!("hyperfine 'solana {t}'"),
+        format!("script -q -c 'solana {t}' /dev/null"),
+        format!("tmux new -d 'solana {t}'"),
+        format!("flock l -c 'solana {t}'"),
+        format!("nix-shell --run 'solana {t}'"),
+        format!("parallel ::: 'solana {t}'"),
+        format!("bash /dev/stdin <<EOF\nsolana {t}\nEOF"),
+        format!(
+            "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['solana','transfer','-um','{DEST}','1'])\nEOF"
+        ),
+        format!("f(){{ solana \"$@\"; }}; f {t}"),
+        format!("=solana {t}"),
+        format!("noglob solana {t}"),
+        format!("nocorrect solana {t}"),
+        format!("repeat 1 solana {t}"),
+        format!("arch -arm64 solana {t}"),
+        format!("sandbox-exec -n x solana {t}"),
+        format!("solana.exe {t}"),
+        format!("echo 'solana {t}' > x.sh; bash x.sh"),
+        format!("SOLANA {t}"),
+        format!("Solana {t}"),
+        format!("case a in a) solana {t};; esac"),
+        format!("for i in 1; solana {t}"),
+        format!("pkexec solana {t}"),
+        format!("sg grp -c 'solana {t}'"),
+        format!("fakeroot solana {t}"),
+        format!("numactl --cpunodebind=0 solana {t}"),
+        format!("chpst -u me solana {t}"),
+        format!("C:\\bin\\solana.exe {t}"),
+        format!("git commit -m 'solana {t}'"),
+        "node -e \"require('@coral-xyz/anchor'); x.transfer()\"".to_string(),
+    ]
+}
+
+#[test]
+fn probe_rows_get_a_verdict_from_the_always_on_hook() {
+    let policy = Policy::default();
+    for cmd in probe_rows() {
+        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+            Some((Verdict::Ask(_) | Verdict::Deny(_), meta)) => assert!(meta.hard_guard, "{cmd}"),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn probe_rows_ask_in_gate_bash_too() {
+    for cmd in probe_rows() {
+        let (d, _) = decide(&cmd, Network::Devnet);
+        assert!(is_ask(&d) || is_deny(&d), "{cmd}: {d:?}");
     }
 }
 
@@ -528,7 +594,8 @@ fn e2e_slow_solana_config_is_unknown_within_its_timeout() {
 }
 
 #[test]
-fn e2e_deadline_asks_before_a_slow_path_finishes() {
+fn e2e_deadline_env_has_a_floor() {
+    // 200 ms is below the 2 s floor: the gate still gets 2 s, and asks.
     let bin = stub_solana("sleep 30");
     let project = TempDir::new("deadline-proj");
     let started = Instant::now();
@@ -541,8 +608,39 @@ fn e2e_deadline_asks_before_a_slow_path_finishes() {
     );
     let elapsed = started.elapsed();
     assert_eq!(label(&run).as_deref(), Some("ask"), "{}", run.stdout);
-    assert!(run.stdout.contains("time limit"), "{}", run.stdout);
-    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    assert!(elapsed >= Duration::from_millis(1500), "took {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(6), "took {elapsed:?}");
+}
+
+#[test]
+fn e2e_deadline_does_not_turn_a_deny_into_an_ask() {
+    // A mainnet `--final` deploy is denied without touching the slow CLI; the shortest
+    // deadline the env can set does not get in its way.
+    let bin = stub_solana("sleep 30");
+    let project = TempDir::new("deadline-deny");
+    let run = run_hook(
+        "gate-bash",
+        "solana program deploy -um --final ./p.so",
+        bin.path(),
+        project.path(),
+        &[("SAFE_AI_SKILL_DEADLINE_MS", "1")],
+    );
+    assert_eq!(label(&run).as_deref(), Some("deny"), "{}", run.stdout);
+}
+
+#[test]
+fn e2e_probe_rows_ask_in_the_secrets_hook() {
+    let bin = stub_solana(MAINNET_STUB);
+    let project = TempDir::new("probe-proj");
+    for cmd in probe_rows() {
+        let run = run_hook("gate-bash-secrets", &cmd, bin.path(), project.path(), &[]);
+        let got = label(&run);
+        assert!(
+            matches!(got.as_deref(), Some("ask" | "deny")),
+            "{cmd}: {got:?} {}",
+            run.stdout
+        );
+    }
 }
 
 #[test]

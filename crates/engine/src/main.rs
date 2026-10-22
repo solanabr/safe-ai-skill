@@ -14,7 +14,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use safe_ai_skill::audit::{self, AuditEntry};
@@ -41,6 +41,16 @@ const GATE_DEADLINE: Duration = Duration::from_secs(8);
 
 /// Env var that may shorten (never lengthen) [`GATE_DEADLINE`], in milliseconds.
 const DEADLINE_ENV: &str = "SAFE_AI_SKILL_DEADLINE_MS";
+
+/// Lowest deadline [`DEADLINE_ENV`] can set outside unit tests.
+const DEADLINE_FLOOR: Duration = Duration::from_secs(2);
+
+/// Stack size of the gate worker thread.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reason for the `ask` when a gate panics.
+const CRASH_REASON: &str =
+    "safe-ai-skill: the gate failed while inspecting this call; review this call manually.";
 
 /// Reason for the `ask` when a gate misses its deadline.
 const DEADLINE_REASON: &str =
@@ -100,39 +110,71 @@ fn gate_deadline() -> Duration {
     deadline_from(std::env::var(DEADLINE_ENV).ok().as_deref())
 }
 
-/// The deadline for a [`DEADLINE_ENV`] value: milliseconds, capped at [`GATE_DEADLINE`].
+/// The deadline for a [`DEADLINE_ENV`] value: milliseconds, capped at [`GATE_DEADLINE`] and
+/// floored at [`DEADLINE_FLOOR`] (outside unit tests), so the environment cannot cut a gate
+/// short enough to turn its deny into the deadline's ask.
 fn deadline_from(value: Option<&str>) -> Duration {
+    let floor = if cfg!(test) {
+        Duration::ZERO
+    } else {
+        DEADLINE_FLOOR
+    };
     value
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_millis)
-        .map_or(GATE_DEADLINE, |d| d.min(GATE_DEADLINE))
+        .map_or(GATE_DEADLINE, |d| d.clamp(floor, GATE_DEADLINE))
 }
 
-/// Run a gate under `budget`. Past it, emit the deadline `ask` (unless the gate already
-/// answered) and exit 0 at once; a panicking gate keeps its crash exit status (101).
-fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> ExitCode {
-    match within(budget, move || handler(&rest)) {
-        Ok(code) => code,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let _ = io::emit_pretooluse(&Decision::Ask {
-                reason: DEADLINE_REASON.to_string(),
-            });
-            std::process::exit(0)
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => std::process::exit(101),
+/// The decision the running gate reached, recorded before it audits and emits, so a
+/// deadline that fires in between still emits a deny as a deny.
+static DECIDED: Mutex<Option<Decision>> = Mutex::new(None);
+
+/// Record the gate's final decision for the deadline path.
+fn record_decision(decision: &Decision) {
+    if let Ok(mut slot) = DECIDED.lock() {
+        *slot = Some(decision.clone());
     }
 }
 
-/// Run `f` on a worker thread and wait at most `budget` for it: `Timeout` when it is still
-/// running, `Disconnected` when it panicked.
+/// What the deadline emits: the gate's deny if it already reached one, else an `ask` with
+/// `reason`.
+fn deadline_decision(reason: &str) -> Decision {
+    match DECIDED.lock().ok().and_then(|slot| slot.clone()) {
+        Some(deny @ Decision::Deny { .. }) => deny,
+        _ => Decision::Ask {
+            reason: reason.to_string(),
+        },
+    }
+}
+
+/// Run a gate under `budget`. Past it, or when the gate panics, emit an `ask` (the gate's
+/// deny if it already decided one; nothing if it already answered) and exit 0: no gate fails
+/// open.
+fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> ExitCode {
+    let reason = match within(budget, move || handler(&rest)) {
+        Ok(code) => return code,
+        Err(mpsc::RecvTimeoutError::Timeout) => DEADLINE_REASON,
+        Err(mpsc::RecvTimeoutError::Disconnected) => CRASH_REASON,
+    };
+    let _ = io::emit_pretooluse(&deadline_decision(reason));
+    std::process::exit(0)
+}
+
+/// Run `f` on a worker thread (8 MiB stack) and wait at most `budget` for it: `Timeout`
+/// when it is still running, `Disconnected` when it panicked or could not be started.
 fn within<T: Send + 'static>(
     budget: Duration,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, mpsc::RecvTimeoutError> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
+    let spawned = std::thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return Err(mpsc::RecvTimeoutError::Disconnected);
+    }
     rx.recv_timeout(budget)
 }
 
@@ -191,6 +233,7 @@ fn ask_unreadable(why: Unreadable, input: &HookInput, raw: &[u8]) -> ExitCode {
         reason: reason.to_string(),
     };
     let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &plugin_data);
+    record_decision(&decision);
     write_audit(
         &effective,
         &plugin_data,
@@ -232,6 +275,7 @@ fn finish_pretooluse(
     raw: &[u8],
 ) -> ExitCode {
     let decision = relax::apply(natural, meta, effective, plugin_data);
+    record_decision(&decision);
 
     // Commit-on-allow: once the FINAL (post-relaxation) decision for a transfer with a
     // known amount is `Allow`, debit the daily spend ledger. The gate evaluated the
@@ -362,14 +406,15 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
-    let decision = safe_ai_skill::gates::bash::with_indirection_prefilter(
+    // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
+    // is decided here too, audited under its own (hard-guard) meta.
+    let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
         safe_ai_skill::gates::secrets::decide(command, &effective),
+        GateMeta::new(Scope::SecretRead, true),
         command,
         &cwd,
         &effective,
     );
-    // Secret reads are always a hard guard.
-    let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
 }
 
@@ -1414,6 +1459,20 @@ mod tests {
     }
 
     #[test]
+    fn worker_has_a_large_stack() {
+        // Deep recursion that overflows a 2 MiB default stack but fits in 8 MiB.
+        fn depth(n: u32) -> u32 {
+            let pad = [n as u8; 4096];
+            if n == 0 {
+                u32::from(pad[0])
+            } else {
+                depth(n - 1).wrapping_add(u32::from(std::hint::black_box(&pad)[1]))
+            }
+        }
+        assert!(within(Duration::from_secs(10), || depth(1000)).is_ok());
+    }
+
+    #[test]
     fn within_reports_a_panic() {
         let r: Result<u8, _> = within(Duration::from_secs(5), || panic!("boom"));
         assert_eq!(r, Err(mpsc::RecvTimeoutError::Disconnected));
@@ -1425,5 +1484,21 @@ mod tests {
         assert_eq!(deadline_from(Some("250")), Duration::from_millis(250));
         assert_eq!(deadline_from(Some("999999999")), GATE_DEADLINE);
         assert_eq!(deadline_from(Some("soon")), GATE_DEADLINE);
+    }
+
+    #[test]
+    fn deadline_keeps_a_deny_already_decided() {
+        assert!(matches!(deadline_decision("r"), Decision::Ask { .. }));
+        record_decision(&Decision::Allow);
+        assert!(matches!(deadline_decision("r"), Decision::Ask { .. }));
+        record_decision(&Decision::Deny {
+            reason: "mainnet --final".into(),
+        });
+        assert_eq!(
+            deadline_decision("r"),
+            Decision::Deny {
+                reason: "mainnet --final".into()
+            }
+        );
     }
 }

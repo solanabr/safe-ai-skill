@@ -171,6 +171,11 @@ pub fn cli_network(cwd: &Path) -> Network {
 }
 
 /// Map an RPC URL or cluster moniker to a [`Network`].
+///
+/// Anything naming mainnet is mainnet (the riskier reading is always safe). Otherwise only
+/// exact hosts count: `api.devnet.solana.com`/`devnet.helius-rpc.com` (devnet),
+/// `api.testnet.solana.com` (testnet), and `localhost`, `127.0.0.1`, `[::1]` or `0.0.0.0`
+/// with nothing after the host but a port (localnet). `devnet.attacker.example` is unknown.
 fn classify_url(raw: &str) -> Network {
     let s = raw
         .trim()
@@ -193,17 +198,25 @@ fn classify_url(raw: &str) -> Network {
     if s.contains('$') || s.contains('`') {
         return Network::Unknown;
     }
-    if s.contains("127.0.0.1") || s.contains("localhost") || s.contains("localnet") {
-        return Network::Localnet;
+    let rest = s.split_once("://").map_or(s.as_str(), |(_, rest)| rest);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(end);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if host_port.starts_with('[') {
+        host_port.find(']').map_or(host_port, |i| &host_port[..=i])
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    match host {
+        "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0" if after.is_empty() || after == "/" => {
+            Network::Localnet
+        }
+        "api.devnet.solana.com" | "devnet.helius-rpc.com" => Network::Devnet,
+        "api.testnet.solana.com" => Network::Testnet,
+        _ => Network::Unknown,
     }
-    if s.contains("devnet") {
-        return Network::Devnet;
-    }
-    if s.contains("testnet") {
-        return Network::Testnet;
-    }
-    Network::Unknown
 }
+
 /// Long flags of the `solana` / `spl-token` / `anchor` CLIs that take a value. Without an
 /// attached `=value`, the next word is the flag's value, never a positional argument.
 const VALUE_FLAGS: &[&str] = &[
@@ -634,28 +647,85 @@ pub fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-/// The nearest `Anchor.toml` (cwd, then ancestors) `[provider] cluster`: `Some` of its
-/// cluster ([`Network::Unknown`] when unrecognized), `None` when no file or no cluster.
+/// The nearest `Anchor.toml` (cwd, then ancestors; the first that exists wins) provider
+/// cluster: `Some` of its cluster ([`Network::Unknown`] when unrecognized, when the file cannot
+/// be read or is oversized, or when it mentions `cluster` in a form this parser does not
+/// understand), `None` when there is no file or it sets no cluster.
 fn network_from_anchor_toml(cwd: &Path) -> Option<Network> {
-    let text = cwd
+    let path = cwd
         .ancestors()
-        .find_map(|dir| read_small_file(&dir.join("Anchor.toml")))?;
-    let mut in_provider = false;
+        .map(|dir| dir.join("Anchor.toml"))
+        .find(|p| std::fs::symlink_metadata(p).is_ok())?;
+    let Some(text) = read_small_file(&path) else {
+        return Some(Network::Unknown);
+    };
+    anchor_toml_cluster(&text)
+}
+
+/// The provider cluster of `Anchor.toml` text, in any of the forms `[provider] cluster = …`,
+/// top-level `provider.cluster = …` or `provider = { cluster = … }`. Several fold to the
+/// riskiest.
+fn anchor_toml_cluster(text: &str) -> Option<Network> {
+    let unquote = |v: &str| {
+        v.trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim()
+            .to_string()
+    };
+    let mut section = String::new();
+    let mut found: Option<Network> = None;
+    let mut add = |value: &str| {
+        let net = classify_url(&unquote(value));
+        found = Some(found.map_or(net, |prev| riskier(prev, net)));
+    };
     for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') {
-            in_provider = line.starts_with("[provider]");
+        let line = strip_toml_comment(raw_line).trim();
+        if let Some(header) = line.strip_prefix('[') {
+            section = header
+                .trim_end_matches(']')
+                .trim()
+                .trim_matches('"')
+                .to_string();
             continue;
         }
-        if in_provider {
-            if let Some(rest) = line.strip_prefix("cluster") {
-                let value = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
-                let value = value.split('#').next().unwrap_or(value);
-                return Some(classify_url(value));
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key: String = key
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'' | ' ' | '\t'))
+            .collect();
+        match (section.as_str(), key.as_str()) {
+            ("provider", "cluster") | ("", "provider.cluster") => add(value),
+            ("", "provider") => {
+                // Inline table: `provider = { cluster = "…", wallet = "…" }`.
+                let inner = value.trim().trim_start_matches('{').trim_end_matches('}');
+                for pair in inner.split(',') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k.trim().trim_matches(|c| c == '"' || c == '\'') == "cluster" {
+                            add(v);
+                        }
+                    }
+                }
             }
+            _ => {}
         }
     }
-    None
+    found.or_else(|| text.contains("cluster").then_some(Network::Unknown))
+}
+
+/// `line` without a `#` comment (a `#` inside quotes is kept).
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '#') => return &line[..i],
+            _ => {}
+        }
+    }
+    line
 }
 
 /// The cached `solana config get` URL.
@@ -1138,6 +1208,86 @@ mod tests {
             "[provider]\ncluster = \"https://rpc.example.com\"\n",
         )
         .unwrap();
+        assert_eq!(network_from_anchor_toml(&sub), Some(Network::Unknown));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_url_matches_hosts_exactly() {
+        for url in [
+            "https://devnet.attacker.example",
+            "https://api.devnet.solana.com.attacker.example",
+            "https://api.devnet.solana.com@evil.example",
+            "http://localhost.attacker.example:8899",
+            "http://127.0.0.1:8899/proxy",
+            "https://rpc.example.com/devnet",
+        ] {
+            assert_eq!(classify_url(url), Network::Unknown, "{url}");
+        }
+        assert_eq!(classify_url("http://[::1]:8899"), Network::Localnet);
+        assert_eq!(classify_url("http://0.0.0.0:8899/"), Network::Localnet);
+        assert_eq!(
+            classify_url("https://devnet.helius-rpc.com/?api-key=x"),
+            Network::Devnet
+        );
+        assert_eq!(
+            classify_url("https://user@api.testnet.solana.com"),
+            Network::Testnet
+        );
+    }
+
+    #[test]
+    fn anchor_toml_cluster_forms() {
+        assert_eq!(
+            anchor_toml_cluster("provider = { cluster = \"Devnet\", wallet = \"k\" }\n"),
+            Some(Network::Devnet)
+        );
+        assert_eq!(
+            anchor_toml_cluster("provider.cluster = 'localnet'\n"),
+            Some(Network::Localnet)
+        );
+        assert_eq!(
+            anchor_toml_cluster("[provider]\ncluster = \"devnet\"\n[x]\ncluster = \"m\"\n"),
+            Some(Network::Devnet)
+        );
+        // Two provider clusters fold to the riskier.
+        assert_eq!(
+            anchor_toml_cluster(
+                "provider.cluster = \"devnet\"\n[provider]\ncluster = \"mainnet\"\n"
+            ),
+            Some(Network::Mainnet)
+        );
+        // Mentions a cluster in a form the parser does not read: unknown, not a fallback.
+        assert_eq!(
+            anchor_toml_cluster("[\"provider\".x]\ncluster = \"devnet\"\n"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(anchor_toml_cluster("[provider]\nwallet = \"k\"\n"), None);
+    }
+
+    #[test]
+    fn nearest_anchor_toml_wins_and_unreadable_is_unknown() {
+        let dir = temp_dir("anchornear");
+        fs::write(
+            dir.join("Anchor.toml"),
+            "[provider]\ncluster = \"devnet\"\n",
+        )
+        .unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        // The nearer file sets no cluster: no fallback to the parent's.
+        fs::write(sub.join("Anchor.toml"), "[workspace]\n").unwrap();
+        assert_eq!(network_from_anchor_toml(&sub), None);
+        // Oversized: unknown.
+        fs::write(
+            sub.join("Anchor.toml"),
+            "#".repeat(MAX_CONFIG_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert_eq!(network_from_anchor_toml(&sub), Some(Network::Unknown));
+        // A directory named Anchor.toml cannot be read: unknown.
+        fs::remove_file(sub.join("Anchor.toml")).unwrap();
+        fs::create_dir_all(sub.join("Anchor.toml")).unwrap();
         assert_eq!(network_from_anchor_toml(&sub), Some(Network::Unknown));
         let _ = fs::remove_dir_all(&dir);
     }

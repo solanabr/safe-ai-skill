@@ -80,11 +80,67 @@ const LAUNCHERS: &[&str] = &[
     "direnv",
     "mise",
     "asdf",
+    "arch",
+    "sandbox-exec",
+    "pkexec",
+    "sg",
+    "fakeroot",
+    "numactl",
+    "chpst",
 ];
+
+/// Subcommand words that change state somewhere: a family name followed later by one of
+/// these routes the whole command to the gate (spec D6.3, default-route ruling). A word
+/// starting with `create-`, `stake-` or `vote-` counts too.
+pub const GATED_TOKENS: &[&str] = &[
+    "transfer",
+    "pay",
+    "program",
+    "deploy",
+    "upgrade",
+    "migrate",
+    "close",
+    "close-mint",
+    "close-vote-account",
+    "set-authority",
+    "set-upgrade-authority",
+    "set-buffer-authority",
+    "authorize",
+    "withdraw",
+    "withdraw-stake",
+    "withdraw-from-vote-account",
+    "delegate-stake",
+    "deactivate-stake",
+    "split-stake",
+    "merge-stake",
+    "mint",
+    "burn",
+    "erase-authority",
+    "write-buffer",
+    "idl",
+    "wrap",
+    "unwrap",
+    "approve",
+    "revoke",
+    "freeze",
+    "thaw",
+    "gc",
+    "config",
+    "test",
+    "run",
+    "airdrop",
+    "redelegate-stake",
+];
+
+/// Characters that continue a word for mention and gated-token matching.
+fn is_mention_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
 
 /// Reserved words stripped from the head of a simple command.
 const RESERVED: &[&str] = &[
-    "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until",
+    "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "case",
+    "in", "esac", "select", "function",
 ];
 
 /// Wrappers: `(name, value-taking short flags, value-taking long flags, positionals before
@@ -138,6 +194,10 @@ const WRAPPERS: &[(&str, &str, &[&str], usize)] = &[
     ("ionice", "cnp", &["--class", "--classdata", "--pid"], 0),
     ("caffeinate", "tw", &[], 0),
     ("coproc", "", &[], 0),
+    // zsh precommand modifiers.
+    ("noglob", "", &[], 0),
+    ("nocorrect", "", &[], 0),
+    ("repeat", "", &[], 1),
 ];
 
 /// One shell word after quote removal.
@@ -166,6 +226,9 @@ pub struct SimpleCommand {
     pub indirect: bool,
     /// Redirects output to a file (other than `/dev/null` or a descriptor).
     pub writes_file: bool,
+    /// A top-level command spelled exactly `solana …`, `spl-token …` or `anchor …` (unquoted,
+    /// lowercase, nothing stripped): the shape Claude Code's `if` filters send to `gate-bash`.
+    pub canonical: bool,
 }
 
 impl SimpleCommand {
@@ -210,24 +273,80 @@ pub fn parse(command: &str) -> Parsed {
     out
 }
 
-/// Whether `command` names a solana-family program anywhere, after removing quotes and
-/// backslashes (`sol""ana`, `s\olana`) or holding ANSI-C quoting (`$'\x73olana'`). The cheap
-/// pre-check of the unconditional Bash hook.
+/// Whether `command` names a solana-family program on a word boundary (`/usr/bin/solana`,
+/// `solana.exe` and `SOLANA` count; `solana-keygen` and `solana.so` do not), after removing
+/// quotes and backslashes (`sol""ana`, `s\olana`), or holds ANSI-C quoting (`$'\x73olana'`).
+/// The cheap pre-check of the unconditional Bash hook.
 pub fn mentions_family(command: &str) -> bool {
-    if command.contains("$'") {
-        return true;
-    }
-    let plain: String = command
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-        .flat_map(char::to_lowercase)
-        .collect();
-    FAMILY.iter().any(|name| plain.contains(name))
+    command.contains("$'") || !mention_scans(command).iter().all(|s| s.mentions == 0)
 }
 
-/// The base name of a program word, lowercased.
+/// How many family mentions in `command` are followed, somewhere later, by a gated
+/// subcommand token ([`GATED_TOKENS`]). Quoted strings and here-document bodies count.
+pub fn gated_mentions(command: &str) -> usize {
+    mention_scans(command)
+        .iter()
+        .map(|s| s.gated)
+        .max()
+        .unwrap_or(0)
+}
+
+/// One way of reading the raw text for mentions.
+struct MentionScan {
+    mentions: usize,
+    gated: usize,
+}
+
+/// Scan `command` twice: quotes removed with backslashes as separators (paths such as
+/// `C:\bin\solana.exe`), and quotes and backslashes both removed (`s\olana`).
+fn mention_scans(command: &str) -> [MentionScan; 2] {
+    let lower = command.to_lowercase();
+    let unquoted: String = lower.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    let plain: String = unquoted.chars().filter(|&c| c != '\\').collect();
+    [scan_mentions(&unquoted), scan_mentions(&plain)]
+}
+
+fn scan_mentions(text: &str) -> MentionScan {
+    let words: Vec<&str> = text
+        .split(|c: char| !is_mention_char(c))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let is_mention = |w: &str| {
+        let w = w.trim_end_matches('.');
+        let w = w.strip_suffix(".exe").unwrap_or(w);
+        FAMILY.contains(&w)
+    };
+    let is_gated = |w: &str| {
+        // `x.transfer()`: a method name counts as a token of its own.
+        w.split('.').any(|part| {
+            GATED_TOKENS.contains(&part)
+                || part.starts_with("create-")
+                || part.starts_with("stake-")
+                || part.starts_with("vote-")
+        })
+    };
+    let mut mentions = 0;
+    let mut gated = 0;
+    for (i, word) in words.iter().enumerate() {
+        if is_mention(word) {
+            mentions += 1;
+            if words.iter().skip(i + 1).any(|w| is_gated(w)) {
+                gated += 1;
+            }
+        }
+    }
+    MentionScan { mentions, gated }
+}
+
+/// The base name of a program word, lowercased: path (`/` or `\`), a zsh `=` prefix and a
+/// `.exe` suffix removed (`C:\bin\Solana.EXE` → `solana`).
 pub fn base_name(word: &str) -> String {
-    word.rsplit('/').next().unwrap_or(word).to_ascii_lowercase()
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let name = name.trim_start_matches('=').to_ascii_lowercase();
+    match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => name,
+    }
 }
 
 /// Parse `script` into `out` at nesting `depth`; `indirect` marks every command found.
@@ -251,6 +370,17 @@ struct Heredoc {
     strip_tabs: bool,
     /// An unquoted delimiter: the body undergoes expansion (its substitutions run).
     expands: bool,
+}
+
+/// What a finished command reads from its standard input.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reads {
+    /// Nothing that runs as code.
+    Data,
+    /// An interpreter's code (`python3 -`).
+    Interpreter,
+    /// A shell script.
+    Shell,
 }
 
 /// A simple command being collected.
@@ -286,8 +416,8 @@ impl Lexer<'_> {
         let mut heredocs: Vec<Heredoc> = Vec::new();
         // A newline or single `&` was seen at this level: later commands are indirect.
         let mut after_break = false;
-        // The current line runs a shell that reads its standard input.
-        let mut line_has_shell = false;
+        // What the current line's commands read from stdin (a here-document's consumer).
+        let mut line_reads = Reads::Data;
         loop {
             self.skip_blanks();
             let Some(c) = self.peek() else {
@@ -298,16 +428,19 @@ impl Lexer<'_> {
                 '#' if cmd_word_boundary(&self.chars, self.i) => self.skip_comment(),
                 '\n' => {
                     self.i += 1;
-                    line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                    line_reads =
+                        line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                     for doc in heredocs.drain(..) {
                         let body = self.read_heredoc_body(&doc);
-                        if line_has_shell {
-                            parse_into(&body, self.depth + 1, true, self.out);
-                        } else if doc.expands {
-                            self.scan_expansions(&body);
+                        match line_reads {
+                            Reads::Shell => parse_into(&body, self.depth + 1, true, self.out),
+                            // Interpreter code the parser cannot read.
+                            Reads::Interpreter => self.out.opaque = true,
+                            Reads::Data if doc.expands => self.scan_expansions(&body),
+                            Reads::Data => {}
                         }
                     }
-                    line_has_shell = false;
+                    line_reads = Reads::Data;
                     after_break = true;
                 }
                 ';' => {
@@ -315,12 +448,14 @@ impl Lexer<'_> {
                     if self.peek() == Some(';') {
                         self.i += 1;
                     }
-                    line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                    line_reads =
+                        line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                 }
                 '&' => match self.peek_at(1) {
                     Some('&') => {
                         self.i += 2;
-                        line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                        line_reads =
+                            line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                     }
                     Some('>') => {
                         self.i += 1;
@@ -328,7 +463,8 @@ impl Lexer<'_> {
                     }
                     _ => {
                         self.i += 1;
-                        line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                        line_reads =
+                            line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                         after_break = true;
                     }
                 },
@@ -345,7 +481,8 @@ impl Lexer<'_> {
                         }
                         _ => true,
                     };
-                    line_has_shell |= self.flush(&mut cmd, indirect || after_break, pipe);
+                    line_reads =
+                        line_reads.max(self.flush(&mut cmd, indirect || after_break, pipe));
                     cmd.after_pipe = true;
                 }
                 '<' | '>' => self.redirection(&mut cmd, &mut heredocs),
@@ -373,7 +510,8 @@ impl Lexer<'_> {
                 ')' => {
                     // A `case` pattern or a stray paren ends the command.
                     self.i += 1;
-                    line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                    line_reads =
+                        line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                 }
                 _ => {
                     let start = self.i;
@@ -390,7 +528,8 @@ impl Lexer<'_> {
                     let lone_brace = word.text == "{" && !word.quoted && !word.splits;
                     if lone_brace && !cmd.words.is_empty() {
                         // `f() {`, `function f {`: the definition ends, its body begins.
-                        line_has_shell |= self.flush(&mut cmd, indirect || after_break, false);
+                        line_reads =
+                            line_reads.max(self.flush(&mut cmd, indirect || after_break, false));
                         cmd.words.push(word);
                     } else if !glued {
                         cmd.words.push(word);
@@ -404,12 +543,12 @@ impl Lexer<'_> {
         }
     }
 
-    /// Finish the pending command, if any. Returns whether it is a shell reading stdin.
-    fn flush(&mut self, cmd: &mut Pending, indirect: bool, pipe_next: bool) -> bool {
+    /// Finish the pending command, if any. Returns what it reads from stdin.
+    fn flush(&mut self, cmd: &mut Pending, indirect: bool, pipe_next: bool) -> Reads {
         let pending = std::mem::take(cmd);
         cmd.piped_in = pipe_next;
         if pending.words.is_empty() {
-            return false;
+            return Reads::Data;
         }
         finish_command(pending, indirect, self.depth, self.out)
     }
@@ -659,6 +798,10 @@ impl Lexer<'_> {
                         word.text.push('(');
                         word.text.push_str(&body);
                         word.text.push(')');
+                        if body.trim().is_empty() {
+                            // `f()`: the definition's name ends here (`f(){` has its `{` next).
+                            break;
+                        }
                         continue;
                     }
                     break;
@@ -931,9 +1074,9 @@ fn is_config_var(name: &str) -> bool {
         || name.starts_with("ANCHOR_")
 }
 
-/// Strip, classify and record one simple command. Returns whether it is a shell reading its
-/// standard input (so a here-document on its line is a script).
-fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Parsed) -> bool {
+/// Strip, classify and record one simple command. Returns what it reads from its standard
+/// input (so a here-document on its line is a script, interpreter code or data).
+fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Parsed) -> Reads {
     let Pending {
         mut words,
         herestrings,
@@ -942,6 +1085,9 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         after_pipe,
     } = pending;
     let mut indirect = indirect || after_pipe;
+    let canonical_head = words
+        .first()
+        .is_some_and(|w| !w.quoted && !w.dynamic && FAMILY.contains(&w.text.as_str()));
 
     loop {
         // Reserved words and `NAME=value` prefixes.
@@ -960,17 +1106,12 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         }
         words.drain(..skip);
         let Some(first) = words.first() else {
-            return false;
+            return Reads::Data;
         };
         let program = base_name(&first.text);
-        if program == "command"
-            && words
-                .iter()
-                .skip(1)
-                .any(|w| w.text == "-v" || w.text == "-V")
-        {
+        if program == "command" && command_lookup(&words) {
             // `command -v solana` looks a program up; it runs nothing.
-            return false;
+            return Reads::Data;
         }
         let Some(&(_, shorts, longs, positionals)) =
             WRAPPERS.iter().find(|(name, ..)| *name == program)
@@ -985,7 +1126,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 let rest: Vec<&str> = words.iter().skip(skip).map(|w| w.text.as_str()).collect();
                 let script = format!("{split} {}", rest.join(" "));
                 parse_into(&script, depth + 1, true, out);
-                return false;
+                return Reads::Data;
             }
             out.cwd_changed |= words
                 .iter()
@@ -1008,19 +1149,20 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             .is_some_and(|w| w.dynamic && w.text == "$XARGS")
         {
             // `xargs` alone runs `echo`.
-            return false;
+            return Reads::Data;
         }
     }
 
     let Some(first) = words.first() else {
-        return false;
+        return Reads::Data;
     };
-    if first.quoted || first.text.contains('/') {
+    let program = base_name(&first.text);
+    if first.quoted || first.text != program {
+        // A quoted, path-qualified, `=`-prefixed, `.exe` or non-lowercase program word.
         indirect = true;
     }
-    let program = base_name(&first.text);
     let args = words.get(1..).unwrap_or_default();
-    let mut reads_stdin = false;
+    let mut reads = Reads::Data;
 
     match program.as_str() {
         "cd" | "pushd" | "popd" => out.cwd_changed = true,
@@ -1052,9 +1194,13 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             match shell_script(args) {
                 ShellInput::Script(script) if script.dynamic => out.opaque = true,
                 ShellInput::Script(script) => parse_into(&script.text, depth + 1, true, out),
+                ShellInput::File(file) if is_stdin_path(&file.text) => {
+                    reads = Reads::Shell;
+                    out.opaque |= piped_in;
+                }
                 ShellInput::File(file) => out.opaque |= file.dynamic,
                 ShellInput::Stdin => {
-                    reads_stdin = true;
+                    reads = Reads::Shell;
                     out.opaque |= piped_in;
                 }
             }
@@ -1079,17 +1225,53 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             // Code piped in is invisible; `-c`/`-e` code is only opaque when it names a
             // solana-family program or is an expansion.
             out.opaque |= piped_in || (runs_code && names);
+            if !args.iter().any(code_flag) && interpreter_reads_stdin(args) {
+                reads = Reads::Interpreter;
+            }
         }
         p if LAUNCHERS.contains(&p) => launch(args, p, depth, out),
         _ => {}
     }
 
+    let indirect = indirect || depth > 0;
     out.commands.push(SimpleCommand {
         words,
-        indirect: indirect || depth > 0,
+        indirect,
         writes_file,
+        canonical: canonical_head && !indirect,
     });
-    reads_stdin
+    reads
+}
+
+/// Whether `command …` only looks a program up: `-v`/`-V` before the first non-option word.
+fn command_lookup(words: &[Word]) -> bool {
+    for word in words.iter().skip(1) {
+        let text = word.text.as_str();
+        if text == "--" || !text.starts_with('-') {
+            return false;
+        }
+        if text.contains('v') || text.contains('V') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a script-file argument means standard input.
+fn is_stdin_path(text: &str) -> bool {
+    matches!(text, "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0")
+}
+
+/// Whether an interpreter without `-c`/`-e` code reads its program from stdin: no script
+/// argument, or `-` / `/dev/stdin`.
+fn interpreter_reads_stdin(args: &[Word]) -> bool {
+    match args
+        .iter()
+        .find(|w| !w.text.starts_with('-') || w.text == "-")
+    {
+        None => true,
+        Some(word) => is_stdin_path(&word.text),
+    }
 }
 
 /// What a shell invocation runs.
@@ -1210,6 +1392,17 @@ fn launch(args: &[Word], program: &str, depth: usize, out: &mut Parsed) {
         out.opaque |= args.iter().any(|w| mentions_family(&w.text));
         return;
     }
+    // A literal argument holding a command line (`watch 'solana …'`, `tmux new 'solana …'`,
+    // `nix-shell --run '…'`, `parallel ::: '…'`) is run by a shell: parse it as a script.
+    for word in args {
+        if word.text.contains([' ', '\t', '\n', ';']) {
+            if word.dynamic {
+                out.opaque = true;
+            } else {
+                parse_into(&word.text, depth + 1, true, out);
+            }
+        }
+    }
     let Some(start) = args
         .iter()
         .position(|w| FAMILY.contains(&base_name(&w.text).as_str()) || shell_word(w))
@@ -1242,6 +1435,7 @@ fn launch(args: &[Word], program: &str, depth: usize, out: &mut Parsed) {
         words,
         indirect: true,
         writes_file: false,
+        canonical: false,
     });
 }
 
@@ -1484,6 +1678,109 @@ mod tests {
         assert!(!parse("FOO=1 solana transfer X 1").env_changed);
         assert!(parse("cd other && anchor deploy").cwd_changed);
         assert!(parse("env -C other anchor deploy").cwd_changed);
+    }
+
+    #[test]
+    fn command_v_only_before_the_program() {
+        assert!(family("command -v solana").is_empty());
+        assert!(family("command -pv solana").is_empty());
+        assert_eq!(family("command solana transfer X 1 -v").len(), 1);
+        assert_eq!(family("command -p solana -v").len(), 1);
+    }
+
+    #[test]
+    fn function_brace_lexes_separately() {
+        let found = family("f(){ solana \"$@\"; }; f transfer X 1");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0[0], "solana");
+        assert!(found[0].1);
+    }
+
+    #[test]
+    fn heredoc_to_stdin_paths_is_a_script() {
+        for command in [
+            "bash /dev/stdin <<EOF\nsolana transfer X 1\nEOF",
+            "sh - <<EOF\nsolana transfer X 1\nEOF",
+            "bash /dev/fd/0 <<EOF\nsolana transfer X 1\nEOF",
+        ] {
+            assert_eq!(family(command).len(), 1, "{command}");
+        }
+        assert!(parse("python3 - <<'EOF'\nprint(1)\nEOF").opaque);
+        assert!(parse("node <<EOF\nx\nEOF").opaque);
+        assert!(!parse("python3 run.py <<EOF\nx\nEOF").opaque);
+    }
+
+    #[test]
+    fn base_name_normalizes_program_words() {
+        assert_eq!(base_name("/usr/bin/solana"), "solana");
+        assert_eq!(base_name(r"C:\bin\Solana.EXE"), "solana");
+        assert_eq!(base_name("=solana"), "solana");
+        assert_eq!(base_name("SPL-TOKEN"), "spl-token");
+    }
+
+    #[test]
+    fn only_the_exact_lowercase_program_is_canonical() {
+        let canon = |c: &str| {
+            parse(c)
+                .commands
+                .iter()
+                .map(|c| c.canonical)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(canon("solana transfer X 1"), vec![true]);
+        for command in [
+            "SOLANA transfer X 1",
+            "Solana transfer X 1",
+            "solana.exe transfer X 1",
+            "=solana transfer X 1",
+            "/usr/bin/solana transfer X 1",
+            "'solana' transfer X 1",
+            "FOO=1 solana transfer X 1",
+            "noglob solana transfer X 1",
+        ] {
+            assert_eq!(canon(command), vec![false], "{command}");
+            // An assignment prefix alone stays direct for gate-bash; it is still not canonical.
+            let prefixed = command.starts_with("FOO=");
+            assert_eq!(parse(command).commands[0].indirect, !prefixed, "{command}");
+        }
+    }
+
+    #[test]
+    fn zsh_modifiers_and_new_launchers() {
+        for command in [
+            "noglob solana transfer X 1",
+            "nocorrect solana transfer X 1",
+            "repeat 3 solana transfer X 1",
+            "arch -arm64 solana transfer X 1",
+            "sandbox-exec -n x solana transfer X 1",
+            "pkexec solana transfer X 1",
+            "fakeroot solana transfer X 1",
+            "chpst -u me solana transfer X 1",
+            "watch -n 1 'solana transfer X 1'",
+            "tmux new -d 'solana transfer X 1'",
+            "nix-shell --run 'solana transfer X 1'",
+            "case a in a) solana transfer X 1;; esac",
+            "function f { solana transfer X 1; }",
+        ] {
+            assert!(!family(command).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn mentions_use_word_boundaries() {
+        assert!(mentions_family("x | /usr/bin/solana balance"));
+        assert!(mentions_family("SOLANA.EXE balance"));
+        assert!(mentions_family(r"C:\bin\solana.exe balance"));
+        assert!(!mentions_family("solana-keygen new"));
+        assert!(!mentions_family("cp target/deploy/solana_program.so x"));
+        assert!(!mentions_family("cargo add anchor-lang"));
+        assert_eq!(
+            gated_mentions("node -e \"require('@coral-xyz/anchor')\""),
+            0
+        );
+        assert_eq!(gated_mentions("git commit -m 'solana transfer fix'"), 1);
+        assert_eq!(gated_mentions("x.transfer(); require('anchor')"), 0);
+        assert_eq!(gated_mentions("solana balance; solana transfer X 1"), 2);
     }
 
     #[test]
