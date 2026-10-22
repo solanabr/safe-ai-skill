@@ -70,7 +70,7 @@ The full table is in the [README](../README.md#firewall-tiers). It is the table 
 
 ### Project `.env` files
 
-- **Default (`env_read: deny`):** a raw read of `.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars` or the Solana CLI config (Read, Grep with a file path, MCP path argument, Bash readers such as `cat`, `grep`, `source`, `sed`, `git show REV:.env`, also behind wrappers such as `timeout 5` or inside `sh -c '…'`, and a network command reading one, `curl -d @.env`) is denied at every tier. The message names `safe-ai-skill env keys|set|unset` and, when the project has a `.env.schema` or varlock, `varlock load --agent` and `varlock run -- <cmd>`.
+- **Default (`env_read: deny`):** a raw read of `.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars` or the Solana CLI config (Read, Grep with a file path, MCP path argument, any Bash command naming one, whatever the program (`cat`, `paste`, `tar`, `vim`, `find … -exec`, `node --env-file=.env`, a wildcard such as `cat .e*`, `git show REV:.env`), also behind wrappers such as `timeout 5` or inside `sh -c '…'`, and a network command reading one, `curl -d @.env`) is denied at every tier. Metadata commands (`ls`, `stat`, …), a search's pattern (`grep -q .env .gitignore`), `find` without `-exec` and `safe-ai-skill env` are not reads. The message names `safe-ai-skill env keys|set|unset` and, when the project has a `.env.schema` or varlock, `varlock load --agent` and `varlock run -- <cmd>`.
 - **varlock value printers** (`varlock printenv`, `reveal`, `load --format json|env|shell` without `--agent`) follow the raw-read row.
 - **`.env.schema` and templates** (`.env.example|.sample|.template|.dist`) are readable, subject to the content guard: a schema holding key material, a literal credential, over 64 KiB or not a regular file is denied.
 - **Opt-in (ships disabled):** release builds of 1.1.0 do not honour it; it needs the `env-read-opt-in` cargo feature, which stays off until the exfil tripwire ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)) can deny an opted-in value sent to the network. In such a build: `safe-ai-skill tier --env-read ask|tier`, user scope only, only while the sandbox is `On`. `tier` follows the tier (no opinion at Off and Relaxed, deny at Medium and High); `ask` prompts at Off, Relaxed and Medium and denies at High. With the sandbox `Unknown`, `Off`, on Windows or on Linux without `bwrap` the opt-in is suspended and reads stay denied ("opt-in suspended: sandbox not on"). A repo's `policy.yaml` `env_read`, a kit file or an env variable can only tighten it. The response to an opted-in raw read isn't value-scrubbed.
@@ -86,7 +86,7 @@ The axis is whether an action destroys a capability **even for its rightful owne
 Defined by the `irreversible` rows of `onchain-verbs.list`:
 
 - `--final` on `program deploy|write-buffer|upgrade|set-upgrade-authority` (`solana`, `anchor program`, `anchor deploy -- --final`), any `program-v4` subcommand with `--final`, `program-v4 finalize`;
-- `program close <program-id>` and `--bypass-warning` (closing a buffer is Class C);
+- `program close … --bypass-warning` (closing a program); without `--bypass-warning` the engine cannot tell a program from a buffer and treats the close as a buffer close (Class C);
 - `spl-token authorize … --disable` (any authority), `spl-token close-mint`, `close`, `burn`; `anchor idl erase-authority`, `anchor idl close`; `close-vote-account`.
 
 The verdict is keyed on the resolved cluster (flag, then a `-C` config file, then for `anchor` the nearest `Anchor.toml`, then the CLI config as `solana config get` reports it; `ANCHOR_PROVIDER_URL` can only make an anchor command riskier, and a command line that sets a variable the CLIs read their config through, or changes directory or the CLI config first, makes later commands Unknown). **Mainnet, Unknown, or any cluster not positively identified as localnet or devnet (testnet included) is a deny**, with the exact command echoed ("run it yourself"). **A positively identified localnet or devnet is a hard-guard ask.** Only exact hosts with an `http(s)://` or `ws(s)://` scheme count (`devnet.attacker.example` and a schemeless `devnet.helius-rpc.com` are Unknown). No grant, tier, repo setting or env variable relaxes either verdict, and Class U is not grantable.
@@ -100,7 +100,7 @@ Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, buffer
 - On mainnet or an Unknown cluster: ask at Off, Relaxed and Medium; deny at High. A confirmed grant that covers it (grantable scopes only, a mainnet deploy included) allows below High and never at High. Policy `network.mainnet: deny` forces a deny at every tier.
 - A grant covers one action of its scope. A command line joining two or more gated on-chain actions, or holding any hard-guard ask, is never covered by a grant and asks (deny at High). A grant allows only a direct `solana …`/`spl-token …`/`anchor …` command; the same command behind a wrapper (`env FOO=1 …`) gets no allow from the plugin.
 - On an identified test cluster: deploy and upgrade have no opinion; a transfer within the spend caps is allowed below High (no opinion at High); an authority change or a recoverable close asks at every tier.
-- The hard guards `set_authority` and `account_close` stay unrelaxable.
+- The hard guards `set_authority` and `account_close` stay unrelaxable. A buffer close is Class C, not `account_close`: a confirmed `destructive` grant can allow it below High.
 
 A Solana command the parser can't read (a name inside `bash -c "solana $X"`, `eval`, a pipe into `sh`, a program spelled as an expansion) asks as a hard guard, and denies at High. A Bash command over 256 KiB, or with more than 2048 nested expansions, asks without being parsed (deny at High and headless). An MCP tool that moves value or signs asks, and denies at High (an MCP call names no cluster).
 
@@ -130,7 +130,7 @@ The naive-exfil tripwire (a network-capable command fed a secret, or a request t
 - A network command that takes a key file, a credential store or a project env file by path (`curl -d @.env`, `--data-binary @`, `-T`, `-F k=@`, `wget --post-file`, `scp`) is denied at every tier, because it is a read of that file.
 - An inline `curl`/`wget` POST body to a non-localhost host asks at every tier (a deny when headless). This includes JSON-RPC calls to a devnet RPC.
 - Requests to listed exfil hosts, IP literals, redirects, DNS, `WebFetch` and values already in context are not gated. solana-ai-kit's sandbox `deniedDomains` (the same 70/79/84-host list, by kit tier) or Claude Code's own sandbox with the entries in [SECURITY.md](../SECURITY.md#recommended-setup) closes the host list for sandboxed commands.
-- Code run through an MCP executor (for example context-mode's `ctx_execute`) is not inspected; only its path arguments are.
+- Code run through an MCP executor (for example context-mode's `ctx_execute`): shell code gets the Bash checks (credential and env reads, on-chain and wallet gates), never an allow and never a grant; other languages get their string literals checked as paths and shell commands, and a Solana CLI named there asks (deny at High).
 
 ## Supply chain
 

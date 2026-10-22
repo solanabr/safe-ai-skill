@@ -14,7 +14,7 @@
 
 safe-ai-skill is a Claude Code security plugin — a Rust hook-based firewall and registry-free supply-chain verifier that works with **any skills, MCPs, or agents** to add a policy-driven security layer. It was built with `solanabr/solana-ai-kit` as the reference integration (gating Solana transactions and deploys, verifying its `ext/` submodules and `skill-registry.json` catalog), but the gates, guards, and verifier are general-purpose and protect any Claude Code setup.
 
-At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — authority changes, account closes, irreversible on-chain actions, secret reads — are never relaxed by any tier, grant or flag.
+At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — authority changes, account closes, irreversible on-chain actions, secret reads — are never relaxed by any tier, grant or flag. The one close that is not a hard guard is a program buffer close: a confirmed `destructive` grant can allow it below High.
 
 ## Read this first: what this plugin cannot protect on its own
 
@@ -31,7 +31,7 @@ Known holes, in short (the full table, with what closes each, is in [SECURITY.md
 - **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
 - **Values already in context:** a secret that was read has reached the model provider and the transcripts; nothing recalls it.
 - **Egress:** no exfil tripwire ships in 1.1.0 (planned, [#19](https://github.com/solanabr/safe-ai-skill/issues/19)). Sending a secret file by path (`curl -d @.env`, `-T`, `-F`, `scp`) is denied and an inline `curl`/`wget` POST to a non-localhost host asks, but requests to request-bin, tunnel and paste hosts, IP literals, redirects, DNS and `WebFetch` URLs are not gated. The kit's sandbox `deniedDomains`, or Claude Code's own sandbox with the entries in [SECURITY.md](SECURITY.md#recommended-setup), closes the host list.
-- **Code run through an MCP executor** (for example context-mode's `ctx_execute` with shell or Python code): the code is not inspected; only path arguments are checked.
+- **Code run through an MCP executor** (for example context-mode's `ctx_execute`): shell code gets the same checks as a Bash call, but code in other languages gets only its string literals checked as paths and shell commands, and a Solana CLI named there asks. Anything built at runtime gets through, as in Bash.
 - **Directory search through Bash `grep`/`rg`:** only a pattern nudge applies there.
 - **Engine crash or tampering by code running as you:** the confidentiality gates fail open (the on-chain, MCP and Skill gates block), and the state's HMAC makes tampering evident, not impossible.
 
@@ -137,7 +137,7 @@ The npm and standalone paths download the binary matching their release tag and 
 
 `set_authority` · `account_close` · irreversible on-chain actions · `secret_read`
 
-No tier, grant, flag or repo policy relaxes them. Authority changes and account closes ask you (they deny at High on mainnet or an unidentified cluster), and secret reads are denied. Irreversible actions (`--final`, program close, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, IDL erase/close, …) deny on mainnet or any cluster not positively identified as localnet or devnet, ask on an identified localnet or devnet, and no grant, tier, repo setting or env var changes either answer. A non-final deploy, including one to mainnet, is a counterparty action: it asks on mainnet or an unidentified cluster (deny at High), and a confirmed `deploy` grant can allow it below High.
+No tier, grant, flag or repo policy relaxes them. Authority changes and account closes ask you (they deny at High on mainnet or an unidentified cluster), and secret reads are denied. Irreversible actions (`--final`, `program close --bypass-warning`, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, IDL erase/close, …) deny on mainnet or any cluster not positively identified as localnet or devnet, ask on an identified localnet or devnet, and no grant, tier, repo setting or env var changes either answer. A program buffer close (`solana program close <buffer>` or `--buffers`, without `--bypass-warning`) is the exception: it is a counterparty action that asks on mainnet or an unidentified cluster (deny at High), and a confirmed `destructive` grant can allow it below High. A non-final deploy, including one to mainnet, is a counterparty action: it asks on mainnet or an unidentified cluster (deny at High), and a confirmed `deploy` grant can allow it below High.
 
 ## Firewall tiers
 
@@ -156,7 +156,7 @@ The plugin takes a tier as an input: `off < relaxed < medium < high`, default `r
 | `env keys` | n/o | n/o | n/o | n/o |
 | Pattern redaction (keys, seeds, PEM, vendor tokens) | on | on | on | on |
 | Value scrub of project env values in tool output, except an opted-in raw read | on | on | on | on |
-| Irreversible on-chain action (`--final`, program close, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
+| Irreversible on-chain action (`--final`, `program close --bypass-warning`, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
 | … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
 | Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
 | Value-moving or authority-changing action on mainnet or an unknown cluster | ask | ask | ask | deny |
@@ -209,7 +209,7 @@ If the engine can't run on a platform (no prebuilt binary, wrong executable form
 
 - **Relaxations need a code only you see.** Unexpired 1.0 grants become pending requests at your first 1.1.0 session; confirm each as described under [Usage tiers](#tier-1--gate-installs-before-they-run), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Lowering the tier needs the same confirmation, and nothing can be confirmed in headless `claude -p`.
 - **Profiles became tiers.** `strict` (the 1.0 default) becomes `relaxed`, `paranoid` becomes `high`, and `autopilot` becomes `relaxed` (the notice names `safe-ai-skill allow --scope transfer` for what autopilot's higher cap did). A tier below `relaxed` is never migrated: a 1.0 `off` is set aside with a hint to run `safe-ai-skill tier off` (confirmed) or set `SAFE_AI_SKILL_DISABLE=1`. Your first session prints one line about it. Raw `.env` reads stay denied for everyone after the upgrade.
-- **What `relaxed` now denies.** Irreversible actions (`--final`, program close, `spl-token close-mint|close|burn`, `authorize --disable`, IDL erase/close, `close-vote-account`) now deny on mainnet, testnet and any cluster that isn't positively identified as localnet or devnet (an RPC host without an `http(s)://` scheme identifies nothing), and still ask on an identified localnet or devnet. Credential stores beyond `~/.ssh/id_*` (`~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.npmrc`, cloud CLI tokens, keychains, browser and wallet-extension data, and more) are read-denied at every tier, by path and by any Bash command naming them. An inline `curl`/`wget` POST body to a non-localhost host still asks at every tier (a deny under `claude -p`).
+- **What `relaxed` now denies.** Irreversible actions (`--final`, `program close --bypass-warning`, `spl-token close-mint|close|burn`, `authorize --disable`, IDL erase/close, `close-vote-account`) now deny on mainnet, testnet and any cluster that isn't positively identified as localnet or devnet (an RPC host without an `http(s)://` scheme identifies nothing), and still ask on an identified localnet or devnet. Credential stores beyond `~/.ssh/id_*` (`~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.npmrc`, cloud CLI tokens, keychains, browser and wallet-extension data, and more) are read-denied at every tier, by path and by any Bash command naming them. An inline `curl`/`wget` POST body to a non-localhost host still asks at every tier (a deny under `claude -p`).
 - **`gate-bash` runs for every Bash call and fails closed.** It used to run only for commands starting with `solana`, `spl-token` or `anchor`, so wrapped forms (`env FOO=1 …`, `bash -c '…'`, `timeout 5 …`) and `solana-keygen` never reached it. A fast path keeps ordinary commands cheap. If the engine crashes, Bash calls are blocked until it is fixed; if it cannot run on your platform at all, only commands naming the Solana CLIs ask.
 - **Headless asks become denies.** Under `claude -p` or CI (`CI`, `GITHUB_ACTIONS`, no `/dev/tty`, …), every `ask` is a `deny`; only a grant you confirmed interactively beforehand passes. `CONFIRM_MAINNET`-style env variables are ignored, and no setting turns headless off.
 - **Skill-pack drift is a BLOCK.** A pinned pack whose content changes is denied (the Skill tool, `/name`, reads and Bash access inside it) until you run `safe-ai-skill verify approve <name>` in a terminal and confirm it. A pack the SessionStart sweep could not fully scan in its time budget is denied the same way until a later sweep scans it; `safe-ai-skill verify check <dir>` scans it without a budget.
@@ -274,8 +274,9 @@ alias for `tier`. The tier `off` keeps every `deny` row; to turn the hooks off e
 
 **State is authenticated.** Grants, the tier, the daily spend ledger and session metadata are
 signed with a per-install key in the plugin data directory, and each file carries a
-generation, so a hand-edited file or an older copy put back is ignored, and a deleted or edited
-spend ledger counts as today's budget spent. This is tamper-evident, not tamper-proof: code
+generation, so a hand-edited file or an older copy put back is ignored, a deleted or edited
+spend ledger counts as today's budget spent, and a deleted `tier.json` makes the tier High
+(with a SessionStart note) until you run `safe-ai-skill tier …` again. This is tamper-evident, not tamper-proof: code
 running as you outside the Claude Code sandbox can read the key, run the hook commands itself
 or restore a snapshot of the whole directory. The sandbox is the hard boundary. At the first
 1.1.0 session, unexpired 1.0 grants become pending requests you can
