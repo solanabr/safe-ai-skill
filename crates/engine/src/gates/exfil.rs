@@ -3,7 +3,7 @@
 //! Relaxed) or targets a host on the tier's list ([`crate::lists::exfil_hosts`] plus
 //! `secrets.exfil_hosts_extra`).
 //!
-//! **F0 stub:** no opinion; the 1.1.0 curl/wget checks still run inside
+//! **Deferred (#19): no opinion in 1.1.0;** the curl/wget upload checks still run inside
 //! [`crate::gates::secrets`]. Call lines: `main::cmd_gate_bash_secrets` ([`decide_bash`]) and
 //! `main::cmd_gate_mcp` ([`decide_mcp`], executor payloads such as `ctx_execute`).
 

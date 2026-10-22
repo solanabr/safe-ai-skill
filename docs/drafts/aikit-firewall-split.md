@@ -15,7 +15,7 @@ Relates to [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-k
 
 **Depends on:** safe-ai-skill 1.1.0 released, and the kit's plugin pin moved to its SHA. Nothing here asks the kit to drop a protection before the plugin has demonstrably replaced it: the retirement steps (A6) are gated on a green cross-stack corpus run.
 
-**Split.** The kit owns the OS sandbox, permission rules, tier selection and regeneration (`/firewall`, `security.json`), and the git, publish, fetch-and-execute, `gh` and MCP tool-name gates. safe-ai-skill owns the Solana-semantic gates, secrets for plugin-only users, supply chain, a labelled best-effort exfil tripwire, and takes the tier as an input. Shared: versioned list files, a conformance corpus, one headless rule.
+**Split.** The kit owns the OS sandbox, permission rules, tier selection and regeneration (`/firewall`, `security.json`), and the git, publish, fetch-and-execute, `gh` and MCP tool-name gates. safe-ai-skill owns the Solana-semantic gates, secrets for plugin-only users, supply chain, and takes the tier as an input; a labelled best-effort exfil tripwire is planned on its side (safe-ai-skill#19) and is not in 1.1.0, so until then the kit's `deniedDomains` is the only host-list control. Shared: versioned list files, a conformance corpus, one headless rule.
 
 ---
 
@@ -55,7 +55,7 @@ safe-ai-skill reads `.claude/security.json` (`tier`, `declared.tier`, `enforced.
 `kit_is_headless()` (`lib-headless.sh:301-311`) honours `KIT_FIREWALL_HEADLESS`, `CI` and `GITHUB_ACTIONS`, and `CONFIRM_MAINNET=1` turns the headless mainnet deny into a pass. A repo's committed settings `env` probably reaches these [I, high confidence: a repo `env` block delivered a disable switch to safe-ai-skill in an earlier review]. Adopt the shared headless rule ([docs/tiers.md](../tiers.md#headless)), identical on both sides:
 
 1. Headless is on when `SAFE_AI_SKILL_HEADLESS` or `KIT_FIREWALL_HEADLESS` is `1`/`true`, when any of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL` is set and not `0`/`false`, or when `/dev/tty` can't be opened for reading. Any signal turns it on; **nothing turns it off** (`KIT_FIREWALL_HEADLESS=0` and `CI=0` don't un-headless).
-2. When headless, every `ask` becomes a `deny`, with the reason naming the interactive route. Retire the kit's "silent when headless" for recoverable asks: the asks it silenced (devnet value moves, curl POST at Relaxed) no longer exist in the end state.
+2. When headless, every `ask` becomes a `deny`, with the reason naming the interactive route. Retire the kit's "silent when headless" for recoverable asks: the asks it silenced (devnet value moves, curl POST at Relaxed) no longer exist in the end state. (safe-ai-skill 1.1.0 still asks on an inline curl POST at every tier; that ask goes away with its exfil tripwire, safe-ai-skill#19.)
 3. Ignore `CONFIRM_MAINNET` and every `CONFIRM_*` for on-chain actions (user-scope grants made interactively are the only escape, and they live in the plugin). `CONFIRM_PUBLISH` stays a kit-only matter for npm and cargo publish.
 
 Test: a repo-scope `env` that sets `CI=0`, `KIT_FIREWALL_HEADLESS=0` or `CONFIRM_MAINNET=1` cannot turn headless off or satisfy an on-chain escape.
@@ -67,7 +67,7 @@ Test: a repo-scope `env` that sets `CI=0`, `KIT_FIREWALL_HEADLESS=0` or `CONFIRM
 - **Implement** (preferred for Medium and above): sandbox `denyWrite` for `**/.env`, `**/.env.local` at Medium and `denyRead` at High (only the sandbox holds against `sed -i`, `perl -pi`, `python3 -c`), plus an `Edit()` deny. Note that `denyRead` on `.env` also stops sandboxed tools that load it themselves (a test run with dotenv); decide whether High accepts that.
 - **Remove** the rows from README, FIREWALL-SPEC and `security.json` (B2 to B4 already carry the corrected text).
 
-Either way safe-ai-skill keeps denying raw agent reads of project `.env` at every tier. Its opt-in raw read (`safe-ai-skill tier --env-read ask|tier`) is user scope only and works only while the sandbox is declared on. Bash writes to `.env` are not covered by the plugin at any tier, so the sandbox rows are the only thing that can close them.
+Either way safe-ai-skill keeps denying raw agent reads of project `.env` at every tier. Its opt-in raw read (`safe-ai-skill tier --env-read ask|tier`) is user scope only, works only while the sandbox is declared on, and ships disabled in 1.1.0 (accepted but inactive) until its exfil tripwire exists. Bash writes to `.env` are not covered by the plugin at any tier, so the sandbox rows are the only thing that can close them.
 
 ### A5. `/firewall` lowers through the plugin's confirmation
 
@@ -127,16 +127,16 @@ R/M/H = Relaxed/Medium/High. "all" = every tier, Off included. "—" = this laye
 | `~/.aws`, host tokens (`~/.npmrc`, `~/.netrc`, `~/.git-credentials`, `gh/hosts.yml`, kube, docker, `~/.pypirc`, gem, cargo) | `denyRead` R/M/H for `~/.aws`; host tokens M/H only | `Read()` deny, all | `secrets-guard`: coverage at R not established | agent reads denied, all; command forms (`gh auth token`, `git credential fill`, `aws configure get *secret*`, …) denied |
 | Default wallet `~/.config/solana/id.json` | `denyRead` R (`id.json`) and M/H (`*.json`; `cli/config.yml` readable); `sb=never` proposed | `Read()` deny and `Bash(cat *id.json)`-style globs, all | `secrets-guard`, all | read denied; overwrite, delete and `keygen --force` denied on every cluster, all |
 | Project keypairs (`target/deploy/*-keypair.json`) | — | `Bash(cat *keypair*.json)` only; the Read tool is allowed by design | — | read denied, all |
-| Project `.env` **read** | — | — | — (`egress-guard` blocks *sending* it, R/M/H) | denied by default, all; opt-in raw read is user scope only, with the sandbox declared on; `.env.example` and `.env.schema` readable |
+| Project `.env` **read** | — | — | — (`egress-guard` blocks *sending* it, R/M/H) | denied by default, all; opt-in raw read is user scope only, with the sandbox declared on (ships disabled in 1.1.0); `.env.example` and `.env.schema` readable |
 | Project `.env` **write** | — | — | — | Write/Edit/MultiEdit and agent `env set\|unset` denied M/H; Bash writes (`sed -i`, `python3 -c`) not covered |
 | Irreversible actions: `--final`, `program close`, `program-v4 finalize`, `spl-token authorize … --disable`, `close-mint`/`close`/`burn`, `anchor idl erase-authority`/`close`, `close-vote-account` | — | deny glob, all (plain form) | `onchain-guard` deny, all (wrapped forms) | deny on mainnet, Unknown and testnet; ask on an identified localnet or devnet; never grantable, all |
 | Value-moving: transfer, deploy, upgrade, buffer write/close, `extend`, authority change | — | deny glob for some plain forms | `onchain-guard`: Off silent; R/M ask on every cluster; H mainnet denied | mainnet or Unknown: ask, deny at High; a covering confirmed grant allows below High; within-cap devnet transfer allowed below High; `set_authority`, `account_close` never relaxable |
 | `solana-keygen new`/`recover --force` without `-o` | — | — | `secrets-guard`, all | deny, all |
 | Spend caps, time-boxed grants | — | — | — | yes (state authenticated, lowering needs a typed confirmation) |
 | Value-moving calls on any MCP server | — | tool-name denies for `context-mode`, Cloudflare, Playwright executors (M/H) | `context-mode` only | every `mcp__*` server, by verb and payload: ask, deny at High |
-| A secret file sent to the network (`curl -d @.env`, `--upload-file`, pipe into `nc`) | `deniedDomains` (known sinks only), R/M/H | — | `egress-guard` deny, R/M/H | deny: key material at every tier, project env files from R (best-effort tripwire) |
-| Known exfil, tunnel and paste hosts | `deniedDomains` 70/79/84, Bash subprocesses only | — | `context-mode` URLs only | deny from R, list sized 70/79/84 by tier |
-| Inline `curl` POST body to an unlisted host | — | — | — | ask at High only |
+| A secret file sent to the network (`curl -d @.env`, `--upload-file`, pipe into `nc`) | `deniedDomains` (known sinks only), R/M/H | — | `egress-guard` deny, R/M/H | deny at every tier for a secret file sent by path (a read of it); the best-effort tripwire for pipes and other forms is planned (safe-ai-skill#19) |
+| Known exfil, tunnel and paste hosts | `deniedDomains` 70/79/84, Bash subprocesses only | — | `context-mode` URLs only | planned (safe-ai-skill#19): deny from R, list sized 70/79/84 by tier; nothing in 1.1.0 |
+| Inline `curl` POST body to an unlisted host | — | — | — | ask at every tier in 1.1.0; ask at High only once the tripwire ships |
 | WebFetch to any host | not established whether `deniedDomains` applies | `WebFetch(*)` is in `allow` | — | — |
 | Fetch-and-execute of an undeclared package | — | — | `fetch-exec-guard`: Off silent; R/M note; H deny | `curl … \| sh` asks |
 | Publish, force push, history rewrite, destructive git, `git config` exec keys, `gh api` | — | destructive git denied, all; `gh api` M/H | `egress-guard`, R/M/H | — |
@@ -185,7 +185,7 @@ Correct "Blocked at every tier" at `docs/firewall.md:25-27` to "Blocked at Relax
 ````markdown
 ### Security firewall: safe-ai-skill
 
-Part of the kit's firewall is a separate Claude Code plugin, [safe-ai-skill](https://github.com/solanabr/safe-ai-skill). The kit enforces its sandbox, its permission rules and its four guard hooks. safe-ai-skill enforces the Solana-semantic gates (cluster-aware mainnet, value-moving and irreversible actions, spend caps and grants), blocking of agent reads of keypairs, credential stores and project `.env` files, output redaction, the session-start skill supply-chain check, a pasted-key prompt guard and a best-effort exfil tripwire. It takes the kit's tier as an input: `.claude/security.json` can raise the plugin's tier, never lower it.
+Part of the kit's firewall is a separate Claude Code plugin, [safe-ai-skill](https://github.com/solanabr/safe-ai-skill). The kit enforces its sandbox, its permission rules and its four guard hooks. safe-ai-skill enforces the Solana-semantic gates (cluster-aware mainnet, value-moving and irreversible actions, spend caps and grants), blocking of agent reads of keypairs, credential stores and project `.env` files, output redaction, the session-start skill supply-chain check, and a pasted-key prompt guard; a best-effort exfil tripwire is planned. It takes the kit's tier as an input: `.claude/security.json` can raise the plugin's tier, never lower it.
 
 **Those rules are active only while the plugin is installed and enabled.** Which layer enforces each rule is tabulated in [docs/firewall.md](docs/firewall.md#who-enforces-what).
 
