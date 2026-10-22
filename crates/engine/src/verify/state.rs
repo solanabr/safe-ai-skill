@@ -540,66 +540,160 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The skill names a pack provides (see [`skill_names_checked`]).
+/// The skill names a pack provides (see [`skill_names_until`]).
 pub fn skill_names(root: &Path) -> Vec<String> {
-    skill_names_checked(root).names
+    skill_names_until(root, None).names
 }
 
-/// What [`skill_names_checked`] found.
+/// Entries the name walk visits per pack before giving up.
+pub const MAX_NAME_WALK_ENTRIES: usize = 20_000;
+/// Directory depth the name walk descends to.
+const MAX_NAME_WALK_DEPTH: usize = 8;
+
+/// What [`skill_names_until`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillNames {
     /// Every name the pack may be invoked by.
     pub names: Vec<String>,
-    /// Some `SKILL.md` has frontmatter that does not parse, so its name may be missing.
+    /// Some names may be missing: a `SKILL.md` whose frontmatter does not parse, or a
+    /// `SKILL.md` / skill dir that resolves outside the pack (or not at all).
     pub unparseable: bool,
+    /// Names of the skill dirs whose `SKILL.md`, or which themselves, link outside the pack:
+    /// their content is never verified, so invoking them is denied.
+    pub escaping: Vec<String>,
+    /// The walk hit [`MAX_NAME_WALK_ENTRIES`] or the deadline before finishing.
+    pub over_budget: bool,
 }
 
-/// The skill names a pack provides: its directory name, and for every `SKILL.md` in it
-/// (any case; not under the pack-root `.git`) the parent directory name and every value its
-/// frontmatter gives `name`. A symlinked `SKILL.md` or skill directory is followed only while
-/// its target stays inside the pack.
-pub fn skill_names_checked(root: &Path) -> SkillNames {
+/// The skill names a pack provides: its directory name, and for every entry named `SKILL.md`
+/// (any case; not under the pack-root `.git` or a `node_modules`) the name of the dir it sits
+/// in, as reached, and every value its frontmatter gives `name`.
+///
+/// Symlinks are never walked through blindly: a `SKILL.md` link or a dir link is resolved once
+/// (the kernel bounds the chain) and followed only when it stays inside the pack; each real dir
+/// is visited once however many links lead to it. A link leaving the pack (or dangling) marks
+/// the result [`SkillNames::unparseable`] and lists the name in [`SkillNames::escaping`]. The
+/// walk stops at [`MAX_NAME_WALK_ENTRIES`] entries or at `deadline`, setting
+/// [`SkillNames::over_budget`].
+pub fn skill_names_until(root: &Path, deadline: Option<std::time::Instant>) -> SkillNames {
+    skill_names_bounded(root, deadline, MAX_NAME_WALK_ENTRIES)
+}
+
+/// [`skill_names_until`] with an explicit entry cap.
+pub(crate) fn skill_names_bounded(
+    root: &Path,
+    deadline: Option<std::time::Instant>,
+    max_entries: usize,
+) -> SkillNames {
     let mut out = SkillNames::default();
-    if let Some(n) = root.file_name().and_then(|n| n.to_str()) {
-        out.names.push(n.to_string());
+    let root_name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if !root_name.is_empty() {
+        out.names.push(root_name.clone());
     }
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let walker = WalkDir::new(root)
-        .follow_links(true)
-        .max_depth(8)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.depth() == 1 && e.file_name() == ".git" {
-                return false;
-            }
-            if e.file_name() == "node_modules" {
-                return false;
-            }
-            // A followed link must stay inside the pack.
-            !e.path_is_symlink()
-                || e.path()
-                    .canonicalize()
-                    .is_ok_and(|c| c.starts_with(&canonical_root))
-        });
-    for entry in walker.flatten() {
-        if !entry.file_type().is_file() || !entry.file_name().eq_ignore_ascii_case("SKILL.md") {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return out;
+    };
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    visited.insert(canonical_root.clone());
+    // (canonical dir, the name it was reached by, depth)
+    let mut stack: Vec<(PathBuf, String, usize)> = vec![(canonical_root.clone(), root_name, 0)];
+    let mut seen = 0usize;
+    while let Some((dir, reached_as, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > max_entries || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                out.over_budget = true;
+                out.unparseable = true;
+                return finish(out);
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str().map(String::from) else {
+                continue;
+            };
+            if (depth == 0 && name == ".git") || name == "node_modules" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = dir.join(&name);
+            if name.eq_ignore_ascii_case("SKILL.md") {
+                // The dir it sits in is a skill name whatever the file resolves to.
+                out.names.push(reached_as.clone());
+                let target = if ft.is_symlink() {
+                    path.canonicalize()
+                        .ok()
+                        .filter(|t| t.starts_with(&canonical_root))
+                } else {
+                    Some(path.clone())
+                };
+                match target.filter(|t| t.is_file()) {
+                    Some(t) => {
+                        let (names, parsed) = frontmatter_names(&t);
+                        out.names.extend(names);
+                        out.unparseable |= !parsed;
+                    }
+                    None => {
+                        out.unparseable = true;
+                        out.escaping.push(reached_as.clone());
+                    }
+                }
+                continue;
+            }
+            if depth + 1 > MAX_NAME_WALK_DEPTH {
+                continue;
+            }
+            if ft.is_dir() {
+                if visited.insert(path.clone()) {
+                    stack.push((path, name, depth + 1));
+                }
+            } else if ft.is_symlink() {
+                match path.canonicalize() {
+                    Ok(t) if t.is_dir() && t.starts_with(&canonical_root) => {
+                        // A linked skill dir is invoked by the link's name.
+                        if has_skill_md(&t) {
+                            out.names.push(name.clone());
+                        }
+                        if visited.insert(t.clone()) {
+                            stack.push((t, name, depth + 1));
+                        }
+                    }
+                    Ok(t) if !t.is_dir() => {}
+                    // A dir link leaving the pack, or one that does not resolve.
+                    _ => {
+                        out.unparseable = true;
+                        out.escaping.push(name);
+                    }
+                }
+            }
         }
-        if let Some(dir) = entry
-            .path()
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-        {
-            out.names.push(dir.to_string());
-        }
-        let (names, parsed) = frontmatter_names(entry.path());
-        out.names.extend(names);
-        out.unparseable |= !parsed;
     }
-    out.names.sort();
-    out.names.dedup();
+    finish(out)
+}
+
+fn finish(mut out: SkillNames) -> SkillNames {
+    for list in [&mut out.names, &mut out.escaping] {
+        list.retain(|n| !n.is_empty());
+        list.sort();
+        list.dedup();
+    }
     out
+}
+
+/// True when `dir` holds an entry named `SKILL.md` (any case).
+fn has_skill_md(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().take(MAX_NAME_WALK_ENTRIES).any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case("SKILL.md"))
+        })
+    })
 }
 
 /// Every `name` a `SKILL.md` frontmatter gives, from its first 64 KiB: the YAML value (a
@@ -658,19 +752,34 @@ fn name_line_value(line: &str) -> Option<String> {
         return None;
     }
     let (key, value) = line.split_once(':')?;
-    let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+    let key = key
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'');
     if key != "name" {
         return None;
     }
-    let value = value.split(" #").next().unwrap_or("").trim();
-    let value = value.trim_matches(|c| c == '"' || c == '\'').trim();
+    let mut value = value.split(" #").next().unwrap_or("").trim();
+    // A YAML tag (`!custom bar`) does not change the scalar.
+    if value.starts_with('!') {
+        value = value
+            .split_once(char::is_whitespace)
+            .map_or("", |x| x.1)
+            .trim();
+    }
+    let value = value
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim_start_matches('\u{feff}')
+        .trim();
     (!value.is_empty()).then(|| value.to_string())
 }
 
 /// A YAML scalar as a string.
 fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
     match v {
-        serde_yaml::Value::String(s) => Some(s.trim().to_string()),
+        serde_yaml::Value::String(s) => Some(s.trim_start_matches('\u{feff}').trim().to_string()),
+        // `name: !custom bar` is still `bar` to anything reading the scalar.
+        serde_yaml::Value::Tagged(t) => yaml_scalar(&t.value),
         serde_yaml::Value::Number(n) => Some(n.to_string()),
         serde_yaml::Value::Bool(b) => Some(b.to_string()),
         _ => None,
@@ -834,6 +943,102 @@ mod tests {
             names("---\n  name: nested\n---\n").0,
             vec!["nested".to_string()]
         );
+    }
+
+    /// `levels` dirs `d1..`, each holding `fan` links to the next; the root holds `fan` links
+    /// to `d1`; the last dir holds the SKILL.md. Walked blindly that is fan^levels paths.
+    #[cfg(unix)]
+    fn fan_out(root: &Path, levels: usize, fan: usize) {
+        for l in 1..=levels {
+            fs::create_dir_all(root.join(format!("d{l}"))).unwrap();
+        }
+        for i in 1..=fan {
+            std::os::unix::fs::symlink("d1", root.join(format!("l{i}"))).unwrap();
+            for l in 1..levels {
+                std::os::unix::fs::symlink(
+                    format!("../d{}", l + 1),
+                    root.join(format!("d{l}/l{i}")),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(
+            root.join(format!("d{levels}/SKILL.md")),
+            "---\nname: deep\n---\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_fan_out_is_walked_once_per_real_dir() {
+        let d = tmp("fanout").join("pack");
+        fan_out(&d, 12, 8);
+        let started = std::time::Instant::now();
+        let names = skill_names_until(&d, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!names.over_budget && !names.unparseable, "{names:?}");
+        assert!(names.names.contains(&"deep".to_string()), "{names:?}");
+        // Hashing never follows links either.
+        let started = std::time::Instant::now();
+        tree_hash(&d);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_name_walk_stops_at_its_entry_cap_and_deadline() {
+        let d = tmp("cap").join("pack");
+        fs::create_dir_all(&d).unwrap();
+        for i in 0..50 {
+            fs::write(d.join(format!("f{i}")), "x").unwrap();
+        }
+        let capped = skill_names_bounded(&d, None, 10);
+        assert!(capped.over_budget && capped.unparseable, "{capped:?}");
+        let late = skill_names_until(&d, Some(std::time::Instant::now()));
+        assert!(late.over_budget, "{late:?}");
+        assert!(!skill_names_until(&d, None).over_budget);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_md_and_skill_dirs_linking_outside_are_named_and_flagged() {
+        let base = tmp("escape");
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("tooldir")).unwrap();
+        fs::write(outside.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+        fs::write(
+            outside.join("tooldir/SKILL.md"),
+            "---\nname: hidden2\n---\n",
+        )
+        .unwrap();
+        let pack = base.join("pack");
+        fs::create_dir_all(pack.join("skills/x")).unwrap();
+        std::os::unix::fs::symlink(outside.join("SKILL.md"), pack.join("skills/x/SKILL.md"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.join("tooldir"), pack.join("tool")).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), pack.join("dangling")).unwrap();
+        let n = skill_names_until(&pack, None);
+        assert!(n.names.contains(&"x".to_string()), "{n:?}");
+        assert!(n.unparseable, "{n:?}");
+        assert_eq!(n.escaping, vec!["dangling", "tool", "x"]);
+        assert!(!n.names.contains(&"hidden".to_string()));
+    }
+
+    #[test]
+    fn tagged_and_bom_prefixed_names_are_read() {
+        let d = tmp("tagged");
+        let names = |body: &str| {
+            fs::write(d.join("SKILL.md"), body).unwrap();
+            frontmatter_names(&d.join("SKILL.md"))
+        };
+        let (n, parsed) = names("---\nname: !custom bar\n---\n");
+        assert!(parsed && n.contains(&"bar".to_string()), "{n:?}");
+        let (n, _) = names("---\nname: \"\u{feff}bar\"\n---\n");
+        assert!(n.iter().all(|x| x == "bar"), "{n:?}");
     }
 
     #[test]

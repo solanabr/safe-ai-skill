@@ -487,6 +487,11 @@ fn now_secs() -> u64 {
 /// The user-scope skills dir: `install --from` installs there, and 1.0.0 swept (and moved) it.
 const USER_SKILLS_DIR: &str = "~/.claude/skills";
 
+/// Time one pack's skill-name walk may take during a sweep before the pack is graded HIGH.
+const NAME_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// Rule id of the HIGH finding for a pack whose name walk ran out of budget.
+const SCAN_BUDGET_RULE: &str = "scan_budget_exceeded";
+
 /// The pack scanner the state machine grades with (see [`grading`]).
 pub type Scanner = fn(&Path) -> grading::PackReport;
 
@@ -861,11 +866,16 @@ struct Evaluated {
 /// Unchanged content (same hash as the last scan) reuses the stored scan when the data dir is
 /// trusted; otherwise the pack is scanned. A pack with no entry is first carried over from the
 /// v1 lockfile when it has a pin there (see [`migrate_v1`]).
+///
+/// `names` are the pack's skill names when the caller already walked for them (each pack is
+/// walked once per invocation). A name walk that runs out of budget grades the pack HIGH
+/// (`scan_budget_exceeded`).
 fn evaluate(
     st: &mut State,
     pack: &Pack,
     env: &Env,
     deadline: Option<std::time::Instant>,
+    names: Option<state::SkillNames>,
 ) -> Option<Evaluated> {
     let over = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let key = state::key_of(&pack.canonical);
@@ -887,14 +897,28 @@ fn evaluate(
             p.names.clone(),
         ),
         None => {
-            let report = (env.scanner)(&pack.canonical);
+            let walked = names.unwrap_or_else(|| {
+                let budget = std::time::Instant::now() + NAME_WALK_BUDGET;
+                let until = deadline.map_or(budget, |d| d.min(budget));
+                state::skill_names_until(&pack.canonical, Some(until))
+            });
+            let mut report = (env.scanner)(&pack.canonical);
+            if walked.over_budget {
+                report.findings.push(grading::Finding {
+                    rule: SCAN_BUDGET_RULE,
+                    sev: grading::Severity::High,
+                    path: PathBuf::new(),
+                    line: None,
+                    ctx: grading::Ctx::Meta,
+                });
+            }
             let (findings, more) = state::stored_findings(&report);
             (
                 grading::grade(&report),
                 findings,
                 more,
                 state::flagged_rules(&report),
-                state::skill_names(&pack.canonical),
+                walked.names,
             )
         }
     };
@@ -1183,7 +1207,7 @@ fn sweep(
 
     let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
     for pack in targets.packs {
-        let Some(ev) = evaluate(&mut st, &pack, &env, None) else {
+        let Some(ev) = evaluate(&mut st, &pack, &env, None, None) else {
             continue;
         };
         swept_keys.push(ev.key.clone());
@@ -3053,6 +3077,102 @@ mod enforce_tests {
         assert_eq!(skill(&d2, &project2, "mystery"), GateVerdict::NoOpinion);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_linking_outside_its_pack_is_denied_and_the_pack_blocked() {
+        let project = tempdir("escape-gate");
+        let d = DataDir {
+            path: project.join("../escape-gate-data"),
+            trusted: false,
+        };
+        let _ = fs::remove_dir_all(&d.path);
+        let outside = tempdir("escape-gate-outside");
+        fs::write(outside.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+        let pack = project.join(".claude/skills/linky");
+        fs::create_dir_all(pack.join("skills/x")).unwrap();
+        fs::write(pack.join("SKILL.md"), "# linky").unwrap();
+        std::os::unix::fs::symlink(outside.join("SKILL.md"), pack.join("skills/x/SKILL.md"))
+            .unwrap();
+        // Before any sweep: the name reached through the escaping link is denied.
+        let GateVerdict::Deny(reason) = skill(&d, &project, "x") else {
+            panic!("not denied")
+        };
+        assert!(reason.contains("links outside the pack"), "{reason}");
+        // The sweep blocks the pack on the escaping symlink.
+        let r = sweep_it(&d, &project);
+        assert_eq!(r.blocked, vec![".claude/skills/linky".to_string()]);
+        assert!(
+            r.system_message.contains("symlink_escape"),
+            "{}",
+            r.system_message
+        );
+        assert!(is_deny(&skill(&d, &project, "linky")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_skill_gate_stays_bounded_on_a_symlink_fan_out() {
+        let (d, project) = blocked_project("fanout-gate");
+        let pack = project.join(".claude/skills/wide");
+        fs::create_dir_all(&pack).unwrap();
+        for l in 1..=10 {
+            fs::create_dir_all(pack.join(format!("d{l}"))).unwrap();
+        }
+        for i in 1..=8 {
+            std::os::unix::fs::symlink("d1", pack.join(format!("l{i}"))).unwrap();
+            for l in 1..10 {
+                std::os::unix::fs::symlink(
+                    format!("../d{}", l + 1),
+                    pack.join(format!("d{l}/l{i}")),
+                )
+                .unwrap();
+            }
+        }
+        fs::write(pack.join("d10/SKILL.md"), "---\nname: deep\n---\n").unwrap();
+        let started = std::time::Instant::now();
+        let _ = skill(&d, &project, "deep");
+        let _ = skill(&d, &project, "absent");
+        sweep_it(&d, &project);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_over_budget_name_walk_grades_the_pack_high() {
+        let project = tempdir("walk-high");
+        let d = DataDir {
+            path: project.join("data"),
+            trusted: false,
+        };
+        let dir = project.join(".claude/skills/big");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "# big").unwrap();
+        let pack = Pack {
+            kind: PackKind::Skill,
+            name: "big".into(),
+            dir: dir.clone(),
+            canonical: dir.clone(),
+            display: ".claude/skills/big".into(),
+        };
+        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack);
+        let mut st = State::default();
+        let names = state::SkillNames {
+            names: vec!["big".into()],
+            unparseable: true,
+            escaping: vec![],
+            over_budget: true,
+        };
+        let ev = evaluate(&mut st, &pack, &env, None, Some(names)).unwrap();
+        let e = &st.packs[&ev.key];
+        assert_eq!(e.state, PackStatus::Unreviewed);
+        assert!(e
+            .flagged_rules
+            .contains(&"scan_budget_exceeded".to_string()));
+    }
+
     #[test]
     fn skill_gate_denies_when_verification_overruns_its_budget() {
         let (d, project) = blocked_project("budget");
@@ -3128,6 +3248,16 @@ mod enforce_tests {
         assert_eq!(raw(r#"{"prompt":"just a long question"#), None);
         assert_eq!(raw(r#"{"hook_event_name":"UserPrompt"#), Some(None));
         assert_eq!(raw("\u{0}garbage"), Some(None));
+    }
+
+    #[test]
+    fn the_cwd_is_read_from_an_unparseable_payload_head() {
+        assert_eq!(
+            enforce::raw_cwd(br#"{"session_id":"s","cwd":"/work/proj","prompt":"/x"#),
+            Some(PathBuf::from("/work/proj"))
+        );
+        assert_eq!(enforce::raw_cwd(br#"{"cwd":"relative/dir""#), None);
+        assert_eq!(enforce::raw_cwd(br#"{"prompt":"x"#), None);
     }
 
     #[test]

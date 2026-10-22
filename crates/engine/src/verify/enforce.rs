@@ -157,7 +157,18 @@ pub(super) fn skill_verdict_in(
                 continue;
             }
             // Current names (a mid-session rename counts) united with the recorded ones.
-            let current = state::skill_names_checked(&pack.canonical);
+            let current = state::skill_names_until(&pack.canonical, Some(deadline));
+            if current.over_budget {
+                return over_budget(skill);
+            }
+            // A skill dir (or its SKILL.md) linking outside the pack is never verified.
+            if let Some(name) = current.escaping.iter().find(|n| is_wanted(n)) {
+                return Verdict::Deny(format!(
+                    "safe-ai-skill: skill `{skill}` resolves through `{name}` in the skill pack \
+                     {}, which links outside the pack, so its content was never verified.",
+                    pack.display
+                ));
+            }
             let stored = st.packs.get(&key);
             let provides = is_wanted(&pack.name)
                 || current.names.iter().any(|n| is_wanted(n))
@@ -172,7 +183,8 @@ pub(super) fn skill_verdict_in(
                 continue;
             }
             seen.push(key.clone());
-            let Some(ev) = super::evaluate(&mut st, &pack, &env, Some(deadline)) else {
+            let Some(ev) = super::evaluate(&mut st, &pack, &env, Some(deadline), Some(current))
+            else {
                 return over_budget(skill);
             };
             if let Some(e) = st.packs.get(&ev.key) {
@@ -211,25 +223,40 @@ fn over_budget(skill: &str) -> Verdict {
 /// `Some(None)` when the payload may be a slash command whose name cannot be read, and `None`
 /// when it is plainly not one.
 pub fn slash_name_from_raw(raw: &[u8]) -> Option<Option<String>> {
-    let head = String::from_utf8_lossy(&raw[..raw.len().min(RAW_HEAD_BYTES)]);
-    // The string value of `key`, up to its closing quote or the end of what was read.
-    let value_of = |key: &str| -> Option<String> {
-        let at = head.find(key)? + key.len();
-        let rest = head[at..].trim_start().strip_prefix(':')?.trim_start();
-        let rest = rest.strip_prefix('"')?;
-        Some(rest.split('"').next().unwrap_or("").to_string())
-    };
-    if let Some(name) = value_of("\"command_name\"") {
+    if let Some(name) = raw_string(raw, "command_name") {
         let name = name.trim();
         return Some((!name.is_empty()).then(|| name.to_string()));
     }
-    match value_of("\"prompt\"") {
+    // An expansion is a slash command whose name lies past what was read.
+    if raw_string(raw, "hook_event_name").as_deref() == Some("UserPromptExpansion") {
+        return Some(None);
+    }
+    match raw_string(raw, "prompt") {
         Some(prompt) => {
             let rest = prompt.trim_start().strip_prefix('/')?;
             Some(rest.split_whitespace().next().map(String::from))
         }
         None => Some(None),
     }
+}
+
+/// The `cwd` an unparseable hook payload carries, read from its head.
+pub fn raw_cwd(raw: &[u8]) -> Option<PathBuf> {
+    raw_string(raw, "cwd")
+        .filter(|c| !c.is_empty() && !c.contains('\\'))
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// The string value of JSON key `key` in the first [`RAW_HEAD_BYTES`] of `raw`, up to its
+/// closing quote or the end of what was read.
+fn raw_string(raw: &[u8], key: &str) -> Option<String> {
+    let head = String::from_utf8_lossy(&raw[..raw.len().min(RAW_HEAD_BYTES)]);
+    let quoted = format!("\"{key}\"");
+    let at = head.find(&quoted)? + quoted.len();
+    let rest = head[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(rest.split('"').next().unwrap_or("").to_string())
 }
 
 /// Block reason for a prompt-time payload the engine could not parse: block a slash command
@@ -248,7 +275,10 @@ pub fn unreadable_prompt_verdict(
         Some(name) => reason(skill_verdict(dir, cwd, policy, &name)),
         None => {
             let st = state::load(dir).state;
-            let scope = project_dirs(cwd);
+            let mut scope = project_dirs(cwd);
+            // User-level packs load in every project.
+            let user = expand_home(USER_SKILLS_DIR);
+            scope.push(user.canonicalize().unwrap_or(user));
             let blocked = blocked_packs(&st).into_iter().find(|b| {
                 b.roots
                     .iter()

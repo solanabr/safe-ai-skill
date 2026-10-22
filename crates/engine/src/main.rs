@@ -388,7 +388,8 @@ fn cmd_gate_prompt_expansion() -> ExitCode {
         // Oversized or malformed: judge the raw head (a blocked slash command, or one whose
         // name cannot be read while a pack in scope is blocked, is blocked).
         _ => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cwd = verify::enforce::raw_cwd(&raw)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
             let dir = verify_dir(&cwd);
             let effective = load_effective_policy(&cwd, &dir.path);
             let block = verify::enforce::unreadable_prompt_verdict(&dir, &cwd, &effective, &raw);

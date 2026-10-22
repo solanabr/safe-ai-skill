@@ -139,8 +139,58 @@ pub fn scan_pack(root: &Path) -> PackReport {
         .collect();
     PackReport {
         findings,
-        combos: Vec::new(),
+        combos: symlink_escapes(root),
     }
+}
+
+/// A `symlink_escape` combo for every symlink in the pack whose target, resolved lexically
+/// against the link's dir, leaves the pack (as WS-D2's `symlink_escape` rule does). Links are
+/// never followed.
+fn symlink_escapes(root: &Path) -> Vec<ComboHit> {
+    let mut hits = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|e| !(e.depth() == 1 && e.file_name() == ".git"));
+    for entry in walker.flatten() {
+        if !entry.path_is_symlink() {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let base = entry.path().parent().unwrap_or(root);
+        let resolved = lexical(&base.join(&target));
+        if !resolved.starts_with(lexical(root)) {
+            hits.push(ComboHit {
+                rule: "symlink_escape",
+                path: entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(entry.path())
+                    .to_path_buf(),
+                line: None,
+                parts: vec!["symlink"],
+            });
+        }
+    }
+    hits
+}
+
+/// `path` with `.` and `..` removed without touching the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Markdown and plain-text files are documentation.

@@ -328,4 +328,38 @@ fn home_relative_paths_into_a_blocked_user_pack_are_denied() {
         assert_eq!(d, "deny", "{cmd}: {}", out.stdout);
         assert!(reason.contains("hpack"), "{reason}");
     }
+    // An unreadable expansion whose name lies past the readable head is blocked while a
+    // user-level pack (loaded in every project) is blocked.
+    let other = TempDir::new("sg-home-other");
+    let body = format!(
+        r#"{{"hook_event_name":"UserPromptExpansion","cwd":"{}","prompt":"{}","command_name":"anything"}}"#,
+        other.path().display(),
+        "x".repeat(1024 * 1024 + 16)
+    );
+    let out = Invocation::new(&["gate-prompt-expansion"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(other.path())
+        .env("CLAUDE_PLUGIN_ROOT", plugin.path().to_str().unwrap())
+        .stdin(body)
+        .run();
+    assert_eq!(out.json()["decision"], "block", "{}", out.stdout);
+}
+
+#[test]
+fn an_unreadable_prompt_is_judged_in_the_payload_cwd() {
+    let f = Fixture::new("sg-cwd");
+    let elsewhere = TempDir::new("sg-cwd-elsewhere");
+    let body = format!(
+        r#"{{"hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"/evil {}"}}"#,
+        f.cwd(),
+        "x".repeat(1024 * 1024 + 16)
+    );
+    let run = Invocation::new(&["gate-prompt-expansion"])
+        .plugin_data(f.data.path())
+        .home(f.home.path())
+        .cwd(elsewhere.path())
+        .stdin(body)
+        .run();
+    assert_eq!(run.json()["decision"], "block", "{}", run.stdout);
 }
