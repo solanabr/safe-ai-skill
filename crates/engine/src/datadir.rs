@@ -3,13 +3,14 @@
 //! The CLI must find the same state the hooks read, so both resolve it here (spec D2.8):
 //!
 //! 1. `CLAUDE_PLUGIN_DATA` (always set for a plugin hook);
-//! 2. else an existing `safe-ai-skill-*` dir under the plugin-data root(s):
-//!    `$CLAUDE_CONFIG_DIR/plugins/data` first when that var is set, then
-//!    `<home>/.claude/plugins/data`. `<home>` is the OS user-database home (see below),
-//!    falling back to `HOME`/`USERPROFILE` only when the lookup fails. In a root,
-//!    `safe-ai-skill-safe-ai-skill` wins, then `safe-ai-skill-stbr`; failing both, a lone
-//!    `safe-ai-skill-*` dir is used, and several are ambiguous (unresolved);
-//! 3. else `<first root>/safe-ai-skill-safe-ai-skill` (created on first write).
+//! 2. else an existing `safe-ai-skill-*` dir under the plugin-data root:
+//!    `$CLAUDE_CONFIG_DIR/plugins/data` when that var is set (it replaces `~/.claude`, as in
+//!    Claude Code), else `<home>/.claude/plugins/data`. `<home>` is the OS user-database home
+//!    (see below), falling back to `HOME`/`USERPROFILE` only when the lookup fails. In the
+//!    root, `safe-ai-skill-safe-ai-skill` wins, then `safe-ai-skill-stbr`; failing both, a
+//!    lone `safe-ai-skill-*` dir is used, and several are ambiguous (unresolved);
+//! 3. else unresolved: an error telling the user to set `CLAUDE_PLUGIN_DATA`. No dir is
+//!    invented (the plugin's dir exists once Claude Code installed it).
 //!
 //! There is no `./.safe-ai-skill` fallback: a relative state dir would let a repo plant it.
 //! When nothing resolves, [`data_dir`] errors; code that needs a path anyway uses
@@ -134,12 +135,14 @@ impl Env {
             .map(|h| h.join(".claude").join("plugins").join("data"))
     }
 
-    /// Roots searched for an install dir, `$CLAUDE_CONFIG_DIR` first.
+    /// The root searched for an install dir: `$CLAUDE_CONFIG_DIR` replaces `~/.claude`.
     fn discovery_roots(&self) -> Vec<PathBuf> {
+        if let Some(root) = self.config_root() {
+            return vec![root];
+        }
         let home = self.passwd_home.as_ref().or(self.env_home.as_ref());
-        self.config_root()
+        home.map(|h| h.join(".claude").join("plugins").join("data"))
             .into_iter()
-            .chain(home.map(|h| h.join(".claude").join("plugins").join("data")))
             .collect()
     }
 }
@@ -174,12 +177,16 @@ fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
             Install::None => {}
         }
     }
-    roots.first().map(|r| r.join(PREFERRED[0])).ok_or_else(|| {
-        Error::Other(
-            "cannot resolve the plugin data dir: no CLAUDE_PLUGIN_DATA, CLAUDE_CONFIG_DIR or home"
-                .to_string(),
-        )
-    })
+    Err(Error::Other(match roots.first() {
+        Some(root) => format!(
+            "no plugin data dir under {} (is the plugin installed?); set CLAUDE_PLUGIN_DATA to \
+             the plugin's data dir, usually ~/.claude/plugins/data/safe-ai-skill-<marketplace>",
+            root.display()
+        ),
+        None => "cannot resolve the plugin data dir: no CLAUDE_PLUGIN_DATA, CLAUDE_CONFIG_DIR or \
+                 home; set CLAUDE_PLUGIN_DATA"
+            .to_string(),
+    }))
 }
 
 /// The install dir under `root`: a preferred name, else the only `safe-ai-skill-*` dir.
@@ -422,6 +429,8 @@ mod tests {
                 .trusted
         );
         // Without CLAUDE_PLUGIN_DATA, discovery uses the passwd home, not HOME.
+        std::fs::create_dir_all(data_root(&fake).join("safe-ai-skill-stbr")).unwrap();
+        std::fs::create_dir_all(data_root(&real).join("safe-ai-skill-safe-ai-skill")).unwrap();
         assert_eq!(
             resolve(&env, None).unwrap().path,
             data_root(&real).join("safe-ai-skill-safe-ai-skill")
@@ -602,17 +611,18 @@ mod tests {
     }
 
     #[test]
-    fn no_install_dir_defaults_under_the_root_never_relative() {
+    fn no_install_dir_is_an_error_naming_claude_plugin_data() {
         let home = tmp("default");
-        let d = resolve(&env_home(&home), None).unwrap();
-        assert_eq!(d.path, data_root(&home).join("safe-ai-skill-safe-ai-skill"));
-        assert!(d.path.is_absolute());
-        assert!(d.trusted);
+        let err = resolve(&env_home(&home), None).unwrap_err().to_string();
+        assert!(err.contains("CLAUDE_PLUGIN_DATA"), "{err}");
+        assert!(!data_root(&home)
+            .join("safe-ai-skill-safe-ai-skill")
+            .exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn config_dir_root_comes_first() {
+    fn config_dir_root_replaces_the_home_root() {
         let home = tmp("cfgdir");
         let cfg = home.join("cfg");
         std::fs::create_dir_all(data_root(&home).join("safe-ai-skill-stbr")).unwrap();
@@ -620,11 +630,8 @@ mod tests {
             config_dir: Some(cfg.clone()),
             ..env_home(&home)
         };
-        // Nothing under the config root: the home install is found.
-        assert_eq!(
-            resolve(&env, None).unwrap().path,
-            data_root(&home).join("safe-ai-skill-stbr")
-        );
+        // `$CLAUDE_CONFIG_DIR` replaces `~/.claude`: the home install is not consulted.
+        assert!(resolve(&env, None).is_err());
         let under_cfg = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
         std::fs::create_dir_all(&under_cfg).unwrap();
         let d = resolve(&env, None).unwrap();

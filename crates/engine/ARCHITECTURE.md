@@ -18,8 +18,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-All four are green: `cargo test` = **314 passed** as of the solana-ai-kit foundation pass
-(`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean).
+All four must be green before a commit (`cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean, `cargo test` passing).
 
 Dependencies (resolved, FROZEN in `Cargo.toml`): `serde 1`, `serde_json 1`, `serde_yaml
 0.9`, `sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`),
@@ -116,6 +116,28 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 
 ---
 
+## Platform shim (`plugins/safe-ai-skill/bin/safe-ai-skill`)
+
+`hooks.json` runs the POSIX sh shim, which execs the prebuilt `safe-ai-skill-<plat>` beside it
+(never `cargo build`, never a binary outside its own directory) and maps failures onto the hook
+contract:
+
+- **Environment failure** (no prebuilt for the platform, not an executable here, exit 126/127):
+  fail open with a notice. `gate-bash` answers `ask` for the Solana surface, SessionStart reports
+  the firewall INACTIVE, every other hook exits 0 with one stderr line.
+- **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash` and `gate-mcp` exit 2 (block);
+  the rest exit 0 with a stderr line.
+- `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
+  turns the hooks off, but is ignored in strict mode or when the committed project
+  `.claude/settings.json` mentions it; SessionStart reports either way.
+- The Solana `gate-bash` entries set `onFailure: block`, the others `continue`. `onFailure`
+  needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
+  never blocks.
+
+CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
+
+---
+
 ## Decision → JSON shapes
 
 - **PreToolUse**:
@@ -137,7 +159,8 @@ under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`; never a rela
 `DataDir::trusted` holds only inside `<passwd home>/.claude/plugins/data`, or inside
 `$CLAUDE_CONFIG_DIR/plugins/data` when that config dir is under the passwd home and neither
 it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
-`key`).
+`key`). The CLI resolves the same dir from a terminal; state is never written to
+`~/.safe-ai-skill` or the cwd.
 
 | File | Producer | Purpose |
 |---|---|---|
@@ -147,7 +170,7 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | `grants.json` | `grants` (round-2) | active scoped grants |
 | `mode.json` | `mode` (round-2) | runtime active-profile override |
 | `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
-| `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
+| `quarantine/<name>` | 1.0.0 `verify` (legacy) | skill dirs 1.0.0 moved; 1.0.1 never writes here. `verify approve <name>` restores one, `verify session` lists leftovers |
 | `session/<id>.json` | `session` (round-2) | ephemeral session keypairs (0600) |
 | `key` | `statefile` | 32-byte HMAC key for authenticated state (0600) |
 | `pending.json` | `confirm` | prompt-nonce pending entries (authenticated, 600 s TTL) |
@@ -351,12 +374,21 @@ pub fn append(entry: &AuditEntry, plugin_data: &Path) -> std::io::Result<()>;
 ### `gates` (STUBS — return safe defaults)
 ```rust
 pub fn gates::bash::decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta);   // (Defer, unknown)
-pub fn gates::secrets::decide(command: &str, policy: &Policy) -> Decision;                            // Defer
+pub fn gates::secrets::decide(command: &str, cwd: &Path, policy: &Policy) -> Decision;                // Defer
 pub fn gates::read::decide(path: &str, policy: &Policy) -> Decision;                                  // Defer
 pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, ctx: &Context, policy: &Policy) -> (Decision, GateMeta); // (Defer, unknown)
+pub fn gates::tamper::decide_bash(command: &str, protected: &Protected) -> Decision;                  // Deny | Ask | Defer
+pub fn gates::tamper::decide_bash_within(command: &str, protected: &Protected, budget: &mut Budget) -> Decision; // Deny | Ask | Defer
+pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &Path, protected: &Protected) -> Decision; // Deny | Defer
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
+> `tamper` is the self-grant tripwire (spec D4.3): `secrets::decide` runs `decide_bash_within`
+> first (with the hook payload's `cwd` as the session directory), sharing one work `Budget`
+> (units plus a 2 s deadline) with its own scan; exhausting it asks ("command too complex to
+> inspect"), never no opinion. `gate-tamper`
+> (`Write|Edit|MultiEdit|NotebookEdit`) runs `decide_file`, audits as `tamper`, and skips
+> `relax::apply`.
 
 ### `redact` / `promptguard` (STUBS)
 ```rust
@@ -411,12 +443,22 @@ pub fn verify::provenance::resolve(source: &str) -> Report;    // empty
 pub fn verify::osv::query(pkg: &str, version: &str) -> Report; // empty
 pub fn verify::lockfile::hash_tree(path: &Path) -> String;     // ""
 
-// NEW — per-ext-submodule discovery (STUB; round-2 Agent B implements + integrates).
-// Returns each `ext/<name>` dir under `skills_dir` as an individual verifiable unit. STUB
-// returns an empty vec; `run_session` behavior is UNCHANGED (still treats ext/ as one unit)
-// until Agent B wires this in (per-submodule git-SHA pin/drift).
-pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;  // []
+// Per-ext-submodule discovery: each `ext/<name>` dir under `skills_dir` is its own verifiable
+// unit (git-SHA pin/drift), walked by `run_session`; empty when `verify_ext_submodules` is off.
+pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;
+pub fn verify::run_session(plugin_data: &Path, project_dir: &Path, policy: &Policy) -> SessionResult;
+pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, policy: &Policy) -> std::io::Result<Approval>;
 ```
+
+**`verify session` is report-only.** `run_session` sweeps each root in `supply_chain.verify_skills_dirs`
+(project `.claude/skills`; `~/.claude/skills` only when a project overlay opts in to it, the one out-of-project dir
+`keep_scan_dirs` accepts, canonicalised by `confine_project_dirs`; except packs `install --from`
+put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
+own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
+if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, High findings
+at `path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is
+moved or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
+`quarantine/` (never over an existing directory).
 
 ### `registry` (NEW — opt-in catalog; STUBS, round-2 Agent A)
 ```rust
@@ -450,7 +492,7 @@ pub fn session::status(plugin_data: &Path) -> error::Result<String>;            
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `redact` · `prompt-guard` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `redact` · `prompt-guard` ·
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·

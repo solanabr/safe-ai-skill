@@ -553,6 +553,16 @@ pub fn plugin_data_dir() -> PathBuf {
         .path
 }
 
+/// The plugin data dir for a CLI command run from the user's terminal: resolved by
+/// [`crate::datadir::data_dir`] like the hooks (`CLAUDE_PLUGIN_DATA`, else the install dir under
+/// `$CLAUDE_CONFIG_DIR` / `~/.claude` `plugins/data`). Never the cwd or `~/.safe-ai-skill`; the
+/// error says to set `CLAUDE_PLUGIN_DATA`.
+pub fn resolve_plugin_data_dir() -> Result<PathBuf, String> {
+    crate::datadir::data_dir()
+        .map(|d| d.path)
+        .map_err(|e| format!("safe-ai-skill: {e}"))
+}
+
 /// Project root for a session. Currently the cwd itself (reserved for a future git-root walk).
 pub fn project_dir(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()

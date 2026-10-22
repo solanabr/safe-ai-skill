@@ -37,6 +37,7 @@ done
 
 ALLOW='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
 SESSION='{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
+SESSION_MSG='{"systemMessage":"engine notice","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
 payload_text=$(cat "$payload")
@@ -80,6 +81,7 @@ engine() {
     ok) mk "$1" 'printf "ran=%s args=%s stdin=%s" "${0##*/}" "$*" "$(cat)"' ;;
     silent) mk "$1" ':' ;;
     session) mk "$1" "printf '%s' '$SESSION'" ;;
+    sessionmsg) mk "$1" "printf '%s' '$SESSION_MSG'" ;;
     bytes) mk "$1" "printf 'line1\\n\\nline3\\n\\n'" ;;
     cksum) mk "$1" 'cksum' ;;
     bigout) mk "$1" "cat '$big_out'" ;;
@@ -215,6 +217,18 @@ expect_notice() {
   expect_json "'$1' in d['systemMessage']
     and d['hookSpecificOutput']['hookEventName'] == 'SessionStart'
     and '$1' in d['hookSpecificOutput']['additionalContext']"
+}
+# expect_unique_keys: stdout is JSON with no key repeated in any object.
+expect_unique_keys() {
+  check
+  "$py" -I -c '
+import json, sys
+def pairs(kv):
+    keys = [k for k, _ in kv]
+    assert len(keys) == len(set(keys)), keys
+    return dict(kv)
+json.load(open(sys.argv[1], encoding="utf-8"), object_pairs_hook=pairs)
+' "$case_dir/out" </dev/null 2>/dev/null || fail "stdout <$(snippet "$case_dir/out")> repeats a key"
 }
 expect_repo_note() {
   expect_json '"SAFE_AI_SKILL_DISABLE set by project settings" in d["systemMessage"]
@@ -498,6 +512,24 @@ matrix() {
   engine "$bin_dir/safe-ai-skill-linux-x64" silent
   e_disable=1
   printf '{"env":{"SAFE_AI_SKILL_DISABLE":"1"}}\n' >"$project_dir/.claude/settings.json"
+  t "SessionStart merges the ignored-DISABLE notice into the engine's systemMessage"
+  engine "$bin_dir/safe-ai-skill-linux-x64" sessionmsg
+  run verify session
+  expect_rc 0
+  expect_unique_keys
+  expect_repo_note
+  expect_json 'd["systemMessage"].startswith("safe-ai-skill: SAFE_AI_SKILL_DISABLE")
+    and d["systemMessage"].endswith("engine notice")
+    and d["hookSpecificOutput"]["additionalContext"] == "engine context"'
+  for code in 2 3; do
+    t "SessionStart names the ignored DISABLE on stderr when the engine exits $code"
+    engine "$bin_dir/safe-ai-skill-linux-x64" "exit:$code"
+    run verify session
+    expect_rc "$code"
+    expect_err_has 'SAFE_AI_SKILL_DISABLE set by project settings'
+    expect_err_has 'engine stderr'
+  done
+  engine "$bin_dir/safe-ai-skill-linux-x64" silent
   t "SessionStart prints the ignored-DISABLE notice on its own when the engine is silent"
   run verify session
   expect_rc 0

@@ -189,11 +189,19 @@ out=$(run_engine "$@") || status=$?
 case $status in
   0 | 2 | 3)
     out=${out%.}
-    # SessionStart reports an ignored repo-set DISABLE: added as systemMessage to the
-    # engine's JSON object, or on its own when the engine had nothing to say.
-    if [ -n "$repo_disable" ] && [ "$kind" = session ] && [ "$status" = 0 ]; then
+    # SessionStart reports an ignored repo-set DISABLE: prefixed to the engine's
+    # systemMessage, added as one when it has none, or on its own when the engine had
+    # nothing to say. On exit 2/3 the engine's verdict stands and stderr names it.
+    if [ -n "$repo_disable" ] && [ "$kind" = session ]; then
+      if [ "$status" != 0 ]; then
+        printf 'safe-ai-skill: %s\n' "$repo_note" >&2
+        printf '%s' "$out"
+        exit "$status"
+      fi
+      key='"systemMessage":"'
       case $out in
         '' | '{}') session_notice "safe-ai-skill: $repo_note" ;;
+        *"$key"*) printf '%s%ssafe-ai-skill: %s\\n%s' "${out%%"$key"*}" "$key" "$repo_note" "${out#*"$key"}" ;;
         '{"'*) printf '{"systemMessage":"safe-ai-skill: %s",%s' "$repo_note" "${out#?}" ;;
         *) printf '%s' "$out" ;;
       esac

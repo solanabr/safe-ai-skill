@@ -304,6 +304,7 @@ fn keep_subset(path: &str, current: &mut Vec<String>, asked: &[String], notes: &
 
 /// [`keep_union`] for skill scan dirs, except an added dir must stay inside the project:
 /// sweeping `~`, `/`, `..` or the project root itself would treat unrelated dirs as packs.
+/// The one exception is the user-scope [`USER_SKILLS_DIR`], which a project may opt in to.
 /// The project's order comes first, since `verify approve` restores into the first dir.
 /// Returns the added dirs; [`Policy::load_with_mode`] re-checks them on disk.
 fn keep_scan_dirs(
@@ -321,7 +322,7 @@ fn keep_scan_dirs(
         }
         if current.contains(dir) {
             dirs.push(dir.clone());
-        } else if is_inside_project(dir) {
+        } else if is_inside_project(dir) || is_user_skills(dir) {
             dirs.push(dir.clone());
             added.push(dir.clone());
         } else {
@@ -353,6 +354,14 @@ fn note_dropped(path: &str, current: &[String], asked: &[String], notes: &mut Ve
             dropped.join(", ")
         ));
     }
+}
+
+/// The only scan dir outside the project a project overlay may add: user-scope skills.
+pub(super) const USER_SKILLS_DIR: &str = "~/.claude/skills";
+
+/// Whether `dir` spells [`USER_SKILLS_DIR`] (a trailing `/` allowed).
+pub(super) fn is_user_skills(dir: &str) -> bool {
+    dir.trim_end_matches('/') == USER_SKILLS_DIR
 }
 
 /// Whether `dir` is, as text, a relative path below the project root. Symlinks are checked

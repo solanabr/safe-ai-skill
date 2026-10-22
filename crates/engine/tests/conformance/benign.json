@@ -309,6 +309,26 @@
       }
     },
     {
+      "name": "gate-tamper: Write a project source file",
+      "args": [
+        "gate-tamper"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "{cwd}/src/lib.rs",
+          "content": "pub fn f() {}\n"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
       "name": "redact: plain output",
       "args": [
         "redact"

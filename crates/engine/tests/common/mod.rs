@@ -154,13 +154,21 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("SAFE_AI_SKILL_PROFILE");
         cmd.env_remove("ANCHOR_PROVIDER_URL");
         cmd.env_remove("SAFE_AI_SKILL_HOME");
+        // The CLI resolves the hooks' data dir from these and HOME: never the real one.
+        cmd.env_remove("CLAUDE_PLUGIN_DATA");
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);
         }
-        if let Some(home) = self.home {
-            cmd.env("HOME", home);
-        }
+        let home = match self.home {
+            Some(home) => home.to_path_buf(),
+            None => std::env::temp_dir().join("safe-ai-skill-it-no-home"),
+        };
+        cmd.env("HOME", &home);
+        // Data-dir discovery uses the OS user-database home, not HOME; `CLAUDE_CONFIG_DIR`
+        // replaces it, so point that at the fake home too (an explicit `.env` overrides).
+        cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }

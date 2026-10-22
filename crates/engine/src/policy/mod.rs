@@ -18,7 +18,9 @@ use serde_yaml::Value as Yaml;
 
 mod ratchet;
 
-use ratchet::{apply_project_overlay, resolve_profile, PROJECT_POLICY, SCAN_DIRS_OUTSIDE};
+use ratchet::{
+    apply_project_overlay, is_user_skills, resolve_profile, PROJECT_POLICY, SCAN_DIRS_OUTSIDE,
+};
 
 /// Embedded default policy. Mirrors `plugins/safe-ai-skill/policy/default.policy.yaml`.
 pub const DEFAULT_POLICY_YAML: &str = r#"
@@ -61,6 +63,7 @@ secrets:
     - "~/.superstack/config.json"
   allow_read_globs:
     - "**/.env.example"
+    - "**/.env.schema"
 redact:
   enabled: true
 audit:
@@ -395,7 +398,7 @@ impl Default for SecretsPolicy {
                 "~/.config/solana/**".into(),
                 "~/.superstack/config.json".into(),
             ],
-            allow_read_globs: vec!["**/.env.example".into()],
+            allow_read_globs: vec!["**/.env.example".into(), "**/.env.schema".into()],
         }
     }
 }
@@ -569,7 +572,8 @@ impl Policy {
             persisted_profile,
             env_profile.as_deref(),
         );
-        policy.confine_project_dirs(cwd);
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+        policy.confine_project_dirs(cwd, home.as_deref().map(Path::new));
         policy
     }
 
@@ -577,8 +581,9 @@ impl Policy {
     /// checks the text only, so a committed symlink (`up -> ..`) would pass it and sweep
     /// whatever it points at. Each dir becomes its canonical path when it is a directory
     /// strictly inside the canonical `root`, so the sweep scans exactly what was checked;
-    /// otherwise it is dropped (and noted when it resolves outside).
-    fn confine_project_dirs(&mut self, root: &Path) {
+    /// otherwise it is dropped (and noted when it resolves outside). The one opt-in outside the
+    /// project, `~/.claude/skills`, is kept as the canonical `<home>/.claude/skills`.
+    fn confine_project_dirs(&mut self, root: &Path, home: Option<&Path>) {
         let added = std::mem::take(&mut self.project_scan_dirs);
         if added.is_empty() {
             return;
@@ -586,10 +591,18 @@ impl Policy {
         let canonical_root = std::fs::canonicalize(root).ok();
         let mut outside = false;
         for dir in added {
-            let resolved = std::fs::canonicalize(root.join(&dir)).ok();
-            let within = match (&canonical_root, &resolved) {
-                (Some(r), Some(path)) => path != r && path.starts_with(r),
-                _ => false,
+            let (resolved, within) = if is_user_skills(&dir) {
+                let resolved =
+                    home.and_then(|h| std::fs::canonicalize(h.join(".claude/skills")).ok());
+                let within = resolved.is_some();
+                (resolved, within)
+            } else {
+                let resolved = std::fs::canonicalize(root.join(&dir)).ok();
+                let within = match (&canonical_root, &resolved) {
+                    (Some(r), Some(path)) => path != r && path.starts_with(r),
+                    _ => false,
+                };
+                (resolved, within)
             };
             // A dir that does not resolve has nothing to sweep: drop it quietly.
             outside |= resolved.is_some() && !within;

@@ -1,20 +1,26 @@
 # Release — safe-ai-skill
 #
 # A release tag must point at a commit that already contains the binaries it
-# ships. v1.0.0 didn't (the tag predates the vendor commit), so a release now
-# runs in this order (maintainer steps: docs/RELEASING.md):
+# ships (v1.0.0 didn't: the tag predates the vendor commit), and main must never
+# get new hooks.json/shim ahead of the binaries they call (a 1.0.0 engine answers
+# `allow` to subcommands it doesn't know). So a release is built, vendored and
+# tagged on a protected branch release/vX.Y.Z, and main gets source and binaries
+# in one merge (maintainer steps: docs/RELEASING.md):
 #
-#   1. Actions → Release → Run workflow on main, input `version` (e.g. 1.0.1):
-#        preflight  dispatched from main; every manifest is at that version;
-#                   neither tag exists yet
-#        build      the four binaries, smoke-tested and attested
-#        vendor     commits them + SHA256SUMS on release/vX.Y.Z and opens a PR
-#   2. The maintainer merges the PR, tags the vendor commit vX.Y.Z and
-#      safe-ai-skill--vX.Y.Z, and pushes both tags.
+#   1. Actions → Release → Run workflow on release/vX.Y.Z, input `version`:
+#        preflight  dispatched from exactly refs/heads/release/v<version>; every
+#                   manifest is at that version; neither tag exists yet
+#        build      the four binaries, smoke-tested and attested (source ref
+#                   refs/heads/release/v<version>)
+#        vendor     commits them + SHA256SUMS on top of the built commit and
+#                   pushes it to release/vX.Y.Z (fast-forward only)
+#   2. The maintainer reviews the vendor commit, tags it vX.Y.Z and
+#      safe-ai-skill--vX.Y.Z, pushes both tags, and merges release/vX.Y.Z to
+#      main (CI's binary-version check passes only now).
 #   3. The vX.Y.Z push runs publish: it re-checks the tagged commit (versions,
-#      twin tag, checksums, attestations made by this workflow on main),
-#      uploads exactly those binaries to the GitHub Release, then runs the npm
-#      install e2e against it.
+#      twin tag, checksums, attestations made by this workflow on
+#      release/vX.Y.Z), uploads exactly those binaries to the GitHub Release,
+#      then runs the npm install e2e against it.
 #
 # Targets (artifact names unchanged since 1.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -35,9 +41,11 @@
 # Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 # GITHUB_TOKEN — provided automatically.
-# RELEASE_PAT  — optional fine-grained PAT (contents + pull_requests write). A PR
-#                opened with GITHUB_TOKEN does not trigger CI; with RELEASE_PAT the
-#                vendor PR runs CI, including the attestation check.
+# RELEASE_PAT  — optional fine-grained PAT (contents write) whose owner may push to
+#                the protected release/v* branches. A push made with GITHUB_TOKEN
+#                does not trigger CI; with RELEASE_PAT the vendor commit runs CI,
+#                including the attestation and binary-version checks. Without it,
+#                the GitHub Actions app must be allowed to push to release/v*.
 
 name: Release
 
@@ -45,7 +53,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to build, without the v (e.g. 1.0.1). Every manifest must already be at it."
+        description: "Version to build, without the v (e.g. 1.0.1). Dispatch on release/v<version>; every manifest must already be at it."
         required: true
   push:
     tags:
@@ -62,23 +70,31 @@ permissions:
   contents: read
 
 # One run per version: a second dispatch of the same version waits, then fails
-# in vendor instead of racing the first one's release branch.
+# in vendor (the branch moved) instead of racing the first one.
 concurrency:
   group: release-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  # ── 1. built from main, versions agree, tags are free ─────────────────────
+  # ── 1. built from release/v<version>, versions agree, tags are free ───────
   preflight:
     name: Preflight
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      # publish and CI only accept attestations whose source ref is main.
-      - name: Releases are built from main
+      # publish and CI only accept attestations whose source ref is exactly
+      # refs/heads/release/v<version>.
+      - name: Releases are built from release/v<version>
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::dispatch the release from main, not $GITHUB_REF"
+          set -euo pipefail
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::version must look like 1.2.3 (no leading v), got '$VERSION'"
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/release/v${VERSION}" ]; then
+            echo "::error::dispatch the release from refs/heads/release/v${VERSION}, not $GITHUB_REF"
             exit 1
           fi
 
@@ -89,10 +105,6 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::version must look like 1.2.3 (no leading v), got '$VERSION'"
-            exit 1
-          fi
           sh scripts/check-versions.sh "$VERSION"
           for t in "v$VERSION" "safe-ai-skill--v$VERSION"; do
             rc=0
@@ -203,20 +215,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # ── 1. vendor the binaries into plugins/safe-ai-skill/bin/ (PR) ───────────
+  # ── 1. vendor the binaries into plugins/safe-ai-skill/bin/ on the branch ──
   # The committed plugin binaries are what the Claude marketplace install
-  # ships, so they land before the tag. Opens a PR (never pushes the base
-  # branch) so a human reviews the binary diff.
+  # ships, so they land on release/vX.Y.Z before the tag and before main.
+  # The commit sits on top of the commit the binaries were built from and is
+  # pushed fast-forward only, so a branch that moved during the run fails here.
   vendor:
-    name: Vendor binaries (PR)
+    name: Vendor binaries (release branch)
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write        # push release/vX.Y.Z
-      pull-requests: write   # open the PR
     env:
       VERSION: ${{ inputs.version }}
-      BASE: ${{ github.ref_name }}
     steps:
       # The same commit the binaries were built from, not the branch head.
       - name: Checkout
@@ -246,45 +257,26 @@ jobs:
               safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 \
               safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
               > SHA256SUMS && sha256sum -c SHA256SUMS )
+          sh scripts/check-binary-versions.sh "$bindir" "$VERSION"
 
-      - name: Commit on release/v${{ inputs.version }} and open the PR
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+      - name: Commit and push to release/v${{ inputs.version }}
         run: |
           set -euo pipefail
           if git diff --quiet -- plugins/safe-ai-skill/bin; then
             echo "::notice::$GITHUB_SHA already contains these binaries; tag it directly (docs/RELEASING.md)."
             exit 0
           fi
-          BRANCH="release/v${VERSION}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
           git add plugins/safe-ai-skill/bin
-          git commit -m "release: vendor v${VERSION} platform binaries"
-          # Never overwrite binaries that may already be under review.
-          rc=0
-          git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null || rc=$?
-          case "$rc" in
-            2) git push origin "$BRANCH" ;;
-            0) git fetch --no-tags --depth=1 origin "refs/heads/$BRANCH"
-               if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" != "$(git rev-parse 'HEAD^{tree}')" ]; then
-                 echo "::error::$BRANCH already exists with different binaries. Close its PR and delete the branch, or bump the version."
-                 exit 1
-               fi
-               echo "::notice::$BRANCH already holds these exact files; not pushing." ;;
-            *) echo "::error::git ls-remote failed ($rc)"
-               exit 1 ;;
-          esac
-          BODY="Automated: vendors the four v${VERSION} binaries + regenerated SHA256SUMS into plugins/safe-ai-skill/bin/, built and attested by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}. Merge with a merge commit (not squash or rebase), then tag this PR's head commit v${VERSION} and safe-ai-skill--v${VERSION} and push both tags; the tag push publishes the release. See docs/RELEASING.md."
-          if ! out=$(gh pr create --base "$BASE" --head "$BRANCH" --title "release: vendor v${VERSION} platform binaries" --body "$BODY" 2>&1); then
-            case "$out" in
-              *"already exists"*) echo "::notice::$out" ;;
-              *) echo "$out" >&2
-                 exit 1 ;;
-            esac
+          git commit -m "release: vendor v${VERSION} platform binaries" \
+            -m "Built and attested by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} from ${GITHUB_SHA}."
+          # Plain push: rejected unless release/vX.Y.Z still points at GITHUB_SHA.
+          if ! git push origin "HEAD:refs/heads/release/v${VERSION}"; then
+            echo "::error::release/v${VERSION} moved since ${GITHUB_SHA}, or the push was refused by branch protection. Re-dispatch on the new head (docs/RELEASING.md)."
+            exit 1
           fi
-          echo "$out"
+          echo "::notice::vendored on release/v${VERSION} as $(git rev-parse HEAD). Review it, tag it, then merge release/v${VERSION} to main (docs/RELEASING.md)."
 
   # ── 3. publish the release from the tagged commit's binaries ──────────────
   publish:
@@ -312,13 +304,14 @@ jobs:
             echo "::error::${twin} must point at the same commit as ${TAG}"
             exit 1
           fi
+          sh scripts/check-binary-versions.sh plugins/safe-ai-skill/bin "$version"
           cd plugins/safe-ai-skill/bin
           sha256sum -c SHA256SUMS
           for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             gh attestation verify "safe-ai-skill-$p" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-ref refs/heads/main
+              --source-ref "refs/heads/release/v${version}"
           done
 
       - name: Create the GitHub Release from the committed binaries

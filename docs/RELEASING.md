@@ -5,40 +5,61 @@ Claude Code installs the plugin from git, and plugin dependency version ranges r
 `safe-ai-skill--vX.Y.Z` tags. `v1.0.0` broke this: it points at d569b66, and the binaries were
 committed afterwards in a8d20f8, so anything that resolves the tag gets a plugin without them.
 
-The order is now build, commit the binaries, tag that commit, publish from it.
-`.github/workflows/release.yml` automates every step except the tag, which a maintainer pushes
-after reviewing the binary PR.
+`main` also has to get new hooks and shim code together with the binaries they call. A 1.0.0
+engine answers `allow` to subcommands it doesn't know, so 1.0.1's `hooks.json` on top of 1.0.0
+binaries would let every Write/Edit through `gate-tamper`. So a release is built, vendored and
+tagged on a protected branch `release/vX.Y.Z`, and `main` receives source and binaries in one
+merge of that branch. CI enforces the order: the required `binary-versions` check fails on any
+branch whose committed binaries aren't the version in `plugin.json`, so a version bump can't be
+merged to `main` before its binaries are vendored.
+
+`.github/workflows/release.yml` builds, attests and vendors; a maintainer reviews the vendor
+commit, pushes the tags and merges.
 
 ## One-time repository setup
 
+- **Branch ruleset** for `release/v*`: no deletion, no force-push, updates restricted to
+  maintainers plus the actor the vendor job pushes as (the `RELEASE_PAT` owner, or the GitHub
+  Actions app when there is no `RELEASE_PAT`). release.yml's attestations name the branch, so
+  whoever can push to it can get a binary attested.
+- **Branch protection on `main`** with the CI checks required, including `Binary versions`
+  (all three runners) and `Verify binary provenance`.
 - **Tag ruleset** for `v*` and `safe-ai-skill--v*`: only maintainers can create them, and nobody
   can update or delete them. A published tag never moves.
 - **Immutable releases** turned on, so release assets can't be swapped after publishing.
-- **`RELEASE_PAT`** secret (optional): a fine-grained token with contents and pull-requests write.
-  Without it the vendor PR is opened with `GITHUB_TOKEN`, which doesn't trigger CI; close and
-  reopen the PR to run it.
-- Without `RELEASE_PAT`, also turn on **Allow GitHub Actions to create and approve pull requests**
-  (Settings → Actions → General → Workflow permissions), or `gh pr create` in the vendor job fails.
+- **`RELEASE_PAT`** secret (optional): a fine-grained token with contents write whose owner may
+  push to `release/v*`. A push made with `GITHUB_TOKEN` doesn't trigger CI, so without it CI first
+  runs on the vendor commit when you open the PR to `main` (step 5).
 
 ## Cutting a release
 
-1. **Bump the version** on a branch: `npm/package.json`, `crates/engine/Cargo.toml` and
-   `Cargo.lock`, `plugins/safe-ai-skill/.claude-plugin/plugin.json`,
+1. **Bump the version** on the hotfix or feature branch: `npm/package.json`,
+   `crates/engine/Cargo.toml` and `Cargo.lock`, `plugins/safe-ai-skill/.claude-plugin/plugin.json`,
    `.claude-plugin/marketplace.json`, the README badge and the `install.sh` default.
-   `sh scripts/check-versions.sh` must pass. Date the CHANGELOG entry. Merge to `main`.
-2. **Build.** Actions → Release → Run workflow on `main`, with `version` set to `X.Y.Z` (no `v`).
-   Any other ref is rejected, because publish and CI only accept attestations whose source ref is
-   `refs/heads/main`. The run checks the manifests and that neither tag exists yet, builds the four
-   binaries (Linux: static musl, smoke-tested in alpine, debian:11 and ubuntu:20.04; macOS: minimum
-   OS checked), attests each binary's build provenance, and opens a PR from `release/vX.Y.Z` that
-   commits them with a regenerated `SHA256SUMS`.
-   - If `release/vX.Y.Z` already exists with different binaries, the run fails instead of
-     overwriting them. Close that PR and delete the branch, or bump the version.
-   - If the built binaries are byte-identical to the ones the dispatched commit already has, there
-     is nothing to commit and no PR: the run says so, and step 4 tags the dispatched commit itself.
-3. **Review and merge the PR** once CI is green, using **Create a merge commit**. Squash or rebase
-   would give the vendor commit a new SHA.
-4. **Tag the vendor commit** (the PR's head) with both names and push them together:
+   `sh scripts/check-versions.sh` must pass. Date the CHANGELOG entry. Don't merge to `main`: CI's
+   binary-version check fails until step 3, by design.
+2. **Create the release branch** from that branch's head and push it. The `release/v*` ruleset
+   protects it from then on.
+
+   ```sh
+   git switch -c release/vX.Y.Z <hotfix-branch>
+   git push origin release/vX.Y.Z
+   ```
+
+3. **Build and vendor.** Actions → Release → Run workflow on `release/vX.Y.Z`, with `version` set
+   to `X.Y.Z` (no `v`). Any other ref, including `main`, is rejected: publish and CI only accept
+   attestations whose source ref is exactly `refs/heads/release/vX.Y.Z`. The run checks the
+   manifests and that neither tag exists yet, builds the four binaries (Linux: static musl,
+   smoke-tested in alpine, debian:11 and ubuntu:20.04; macOS: minimum OS checked), attests each
+   binary's build provenance, and commits them with a regenerated `SHA256SUMS` on top of the
+   commit it built from, pushed to `release/vX.Y.Z`.
+   - The push is fast-forward only. If the branch moved during the run, the vendor job fails;
+     dispatch again on the new head.
+   - If the built binaries are byte-identical to the ones already committed, there is nothing to
+     commit: the run says so, and step 4 tags the dispatched commit itself.
+4. **Review and tag the vendor commit** (the head of `release/vX.Y.Z`). Check the binary diff,
+   that `sh scripts/check-binary-versions.sh` passes on a checkout of it, and that its parent is
+   the commit you dispatched. Then tag it with both names and push them together:
 
    ```sh
    git fetch origin
@@ -49,12 +70,17 @@ after reviewing the binary PR.
    ```
 
    Pushing `vX.Y.Z` runs the publish job. It checks that the manifests say `X.Y.Z`, that
-   `safe-ai-skill--vX.Y.Z` points at the same commit, that the binaries match `SHA256SUMS`, and
-   that each one carries a provenance attestation from `release.yml` run on `main`. It then creates
-   the GitHub Release from those exact files and runs the npm install e2e against it.
-5. **Publish to npm** once the GitHub Release exists, because `postinstall` downloads from it:
+   `safe-ai-skill--vX.Y.Z` points at the same commit, that each binary reports `X.Y.Z`, that the
+   binaries match `SHA256SUMS`, and that each one carries a provenance attestation from
+   `release.yml` run on `refs/heads/release/vX.Y.Z`. It then creates the GitHub Release from those
+   exact files and runs the npm install e2e against it.
+5. **Merge `release/vX.Y.Z` to `main`** in one PR, once CI is green, using **Create a merge
+   commit**. Squash or rebase would give the tagged commit a new SHA, so `main` wouldn't contain
+   it. This is the first time `main` sees the new version, and it gets the source and the
+   binaries together.
+6. **Publish to npm** once the GitHub Release exists, because `postinstall` downloads from it:
    `cd npm && npm publish`.
-6. **Downstream:** solana-ai-kit re-pins its `stbr` entry to the tagged commit in its own PR and
+7. **Downstream:** solana-ai-kit re-pins its `stbr` entry to the tagged commit in its own PR and
    release.
 
 `claude plugin tag --dry-run plugins/safe-ai-skill` (on a clean checkout of the vendor commit)
@@ -80,11 +106,11 @@ Both point at the same commit, and that commit contains the binaries.
   ```
 
   Leave `v1.0.0` where it is. Moving a published tag breaks every cached checkout and checksum.
-- **1.0.1 is the first release built this way.** Follow steps 1–6. The vendor PR replaces all four
-  1.0.0 binaries, and the two Linux ones become static.
-- **After the 1.0.1 vendor PR merges,** delete the `legacy_1_0_0` hash list from the
-  `verify-attestations` job in `.github/workflows/ci.yml`. From then on every committed binary needs
-  an attestation.
+- **1.0.1 is the first release built this way.** Create `release/v1.0.1` from the hotfix branch
+  and follow steps 2–7. The vendor commit replaces all four 1.0.0 binaries, and the two Linux ones
+  become static. Until then the hotfix branch fails CI's `binary-versions` and
+  `verify-attestations` checks, because it carries 1.0.0 binaries: that is the guard working, not
+  something to waive.
 
 ## Bumping the toolchain
 
