@@ -768,11 +768,18 @@ pub(crate) mod tests {
             .map(|_| {
                 let dir = dir.clone();
                 // Each create fsyncs under the lock; under a loaded parallel test run the lock
-                // wait can lapse, which is not what this test is about: retry on busy.
+                // wait can lapse, which is not what this test is about: retry on busy, for at
+                // most a minute so a lock that is never released fails instead of hanging.
+                let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 let create = move || loop {
                     match create_pending(&dir, PendingKind::Grant, "s", json!(null)) {
                         Ok(n) => break n,
-                        Err(e) if e.to_string().contains("busy") => continue,
+                        Err(e)
+                            if e.to_string().contains("busy")
+                                && std::time::Instant::now() < give_up =>
+                        {
+                            continue
+                        }
                         Err(e) => panic!("{e}"),
                     }
                 };
