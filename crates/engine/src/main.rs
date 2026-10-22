@@ -2143,12 +2143,9 @@ mod tests {
     fn a_tier_gate_allow_is_ignored() {
         let dir = trusted_dir_with_transfer_grant("allow");
         let allow = || {
-            relax::apply_verdict(
-                Verdict::Ask("x".into()),
-                &GateMeta::new(Scope::Transfer, false),
-                &Policy::default(),
-                &dir,
-            )
+            let mut meta = GateMeta::new(Scope::Transfer, false);
+            meta.amount_sol = Some(0.1);
+            relax::apply_verdict(Verdict::Ask("x".into()), &meta, &Policy::default(), &dir)
         };
         assert!(matches!(allow(), Verdict::Allow(_)));
         assert_eq!(strictest([Some(Verdict::NoOpinion), None]), None);
