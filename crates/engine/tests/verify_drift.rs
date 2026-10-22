@@ -530,3 +530,35 @@ fn trust_is_refused_for_an_untrusted_data_dir() {
         "{v}"
     );
 }
+
+#[test]
+fn a_drifted_pack_is_never_moved_at_any_tier_by_default() {
+    use safe_ai_skill::policy::tier::Tier;
+    let project = TempDir::new("drift-tiers-proj");
+    let home = TempDir::new("drift-tiers-home");
+    let data = TempDir::new("drift-tiers-data");
+    let skill = skills_root(project.path()).join("address-formatter");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "# Address Formatter\n").unwrap();
+    assert!(emit(&verify_session(project.path(), home.path(), data.path())).is_none());
+    tamper(&skill.join("SKILL.md"));
+    for tier in [Tier::Relaxed, Tier::Medium, Tier::High] {
+        let run = Invocation::new(&["verify", "session"])
+            .plugin_data(data.path())
+            .home(home.path())
+            .tier(tier)
+            .stdin(payload(project.path()))
+            .run();
+        let (sys, ctx) = messages(&emit(&run).expect("a drift report"));
+        for text in [&sys, &ctx] {
+            assert!(
+                text.contains("BLOCK") && text.contains("address-formatter"),
+                "{text}"
+            );
+            assert!(!text.contains("MOVED"), "{text}");
+        }
+        assert!(sys.contains("safe-ai-skill verify approve"), "{sys}");
+        assert!(skill.join("SKILL.md").exists(), "moved at {tier:?}");
+        assert!(!data.path().join("quarantine").exists());
+    }
+}

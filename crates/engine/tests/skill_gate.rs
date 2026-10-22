@@ -6,6 +6,7 @@
 mod common;
 
 use common::{permission_decision, Invocation, Run, TempDir};
+use safe_ai_skill::policy::tier::Tier;
 use std::path::PathBuf;
 
 struct Fixture {
@@ -362,4 +363,43 @@ fn an_unreadable_prompt_is_judged_in_the_payload_cwd() {
         .stdin(body)
         .run();
     assert_eq!(run.json()["decision"], "block", "{}", run.stdout);
+}
+
+#[test]
+fn a_blocked_pack_stays_denied_at_medium_and_high_with_the_tier_selected() {
+    let f = Fixture::new("sg-tiers");
+    for tier in [Tier::Medium, Tier::High] {
+        let run = Invocation::new(&["gate-skill"])
+            .plugin_data(f.data.path())
+            .home(f.home.path())
+            .tier(tier)
+            .stdin(
+                serde_json::json!({
+                    "hook_event_name": "PreToolUse", "cwd": f.cwd(),
+                    "tool_name": "Skill", "tool_input": {"skill": "evil"},
+                })
+                .to_string(),
+            )
+            .run();
+        assert_denied_naming_the_pack(&run);
+    }
+    assert!(f.evil().join("SKILL.md").exists(), "never moved");
+}
+
+#[test]
+fn a_clean_pack_is_not_touched_by_the_high_tier() {
+    let f = Fixture::new("sg-high-clean");
+    let run = Invocation::new(&["gate-skill"])
+        .plugin_data(f.data.path())
+        .home(f.home.path())
+        .tier(Tier::High)
+        .stdin(
+            serde_json::json!({
+                "hook_event_name": "PreToolUse", "cwd": f.cwd(),
+                "tool_name": "Skill", "tool_input": {"skill": "fine"},
+            })
+            .to_string(),
+        )
+        .run();
+    assert_eq!((run.code, run.stdout.trim()), (Some(0), ""));
 }
