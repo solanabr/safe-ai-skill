@@ -32,16 +32,23 @@ swap:
   rugcheck_timeout_ms: 3000     # on timeout/API-down → ask (never hard-block on third-party uptime)
   trusted_mints: [ "So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" ]
 secrets:
-  deny_read_globs:
+  # Built-in classes (crates/engine/src/gates/secretpath.rs), matched case-insensitively on the
+  # raw and the symlink-resolved path:
+  #   hard deny (never relaxable): *-keypair.json, ~/.config/solana/** except cli/config.yml,
+  #     ~/.ssh/id_*, ~/.superstack/config.json, the varlock key store, any file whose content is a
+  #     keypair or holds a private-key block, id.json / *.pem / *.key when unreadable;
+  #   env class (raw read denied, use `safe-ai-skill env keys|set|unset`): .env, .env.*, *.env,
+  #     .envrc, .dev.vars, .varlock-frozen-env, ~/.config/solana/cli/config.yml.
+  env_read: deny                      # `ask` = prompt for raw env-class reads instead (opt-in)
+  deny_read_globs:                    # extra denies on top of the built-in classes
     - "**/*-keypair.json"
-    - "**/id.json"
-    - "**/.env"
-    - "**/.env.*"
-    - "**/*.pem"
-    - "~/.config/solana/**"
     - "~/.superstack/config.json"     # holds the plaintext Copilot JWT
-  allow_read_globs:
+  allow_read_globs:                   # readable despite the env class (never a hard-deny class)
     - "**/.env.example"
+    - "**/.env.sample"
+    - "**/.env.template"
+    - "**/.env.dist"
+    - "**/.env.schema"                # varlock schema: keys + decorators only; the read gate sniffs it
 redact: { enabled: true }
 audit:  { enabled: true }
 catalog:

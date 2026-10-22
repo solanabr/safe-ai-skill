@@ -8,6 +8,84 @@
 //!
 //! Everything is pure in-memory byte/char scanning with no compiled-regex dependency,
 //! so it stays cheap enough to run on every tool output.
+//!
+//! Hook contract (spec D3.5): the input is the PostToolUse `tool_response`, whose shape differs
+//! per tool (Read `{type:"text",file:{filePath,content,…}}`, Bash `{stdout,stderr,…}`, Grep
+//! `{mode,filenames,content,…}`, MCP content blocks or a string). [`scrub_response`] rewrites
+//! the string leaves in place and keeps every other field, so the output has the tool's exact
+//! shape: Claude Code silently ignores a mismatched `updatedToolOutput` and the original, with
+//! the secret, reaches the model. Two passes run on each string: exact project env values
+//! ([`scrub_values`], `«redacted:KEY»`), then the pattern detectors ([`scrub`]).
+//!
+//! The hook fails open: a `tool_response` larger than [`MAX_SCAN_BYTES`] (stdin payload) is not
+//! parsed and passes unchanged. Claude Code already truncates Bash output and pages Read output
+//! well below that, so the bound only matters for unusually large MCP results.
+
+use serde_json::Value;
+
+use crate::env::values::KnownValue;
+
+/// Largest PostToolUse payload the redact hook parses (8 MiB). Larger payloads pass unscanned.
+pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
+/// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
+pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
+    match response {
+        Value::String(text) => {
+            let after_values = scrub_values(text, values);
+            let base = after_values.as_deref().unwrap_or(text);
+            match scrub(base) {
+                Some(out) => Some(Value::String(out)),
+                None => after_values.map(Value::String),
+            }
+        }
+        Value::Array(items) => {
+            let scrubbed: Vec<Option<Value>> =
+                items.iter().map(|v| scrub_response(v, values)).collect();
+            if scrubbed.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(Value::Array(
+                scrubbed
+                    .into_iter()
+                    .zip(items)
+                    .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                    .collect(),
+            ))
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            let mut out = map.clone();
+            for (key, value) in map {
+                if let Some(new) = scrub_response(value, values) {
+                    out.insert(key.clone(), new);
+                    changed = true;
+                }
+            }
+            changed.then_some(Value::Object(out))
+        }
+        _ => None,
+    }
+}
+
+/// Replace each occurrence of a known env value with `«redacted:KEY»`. `values` should be
+/// longest first (as [`crate::env::values::load`] returns them) so a value containing another
+/// is replaced whole. `None` when nothing matched.
+pub fn scrub_values(text: &str, values: &[KnownValue]) -> Option<String> {
+    let mut out: Option<String> = None;
+    for known in values {
+        if known.value.is_empty() {
+            continue;
+        }
+        let current = out.as_deref().unwrap_or(text);
+        if current.contains(&known.value) {
+            let marker = format!("«redacted:{}»", known.key);
+            out = Some(current.replace(&known.value, &marker));
+        }
+    }
+    out
+}
 
 /// A single redaction span: `[start, end)` byte range and the marker kind.
 struct Span {
@@ -163,6 +241,48 @@ pub(crate) fn find_seed_phrase(text: &str) -> Option<(usize, usize)> {
         idx = j + 1;
     }
     None
+}
+
+/// Whether `text` holds key material: a keypair-style byte array, a base58-encoded 64-byte
+/// secret key, or a PEM/OpenSSH private-key block. Narrower than [`scrub`] on purpose (no
+/// `*_API_KEY=` or JWT shapes), so a schema line such as `HELIUS_API_KEY=varlock("local:…")`
+/// is not a hit.
+pub(crate) fn contains_key_material(text: &str) -> bool {
+    if find_keypair_array(text).is_some() {
+        return true;
+    }
+    let mut spans = Vec::new();
+    collect_base58_secret_keys(text, &mut spans);
+    if !spans.is_empty() {
+        return true;
+    }
+    crate::gates::secretpath::has_private_key_block(text)
+}
+
+/// Whether `text` holds a high-confidence API credential: a vendor-prefixed token long enough
+/// to be real (`sk_live_…`, `sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, `AIza…`) or a JWT. Key names
+/// alone (`*_API_KEY=`) never count.
+pub(crate) fn contains_high_confidence_token(text: &str) -> bool {
+    const PREFIXES: &[(&str, usize)] = &[
+        ("sk_live_", 20),
+        ("rk_live_", 20),
+        ("sk_test_", 20),
+        ("sk-", 24),
+        ("ghp_", 30),
+        ("gho_", 30),
+        ("ghs_", 30),
+        ("github_pat_", 30),
+        ("xoxb-", 20),
+        ("xoxp-", 20),
+        ("AKIA", 20),
+        ("AIza", 35),
+    ];
+    let mut spans = Vec::new();
+    for (prefix, min) in PREFIXES {
+        collect_prefixed_tokens(text, prefix, *min, &mut spans, "api_key");
+    }
+    collect_jwts(text, &mut spans);
+    !spans.is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +487,11 @@ fn collect_kv_assignments(text: &str, spans: &mut Vec<Span>) {
                     quote = bytes[vs];
                     vs += 1;
                 }
+                // Already replaced by the exact-value pass: keep its key-naming marker.
+                if text[vs..].starts_with("«redacted:") {
+                    i = vs;
+                    continue;
+                }
                 let mut ve = vs;
                 while ve < bytes.len() {
                     let b = bytes[ve];
@@ -484,6 +609,60 @@ fn is_wordlist_shape(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn known(key: &str, value: &str) -> KnownValue {
+        KnownValue {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn scrub_values_longest_first() {
+        let values = [known("LONG", "abcdefgh-ijkl"), known("SHORT", "abcdefgh")];
+        assert_eq!(
+            scrub_values("x abcdefgh-ijkl y abcdefgh", &values).as_deref(),
+            Some("x «redacted:LONG» y «redacted:SHORT»")
+        );
+        assert_eq!(scrub_values("clean", &values), None);
+    }
+
+    #[test]
+    fn scrub_response_keeps_shape() {
+        let values = [known("K", "secret-value-1")];
+        let response = json!({
+            "stdout": "a secret-value-1 b",
+            "stderr": "",
+            "interrupted": false,
+            "nested": [1, "secret-value-1", {"x": null}]
+        });
+        assert_eq!(
+            scrub_response(&response, &values),
+            Some(json!({
+                "stdout": "a «redacted:K» b",
+                "stderr": "",
+                "interrupted": false,
+                "nested": [1, "«redacted:K»", {"x": null}]
+            }))
+        );
+        assert_eq!(
+            scrub_response(&json!({"a": "clean", "n": 3}), &values),
+            None
+        );
+    }
+
+    #[test]
+    fn scrub_response_applies_patterns_after_values() {
+        let arr: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let text = format!("[{}] secret-value-1", arr.join(","));
+        let out = scrub_response(&json!(text), &[known("K", "secret-value-1")]).unwrap();
+        let out = out.as_str().unwrap();
+        assert!(
+            out.contains("***REDACTED:keypair***") && out.contains("«redacted:K»"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn keypair_byte_array_redacted() {

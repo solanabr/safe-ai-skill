@@ -4,4 +4,5 @@
 pub mod bash;
 pub mod mcp;
 pub mod read;
+pub mod secretpath;
 pub mod secrets;

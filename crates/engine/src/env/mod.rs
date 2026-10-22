@@ -16,12 +16,15 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::gates::secretpath::{self, Class, TEMPLATES};
 use parse::{EnvFile, Format};
 use render::{Shown, Unmet};
 use write::Change;
 
 pub mod parse;
 pub mod render;
+pub mod schema;
+pub mod values;
 pub mod write;
 
 const EXIT_ERROR: u8 = 1;
@@ -29,9 +32,6 @@ const EXIT_USAGE: u8 = 3;
 
 /// Largest file `env` reads.
 const MAX_FILE_BYTES: usize = 8 << 20;
-
-/// `.env.*` templates: not secret, readable directly, so not env-class.
-const TEMPLATES: &[&str] = &[".env.example", ".env.sample", ".env.template", ".env.dist"];
 
 const USAGE: &str = "usage:
   safe-ai-skill env keys [FILE] [--json] [--require K1,K2]
@@ -46,16 +46,12 @@ placeholder.
 ";
 
 /// Whether `path` names an env-class file (spec D3.1, case-insensitive): `.env`, `.env.*`,
-/// `*.env`, `.envrc`, `.dev.vars`, or `~/.config/solana/cli/config.yml`. The
-/// `.env.example|.sample|.template|.dist` templates are not env-class. Windows separators, an
-/// NTFS `:stream` suffix and trailing dots/spaces are normalised away first.
+/// `*.env`, `.envrc`, `.dev.vars[.*]`, `.varlock-frozen-env`, or
+/// `~/.config/solana/cli/config.yml`. Templates (`.env.example|.sample|.template|.dist`) and
+/// the varlock `.env.schema` are not env-class. Windows separators, an NTFS `:stream` suffix
+/// and trailing dots/spaces are normalised away first ([`secretpath::classify`]).
 pub fn is_env_class(path: &Path) -> bool {
-    let dotenv = match basename(path).as_str() {
-        ".env" | ".envrc" | ".dev.vars" => true,
-        name if TEMPLATES.contains(&name) => false,
-        name => name.starts_with(".env.") || name.ends_with(".env"),
-    };
-    dotenv || is_solana_cli_config(path)
+    secretpath::classify(&path.to_string_lossy()) == Class::Env
 }
 
 fn is_template(path: &Path) -> bool {
@@ -356,7 +352,11 @@ fn resolve(file: &str) -> Result<Target, Failure> {
 
 /// The refusal for a file that is not env-class. It never names the file.
 fn refusal(path: &Path) -> Failure {
-    if is_template(path) {
+    if basename(path) == ".env.schema" {
+        Failure::error(
+            "refusing: .env.schema holds keys and decorators, never values; read or edit it directly (env keys reads it next to the env file)",
+        )
+    } else if is_template(path) {
         Failure::error(
             "refusing: an env template (.env.example, .env.sample, .env.template, .env.dist) is not secret; read or edit it directly",
         )

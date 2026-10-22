@@ -49,8 +49,10 @@ pub struct HookInput {
     pub tool_name: Option<String>,
     /// Tool input arguments.
     pub tool_input: Option<Value>,
-    /// Tool output (PostToolUse).
+    /// Tool output (legacy field name; Claude Code sends `tool_response`).
     pub tool_output: Option<Value>,
+    /// Tool output (PostToolUse), shaped per tool.
+    pub tool_response: Option<Value>,
     /// User prompt text (UserPromptSubmit).
     pub prompt: Option<String>,
     /// Event source (`startup`, `resume`, ...).
@@ -98,12 +100,20 @@ impl HookInput {
 /// before content, and reading stops one byte past the bound, so an oversized or endless
 /// stream is never buffered whole.
 pub fn read_payload(reader: impl Read) -> (Vec<u8>, Result<HookInput, Unreadable>) {
+    read_payload_bounded(reader, MAX_STDIN_BYTES)
+}
+
+/// [`read_payload`] with a caller-chosen bound (the redact hook scans larger tool output).
+pub fn read_payload_bounded(
+    reader: impl Read,
+    max: usize,
+) -> (Vec<u8>, Result<HookInput, Unreadable>) {
     let mut bytes = Vec::new();
     // A read error keeps the bytes that arrived; the checks below classify them.
     let _ = reader
-        .take(MAX_STDIN_BYTES as u64 + 1)
+        .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
         .read_to_end(&mut bytes);
-    let parsed = if bytes.len() > MAX_STDIN_BYTES {
+    let parsed = if bytes.len() > max {
         Err(Unreadable::Oversized)
     } else if bytes.trim_ascii().is_empty() {
         Err(Unreadable::Empty)
@@ -188,23 +198,41 @@ pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()> {
     write_opinion(render_pretooluse(d))
 }
 
+/// Build a PreToolUse input rewrite with no permission decision (no I/O):
+/// `{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":…}}`. Claude Code
+/// applies `updatedInput` without an `allow`, so the normal permission flow still decides.
+pub fn render_updated_input(updated: Value) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": updated,
+        }
+    })
+}
+
+/// Emit a PreToolUse input rewrite (see [`render_updated_input`]) and flush.
+pub fn emit_updated_input(updated: Value) -> std::io::Result<()> {
+    write_json(&render_updated_input(updated))
+}
+
 /// Build the PostToolUse redaction JSON value (no I/O).
 ///
-/// `None` (no change) renders to `None`: no output. `Some(text)` → `updatedMCPToolOutput`
-/// when `mcp` is true, else `updatedToolOutput`.
-pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Option<Value> {
-    let text = updated?;
-    let key = if mcp {
-        "updatedMCPToolOutput"
-    } else {
-        "updatedToolOutput"
-    };
-    Some(json!({ key: text }))
+/// `None` (no change) renders to `None`: no output. `Some(response)` →
+/// `{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":response}}`,
+/// where `response` has the tool's own `tool_response` shape (every tool, MCP included).
+pub fn render_posttooluse_redact(updated: Option<Value>) -> Option<Value> {
+    let response = updated?;
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": response,
+        }
+    }))
 }
 
 /// Emit a PostToolUse redaction result to stdout and flush; no change writes nothing.
-pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()> {
-    write_opinion(render_posttooluse_redact(updated, mcp))
+pub fn emit_posttooluse_redact(updated: Option<Value>) -> std::io::Result<()> {
+    write_opinion(render_posttooluse_redact(updated))
 }
 
 /// Build the UserPromptSubmit JSON value (no I/O).
@@ -392,14 +420,35 @@ mod tests {
     #[test]
     fn render_redact_variants() {
         // No change is no output, not `{}`.
-        assert_eq!(render_posttooluse_redact(None, false), None);
+        assert_eq!(render_posttooluse_redact(None), None);
+        let response = json!({ "stdout": "clean", "stderr": "" });
         assert_eq!(
-            render_posttooluse_redact(Some("clean".into()), false),
-            Some(json!({ "updatedToolOutput": "clean" }))
+            render_posttooluse_redact(Some(response.clone())),
+            Some(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "updatedToolOutput": response
+                }
+            }))
         );
+    }
+
+    #[test]
+    fn render_updated_input_has_no_decision() {
+        let v = render_updated_input(json!({ "pattern": "x", "glob": "!{a}" }));
+        let inner = &v["hookSpecificOutput"];
+        assert_eq!(inner["hookEventName"], "PreToolUse");
+        assert_eq!(inner["updatedInput"]["glob"], "!{a}");
+        assert!(inner.get("permissionDecision").is_none());
+    }
+
+    #[test]
+    fn read_payload_bounded_uses_its_bound() {
+        let body = format!(r#"{{"prompt":"{}"}}"#, "a".repeat(100));
+        assert!(read_payload_bounded(body.as_bytes(), 200).1.is_ok());
         assert_eq!(
-            render_posttooluse_redact(Some("clean".into()), true),
-            Some(json!({ "updatedMCPToolOutput": "clean" }))
+            read_payload_bounded(body.as_bytes(), 50).1.err(),
+            Some(Unreadable::Oversized)
         );
     }
 

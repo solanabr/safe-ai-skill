@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use safe_ai_skill::audit::{self, AuditEntry};
 use safe_ai_skill::context::{self, Context};
 use safe_ai_skill::gate::{GateMeta, Scope};
+use safe_ai_skill::gates::read;
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::Policy;
 use safe_ai_skill::{grants, mode, promptguard, redact, registry, relax, session, verify};
@@ -297,7 +298,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let command = input.bash_command().unwrap_or("");
-    let decision = safe_ai_skill::gates::secrets::decide(command, &effective);
+    let decision = safe_ai_skill::gates::secrets::decide_in(command, &effective, Some(&cwd));
     // Secret reads are always a hard guard.
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
@@ -313,8 +314,23 @@ fn cmd_gate_read() -> ExitCode {
     let cwd = cwd_of(&input);
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
-    let path = input.read_path().unwrap_or("");
-    let decision = safe_ai_skill::gates::read::decide(path, &effective);
+    let tool = input.tool_name.as_deref().unwrap_or("Read");
+    let verdict = read::decide_tool(tool, input.tool_input.as_ref(), &cwd, &effective);
+    let decision = match verdict {
+        read::ReadVerdict::Decide(decision) => decision,
+        read::ReadVerdict::Rewrite(updated) => {
+            write_audit(
+                &effective,
+                &plugin_data,
+                &input,
+                &raw,
+                "secret_read_rewrite",
+                &Decision::Defer,
+            );
+            let _ = io::emit_updated_input(updated);
+            return ExitCode::SUCCESS;
+        }
+    };
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
 }
@@ -331,28 +347,32 @@ fn cmd_gate_mcp() -> ExitCode {
     let effective = load_effective_policy(&cwd, &plugin_data);
     let tool = input.tool_name.clone().unwrap_or_default();
     let payload = input.mcp_payload();
+    // Path-like arguments get the read check first (`ctx_execute_file {path:".env"}`).
+    let secret = read::decide_mcp_args(payload, &cwd, &effective);
+    if !matches!(secret, Decision::Defer) {
+        let meta = GateMeta::new(Scope::SecretRead, true);
+        return finish_pretooluse(secret, &meta, &effective, &plugin_data, &input, &raw);
+    }
     let ctx = Context::build("", &cwd);
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
 }
 
 fn cmd_redact() -> ExitCode {
-    let Ok(input) = read_input().1 else {
+    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5).
+    let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
         return ExitCode::SUCCESS;
     };
-    let is_mcp = input
-        .tool_name
-        .as_deref()
-        .map(|t| t.starts_with("mcp__"))
-        .unwrap_or(false);
-    let text = input
-        .tool_output
-        .as_ref()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .or_else(|| input.tool_output.as_ref().map(|v| v.to_string()))
-        .unwrap_or_default();
-    let updated = redact::scrub(&text);
-    let _ = io::emit_posttooluse_redact(updated, is_mcp);
+    let Some(response) = input.tool_response.as_ref() else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let plugin_data = context::plugin_data_dir();
+    if !load_effective_policy(&cwd, &plugin_data).redact.enabled {
+        return ExitCode::SUCCESS;
+    }
+    let values = safe_ai_skill::env::values::load(&cwd);
+    let _ = io::emit_posttooluse_redact(redact::scrub_response(response, &values));
     ExitCode::SUCCESS
 }
 
