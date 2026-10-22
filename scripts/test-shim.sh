@@ -885,14 +885,13 @@ matrix() {
 }
 
 sh_name=hooks.json
-t "hooks.json wires onFailure: block on the Solana entries and the Skill gate, continue elsewhere"
+t "hooks.json wires onFailure: block on the Bash gate-bash entry and the Skill gate, continue elsewhere"
 check
 "$py" -I - "$hooks_json" "$work/hook-commands" <<'EOF' || fail "see above"
 import json, re, sys
 
 cfg = json.load(open(sys.argv[1]))
 prefix = '"${CLAUDE_PLUGIN_ROOT}"/bin/safe-ai-skill '
-solana = re.compile(r"Bash\((solana|spl-token|anchor) \*\)")
 problems, commands, blocking = [], set(), 0
 for event, groups in cfg["hooks"].items():
     for group in groups:
@@ -907,18 +906,20 @@ for event, groups in cfg["hooks"].items():
             skill = event == "PreToolUse" and group.get("matcher") == "Skill"
             if skill and sub != "gate-skill":
                 problems.append(f"{event}: the Skill matcher must run gate-skill, runs {cmd!r}")
-            solana_entry = bool(solana.fullmatch(hook.get("if", "")))
+            # gate-bash runs for every Bash call (an `if` filter misses wrapped, quoted,
+            # path-qualified, expansion and solana-keygen commands) and fails closed.
+            solana_entry = sub == "gate-bash"
             want = "block" if solana_entry or skill else "continue"
             blocking += solana_entry
-            if solana_entry and sub != "gate-bash":
-                problems.append(f"{event}: {hook['if']} must run gate-bash, runs {cmd!r}")
+            if solana_entry and (group.get("matcher") != "Bash" or "if" in hook):
+                problems.append(f"{event}: gate-bash must be an unconditional Bash entry")
             if hook.get("onFailure") != want:
                 problems.append(
                     f"{event} {cmd[len(prefix):]!r} if={hook.get('if')!r}: "
                     f"onFailure={hook.get('onFailure')!r}, want {want!r}"
                 )
-if blocking != 3:
-    problems.append(f"{blocking} Solana entries, want 3")
+if blocking != 1:
+    problems.append(f"{blocking} gate-bash entries, want 1")
 with open(sys.argv[2], "w") as out:
     out.write("".join(c + "\n" for c in sorted(commands)))
 for p in problems:

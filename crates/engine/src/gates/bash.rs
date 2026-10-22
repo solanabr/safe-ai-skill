@@ -47,7 +47,50 @@ use crate::spend::{self, SpendLedger};
 /// Returns the natural decision (before relaxation) and a [`GateMeta`] describing the
 /// action. The caller (`main.rs`) applies the relaxation layer to the result.
 pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
-    decide_parsed(command, &shell::parse(command), ctx, policy)
+    let parsed = shell::parse(command);
+    match decide_parsed(command, &parsed, ctx, policy) {
+        // An allow vouches for the whole tool call: only for direct (canonical) commands, never
+        // one reached behind a wrapper, a quoted or path-qualified program word.
+        (Decision::Allow, meta)
+            if parsed
+                .commands
+                .iter()
+                .any(|c| c.is_family() && !c.canonical) =>
+        {
+            (Decision::Defer, meta)
+        }
+        other => other,
+    }
+}
+
+/// Whether `command` could concern this gate or the wallet gate: some reading of it names a
+/// solana-family program or `solana-keygen` (any path, quoted, escaped, inside wrappers, `-c`
+/// strings or substitutions: the raw text is searched), holds ANSI-C quoting, runs an
+/// expansion as a program, or cannot be read. `false` lets `gate-bash`, wired for every Bash
+/// call, answer no opinion before loading anything. Pure and allocation-light.
+pub fn may_concern(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("$'") {
+        return true;
+    }
+    let plain: String = lower
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    if ["solana", "spl-token", "anchor", "keygen"]
+        .iter()
+        .any(|w| plain.contains(w))
+    {
+        return true;
+    }
+    let parsed = shell::parse(command);
+    parsed.unparseable
+        || parsed.opaque
+        || parsed.write_then_run
+        || parsed
+            .commands
+            .iter()
+            .any(|c| c.words.first().is_some_and(|w| w.dynamic))
 }
 
 /// The indirection prefilter of the unconditional Bash hook (spec D6.3, default-route).

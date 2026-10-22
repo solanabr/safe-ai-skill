@@ -546,28 +546,19 @@ impl World {
         inv.run()
     }
 
-    /// The decision both Bash hooks together produce (Claude Code takes the strictest):
-    /// `gate-bash` runs only for a command its `if` filters match.
+    /// The decision both Bash hooks together produce (Claude Code takes the strictest); both
+    /// run for every Bash call (`hooks.json`, pinned by `hooks_json_runs_gate_bash_for_every_bash_call`).
     fn bash(&self, command: &str, tier: Tier) -> String {
         self.bash_env(command, tier, &[])
     }
 
     fn bash_env(&self, command: &str, tier: Tier, extra: &[(&str, &str)]) -> String {
-        let mut labels = Vec::new();
         // `gate-bash` first: a data dir holding an audit log but no spend ledger counts
         // today's budget as spent (spend.rs), and `gate-bash-secrets` writes the audit log.
-        if ["solana ", "spl-token ", "anchor "]
-            .iter()
-            .any(|p| command.starts_with(p))
-        {
-            labels.push(decision_label(&self.run("gate-bash", command, tier, extra)));
-        }
-        labels.push(decision_label(&self.run(
-            "gate-bash-secrets",
-            command,
-            tier,
-            extra,
-        )));
+        let labels = [
+            decision_label(&self.run("gate-bash", command, tier, extra)),
+            decision_label(&self.run("gate-bash-secrets", command, tier, extra)),
+        ];
         strictest(&labels)
     }
 
@@ -873,5 +864,120 @@ fn e2e_keygen_rows_with_no_opinion() {
         ] {
             assert_eq!(w.bash(cmd, tier), "", "{cmd} {tier:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Wiring: gate-bash runs for every Bash call
+// ---------------------------------------------------------------------------------------
+
+/// The PreToolUse `Bash` entries of the plugin's `hooks.json`: `(subcommand, if, onFailure)`.
+fn bash_entries() -> Vec<(String, Option<String>, String)> {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/safe-ai-skill/hooks/hooks.json");
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|g| g["matcher"] == "Bash")
+        .flat_map(|g| g["hooks"].as_array().unwrap().clone())
+        .map(|h| {
+            let cmd = h["command"].as_str().unwrap();
+            (
+                cmd.rsplit(' ').next().unwrap().to_string(),
+                h["if"].as_str().map(str::to_string),
+                h["onFailure"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn hooks_json_runs_gate_bash_for_every_bash_call() {
+    let entries = bash_entries();
+    let gate_bash: Vec<_> = entries
+        .iter()
+        .filter(|(s, _, _)| s == "gate-bash")
+        .collect();
+    assert_eq!(gate_bash.len(), 1, "{entries:?}");
+    let (_, filter, on_failure) = gate_bash[0];
+    assert_eq!(
+        filter, &None,
+        "an `if` filter misses wrapped and keygen commands"
+    );
+    assert_eq!(on_failure, "block");
+    // So wrapped, path-qualified, expansion and solana-keygen rows reach gate-bash itself.
+    let w = World::new("onchain-wiring");
+    for (cmd, want) in [
+        ("env FOO=1 solana program deploy --final x.so -um", "deny"),
+        ("bash -c 'spl-token close A -um'", "deny"),
+        (
+            "timeout 5 anchor idl close P --provider.cluster mainnet",
+            "deny",
+        ),
+        (
+            "/usr/local/bin/solana program close P --bypass-warning -um",
+            "deny",
+        ),
+        ("$S transfer D 1", "ask"),
+        ("solana-keygen new --force", "deny"),
+        ("rm ~/.config/solana/id.json", "deny"),
+    ] {
+        let run = w.run("gate-bash", cmd, Tier::Relaxed, &[]);
+        assert_eq!(decision_label(&run), want, "{cmd}");
+    }
+    // A wrapped within-cap devnet transfer is not allowed by the hook (only direct ones).
+    let fresh = World::new("onchain-wiring-xfer");
+    let run = fresh.run(
+        "gate-bash",
+        &format!("env FOO=1 solana transfer {D} 0.5 -ud"),
+        Tier::Relaxed,
+        &[],
+    );
+    assert_eq!(decision_label(&run), "");
+}
+
+#[test]
+fn gate_bash_fast_path_is_silent_and_touches_nothing() {
+    let w = World::new("onchain-fast");
+    for cmd in [
+        "ls -la",
+        "cargo build --release",
+        "git status && npm test",
+        "rm -rf build",
+    ] {
+        let run = w.invocation("gate-bash", w.bash_payload(cmd)).run();
+        assert_eq!(decision_label(&run), "", "{cmd}");
+        assert!(run.stdout.is_empty() && run.stderr.is_empty(), "{cmd}");
+    }
+    // No policy, state or audit was loaded or written.
+    assert_eq!(std::fs::read_dir(w.data.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn fast_path_lets_every_solana_shape_through() {
+    for cmd in [
+        "solana balance",
+        "s\\olana transfer D 1",
+        "sol''ana transfer D 1",
+        "$'\\x73olana' transfer D 1",
+        "$(echo sol)ana transfer D 1",
+        "$S transfer D 1",
+        "X=/opt/bin/SPL-TOKEN; $X close A",
+        "python3 -c 'import os; os.system(\"anchor deploy\")'",
+        "/usr/bin/solana-keygen new -f",
+        "echo \"unterminated",
+    ] {
+        assert!(bash::may_concern(cmd), "{cmd}");
+    }
+    for cmd in [
+        "ls -la",
+        "cargo test",
+        "rm -rf build",
+        "git push origin main",
+    ] {
+        assert!(!bash::may_concern(cmd), "{cmd}");
     }
 }

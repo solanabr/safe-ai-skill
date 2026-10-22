@@ -532,11 +532,19 @@ fn cmd_gate_bash() -> ExitCode {
     let Some(command) = input.bash_command() else {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
+    // Wired unconditionally for every Bash call: nothing solana-shaped → no opinion, before
+    // any policy, list or state is loaded.
+    if !safe_ai_skill::gates::bash::may_concern(command) {
+        return ExitCode::SUCCESS;
+    }
     let cwd = cwd_of(&input);
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let ctx = Context::build(command, &cwd);
     let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
+    // Default-wallet destruction also fails closed here (this entry is `onFailure: block`).
+    let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
+    let (decision, meta) = join_tier(strictest([wallet_verdict]), decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
