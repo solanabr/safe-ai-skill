@@ -244,3 +244,64 @@ fn hooks_json_wires_the_shared_contract_hooks() {
         "verify session"
     ));
 }
+
+/// The final 1.1.0 shape: `onFailure: block` on the three Solana CLI entries and the Skill
+/// matcher only, `continue` everywhere else, and every hook the workstreams added is present.
+#[test]
+fn hooks_json_final_shape() {
+    let events = [
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+        "UserPromptExpansion",
+        "SessionStart",
+    ];
+    let mut blocking = Vec::new();
+    for event in events {
+        for (matcher, hook) in entries(event) {
+            let cmd = hook["command"].as_str().unwrap_or("").to_string();
+            match hook["onFailure"].as_str() {
+                Some("block") => blocking.push((
+                    matcher.clone(),
+                    cmd.rsplit(' ').next().unwrap_or("").to_string(),
+                    hook["if"].as_str().unwrap_or("").to_string(),
+                )),
+                Some("continue") => {}
+                other => panic!("{event} {matcher} {cmd}: onFailure {other:?}"),
+            }
+        }
+    }
+    blocking.sort();
+    let want: Vec<(String, String, String)> = [
+        ("Bash", "gate-bash", "Bash(anchor *)"),
+        ("Bash", "gate-bash", "Bash(solana *)"),
+        ("Bash", "gate-bash", "Bash(spl-token *)"),
+        ("Skill", "gate-skill", ""),
+    ]
+    .iter()
+    .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+    .collect();
+    assert_eq!(blocking, want);
+    let has = |event: &str, matcher: &str, sub: &str| {
+        entries(event).into_iter().any(|(m, h)| {
+            m == matcher
+                && h["command"]
+                    .as_str()
+                    .unwrap_or("")
+                    .ends_with(&format!(" {sub}"))
+        })
+    };
+    assert!(has(
+        "PreToolUse",
+        "Write|Edit|MultiEdit|NotebookEdit",
+        "gate-tamper"
+    ));
+    assert!(has("PostToolUse", "Bash", "pending-notice"));
+    assert!(has("PreToolUse", "Skill", "gate-skill"));
+    assert!(has("UserPromptExpansion", "", "gate-prompt-expansion"));
+    assert!(has(
+        "SessionStart",
+        "startup|resume|clear|compact",
+        "verify session"
+    ));
+}
