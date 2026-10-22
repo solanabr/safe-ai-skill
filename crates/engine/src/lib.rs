@@ -23,6 +23,7 @@ pub mod audit;
 pub mod confirm;
 pub mod context;
 pub mod datadir;
+pub mod doctor;
 pub mod env;
 pub mod error;
 pub mod gate;

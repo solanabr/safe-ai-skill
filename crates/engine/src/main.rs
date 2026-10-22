@@ -58,6 +58,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("revoke", |_| cmd_revoke()),
     ("status", |_| cmd_status()),
     ("env", safe_ai_skill::env::main),
+    ("doctor", safe_ai_skill::doctor::main),
     ("--version", |_| cmd_version()),
 ];
 
@@ -432,6 +433,14 @@ fn cmd_verify_session() -> ExitCode {
             }
             field.push_str(&notice);
         }
+    }
+
+    // One-time tip (per project) when env files exist without a `.env.schema` (spec D3.8.6).
+    if let Some(tip) = safe_ai_skill::env::schema_tip(&cwd, &plugin_data) {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&tip);
     }
 
     if let Some(out) = res.hook_output() {

@@ -183,3 +183,100 @@ fn env_set_refuses_the_schema() {
         run.stderr
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// C8 SessionStart tip and C6 doctor
+// ---------------------------------------------------------------------------------------
+
+fn session(project: &Path, data: &Path, home: &Path) -> Run {
+    Invocation::new(&["verify", "session"])
+        .plugin_data(data)
+        .home(home)
+        .stdin(
+            serde_json::json!({
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "cwd": project,
+            })
+            .to_string(),
+        )
+        .run()
+}
+
+#[test]
+fn session_tip_once_when_env_files_lack_a_schema() {
+    let proj = TempDir::new("tip-proj");
+    let data = TempDir::new("tip-data");
+    let home = TempDir::new("tip-home");
+    fs::write(proj.join(".env"), format!("K={SECRET}\n")).unwrap();
+    let first = session(proj.path(), data.path(), home.path());
+    assert_no_secret(&first);
+    let v: serde_json::Value = serde_json::from_str(first.stdout.trim()).unwrap();
+    let msg = v["systemMessage"].as_str().unwrap_or_default();
+    assert!(msg.contains("safe-ai-skill env init-schema"), "{msg}");
+    let second = session(proj.path(), data.path(), home.path());
+    assert!(
+        !second.stdout.contains("init-schema"),
+        "tip repeats: {}",
+        second.stdout
+    );
+}
+
+#[test]
+fn session_tip_silent_with_a_schema_or_without_env_files() {
+    let data = TempDir::new("tip-data2");
+    let home = TempDir::new("tip-home2");
+    let with_schema = TempDir::new("tip-schema");
+    fs::write(with_schema.join(".env"), "K=v\n").unwrap();
+    fs::write(with_schema.join(".env.schema"), "# ---\nK=\n").unwrap();
+    let none = TempDir::new("tip-none");
+    fs::write(none.join(".env.example"), "K=\n").unwrap();
+    for proj in [&with_schema, &none] {
+        let run = session(proj.path(), data.path(), home.path());
+        assert!(!run.stdout.contains("init-schema"), "{}", run.stdout);
+    }
+}
+
+#[test]
+fn doctor_recommends_sandbox_deny_read() {
+    let home = TempDir::new("doctor-home");
+    let proj = TempDir::new("doctor-proj");
+    let run = Invocation::new(&["doctor"])
+        .home(home.path())
+        .cwd(proj.path())
+        .run();
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let out = &run.stdout;
+    assert!(out.contains("sandbox: not enabled"), "{out}");
+    for glob in [
+        "**/*-keypair.json",
+        "~/.config/solana/*.json",
+        "**/.env",
+        "~/.ssh/id_*",
+    ] {
+        assert!(out.contains(glob), "{glob}: {out}");
+    }
+    assert!(out.contains("\"denyRead\""), "{out}");
+
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let globs: Vec<String> = safe_ai_skill::doctor::RECOMMENDED_DENY_READ
+        .iter()
+        .map(|g| g.to_string())
+        .collect();
+    fs::write(
+        home.join(".claude/settings.json"),
+        serde_json::json!({ "sandbox": { "enabled": true, "filesystem": { "denyRead": globs } } })
+            .to_string(),
+    )
+    .unwrap();
+    let ok = Invocation::new(&["doctor"])
+        .home(home.path())
+        .cwd(proj.path())
+        .run();
+    assert!(ok.stdout.contains("sandbox: enabled"), "{}", ok.stdout);
+    assert!(
+        ok.stdout.contains("denyRead: all recommended"),
+        "{}",
+        ok.stdout
+    );
+}

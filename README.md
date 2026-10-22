@@ -96,7 +96,7 @@ The npm and standalone paths download the binary matching their release tag and 
 
 - CLI commands: any `solana`, `spl-token`, `anchor`, or arbitrary shell command matching policy
 - MCP calls: value-moving and authority-changing verbs (`send*`, `stake*`, `delegate*`, `mint*`, `bridge*`, `lend*`, `borrow*`) across any connected MCP
-- Secret reads: `.env`, keypair files, credential paths
+- Secret reads: `.env` and other env files, keypair files (by name and by content), private keys, credential paths — on Read, Grep and MCP path arguments, matched case-insensitively and through symlinks (see [Secrets and `.env`](#secrets-and-env))
 - Interactive gate breakage: replaces broken `read -r` prompts (no TTY in hook context) with a functioning `ask` decision
 
 **Supply-chain (SessionStart verifier)**
@@ -113,6 +113,25 @@ The npm and standalone paths download the binary matching their release tag and 
 `mainnet_deploy` · `set_authority` · `account_close` · `secret_read`
 
 These block unconditionally. No profile flag or explicit grant overrides them.
+
+## Secrets and `.env`
+
+Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Keypair files, private keys, `~/.ssh/id_*` and the Solana config tree are never readable. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory has env and key files excluded from its results; Glob only lists names and is not gated. Tool output that still contains a value from a project env file is shown as `«redacted:KEY»`.
+
+Three tiers, pick the one that fits; each keeps working without the next:
+
+1. **Plain `.env` + `safe-ai-skill env`.** The agent works with keys, never values:
+
+   ```bash
+   safe-ai-skill env keys .env                              # keys with masked values
+   printf %s '<value>' | safe-ai-skill env set .env KEY     # value on stdin, never in argv
+   safe-ai-skill env unset .env KEY
+   ```
+
+2. **Add a `.env.schema`** ([env-spec](https://varlock.dev/env-spec/), the format varlock uses). It lists keys, types and `@sensitive`/`@required` decorators and is committed, so the agent can read it directly. `safe-ai-skill env init-schema` writes one from your `.env` (keys only, every key sensitive by default), and `env keys` then annotates each key and lists declared keys that are unset. safe-ai-skill parses the schema itself: it never runs varlock, because loading a schema with varlock executes `$(…)`/`exec()` values and plugins.
+3. **varlock** with a secret provider or `varlock("local:…")` encryption. Run tools with `varlock run -- <cmd>` and inspect with `varlock load --agent`. Commands that print resolved values (`varlock printenv`, `reveal`, `load --format json|env|shell` without `--agent`, …) are treated like `cat .env`.
+
+Opt in to prompted raw reads with `secrets.env_read: ask` in the plugin's `policy/default.policy.yaml` (a project policy can't loosen it). The hooks stop a careless or prompt-injected model; for a hard boundary enable Claude Code's sandbox with `sandbox.filesystem.denyRead` — `safe-ai-skill doctor` checks your settings and prints the globs to add.
 
 ## Threat model
 

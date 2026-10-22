@@ -56,6 +56,37 @@ pub fn is_env_class(path: &Path) -> bool {
     secretpath::classify(&path.to_string_lossy()) == Class::Env
 }
 
+/// The one-time SessionStart tip for a project with env-class files and no `.env.schema`
+/// (spec D3.8.6). Shown once per project directory: a marker under
+/// `<plugin_data>/tips/` records it, and when the marker cannot be written the tip is skipped
+/// (a tip that repeats every session is noise). Only `cwd` itself is checked.
+pub fn schema_tip(cwd: &Path, plugin_data: &Path) -> Option<String> {
+    if cwd.join(".env.schema").exists() {
+        return None;
+    }
+    let has_env = fs::read_dir(cwd)
+        .ok()?
+        .flatten()
+        .any(|entry| entry.file_type().is_ok_and(|t| t.is_file()) && is_env_class(&entry.path()));
+    if !has_env {
+        return None;
+    }
+    let id = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hash = crate::audit::sha256_hex(id.to_string_lossy().as_bytes());
+    hash.truncate(16);
+    let dir = plugin_data.join("tips");
+    fs::create_dir_all(&dir).ok()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(format!("env-schema-{hash}")))
+        .ok()?;
+    Some(
+        "safe-ai-skill tip: add a .env.schema so the agent can see your config without reading secrets: `safe-ai-skill env init-schema` (keys only, no values copied). Plain .env keeps working; varlock is optional."
+            .to_string(),
+    )
+}
+
 fn is_template(path: &Path) -> bool {
     TEMPLATES.contains(&basename(path).as_str())
 }
