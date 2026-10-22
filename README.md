@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml"><img src="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-1.0.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Rust-1.82+-orange?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-purple" alt="Claude Code plugin">
@@ -102,12 +102,12 @@ The npm and standalone paths download the binary matching their release tag and 
 **Supply-chain (SessionStart verifier)**
 
 - Skill packs: sweeps the project's `.claude/skills`; `~/.claude/skills` only when a project's `.safe-ai-skill/policy.yaml` adds it to `supply_chain.verify_skills_dirs` (the only dir outside the project a project may add), plus packs installed there with `install --from`
-- Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); reports drift without moving anything. A drifted pack is reported every session until you run `safe-ai-skill verify approve <name>`, which re-pins it in place
+- Pack state: each skill pack and `ext/` submodule is graded (clean, warned, unreviewed, blocked) and pinned by content (ext submodules also by git SHA). A combination rule, drift from the pin, or a mismatch with a committed `.safe-ai-skill/packs.lock` blocks the pack: it is denied in place (Skill tool, `/name`, reads and Bash access inside it), never moved unless `supply_chain.on_block: move`. `safe-ai-skill verify approve <name>` (or `verify trust <dir>`, which follows the content to other worktrees) clears drift, unreviewed and reviewed lock mismatches after you confirm it; nothing clears a combination rule.
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute
 - MCP version tracking: flags `@latest` entries as informational — does not silently rewrite them
 - CVE lookup: `add` queries osv.dev for an exact, non-local npm source such as `add mcp`'s resolved `pkg@version` (no API key required). The session sweep makes no network calls
-- Heuristic scan: outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec
+- Pack scanner: rule-based detectors with code/doc/meta context (docs cap at WARN, a single code signal is HIGH, only combinations BLOCK); see [docs/scanner-coverage.md](docs/scanner-coverage.md)
 
 **Hard guards (never relaxable)**
 
@@ -140,12 +140,13 @@ safe-ai-skill protects against a careless model and prompt-injected instructions
 
 If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE, but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
 
-## Known limitations in 1.0.1 (fixed in 1.1.0)
+## Upgrading to 1.1.0 (read before upgrading)
 
-- A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
-- A Solana command wrapped in another command or prefixed with environment assignments may not be gated. Keep the sandbox on.
-- There is no SessionStart notice yet for Claude Code older than 2.1.295.
-- Deleting a parent of the plugin data directory (for example `~/.claude/plugins/data`) resets the daily spend ledger, along with grants and pins. The tripwire doesn't cover removing an ancestor. 1.1.0 fixes this with authenticated state.
+- **Relaxations need a code only you see.** Unexpired 1.0 grants and an `autopilot` mode become pending requests at your first 1.1.0 session; confirm each with the code shown then (type `safe-ai-skill confirm <code>` as your whole prompt), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Nothing can be confirmed in headless `claude -p`.
+- **Skill-pack drift is a BLOCK.** A pinned pack whose content changes is denied (the Skill tool, `/name`, reads and Bash access inside it) until you run `safe-ai-skill verify approve <name>` in a terminal and confirm it. A pack the SessionStart sweep could not fully scan in its time budget is denied the same way until a later sweep scans it; `safe-ai-skill verify check <dir>` scans it without a budget.
+- **The agent can't read Claude Code transcripts (`~/.claude/projects`) or the plugin's state key**, through Read, Grep or Bash. `safe-ai-skill doctor` recommends matching sandbox `denyRead` entries.
+- **The Skill hook fails closed**: a broken engine blocks the Skill tool until it is fixed.
+- **The CLI needs the plugin installed**: from a terminal it uses `$CLAUDE_PLUGIN_DATA`, else the plugin's data dir, and exits 1 asking for `CLAUDE_PLUGIN_DATA` when there is none.
 
 **Runtime threats** — agentic workflows drive CLI commands and value-moving MCP calls with no gating. Interactive `read -r` prompts silently fail in hook context (no TTY). safe-ai-skill intercepts every such action before execution.
 
@@ -223,14 +224,14 @@ safe-ai-skill install --home ~               # install into <dir>/.claude/skills
 
 Trust is based on the artifact itself, not a hash allowlist to maintain:
 
-1. **Static heuristics** — scan SKILL.md, scripts, and package.json for outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec, and `curl | bash` patterns. Generic patterns — they do not grow per-package.
-2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA is reported in every session (High findings listed at `path:line`) until you run `verify approve <name>`. Nothing is moved, so the working tree stays clean.
+1. **Rule-based scan** — every file of a pack is classified as code, documentation or pack metadata, and detectors run in that context (strings and comments are data, interpolations are code). Findings in docs cap at WARN, a single code signal is HIGH (the pack is *unreviewed*: reported, not blocked), and only combinations of signals (an exfiltrating `` !`cmd` ``, padding plus a sink, `eval` plus a decoder, a symlink leaving the pack, …) BLOCK.
+2. **Per-pack pinning** — each skill pack and `ext/` submodule is pinned on first sight by content (ext submodules also by commit SHA). Later drift blocks the pack, in place, until you approve it with `safe-ai-skill verify approve <name>` and confirm the code safe-ai-skill shows you.
 3. **Catalog gating** — entries are classified by risk class. High-risk classes require explicit policy approval; safe-ai-skill blocks installation of denied classes without prompting.
 4. **Provenance pinning** — GitHub URLs resolve to immutable commit SHAs (moving refs are rejected). npm packages pin to `pkg@x.y.z` plus `dist.shasum`. `@latest` entries are flagged informational.
 5. **CVE lookup** — `add` queries osv.dev for an exact, non-local npm source (for example `add mcp`'s resolved `pkg@version`). No API key required. This is the only network step; the session sweep and gates make no network calls.
-6. **Local TOFU lockfile** — pin the content hash on first install; any later change is reported as drift until you approve it.
+6. **Local state** — per-pack state (`state.json`, authenticated) records the pin, grade and findings; a project may commit `.safe-ai-skill/packs.lock` to pin pack contents for everyone (a mismatch blocks, a match can't clear a block).
 
-Block on high-severity heuristic match or known CVE. Warn and `ask` on medium. Pass and pin on clean.
+At SessionStart: block on a combination rule or drift, report a HIGH as unreviewed, warn on documentation findings, pin clean. `add` and `install` also block on a known CVE.
 
 ## Integration model
 
