@@ -202,8 +202,6 @@ fn toggles_limits_and_lists_refuse_loosening() {
         p.mcp.sensitive_name_pattern,
         format!("{}|zzz", b.mcp.sensitive_name_pattern)
     );
-    assert_eq!(p.hard_guards, b.hard_guards);
-    assert_eq!(p.gates, b.gates);
     for path in [
         "redact.enabled",
         "audit.enabled",
@@ -223,14 +221,27 @@ fn toggles_limits_and_lists_refuse_loosening() {
 
 #[test]
 fn toggles_limits_and_lists_accept_tightening() {
-    let p = with_repo(concat!(
-        "swap:\n  rugcheck_max_score: 10\n  trusted_mints: []\n",
-        "hard_guards: [mainnet_deploy, set_authority, account_close, secret_read, program_upgrade]\n",
-    ));
+    let p = with_repo("swap:\n  rugcheck_max_score: 10\n  trusted_mints: []\n");
     assert_eq!(p.swap.rugcheck_max_score, 10);
     assert!(p.swap.trusted_mints.is_empty());
-    assert!(p.hard_guards.contains(&"program_upgrade".to_string()));
     assert!(p.ignored_overrides.is_empty(), "{:?}", p.ignored_overrides);
+}
+
+#[test]
+fn removed_gates_and_hard_guards_keys_are_listed_as_ignored() {
+    let p = with_repo(concat!(
+        "hard_guards: [mainnet_deploy, set_authority, account_close, secret_read, program_upgrade]\n",
+        "gates: []\n",
+    ));
+    assert_eq!(without_notes(p.clone()), base());
+    for key in ["hard_guards", "gates"] {
+        assert!(
+            p.ignored_overrides
+                .contains(&format!("{key}: removed in 1.1.0; ignored")),
+            "{:?}",
+            p.ignored_overrides
+        );
+    }
 }
 
 #[test]
@@ -580,7 +591,8 @@ fn env_profile_cannot_select_a_looser_profile() {
 }
 
 #[test]
-fn persisted_mode_still_selects_autopilot() {
+fn an_unauthenticated_mode_json_does_not_select_autopilot() {
+    // A hand-written (or 1.0) mode.json is not an authenticated envelope: strict applies.
     let proj = project("");
     let data = TempDir::new("ratchet-data");
     std::fs::write(
@@ -596,7 +608,21 @@ fn persisted_mode_still_selects_autopilot() {
         data.path(),
         &[],
     );
-    assert_eq!(label, "allow");
+    assert_eq!(label, "ask");
+}
+
+#[test]
+fn autopilot_in_the_base_policy_needs_a_confirmed_mode() {
+    let base_autopilot =
+        DEFAULT_POLICY_YAML.replace("active_profile: strict", "active_profile: autopilot");
+    let p = Policy::from_sources(&base_autopilot, None, None, None);
+    assert_eq!(p.active_profile, "strict");
+    assert!(noted(&p, "active_profile"), "{:?}", p.ignored_overrides);
+    assert_eq!(p.effective().spend.per_tx_sol_max, 1.0);
+    // The confirmed (persisted) mode is what selects it.
+    let p = Policy::from_sources(&base_autopilot, None, Some("autopilot"), None);
+    assert_eq!(p.active_profile, "autopilot");
+    assert_eq!(p.effective().spend.per_tx_sol_max, 2.0);
 }
 
 // ---------------------------------------------------------------------------------------

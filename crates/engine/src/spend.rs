@@ -1,4 +1,4 @@
-//! Daily spend ledger (`${CLAUDE_PLUGIN_DATA}/spend.json`).
+//! Daily spend ledger (`${CLAUDE_PLUGIN_DATA}/spend.json`, authenticated, spec D4.2).
 //!
 //! The ledger tracks SOL spent within the current UTC day. It rolls over (resets to
 //! zero) when the UTC date changes. Two evaluation paths are provided so callers can
@@ -12,6 +12,12 @@
 //!   it only once an action is actually being allowed, so the daily total reflects real
 //!   spend.
 //!
+//! `spend.json` is a [`crate::statefile`] envelope. A ledger that fails authentication, or
+//! one missing once the state key exists (it was deleted), means **today's budget is
+//! exhausted**: [`SpendLedger::load`] replaces it with an exhausted ledger dated today, so
+//! the next UTC day starts fresh. Only a first run (no key yet) starts at zero. The data
+//! dir's trust does not matter here: a ledger can only tighten.
+//!
 //! All arithmetic is guarded against `NaN`, negative, and non-finite inputs, and the
 //! running total is accumulated with saturating semantics so a corrupt or adversarial
 //! ledger value cannot wrap or panic.
@@ -21,13 +27,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::audit::{self, AuditEntry};
 use crate::context::Network;
+use crate::datadir::DataDir;
 use crate::gate::{AllowReason, Verdict};
 use crate::io::Decision;
 use crate::policy::Policy;
+use crate::statefile::{self, Loaded};
 
 /// Seconds in a UTC day.
 const SECONDS_PER_DAY: u64 = 86_400;
+
+/// State file holding the ledger.
+pub const SPEND_FILE: &str = "spend.json";
+
+/// The running total of an exhausted ledger: no spend fits under any daily cap.
+pub const EXHAUSTED_SOL: f64 = f64::MAX;
+
+/// What [`ledger_state`] found on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerState {
+    /// An authenticated ledger.
+    Valid,
+    /// No ledger and no state key: a first run.
+    Fresh,
+    /// No ledger although the state key exists: it was deleted.
+    Deleted,
+    /// The ledger failed authentication.
+    Tampered,
+}
 
 /// Daily spend ledger.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -39,16 +67,55 @@ pub struct SpendLedger {
 }
 
 impl SpendLedger {
-    /// Load the ledger from `${plugin_data}/spend.json`, rolling the day over.
+    /// Load the authenticated ledger from `${plugin_data}/spend.json`, rolling the day over.
     ///
-    /// A missing, empty, or malformed file yields a fresh ledger for the current day.
-    /// If the persisted day predates today (UTC), the running total is reset to zero so
-    /// the daily cap restarts each calendar day.
+    /// A first run (no ledger, no state key) stores and returns a fresh ledger. A ledger that
+    /// was deleted or fails authentication is replaced by one exhausted for today (audited),
+    /// and that is returned: no further spend fits today, and the next day rolls it over.
     pub fn load(plugin_data: &Path) -> SpendLedger {
         let today = current_epoch_day();
-        let mut ledger = read_ledger(plugin_data).unwrap_or_default();
+        let dir = state_dir(plugin_data);
+        let (state, ledger) = read_ledger(&dir);
+        let mut ledger = match (state, ledger) {
+            (LedgerState::Valid, Some(l)) => l,
+            (LedgerState::Fresh, _) | (LedgerState::Valid, None) => {
+                let fresh = SpendLedger {
+                    day: today,
+                    total_sol: 0.0,
+                };
+                let _ = fresh.save(plugin_data);
+                fresh
+            }
+            (LedgerState::Deleted | LedgerState::Tampered, _) => {
+                let exhausted = SpendLedger {
+                    day: today,
+                    total_sol: EXHAUSTED_SOL,
+                };
+                let what = if state == LedgerState::Deleted {
+                    "missing"
+                } else {
+                    "failed authentication"
+                };
+                let entry = AuditEntry::new(
+                    "",
+                    "safe-ai-skill",
+                    "state_tamper",
+                    "ask",
+                    format!("spend.json {what}; today's budget treated as exhausted"),
+                    "",
+                );
+                let _ = audit::append(&entry, plugin_data);
+                let _ = exhausted.save(plugin_data);
+                exhausted
+            }
+        };
         ledger.roll_over(today);
         ledger
+    }
+
+    /// Whether this ledger was exhausted because the stored one was missing or tampered.
+    pub fn is_exhausted(&self) -> bool {
+        self.total_sol >= EXHAUSTED_SOL
     }
 
     /// Reset the running total if `today` is a different (later) day than the stored one.
@@ -70,9 +137,10 @@ impl SpendLedger {
         self.total_sol = if sum.is_finite() { sum } else { f64::MAX };
     }
 
-    /// Persist the ledger to `${plugin_data}/spend.json` (write-temp + rename).
+    /// Persist the ledger to `${plugin_data}/spend.json` as an authenticated envelope.
     fn save(&self, plugin_data: &Path) -> std::io::Result<()> {
-        write_ledger(plugin_data, self)
+        statefile::store(&state_dir(plugin_data), SPEND_FILE, self)
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -96,6 +164,14 @@ pub fn check(amount: f64, ledger: &SpendLedger, policy: &Policy) -> Decision {
                 "Transfer of {amount} SOL exceeds the hard per-tx cap of {} SOL",
                 caps.hard_tx_sol_max
             ),
+        };
+    }
+
+    if ledger.is_exhausted() {
+        return Decision::Ask {
+            reason: "Today's spend ledger was missing or failed authentication, so the daily \
+                     budget is treated as exhausted — approve to proceed"
+                .to_string(),
         };
     }
 
@@ -195,21 +271,35 @@ fn current_epoch_day() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read and deserialize the ledger file. `None` on any I/O or parse failure.
-fn read_ledger(plugin_data: &Path) -> Option<SpendLedger> {
-    let path = plugin_data.join("spend.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// The data dir as [`statefile`] wants it. Trust is irrelevant to a ledger (it only
+/// tightens), so it is not resolved.
+fn state_dir(plugin_data: &Path) -> DataDir {
+    DataDir {
+        path: plugin_data.to_path_buf(),
+        trusted: false,
+    }
 }
 
-/// Persist the ledger atomically: write to a temp file, then rename over the target.
-fn write_ledger(plugin_data: &Path, ledger: &SpendLedger) -> std::io::Result<()> {
-    std::fs::create_dir_all(plugin_data)?;
-    let path = plugin_data.join("spend.json");
-    let tmp = plugin_data.join("spend.json.tmp");
-    let body = serde_json::to_string(ledger).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)
+/// What is on disk for the ledger, without repairing anything.
+pub fn ledger_state(plugin_data: &Path) -> LedgerState {
+    read_ledger(&state_dir(plugin_data)).0
+}
+
+/// Load the ledger envelope and classify it.
+fn read_ledger(dir: &DataDir) -> (LedgerState, Option<SpendLedger>) {
+    match statefile::load::<SpendLedger>(dir, SPEND_FILE) {
+        Loaded::Valid(l) => (LedgerState::Valid, Some(l)),
+        Loaded::Tampered => (LedgerState::Tampered, None),
+        Loaded::Missing if dir.is_unresolved() => (LedgerState::Tampered, None),
+        Loaded::Missing => {
+            let key = dir.path.join(statefile::KEY_FILE);
+            if std::fs::symlink_metadata(key).is_ok() {
+                (LedgerState::Deleted, None)
+            } else {
+                (LedgerState::Fresh, None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,21 +480,82 @@ mod tests {
     fn load_rolls_over_stale_persisted_day() {
         let dir = temp_dir("rollover_load");
         // Persist a ledger dated yesterday with a non-zero total.
-        std::fs::create_dir_all(&dir).unwrap();
         let stale = SpendLedger {
             day: current_epoch_day().saturating_sub(1),
             total_sol: 9.0,
         };
-        std::fs::write(
-            dir.join("spend.json"),
-            serde_json::to_string(&stale).unwrap(),
-        )
-        .unwrap();
+        stale.save(&dir).unwrap();
 
         let ledger = SpendLedger::load(&dir);
         assert_eq!(ledger.day, current_epoch_day());
         assert_eq!(ledger.total_sol, 0.0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_run_starts_a_fresh_authenticated_ledger() {
+        let dir = temp_dir("first_run");
+        assert_eq!(ledger_state(&dir), LedgerState::Fresh);
+        let ledger = SpendLedger::load(&dir);
+        assert_eq!(ledger.total_sol, 0.0);
+        assert!(!ledger.is_exhausted());
+        // It was stored (and the key created), so a later deletion is detectable.
+        assert_eq!(ledger_state(&dir), LedgerState::Valid);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_ledger_exhausts_todays_budget() {
+        let dir = temp_dir("deleted");
+        let policy = policy_with_caps(1.0, 10.0, 5.0);
+        assert_eq!(record_and_check(&dir, 0.5, &policy), Decision::Allow);
+        std::fs::remove_file(dir.join(SPEND_FILE)).unwrap();
+        assert_eq!(ledger_state(&dir), LedgerState::Deleted);
+
+        let ledger = SpendLedger::load(&dir);
+        assert!(ledger.is_exhausted());
+        match check(0.1, &ledger, &policy) {
+            Decision::Ask { reason } => assert!(reason.contains("exhausted"), "{reason}"),
+            other => panic!("expected ask, got {other:?}"),
+        }
+        // The repair is stored and audited.
+        assert_eq!(ledger_state(&dir), LedgerState::Valid);
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("state_tamper"), "{audit}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_ledger_exhausts_today_and_rolls_over_tomorrow() {
+        let dir = temp_dir("tampered");
+        SpendLedger {
+            day: current_epoch_day(),
+            total_sol: 4.0,
+        }
+        .save(&dir)
+        .unwrap();
+        // Hand-edit the total down to zero.
+        let path = dir.join(SPEND_FILE);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"total_sol\":4.0", "\"total_sol\":0.0");
+        std::fs::write(&path, edited).unwrap();
+        assert_eq!(ledger_state(&dir), LedgerState::Tampered);
+
+        let ledger = SpendLedger::load(&dir);
+        assert!(ledger.is_exhausted());
+        let policy = policy_with_caps(1.0, 10.0, 5.0);
+        assert!(matches!(check(0.1, &ledger, &policy), Decision::Ask { .. }));
+
+        // Tomorrow the repaired (exhausted, dated today) ledger rolls over.
+        let mut stored = match statefile::load::<SpendLedger>(&state_dir(&dir), SPEND_FILE) {
+            Loaded::Valid(l) => l,
+            other => panic!("expected a repaired ledger, got {other:?}"),
+        };
+        assert_eq!(stored.day, current_epoch_day());
+        stored.roll_over(current_epoch_day() + 1);
+        assert_eq!(stored.total_sol, 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -431,13 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn malformed_ledger_file_yields_fresh() {
+    fn malformed_ledger_file_is_exhausted() {
         let dir = temp_dir("malformed");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("spend.json"), "not json").unwrap();
         let ledger = SpendLedger::load(&dir);
-        assert_eq!(ledger.total_sol, 0.0);
+        assert!(ledger.is_exhausted());
         assert_eq!(ledger.day, current_epoch_day());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_v1_ledger_is_not_trusted() {
+        let dir = temp_dir("v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("spend.json"),
+            format!("{{\"day\":{},\"total_sol\":0.0}}", current_epoch_day()),
+        )
+        .unwrap();
+        assert!(SpendLedger::load(&dir).is_exhausted());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

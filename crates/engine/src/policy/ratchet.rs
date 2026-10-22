@@ -11,13 +11,17 @@ use std::path::{Component, Path};
 
 use serde_yaml::Value as Yaml;
 
-use super::{merge_yaml, Policy, PROFILE_ENV};
+use super::{merge_yaml, Policy, PROFILE_ENV, REMOVED_TOP_LEVEL};
+use crate::mode::{DEFAULT_PROFILE, KNOWN_PROFILES};
 
 /// A project's policy overlay, relative to the project root.
 pub(super) const PROJECT_POLICY: &str = ".safe-ai-skill/policy.yaml";
 
 /// Known profiles from loosest to strictest. [`PROFILE_ENV`] may only move right.
-const PROFILE_STRICTNESS: [&str; 4] = ["off", "autopilot", "strict", "paranoid"];
+const PROFILE_STRICTNESS: [&str; 3] = KNOWN_PROFILES;
+
+/// The profile that needs a confirmed `mode.json` (spec D1.11).
+const CONFIRMED_ONLY: &str = "autopilot";
 
 /// The skill scan dirs, and the note for project dirs that leave the project.
 const SCAN_DIRS: &str = "supply_chain.verify_skills_dirs";
@@ -52,6 +56,14 @@ pub(super) fn apply_project_overlay(policy: &mut Policy, base: &Yaml, text: &str
                     "{key}: a project may not select or define profiles"
                 ));
             }
+        }
+    }
+
+    for key in REMOVED_TOP_LEVEL {
+        if overlay.remove(key).is_some() {
+            policy
+                .ignored_overrides
+                .push(format!("{key}: removed in 1.1.0; ignored"));
         }
     }
 
@@ -116,13 +128,6 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         }
     }
 
-    keep_union("gates", &mut policy.gates, &asked.gates, n);
-    keep_union(
-        "hard_guards",
-        &mut policy.hard_guards,
-        &asked.hard_guards,
-        n,
-    );
     keep_pattern(
         "mcp.sensitive_name_pattern",
         &mut policy.mcp.sensitive_name_pattern,
@@ -405,29 +410,45 @@ fn keep_fixed<T: PartialEq>(path: &str, current: &T, asked: &T, notes: &mut Vec<
 
 /// Pick the active profile: the user's `persisted` choice replaces `base`, then `env` (which
 /// a repo's `.claude/settings.json` can set) may only select a stricter profile. Returns the
-/// profile and a note when `env` was refused.
+/// profile and a note per refusal.
+///
+/// `autopilot` is honoured only from `persisted` (a confirmed, authenticated `mode.json`);
+/// named by the base policy it falls back to strict. An unknown name is strict too.
 pub(super) fn resolve_profile(
     base: &str,
     persisted: Option<&str>,
     env: Option<&str>,
-) -> (String, Option<String>) {
-    let current = persisted
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .unwrap_or(base);
-    let env = match env.map(str::trim).filter(|e| !e.is_empty()) {
-        Some(e) => e,
-        None => return (current.to_string(), None),
-    };
+) -> (String, Vec<String>) {
+    let mut notes = Vec::new();
+    let persisted = persisted.map(str::trim).filter(|p| !p.is_empty());
+    let mut current = persisted.unwrap_or(base).to_string();
     let rank = |profile: &str| PROFILE_STRICTNESS.iter().position(|p| *p == profile);
-    match (rank(current), rank(env)) {
-        (Some(floor), Some(asked)) if asked >= floor => (env.to_string(), None),
-        _ if env == current => (current.to_string(), None),
-        _ => (
-            current.to_string(),
-            Some(format!(
-                "{PROFILE_ENV}: kept profile `{current}` (it may only select a stricter one)"
-            )),
-        ),
+    if rank(&current).is_none() {
+        let shown: String = current
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(20)
+            .collect();
+        notes.push(format!(
+            "active_profile: `{shown}` is not a profile; using {DEFAULT_PROFILE}"
+        ));
+        current = DEFAULT_PROFILE.to_string();
+    } else if current == CONFIRMED_ONLY && persisted != Some(CONFIRMED_ONLY) {
+        notes.push(format!(
+            "active_profile: `{CONFIRMED_ONLY}` applies only through a confirmed \
+             `safe-ai-skill mode {CONFIRMED_ONLY}`; using {DEFAULT_PROFILE}"
+        ));
+        current = DEFAULT_PROFILE.to_string();
     }
+    let Some(env) = env.map(str::trim).filter(|e| !e.is_empty()) else {
+        return (current, notes);
+    };
+    match (rank(&current), rank(env)) {
+        (Some(floor), Some(asked)) if asked >= floor => return (env.to_string(), notes),
+        _ if env == current => {}
+        _ => notes.push(format!(
+            "{PROFILE_ENV}: kept profile `{current}` (it may only select a stricter one)"
+        )),
+    }
+    (current, notes)
 }

@@ -16,11 +16,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use safe_ai_skill::audit::{self, AuditEntry};
+use safe_ai_skill::confirm::{self, PendingKind};
 use safe_ai_skill::context::{self, Context};
+use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::{GateMeta, Scope};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::Policy;
-use safe_ai_skill::{grants, mode, promptguard, redact, registry, relax, session, verify};
+use safe_ai_skill::spend::{self, SpendLedger};
+use safe_ai_skill::statefile::Loaded;
+use safe_ai_skill::{
+    grants, migrate, mode, notice, promptguard, redact, registry, relax, session, verify,
+};
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
 const EXIT_USAGE: u8 = 3;
@@ -119,20 +125,13 @@ fn ask_unreadable(why: Unreadable, input: &HookInput, raw: &[u8]) -> ExitCode {
         Unreadable::Empty | Unreadable::Malformed => MALFORMED_REASON,
     };
     let cwd = cwd_of(input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let ask = Decision::Ask {
         reason: reason.to_string(),
     };
-    let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &plugin_data);
-    write_audit(
-        &effective,
-        &plugin_data,
-        input,
-        raw,
-        "unreadable",
-        &decision,
-    );
+    let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &dir);
+    write_audit(&effective, &dir.path, input, raw, "unreadable", &decision);
     let _ = io::emit_pretooluse(&decision);
     ExitCode::SUCCESS
 }
@@ -141,10 +140,22 @@ fn ask_unreadable(why: Unreadable, input: &HookInput, raw: &[u8]) -> ExitCode {
 ///
 /// The persistent runtime override written by `safe-ai-skill mode <profile>` (`mode.json`)
 /// replaces the policy's profile; the `SAFE_AI_SKILL_PROFILE` env var may then only select a
-/// stricter one (see [`Policy::load_with_mode`]). This is what makes `safe-ai-skill mode
-/// autopilot` actually take effect for every subsequent gate.
-fn load_effective_policy(cwd: &Path, plugin_data: &Path) -> Policy {
-    Policy::load_with_mode(cwd, mode::persisted(plugin_data).as_deref()).effective()
+/// stricter one (see [`Policy::load_with_mode`]). Only an authenticated `mode.json` in a
+/// trusted data dir counts ([`mode::persisted`]).
+fn load_effective_policy(cwd: &Path, dir: &DataDir) -> Policy {
+    Policy::load_with_mode(cwd, mode::persisted(dir).as_deref()).effective()
+}
+
+/// The plugin data dir for a session rooted at `cwd`, resolved exactly as for a hook
+/// (`cwd` is the payload's, or the process cwd for the CLI). Unresolvable → the sentinel,
+/// which stores nothing and relaxes nothing.
+fn state_dir(cwd: &Path) -> DataDir {
+    datadir::data_dir_with_cwd(Some(cwd)).unwrap_or_else(|_| datadir::unresolved())
+}
+
+/// The process cwd, for CLI subcommands.
+fn process_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Resolve the session cwd from the hook payload, defaulting to the process cwd.
@@ -161,11 +172,12 @@ fn finish_pretooluse(
     natural: Decision,
     meta: &GateMeta,
     effective: &Policy,
-    plugin_data: &Path,
+    dir: &DataDir,
     input: &HookInput,
     raw: &[u8],
 ) -> ExitCode {
-    let decision = relax::apply(natural, meta, effective, plugin_data);
+    let plugin_data = dir.path.as_path();
+    let decision = relax::apply(natural, meta, effective, dir);
 
     // Commit-on-allow: once the FINAL (post-relaxation) decision for a transfer with a
     // known amount is `Allow`, debit the daily spend ledger. The gate evaluated the
@@ -174,7 +186,7 @@ fn finish_pretooluse(
     // they still count against the daily ledger here so the daily cap stays authoritative.
     if matches!(decision, Decision::Allow) && meta.scope == Scope::Transfer {
         if let Some(amount) = meta.amount_sol {
-            safe_ai_skill::spend::commit(plugin_data, amount);
+            spend::commit(plugin_data, amount);
         }
     }
 
@@ -278,11 +290,17 @@ fn cmd_gate_bash() -> ExitCode {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let ctx = Context::build(command, &cwd);
-    let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
-    finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
+    let (mut decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
+    // paranoid: every Solana CLI command asks, including the ones with no opinion.
+    if matches!(decision, Decision::Defer) && effective.active_overlay().ask_all {
+        decision = Decision::Ask {
+            reason: relax::ASK_ALL_REASON.to_string(),
+        };
+    }
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_gate_bash_secrets() -> ExitCode {
@@ -293,13 +311,13 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let command = input.bash_command().unwrap_or("");
     let decision = safe_ai_skill::gates::secrets::decide(command, &effective);
     // Secret reads are always a hard guard.
     let meta = GateMeta::new(Scope::SecretRead, true);
-    finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_gate_read() -> ExitCode {
@@ -310,12 +328,12 @@ fn cmd_gate_read() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let path = input.read_path().unwrap_or("");
     let decision = safe_ai_skill::gates::read::decide(path, &effective);
     let meta = GateMeta::new(Scope::SecretRead, true);
-    finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_gate_mcp() -> ExitCode {
@@ -326,13 +344,13 @@ fn cmd_gate_mcp() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let tool = input.tool_name.clone().unwrap_or_default();
     let payload = input.mcp_payload();
     let ctx = Context::build("", &cwd);
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
-    finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_redact() -> ExitCode {
@@ -355,13 +373,25 @@ fn cmd_redact() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `prompt-guard` — the UserPromptSubmit hook: block a prompt carrying a raw secret, else
+/// handle a `safe-ai-skill confirm <nonce>` prompt (spec D4.1). The nonce is read from the
+/// UserPromptSubmit `prompt` alone ([`confirm::user_prompt`]).
 fn cmd_prompt_guard() -> ExitCode {
     let Ok(input) = read_input().1 else {
         return ExitCode::SUCCESS;
     };
     let prompt = input.prompt.clone().unwrap_or_default();
-    let block = promptguard::check(&prompt);
-    let _ = io::emit_userpromptsubmit(block.as_deref());
+    if let Some(block) = promptguard::check(&prompt) {
+        let _ = io::emit_userpromptsubmit(Some(&block));
+        return ExitCode::SUCCESS;
+    }
+    let Some(user_prompt) = confirm::user_prompt(&input) else {
+        return ExitCode::SUCCESS;
+    };
+    let dir = state_dir(&cwd_of(&input));
+    if let Some(outcome) = relax::confirm_prompt(&dir, user_prompt, now_secs()) {
+        print_json(&outcome.hook_output());
+    }
     ExitCode::SUCCESS
 }
 
@@ -397,19 +427,44 @@ fn cmd_verify_session() -> ExitCode {
     // SessionStart hooks may carry a cwd on stdin; fall back to the process cwd.
     let input = read_input().1.unwrap_or_default();
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let plugin_data = dir.path.clone();
+    let now = now_secs();
 
+    // 1.0 state is migrated once, before anything creates the state key; then the spend
+    // ledger is started (or repaired), which creates the key on a first run.
+    let migrated = migrate::run(&dir, now);
+    let spend_state = spend::ledger_state(&plugin_data);
+    let _ = SpendLedger::load(&plugin_data);
+
+    let effective = load_effective_policy(&cwd, &dir);
     let mut res = verify::run_session(&plugin_data, &cwd, &effective);
 
-    // Overrides the policy ratchet refused (project overlay, looser profile env var): shown to
-    // the user and given to the model.
-    if let Some(notice) = effective.ignored_notice() {
+    // Overrides the policy ratchet refused (project overlay, looser profile env var, removed
+    // settings), then the active loosenings (spec D4.4): shown to the user and given to the
+    // model.
+    let env_profile = std::env::var(safe_ai_skill::policy::PROFILE_ENV).ok();
+    let project = std::env::var_os("CLAUDE_PROJECT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.clone());
+    let loosenings = notice::loosenings(&notice::Inputs {
+        dir: &dir,
+        env_profile: env_profile.as_deref(),
+        spend: spend_state,
+        migrated: &migrated,
+        sandbox: notice::sandbox_state(&project),
+        now,
+    });
+    for text in [effective.ignored_notice(), loosenings]
+        .into_iter()
+        .flatten()
+    {
         for field in [&mut res.system_message, &mut res.additional_context] {
             if !field.is_empty() {
                 field.push('\n');
             }
-            field.push_str(&notice);
+            field.push_str(&text);
         }
     }
 
@@ -430,11 +485,12 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
         }));
         return ExitCode::SUCCESS;
     }
-    let plugin_data = context::plugin_data_dir();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = process_cwd();
+    let dir = state_dir(&cwd);
+    let plugin_data = dir.path.clone();
     // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
     let project = verify::project_root(&cwd);
-    let effective = load_effective_policy(&project, &plugin_data);
+    let effective = load_effective_policy(&project, &dir);
 
     match verify::approve(&plugin_data, &project, name, &effective) {
         Ok(approval) => {
@@ -613,8 +669,9 @@ fn resolve_high_risk_target(
     plugin_data: &Path,
     source: &str,
 ) -> Option<(String, &'static str, &'static str)> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let policy = load_effective_policy(&cwd, plugin_data);
+    let _ = plugin_data;
+    let cwd = process_cwd();
+    let policy = load_effective_policy(&cwd, &state_dir(&cwd));
     let reg_path = cwd.join(&policy.catalog.registry_path);
     let reg = registry::Registry::load(&reg_path).ok()?;
 
@@ -1003,9 +1060,10 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
 /// run on a project that has not opted into the catalog.
 fn cmd_registry(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("list");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let plugin_data = context::plugin_data_dir();
-    let policy = load_effective_policy(&cwd, &plugin_data);
+    let cwd = process_cwd();
+    let dir = state_dir(&cwd);
+    let plugin_data = dir.path.clone();
+    let policy = load_effective_policy(&cwd, &dir);
     let reg_path = cwd.join(&policy.catalog.registry_path);
 
     if action != "verify" && action != "list" {
@@ -1109,7 +1167,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn cmd_session(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("status");
-    let plugin_data = context::plugin_data_dir();
+    let dir = state_dir(&process_cwd());
     let result = match action {
         "init" => {
             let cap = rest
@@ -1118,119 +1176,177 @@ fn cmd_session(rest: &[String]) -> ExitCode {
                 .and_then(|i| rest.get(i + 1))
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0);
-            session::init(cap, &plugin_data).unwrap_or_default()
+            session::init(cap, &dir).unwrap_or_default()
         }
-        _ => session::status(&plugin_data).unwrap_or_default(),
+        _ => session::status(&dir).unwrap_or_default(),
     };
     print_json(&serde_json::json!({ "command": "session", "action": action, "result": result }));
     ExitCode::SUCCESS
 }
 
-fn cmd_allow(rest: &[String]) -> ExitCode {
-    // Parse --scope --for --max-tx --budget --programs --to --danger, build a grant, and
-    // persist it. Creating a grant is an authority-granting action, so it is always audited.
-    let scope = flag_value(rest, "--scope").unwrap_or_default();
-    let for_dur = flag_value(rest, "--for").unwrap_or_default();
-    let max_tx = flag_value(rest, "--max-tx")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let budget = flag_value(rest, "--budget")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let programs = flag_value(rest, "--programs").unwrap_or_default();
-    let to = flag_value(rest, "--to").unwrap_or_default();
-    let danger = rest.iter().any(|a| a == "--danger");
-
-    let plugin_data = context::plugin_data_dir();
-    let now = now_secs();
-
-    let grant = match grants::Grant::from_args(
-        &scope, &for_dur, max_tx, budget, &programs, &to, danger, now,
-    ) {
-        Some(g) => g,
-        None => {
-            print_json(&serde_json::json!({
-                "command": "allow",
-                "status": "error",
-                "error": "could not parse --scope / --for; expected e.g. --scope swap --for 30m",
-            }));
-            return ExitCode::SUCCESS;
-        }
-    };
-
-    let mut store = grants::load(&plugin_data);
-    let grant_id = grant.id.clone();
-    let grant_scope = grant.scope.label();
-    let grant_expiry = grant.expires_at;
-    store.grants.push(grant);
-    let _ = grants::save(&plugin_data, &store);
-
-    // Audit the grant creation.
-    audit_event(
-        &plugin_data,
-        "grant_create",
-        "allow",
-        &format!(
-            "scope={grant_scope} max_tx={max_tx} budget={budget} expires_at={grant_expiry} danger={danger}"
-        ),
-    );
-
+/// A CLI argument error: JSON on stdout, exit 1.
+fn cli_error(command: &str, error: &str) -> ExitCode {
     print_json(&serde_json::json!({
-        "command": "allow",
-        "status": "granted",
-        "id": grant_id,
-        "scope": grant_scope,
-        "for": for_dur,
-        "max_tx_sol": max_tx,
-        "budget_sol": budget,
-        "programs": programs,
-        "to": to,
-        "danger": danger,
-        "expires_at": grant_expiry,
+        "command": command,
+        "status": "error",
+        "error": error,
+    }));
+    ExitCode::FAILURE
+}
+
+/// Park a relaxing action for prompt-nonce confirmation (spec D4.1) and tell whoever ran
+/// the command exactly what to type: JSON on stdout, plain text on stderr. Nothing takes
+/// effect until the user's own next prompt is `safe-ai-skill confirm <nonce>`.
+fn park_pending(
+    command: &str,
+    dir: &DataDir,
+    kind: PendingKind,
+    summary: &str,
+    payload: serde_json::Value,
+) -> ExitCode {
+    // Start the spend ledger first: creating the state key without it would make the ledger
+    // look deleted (budget exhausted) at the next session.
+    let _ = SpendLedger::load(&dir.path);
+    let nonce = match confirm::create_pending(dir, kind, summary, payload) {
+        Ok(n) => n,
+        Err(e) => return cli_error(command, &format!("could not record the request: {e}")),
+    };
+    let line = format!("safe-ai-skill confirm {nonce}");
+    let minutes = confirm::TTL_SECS / 60;
+    let untrusted = !dir.trusted;
+    let mut message = format!(
+        "Nothing has changed yet. Requested: {summary}.\n\
+         To approve it, type this line as your entire next prompt in Claude Code \
+         (valid {minutes} minutes, single use):\n\n    {line}\n"
+    );
+    if untrusted {
+        message.push_str(
+            "\nWarning: the plugin data dir is not in a trusted location, so this will not \
+             take effect even once confirmed.\n",
+        );
+    }
+    let _ = writeln!(std::io::stderr(), "{message}");
+    audit_event(&dir.path, kind_label(kind), "pending", summary);
+    print_json(&serde_json::json!({
+        "command": command,
+        "status": "pending",
+        "summary": summary,
+        "confirm": line,
+        "expires_in_secs": confirm::TTL_SECS,
+        "data_dir_trusted": !untrusted,
+        "message": message,
     }));
     ExitCode::SUCCESS
 }
 
-fn cmd_mode(rest: &[String]) -> ExitCode {
-    let plugin_data = context::plugin_data_dir();
-    match rest.first() {
-        Some(profile) => match mode::set(&plugin_data, profile) {
-            Ok(()) => {
-                audit_event(
-                    &plugin_data,
-                    "mode_set",
-                    "mode",
-                    &format!("active_profile={profile}"),
-                );
-                print_json(&serde_json::json!({
-                    "command": "mode",
-                    "status": "set",
-                    "active_profile": profile,
-                }));
-            }
-            Err(e) => {
-                print_json(&serde_json::json!({
-                    "command": "mode",
-                    "status": "error",
-                    "error": e.to_string(),
-                }));
-            }
-        },
-        None => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let current = load_effective_policy(&cwd, &plugin_data).active_profile;
-            print_json(&serde_json::json!({ "command": "mode", "active_profile": current }));
-        }
+/// Audit classification of a pending kind.
+fn kind_label(kind: PendingKind) -> &'static str {
+    match kind {
+        PendingKind::Grant => "grant_create",
+        PendingKind::Mode => "mode_set",
+        PendingKind::Trust => "verify_trust",
+        PendingKind::Approve => "verify_approve",
     }
-    ExitCode::SUCCESS
 }
 
+/// `allow --scope <s> --for <dur> [--max-tx N] [--budget N] [--programs a,b] [--to a,b]
+/// [--danger]` — request a grant. It is only parked; the user confirms it with the prompt
+/// nonce. An unknown scope (including the removed `other`) is an error.
+fn cmd_allow(rest: &[String]) -> ExitCode {
+    let scope = flag_value(rest, "--scope").unwrap_or_default();
+    let for_dur = flag_value(rest, "--for").unwrap_or_default();
+    let amount = |flag: &str| -> Result<f64, String> {
+        match flag_value(rest, flag) {
+            None => Ok(0.0),
+            Some(v) => v
+                .parse::<f64>()
+                .map_err(|_| format!("{flag}: expected a SOL amount")),
+        }
+    };
+    let (max_tx, budget) = match (amount("--max-tx"), amount("--budget")) {
+        (Ok(m), Ok(b)) => (m, b),
+        (Err(e), _) | (_, Err(e)) => return cli_error("allow", &e),
+    };
+    let programs = flag_value(rest, "--programs").unwrap_or_default();
+    let to = flag_value(rest, "--to").unwrap_or_default();
+    let danger = rest.iter().any(|a| a == "--danger");
+
+    let request = match grants::GrantRequest::from_args(
+        &scope, &for_dur, max_tx, budget, &programs, &to, danger,
+    ) {
+        Ok(r) => r,
+        Err(e) => return cli_error("allow", &e),
+    };
+    let payload = match serde_json::to_value(&request) {
+        Ok(v) => v,
+        Err(e) => return cli_error("allow", &e.to_string()),
+    };
+    let dir = state_dir(&process_cwd());
+    park_pending(
+        "allow",
+        &dir,
+        PendingKind::Grant,
+        &request.summary(),
+        payload,
+    )
+}
+
+/// `mode [<profile>]` — show the active profile, or select one. A stricter profile is
+/// written at once; a looser one (`autopilot`) is parked for prompt-nonce confirmation.
+fn cmd_mode(rest: &[String]) -> ExitCode {
+    let cwd = process_cwd();
+    let dir = state_dir(&cwd);
+    let Some(profile) = rest.first() else {
+        let current = load_effective_policy(&cwd, &dir).active_profile;
+        print_json(&serde_json::json!({ "command": "mode", "active_profile": current }));
+        return ExitCode::SUCCESS;
+    };
+    if !mode::is_known_profile(profile) {
+        return cli_error("mode", &mode::unknown_profile(profile));
+    }
+    let current = Policy::load_with_mode(&cwd, mode::persisted(&dir).as_deref()).active_profile;
+    if mode::is_looser(profile, &current) {
+        return park_pending(
+            "mode",
+            &dir,
+            PendingKind::Mode,
+            &format!("mode {profile} (from {current})"),
+            serde_json::json!({ "profile": profile }),
+        );
+    }
+    let _ = SpendLedger::load(&dir.path);
+    match mode::set(&dir, profile, now_secs()) {
+        Ok(()) => {
+            audit_event(
+                &dir.path,
+                "mode_set",
+                "mode",
+                &format!("active_profile={profile}"),
+            );
+            print_json(&serde_json::json!({
+                "command": "mode",
+                "status": "set",
+                "active_profile": profile,
+            }));
+            ExitCode::SUCCESS
+        }
+        Err(e) => cli_error("mode", &e.to_string()),
+    }
+}
+
+/// `revoke` — clear every grant (tightening, so it takes effect at once).
 fn cmd_revoke() -> ExitCode {
-    let plugin_data = context::plugin_data_dir();
-    let cleared = grants::load(&plugin_data).grants.len();
-    let _ = grants::save(&plugin_data, &grants::Grants::default());
+    let dir = state_dir(&process_cwd());
+    let cleared = match grants::load(&dir) {
+        Loaded::Valid(g) => g.grants.len(),
+        _ => 0,
+    };
+    let _ = SpendLedger::load(&dir.path);
+    if let Err(e) = grants::save(&dir, &grants::Grants::default()) {
+        return cli_error("revoke", &e.to_string());
+    }
     audit_event(
-        &plugin_data,
+        &dir.path,
         "grant_revoke",
         "revoke",
         &format!("cleared={cleared}"),
@@ -1243,14 +1359,29 @@ fn cmd_revoke() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_status() -> ExitCode {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+/// The label of a state file's authentication result.
+fn state_label<T>(loaded: &Loaded<T>) -> &'static str {
+    match loaded {
+        Loaded::Valid(_) => "valid",
+        Loaded::Missing => "missing",
+        Loaded::Tampered => "failed authentication",
+    }
+}
 
-    // Live grants with derived remaining-budget / time-left.
+fn cmd_status() -> ExitCode {
+    let cwd = process_cwd();
+    let dir = state_dir(&cwd);
+    let plugin_data = dir.path.clone();
+    let effective = load_effective_policy(&cwd, &dir);
+
+    // Grants with derived remaining-budget / time-left (authenticated file only).
     let now = now_secs();
-    let live = grants::load(&plugin_data);
+    let loaded = grants::load(&dir);
+    let grants_state = state_label(&loaded);
+    let live = match loaded {
+        Loaded::Valid(g) => g,
+        _ => grants::Grants::default(),
+    };
     let grants_view: Vec<serde_json::Value> = live
         .grants
         .iter()
@@ -1270,9 +1401,10 @@ fn cmd_status() -> ExitCode {
         .collect();
 
     // Today's spend against the effective caps.
-    let ledger = safe_ai_skill::spend::SpendLedger::load(&plugin_data);
+    let ledger = SpendLedger::load(&plugin_data);
     let spend_view = serde_json::json!({
-        "today_sol": ledger.total_sol,
+        "today_sol": if ledger.is_exhausted() { serde_json::Value::Null } else { serde_json::json!(ledger.total_sol) },
+        "exhausted": ledger.is_exhausted(),
         "per_tx_sol_max": effective.spend.per_tx_sol_max,
         "hard_tx_sol_max": effective.spend.hard_tx_sol_max,
         "daily_sol_max": effective.spend.daily_sol_max,
@@ -1281,6 +1413,9 @@ fn cmd_status() -> ExitCode {
     print_json(&serde_json::json!({
         "command": "status",
         "active_profile": effective.active_profile,
+        "data_dir_trusted": dir.trusted,
+        "grants_state": grants_state,
+        "mode_state": state_label(&mode::load(&dir)),
         "grants": grants_view,
         "spend": spend_view,
         "recent_audit": recent_audit_lines(&plugin_data, 5),

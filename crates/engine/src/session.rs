@@ -2,8 +2,9 @@
 //!
 //! A session key is a freshly generated Ed25519 keypair written in the Solana CLI keypair
 //! format (a JSON array of 64 bytes: 32-byte secret seed followed by the 32-byte public key)
-//! with `0600` permissions under `${plugin_data}/session/<id>.json`. Its metadata records a
-//! hard SOL cap.
+//! with `0600` permissions under `${plugin_data}/session/<id>.json` (the CLI reads it there,
+//! so it stays plain). Its metadata, which records a hard SOL cap, and the active-session
+//! pointer live in the authenticated `${plugin_data}/sessions.json` ([`crate::statefile`]).
 //!
 //! ## "autopilot" by construction
 //!
@@ -18,7 +19,21 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
+use crate::datadir::DataDir;
 use crate::error::{Error, Result};
+use crate::statefile::{self, Loaded};
+
+/// State file holding session metadata and the active-session pointer.
+pub const SESSIONS_FILE: &str = "sessions.json";
+
+/// The body of [`SESSIONS_FILE`].
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Sessions {
+    /// Id of the active session, if any.
+    pub active: Option<String>,
+    /// Every session created.
+    pub sessions: Vec<SessionMeta>,
+}
 
 /// Persisted session metadata (written alongside the keypair, and embedded as `meta`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,13 +53,14 @@ pub struct SessionMeta {
 /// Initialize an ephemeral session keypair capped at `cap_sol`.
 ///
 /// Generates an Ed25519 keypair, writes it `0600` in Solana CLI keypair format to
-/// `${plugin_data}/session/<id>.json`, records [`SessionMeta`] next to it, and returns a
+/// `${plugin_data}/session/<id>.json`, records [`SessionMeta`] in [`SESSIONS_FILE`] as the
+/// active session, and returns a
 /// human-readable summary including the funding instruction. The funding transfer
 /// (`solana transfer <pubkey> <cap_sol>`) is run by the caller and itself passes through the
 /// transfer gate.
 ///
 /// A non-finite or negative `cap_sol` is rejected.
-pub fn init(cap_sol: f64, plugin_data: &Path) -> Result<String> {
+pub fn init(cap_sol: f64, dir: &DataDir) -> Result<String> {
     if !cap_sol.is_finite() || cap_sol < 0.0 {
         return Err(Error::Other(
             "session cap must be a finite, non-negative SOL value".to_string(),
@@ -56,7 +72,7 @@ pub fn init(cap_sol: f64, plugin_data: &Path) -> Result<String> {
     let created_at = now_secs();
     let id = format!("sess-{created_at:x}");
 
-    let session_dir = plugin_data.join("session");
+    let session_dir = dir.path.join("session");
     std::fs::create_dir_all(&session_dir)?;
 
     // Solana CLI keypair: a 64-int JSON array of [secret_32 || public_32].
@@ -71,14 +87,14 @@ pub fn init(cap_sol: f64, plugin_data: &Path) -> Result<String> {
         created_at,
         autopilot: true,
     };
-    let meta_path = session_dir.join(format!("{id}.meta.json"));
-    let meta_body =
-        serde_json::to_string(&meta).map_err(|e| Error::Parse(format!("session meta: {e}")))?;
-    write_secure(&meta_path, &meta_body)?;
-
-    // Record the active session pointer for `status`.
-    let active_path = plugin_data.join("session").join("active.json");
-    let _ = std::fs::write(&active_path, serde_json::json!({ "id": id }).to_string());
+    // A tampered file is replaced: its metadata could not be believed anyway.
+    let mut sessions = match statefile::load::<Sessions>(dir, SESSIONS_FILE) {
+        Loaded::Valid(s) => s,
+        Loaded::Missing | Loaded::Tampered => Sessions::default(),
+    };
+    sessions.sessions.push(meta);
+    sessions.active = Some(id.clone());
+    statefile::store(dir, SESSIONS_FILE, &sessions)?;
 
     Ok(format!(
         "session {id} ready (pubkey {pubkey}, cap {cap_sol} SOL). \
@@ -88,22 +104,22 @@ pub fn init(cap_sol: f64, plugin_data: &Path) -> Result<String> {
 
 /// Human-readable status of the active session (id, pubkey, cap).
 ///
-/// Reads the active-session pointer and its metadata. Returns a fixed string when no session
-/// is active. Balance lookups are intentionally not performed here (no network in this build).
-pub fn status(plugin_data: &Path) -> Result<String> {
-    let active_path = plugin_data.join("session").join("active.json");
-    let active = match std::fs::read_to_string(&active_path) {
-        Ok(text) => text,
-        Err(_) => return Ok("no active session".to_string()),
+/// Reads the authenticated [`SESSIONS_FILE`]. Returns a fixed string when no session is
+/// active, and says so when the file fails authentication. Balance lookups are intentionally
+/// not performed here (no network in this build).
+pub fn status(dir: &DataDir) -> Result<String> {
+    let sessions = match statefile::load::<Sessions>(dir, SESSIONS_FILE) {
+        Loaded::Valid(s) => s,
+        Loaded::Missing => return Ok("no active session".to_string()),
+        Loaded::Tampered => {
+            return Ok("session metadata failed authentication; ignored".to_string())
+        }
     };
-    let id = serde_json::from_str::<serde_json::Value>(&active)
-        .ok()
-        .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string));
-    let id = match id {
-        Some(id) => id,
-        None => return Ok("no active session".to_string()),
-    };
-    match load_meta(plugin_data, &id) {
+    let meta = sessions
+        .active
+        .as_deref()
+        .and_then(|id| sessions.sessions.iter().find(|m| m.id == id));
+    match meta {
         Some(meta) => Ok(format!(
             "session {} active: pubkey {} cap {} SOL (autopilot={})",
             meta.id, meta.pubkey, meta.cap_sol, meta.autopilot
@@ -112,11 +128,12 @@ pub fn status(plugin_data: &Path) -> Result<String> {
     }
 }
 
-/// Load a session's metadata by id.
-pub fn load_meta(plugin_data: &Path, id: &str) -> Option<SessionMeta> {
-    let meta_path = plugin_data.join("session").join(format!("{id}.meta.json"));
-    let text = std::fs::read_to_string(meta_path).ok()?;
-    serde_json::from_str(&text).ok()
+/// Load a session's metadata by id (authenticated).
+pub fn load_meta(dir: &DataDir, id: &str) -> Option<SessionMeta> {
+    match statefile::load::<Sessions>(dir, SESSIONS_FILE) {
+        Loaded::Valid(s) => s.sessions.into_iter().find(|m| m.id == id),
+        _ => None,
+    }
 }
 
 /// Generate a fresh Ed25519 signing key, seeding from the OS CSPRNG.
@@ -180,15 +197,8 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "safe_ai_skill_session_{}_{}_{}",
-            tag,
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn tmp_dir(tag: &str) -> DataDir {
+        crate::grants::tests::tmp_data(&format!("session_{tag}"))
     }
 
     #[test]
@@ -209,7 +219,7 @@ mod tests {
         assert!(summary.contains("solana transfer"));
 
         // The keypair file parses as 64 ints, each 0..=255.
-        let session_dir = dir.join("session");
+        let session_dir = dir.path.join("session");
         let entries: Vec<_> = std::fs::read_dir(&session_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -232,7 +242,7 @@ mod tests {
             assert!((0..=255).contains(n));
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[cfg(unix)]
@@ -241,7 +251,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("perms");
         init(0.5, &dir).unwrap();
-        let session_dir = dir.join("session");
+        let session_dir = dir.path.join("session");
         for entry in std::fs::read_dir(&session_dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".json") && !name.contains("meta") && name != "active.json" {
@@ -249,7 +259,7 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o600, "keypair file must be 0600");
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
@@ -260,14 +270,14 @@ mod tests {
         assert!(status.contains("active"));
         assert!(status.contains("cap 2 SOL"));
         assert!(status.contains("autopilot=true"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
     fn status_no_session() {
         let dir = tmp_dir("nosession");
         assert_eq!(status(&dir).unwrap(), "no active session");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
@@ -275,16 +285,14 @@ mod tests {
         let dir = tmp_dir("pubkey");
         init(1.0, &dir).unwrap();
         // Find the meta and key, verify the public 32 bytes match the keypair tail.
-        let session_dir = dir.join("session");
+        let session_dir = dir.path.join("session");
         let mut meta: Option<SessionMeta> = None;
         let mut key_bytes: Option<Vec<u8>> = None;
         for entry in std::fs::read_dir(&session_dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".meta.json") {
-                let text = std::fs::read_to_string(entry.path()).unwrap();
-                meta = serde_json::from_str(&text).ok();
-            } else if name.starts_with("sess-") && name.ends_with(".json") && name != "active.json"
-            {
+            if name.starts_with("sess-") && name.ends_with(".json") {
+                let id = name.trim_end_matches(".json");
+                meta = load_meta(&dir, id);
                 let text = std::fs::read_to_string(entry.path()).unwrap();
                 let nums: Vec<u8> = serde_json::from_str(&text).unwrap();
                 key_bytes = Some(nums);
@@ -294,7 +302,20 @@ mod tests {
         let key_bytes = key_bytes.unwrap();
         let pub_from_file = bs58::encode(&key_bytes[32..64]).into_string();
         assert_eq!(meta.pubkey, pub_from_file);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn edited_session_metadata_is_not_believed() {
+        let dir = tmp_dir("tamper");
+        init(2.0, &dir).unwrap();
+        let path = dir.path.join(SESSIONS_FILE);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"cap_sol\":2.0", "\"cap_sol\":2000.0");
+        std::fs::write(&path, edited).unwrap();
+        assert!(status(&dir).unwrap().contains("failed authentication"));
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
@@ -302,6 +323,6 @@ mod tests {
         let dir = tmp_dir("negcap");
         assert!(init(-1.0, &dir).is_err());
         assert!(init(f64::NAN, &dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 }

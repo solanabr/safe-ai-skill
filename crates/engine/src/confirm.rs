@@ -578,7 +578,21 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let dir = dir.clone();
-                std::thread::spawn(move || (0..4).map(|_| grant(&dir)).collect::<Vec<_>>())
+                // Each create fsyncs under the lock; under a loaded parallel test run the 2 s
+                // lock wait can lapse, which is not what this test is about: retry on busy.
+                let create = move || loop {
+                    match create_pending(
+                        &dir,
+                        PendingKind::Grant,
+                        "transfer up to 1 SOL for 1h",
+                        json!({"scope": "transfer", "budget_sol": 1.0}),
+                    ) {
+                        Ok(n) => break n,
+                        Err(e) if e.to_string().contains("busy") => continue,
+                        Err(e) => panic!("{e}"),
+                    }
+                };
+                std::thread::spawn(move || (0..4).map(|_| create()).collect::<Vec<_>>())
             })
             .collect();
         let nonces: Vec<Nonce> = handles
