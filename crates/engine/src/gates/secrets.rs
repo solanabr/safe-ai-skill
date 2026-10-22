@@ -246,8 +246,17 @@ fn decide_segment(
                     || t.starts_with("--regexp=")
                     || t.starts_with("--file=")
             });
+        // `scp -i <key>` names the identity it authenticates with, not a file it copies.
+        let mut skip_identity = false;
         for arg in tokens.iter().skip(1) {
+            if std::mem::take(&mut skip_identity) {
+                continue;
+            }
             if is_flag(arg) {
+                skip_identity = program == "scp" && arg == "-i";
+                continue;
+            }
+            if program == "scp" && arg.to_ascii_lowercase().starts_with("identityfile") {
                 continue;
             }
             if std::mem::take(&mut skip_pattern) {
