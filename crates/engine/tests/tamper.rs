@@ -176,16 +176,16 @@ fn assert_no_opinion(run: &Run, what: &str) {
 #[test]
 fn bash_self_grant_denies() {
     let sb = Sandbox::new("tw-allow");
-    let run = sb.bash("safe-ai-skill allow --scope transfer --for 24h");
-    assert_deny(&run, "safe-ai-skill allow");
+    let run = sb.bash("safe-ai-skill revoke --scope transfer --for 24h");
+    assert_deny(&run, "safe-ai-skill revoke");
 }
 
 #[test]
 fn bash_npx_scoped_package_allow_denies() {
     let sb = Sandbox::new("tw-npx");
     assert_deny(
-        &sb.bash("npx @stbr/safe-ai-skill allow"),
-        "npx @stbr/safe-ai-skill allow",
+        &sb.bash("npx @stbr/safe-ai-skill revoke"),
+        "npx @stbr/safe-ai-skill revoke",
     );
 }
 
@@ -193,8 +193,8 @@ fn bash_npx_scoped_package_allow_denies() {
 fn bash_env_prefixed_absolute_mode_denies() {
     let sb = Sandbox::new("tw-mode");
     assert_deny(
-        &sb.bash("FOO=1 /x/safe-ai-skill mode autopilot"),
-        "FOO=1 /x/safe-ai-skill mode autopilot",
+        &sb.bash("FOO=1 /x/safe-ai-skill confirm 31415926"),
+        "FOO=1 /x/safe-ai-skill confirm 31415926",
     );
 }
 
@@ -207,14 +207,14 @@ fn bash_mutating_subcommands_deny() {
         "safe-ai-skill revoke",
         "safe-ai-skill confirm 1234-5678",
         "safe-ai-skill grant transfer",
-        "bash -c 'safe-ai-skill allow --scope swap --for 1h'",
-        "SAFE=1 env safe-ai-skill-darwin-arm64 mode autopilot",
-        "npx -y @stbr/safe-ai-skill@1.0.1 'allow' --scope transfer",
-        "python3 -c \"import subprocess; subprocess.run(['safe-ai-skill','allow','--scope','transfer'])\"",
-        "node -e \"require('child_process').execSync('safe-ai-skill mode autopilot')\"",
-        "cargo run -q -p safe-ai-skill -- allow --scope transfer --for 1h",
-        "safe-ai-skill $(echo allow) --scope transfer",
-        "Safe-AI-Skill ALLOW --scope transfer",
+        "bash -c 'safe-ai-skill revoke --scope swap --for 1h'",
+        "SAFE=1 env safe-ai-skill-darwin-arm64 confirm 31415926",
+        "npx -y @stbr/safe-ai-skill@1.0.1 'revoke' --scope transfer",
+        "python3 -c \"import subprocess; subprocess.run(['safe-ai-skill','revoke','--scope','transfer'])\"",
+        "node -e \"require('child_process').execSync('safe-ai-skill confirm 31415926')\"",
+        "cargo run -q -p safe-ai-skill -- revoke --scope transfer --for 1h",
+        "safe-ai-skill $(echo revoke) --scope transfer",
+        "Safe-AI-Skill REVOKE --scope transfer",
     ] {
         assert_deny(&sb.bash(cmd), cmd);
     }
@@ -285,7 +285,7 @@ fn bash_runs_plugin_binary_from_cache_path_read_only() {
         &sb.bash(&format!("\"{bin}\" status")),
         "cache binary status",
     );
-    assert_deny(&sb.bash(&format!("{bin} allow")), "cache binary allow");
+    assert_deny(&sb.bash(&format!("{bin} revoke")), "cache binary revoke");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -362,12 +362,12 @@ fn bash_relative_and_glob_data_dir_paths_deny() {
 fn bash_computed_or_split_binary_with_mutating_subcommand_denies() {
     let sb = Sandbox::new("tw-computed");
     for cmd in [
-        "safe-ai-\\\nskill allow",
-        "safe-ai-skill al\\\nlow",
-        "$(which safe-ai-skill) allow",
-        "\"$(command -v safe-ai-skill)\" mode autopilot",
-        "$(find / -name safe-ai-skill -type f | head -1) allow",
-        "safe-ai-skill${IFS}allow",
+        "safe-ai-\\\nskill revoke",
+        "safe-ai-skill re\\\nvoke",
+        "$(which safe-ai-skill) revoke",
+        "\"$(command -v safe-ai-skill)\" confirm 31415926",
+        "$(find / -name safe-ai-skill -type f | head -1) revoke",
+        "safe-ai-skill${IFS}revoke",
     ] {
         assert_deny(&sb.bash(cmd), cmd);
     }
@@ -536,7 +536,7 @@ fn bash_unrelated_commands_have_no_opinion() {
 #[test]
 fn deny_reason_tells_model_the_user_must_run_it() {
     let sb = Sandbox::new("tw-reason");
-    let grant = sb.bash("safe-ai-skill allow --scope transfer --for 24h");
+    let grant = sb.bash("safe-ai-skill revoke");
     let write = sb.write(&format!("{}/.safe-ai-skill/grants.json", sb.home()));
     for run in [grant, write] {
         assert_deny(&run, "reason probe");
