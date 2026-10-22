@@ -14,7 +14,7 @@
 
 safe-ai-skill is a Claude Code security plugin — a Rust hook-based firewall and registry-free supply-chain verifier that works with **any skills, MCPs, or agents** to add a policy-driven security layer. It was built with `solanabr/solana-ai-kit` as the reference integration (gating Solana transactions and deploys, verifying its `ext/` submodules and `skill-registry.json` catalog), but the gates, guards, and verifier are general-purpose and protect any Claude Code setup.
 
-At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never relaxed by any profile, grant or flag.
+At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never relaxed by any tier, grant or flag.
 
 ## Read this first: what this plugin cannot protect on its own
 
@@ -23,30 +23,20 @@ At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before 
 >
 > **The [solana-ai-kit](https://github.com/solanabr/ai-kit) implementation (OS sandbox plus permission rules) closes most of them. Run both.** Without the kit, turn on Claude Code's own sandbox with the recommended `denyRead` and `deniedDomains` entries in [SECURITY.md](SECURITY.md#recommended-setup).
 
-Known holes, by what a hook can't see:
+Known holes, in short (the full table, with what closes each, is in [SECURITY.md](SECURITY.md#known-holes)):
 
-- **Cross-call write-then-run.** A script written in one call and run by name in a later one. The second call contains no secret path and no Solana verb.
-- **Encoded and indirect forms.** `base64 -d`, `$'…'` quoting, variables, paths built at runtime, `python3 -c` and `node -e` one-liners. The parser recognises the forms it was written for. 1.1.0 follows the common wrappers and `FOO=1` prefixes; what it can't read is an `ask` (a `deny` at High), not a pass, but a disguised command it doesn't recognise as Solana-related gets no opinion.
-- **Bash writes to `.env`.** Write, Edit and MultiEdit to env files are denied at Medium and High. `sed -i`, `perl -pi` and `python3 -c` writes through Bash are not covered at any tier.
-- **Any process running as you outside the sandbox.** Test suites, `build.rs`, postinstall scripts, compiled helpers and MCP server processes can read `.env`, keys and home credential stores. Hooks see the agent's tool calls, not processes. The same goes for rewriting this plugin's own state: its HMAC makes tampering evident, not impossible.
-- **Values already in context.** A secret that was read, printed by a test or returned by an MCP tool has reached the model provider and the on-disk transcripts, and from there memory and indexing plugins, MCP arguments and files that get committed. Redaction and the raw-read deny only reduce this; nothing recalls a value.
-- **Egress.** The exfil tripwire is labelled *naive-exfil tripwire (best-effort)*. It denies a secret file sent by a recognised network command and requests to listed exfil hosts. It does not stop raw IP literals (`curl https://203.0.113.5/`), redirects, DNS, an unlisted host, an inline body below High, a `git push` to a new remote, publishing, or the URLs `WebFetch` and `WebSearch` fetch.
-- **Directory search.** 1.1.0 appends credential exclusions to a directory Grep (including one rooted at or above `$HOME`), which closes the 1.0.1 leak where a directory-wide Grep could return `.env*` contents. That covers the Grep tool. On Claude Code builds where searching goes through Bash `grep`/`rg` instead (observed on 2.1.304), only the Bash reader patterns apply, and those are a nudge, not the control.
-- **A localhost RPC proxy that forwards to mainnet** counts as an identified localnet, because clusters are identified by host.
-- **If the engine crashes,** the confidentiality gates fail open (one stderr line); only the Solana and MCP gates block. A repo's `.claude/settings.json` `env` can replace any hook through `PATH` or loader variables. PowerShell-tool calls on Windows and your own `!` shell commands are not gated.
-- **By design:** reads of `~/.claude/projects/**` are denied. That also stops the agent from reading its own auto-memory files (`~/.claude/projects/<project>/memory/`) with its tools, because transcripts and hook messages live in the same tree.
+- **Cross-call write-then-run:** a script written in one call and run in a later one.
+- **Encoded and indirect forms:** `base64 -d`, `$'…'`, variables, runtime-built paths, `python3 -c` one-liners.
+- **Bash writes to `.env`** (`sed -i`, `perl -pi`): not covered at any tier.
+- **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
+- **Values already in context:** a secret that was read has reached the model provider and the transcripts; nothing recalls it.
+- **Egress:** the exfil tripwire is best-effort and misses IP literals, redirects, DNS, unlisted hosts and `WebFetch` URLs.
+- **Directory search through Bash `grep`/`rg`:** only a pattern nudge applies there.
+- **Engine crash or tampering by code running as you:** the confidentiality gates fail open, and the state's HMAC makes tampering evident, not impossible.
 
-What the kit's sandbox and permission rules add, because they enforce file and network policy on every sandboxed process rather than on command text (kit 2.4.0, rule set 7):
+The kit's sandbox and permission rules close most of these because they enforce file and network policy on every sandboxed process, not on command text. Neither layer closes values already in context, `WebFetch` URLs [unverified], DNS, MCP server processes, or commands the kit leads with `excludedCommands` (`anchor test*` and `surfpool *` run unsandboxed).
 
-- **Subprocesses, compiled helpers and cross-call scripts** reading SSH, cloud, keychain, browser or wallet stores, or `.env`-class files you add: sandbox `denyRead` (host tokens from Medium).
-- **Writes you want refused** (state files, `.env`): sandbox `denyWrite` and the `allowWrite` fence. The kit has no `.env` rule at any tier as of rule set 7 ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) proposes implementing or removing its documented rows), so add one to your own settings.
-- **Bash egress to known request-bin, tunnel and paste hosts,** including through an interpreter: sandbox `deniedDomains` (70/79/84 hosts by tier). A user-scope `strictAllowlist` is the only control that covers unlisted hosts.
-- **Credential-path searches:** `Read()` deny rules cover Read, Grep and Glob at every tier.
-- **Transcripts read back by commands:** `denyRead` on `~/.claude/projects` at Medium and High.
-
-Neither layer closes values already in context, WebFetch URLs [unverified whether `deniedDomains` applies], DNS, MCP server processes, or commands the kit leads with `excludedCommands` (`anchor test*` and `surfpool *` run unsandboxed).
-
-**Recommended:** run safe-ai-skill together with solana-ai-kit's firewall at Relaxed or above, or enable Claude Code's own sandbox with the `denyRead` and `deniedDomains` entries in [SECURITY.md](SECURITY.md#recommended-setup). `safe-ai-skill doctor` checks your settings and prints the snippet. SECURITY.md lists which layer closes each hole and which stay open either way. The scope split between the two projects is proposed in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265); until the kit moves its plugin pin, it still ships safe-ai-skill 1.0.0.
+**Recommended:** run safe-ai-skill together with solana-ai-kit's firewall at Relaxed or above, or enable Claude Code's own sandbox with the `denyRead` and `deniedDomains` entries in [SECURITY.md](SECURITY.md#recommended-setup). `safe-ai-skill doctor` checks your settings and prints the snippet. The scope split between the two projects is proposed in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265); until the kit moves its plugin pin, it still ships safe-ai-skill 1.0.0.
 
 ## Install
 
@@ -154,35 +144,35 @@ The plugin takes a tier as an input: `off < relaxed < medium < high`, default `r
 
 | Gate | Off | Relaxed | Medium | High |
 |---|---|---|---|---|
-| Key material + home credential stores, path or command-form read (§4) | deny | deny | deny | deny |
-| Key material to a network-capable command (§5) | deny | deny | deny | deny |
-| Project env raw read, default (`env_read: deny`) | deny | deny | deny | deny |
+| Credential stores and key files, read by path or by command | deny | deny | deny | deny |
+| Key material sent to a network command | deny | deny | deny | deny |
+| Project env file, raw read (default `env_read: deny`) | deny | deny | deny | deny |
 | … user-scope `env_read: tier`, sandbox `On` | n/o | n/o | deny | deny |
 | … user-scope `env_read: ask`, sandbox `On` | ask | ask | ask | deny |
-| varlock value printers (D3.8.5 list) | = raw-read row | = | = | = |
-| `.env.schema`, templates (content guard applies) | n/o | n/o | n/o | n/o |
-| Write/Edit/MultiEdit to project env; agent `env set\|unset` | n/o | n/o | deny | deny |
+| varlock commands that print values | = raw-read row | = | = | = |
+| `.env.schema` and templates (content guard applies) | n/o | n/o | n/o | n/o |
+| Write/Edit/MultiEdit to a project env file; agent `env set\|unset` | n/o | n/o | deny | deny |
 | `env keys` | n/o | n/o | n/o | n/o |
 | Pattern redaction (keys, seeds, PEM, vendor tokens) | on | on | on | on |
-| Value scrub (WS-C ruling 200), except the response of an opted-in raw read | on | on | on | on |
-| Class U, mainnet, Unknown, or any cluster not positively identified as localnet/devnet (§3.1) | deny | deny | deny | deny |
-| Class U, positively identified localnet/devnet (never relaxed by grant) | ask | ask | ask | ask |
+| Value scrub of project env values in tool output, except an opted-in raw read | on | on | on | on |
+| Irreversible on-chain action (`--final`, program close, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
+| … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
 | Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
-| Class C on mainnet or Unknown (§3.2) | ask | ask | ask | deny |
+| Value-moving or authority-changing action on mainnet or an unknown cluster | ask | ask | ask | deny |
 | … with a live confirmed grant covering it (grantable scopes only) | allow | allow | allow | deny |
-| Class C on identified test cluster: deploy/upgrade | n/o | n/o | n/o | n/o |
+| … on an identified test cluster: deploy/upgrade | n/o | n/o | n/o | n/o |
 | … transfer within spend caps | allow | allow | allow | n/o |
-| … authority change, recoverable close (1.1.0 behaviour kept) | ask | ask | ask | ask |
-| Unparseable/opaque/dynamic Solana-family command (WS-A) | ask | ask | ask | deny |
+| … authority change, recoverable close | ask | ask | ask | ask |
+| Solana command the parser cannot read (opaque or dynamic) | ask | ask | ask | deny |
 | MCP value-moving or signing tool (`gate-mcp`) | ask | ask | ask | deny |
-| Exfil tripwire: project env file to network (§5) | n/o | deny | deny | deny |
+| Exfil tripwire: project env file to a network command | n/o | deny | deny | deny |
 | Exfil tripwire: known exfil host (list size) | n/o | deny (70) | deny (79) | deny (84) |
-| Inline `curl`/`wget` POST body to non-localhost | n/o | n/o | n/o | ask |
-| Supply chain: combo, drift, `lock_mismatch`, unscanned (§6) | report | deny in place | deny in place | deny in place |
-| Supply chain: HIGH heuristic (`unreviewed`) | report | report | report | deny in place |
+| Inline `curl`/`wget` POST body to a non-localhost host | n/o | n/o | n/o | ask |
+| Supply chain: combination rule, drift, lock mismatch, unscanned pack | report | deny in place | deny in place | deny in place |
+| Supply chain: HIGH heuristic (unreviewed pack) | report | report | report | deny in place |
 | Tamper tripwire, authenticated state, prompt guard | on | on | on | on |
 
-Section marks in the Gate column (§3.1, §3.2, §4, §5, §6) and the `D3.8.5` and `WS-A`/`WS-C` tags are explained in [docs/tiers.md](docs/tiers.md#2-behaviour-per-gate). At High the engine never emits `allow` (a grant or a within-cap transfer falls back to Claude Code's own flow), no tier emits `defer`, and headless runs turn every `ask` into a `deny`.
+What each row covers is explained in [docs/tiers.md](docs/tiers.md#behaviour-per-gate). At High the engine never emits `allow` (a grant or a within-cap transfer falls back to Claude Code's own flow), no tier emits `defer`, and headless runs turn every `ask` into a `deny`.
 
 Choose a tier with `safe-ai-skill tier` ([Usage tiers](#tier-1--gate-installs-before-they-run) lists the command). Only a user-scope tier, written by that command and confirmed by you in the prompt, can go below the default. A tier named by solana-ai-kit's `.claude/security.json`, by a repo's `.safe-ai-skill/policy.yaml` or by `SAFE_AI_SKILL_TIER` can only raise it. Without Claude Code's sandbox declared on, the label reads `relaxed (hooks only)`. Selection, the confirmation flow, migration from profiles and the headless rule are in [docs/tiers.md](docs/tiers.md).
 
@@ -190,7 +180,7 @@ Choose a tier with `safe-ai-skill tier` ([Usage tiers](#tier-1--gate-installs-be
 
 Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Key material and home credential stores are denied at every tier, Off included, through Read, Grep, MCP path arguments and Bash readers: Solana keypairs and the Solana config tree (except `cli/config.yml`), `~/.ssh/**` (except `config`, `known_hosts` and `*.pub`), `~/.gnupg`, `~/.aws`, `~/.kube/config`, the `~/.claude/.credentials.json` token file, registry and git-host tokens (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `gh/hosts.yml`, …), keychains and password-manager stores, browser profiles and wallet-extension data. Commands that print a credential (`gh auth token`, `git credential fill`, `security find-generic-password -w`, `aws configure get *secret*`, `npm config get *_authToken`, `docker-credential-* get`, `pass show`, `op read`, `bw get`, …) are denied the same way. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory gets env, key and credential globs excluded from its results, including one rooted at or above `$HOME` (this also hides `.env.example` and `.env.schema` from directory searches; read them directly), and a Grep rooted inside a credential store is denied; Glob only lists names and is not gated. Tool output that still contains a value from a project env file, and any key, seed, PEM or vendor-token pattern, is shown redacted (`«redacted:KEY»`) at every tier. Reads of Claude Code transcripts (`~/.claude/projects/**`) are denied, which also stops the agent reading its own auto-memory files with its tools; open those yourself.
 
-Three tiers, pick the one that fits; each keeps working without the next:
+Three options, pick the one that fits; each keeps working without the next:
 
 1. **Plain `.env` + `safe-ai-skill env`.** The agent works with keys, never values:
 
@@ -217,7 +207,7 @@ If the engine can't run on a platform (no prebuilt binary, wrong executable form
 
 ## Upgrading to 1.1.0 (read before upgrading)
 
-- **Relaxations need a code only you see.** Unexpired 1.0 grants become pending requests at your first 1.1.0 session; confirm each with the code shown then (type `safe-ai-skill confirm <code>` as your whole prompt), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Nothing can be confirmed in headless `claude -p`. Lowering the tier needs the same confirmation (see the next item).
+- **Relaxations need a code only you see.** Unexpired 1.0 grants become pending requests at your first 1.1.0 session; confirm each as described under [Usage tiers](#tier-1--gate-installs-before-they-run), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Lowering the tier needs the same confirmation, and nothing can be confirmed in headless `claude -p`.
 - **Profiles became tiers.** `strict` (the 1.0 default) becomes `relaxed`, `paranoid` becomes `high`, and `autopilot` becomes `relaxed` (the notice names `safe-ai-skill allow --scope transfer` for what autopilot's higher cap did). A tier below `relaxed` is never migrated: a 1.0 `off` is set aside with a hint to run `safe-ai-skill tier off` (confirmed) or set `SAFE_AI_SKILL_DISABLE=1`. Your first session prints one line about it. Raw `.env` reads stay denied for everyone after the upgrade.
 - **What `relaxed` no longer asks, and now denies.** An inline `curl`/`wget` POST body to a non-localhost host no longer asks below High (JSON-RPC calls included), so CI runs stop failing on it. Irreversible actions (`--final`, program close, `spl-token close-mint|close|burn`, `authorize --disable`, IDL erase/close, `close-vote-account`) now deny on mainnet, testnet and any cluster that isn't positively identified as localnet or devnet, and still ask on an identified localnet or devnet. Sending a project env file to a network command, or any request to a known exfil host, is denied at Relaxed and above. Credential stores beyond `~/.ssh/id_*` (`~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.npmrc`, keychains, browser and wallet-extension data, and more) are read-denied at every tier.
 - **Headless asks become denies.** Under `claude -p` or CI (`CI`, `GITHUB_ACTIONS`, no `/dev/tty`, …), every `ask` is a `deny`; only a grant you confirmed interactively beforehand passes. `CONFIRM_MAINNET`-style env variables are ignored, and no setting turns headless off.
@@ -248,7 +238,7 @@ safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.jso
 safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
 safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
-safe-ai-skill status                 # pins, active profile, live grants, spend, recent decisions
+safe-ai-skill status                 # pins, tier, live grants, spend, recent decisions
 safe-ai-skill tier                   # show the tier, where it came from, and the sandbox state
 safe-ai-skill tier <name> [--project] [--env-read deny|ask|tier]
                                      # off | relaxed (default) | medium | high; lowering needs confirmation
@@ -259,16 +249,15 @@ safe-ai-skill revoke                 # drop every grant at once
 safe-ai-skill session                # show active session state
 ```
 
-`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. The agent may run `allow` and `tier`: a lowering only creates a request it cannot confirm. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
+`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
 
 **Relaxations need your confirmation in the prompt.** `allow` and a `tier` lowering (or an `--env-read` loosening) change
-nothing on their own: they record a request (`request r3fa91c`) and print no code. Claude Code
+nothing on their own (the agent may run them, because they only create a request it cannot confirm): they record a request (`request r3fa91c`) and print no code. Claude Code
 then shows **you** a confirmation code in a hook message (right after the command, or at your
 next prompt or session start) that is never put in the agent's context. The request takes
 effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
 (within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
-pasted text is refused, and three wrong codes cancel every pending request. The agent may run
-`allow` itself: it only creates a request it cannot confirm. In headless `claude -p`, where
+pasted text is refused, and three wrong codes cancel every pending request. In headless `claude -p`, where
 hook messages aren't shown, nothing can be confirmed. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
@@ -329,10 +318,10 @@ The kit's `stbr` marketplace installs this plugin; don't add this marketplace to
 
 - **The kit owns:** the OS sandbox, permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), and the git, publish, fetch-and-execute, `gh` and MCP tool-name gates.
 - **This plugin owns:** the Solana-semantic gates (cluster, amounts, irreversible and authority actions, mainnet, grants), secrets for plugin-only users (key material and home stores, `.env` through the `env` CLI, varlock and redaction), supply chain (scan, pins, Skill and slash deny, no moves) and a labelled best-effort exfil tripwire. It takes the kit's tier as an input: `.claude/security.json` can raise the plugin's tier, never lower it.
-- **Shared:** versioned list files in [`policy/shared/`](docs/tiers.md#10-shared-lists) (credential globs, exfil hosts, on-chain verbs), which the kit vendors and pins, and a conformance corpus both parsers run.
+- **Shared:** versioned list files in [`policy/shared/`](docs/tiers.md#shared-lists) (credential globs, exfil hosts, on-chain verbs), which the kit vendors and pins, and a conformance corpus both parsers run.
 - Duplicated hard denies are kept as defence in depth (default-wallet `solana-keygen --force`, irreversible actions on mainnet); two denies never conflict.
 
-The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs); the proposed kit-side changes are drafted in [docs/drafts/aikit-firewall-split.md](docs/drafts/aikit-firewall-split.md). Until they land, today both hook sets run on every Bash call, and the kit's `/firewall` prints the `safe-ai-skill tier` command instead of running it.
+The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs); the proposed kit-side changes are drafted in [docs/drafts/aikit-firewall-split.md](docs/drafts/aikit-firewall-split.md). Until the kit change lands, `/firewall` does not run `safe-ai-skill tier`; run `safe-ai-skill tier <t> --project` yourself. Today both hook sets run on every Bash call.
 
 safe-ai-skill is standalone — it can be installed independently of any particular skill hub. It adds a security and control layer over whatever skills, MCPs, and agents you already have.
 

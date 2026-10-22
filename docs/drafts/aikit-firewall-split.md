@@ -11,9 +11,9 @@ Tags: [V] verified in source or by running a generated tier, [I] inferred, not t
 
 # Proposed kit PR: split the firewall with safe-ai-skill 1.1.0
 
-Relates to [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265). Contract: `policy/shared/` and the shared-contract notes in the [safe-ai-skill repo](https://github.com/solanabr/safe-ai-skill); tier semantics: [docs/tiers.md](../tiers.md).
+Relates to [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265). Shared list format: `policy/shared/` in the [safe-ai-skill repo](https://github.com/solanabr/safe-ai-skill); tier semantics and the headless rule: [docs/tiers.md](../tiers.md).
 
-**Depends on:** safe-ai-skill 1.1.0 released, and the kit's plugin pin moved to its SHA (migration steps M3 to M8 in the contract). Nothing here asks the kit to drop a protection before the plugin has demonstrably replaced it: the retirement steps (A6) are gated on a green cross-stack corpus run.
+**Depends on:** safe-ai-skill 1.1.0 released, and the kit's plugin pin moved to its SHA. Nothing here asks the kit to drop a protection before the plugin has demonstrably replaced it: the retirement steps (A6) are gated on a green cross-stack corpus run.
 
 **Split.** The kit owns the OS sandbox, permission rules, tier selection and regeneration (`/firewall`, `security.json`), and the git, publish, fetch-and-execute, `gh` and MCP tool-name gates. safe-ai-skill owns the Solana-semantic gates, secrets for plugin-only users, supply chain, a labelled best-effort exfil tripwire, and takes the tier as an input. Shared: versioned list files, a conformance corpus, one headless rule.
 
@@ -52,7 +52,7 @@ safe-ai-skill reads `.claude/security.json` (`tier`, `declared.tier`, `enforced.
 
 ### A3. One headless rule, and no repo-settable escapes (#264 task 5)
 
-`kit_is_headless()` (`lib-headless.sh:301-311`) honours `KIT_FIREWALL_HEADLESS`, `CI` and `GITHUB_ACTIONS`, and `CONFIRM_MAINNET=1` turns the headless mainnet deny into a pass. A repo's committed settings `env` probably reaches these [I, high confidence: a repo `env` block delivered a disable switch to safe-ai-skill in an earlier review]. Adopt the shared rule (contract section 3.3), identical on both sides:
+`kit_is_headless()` (`lib-headless.sh:301-311`) honours `KIT_FIREWALL_HEADLESS`, `CI` and `GITHUB_ACTIONS`, and `CONFIRM_MAINNET=1` turns the headless mainnet deny into a pass. A repo's committed settings `env` probably reaches these [I, high confidence: a repo `env` block delivered a disable switch to safe-ai-skill in an earlier review]. Adopt the shared headless rule ([docs/tiers.md](../tiers.md#headless)), identical on both sides:
 
 1. Headless is on when `SAFE_AI_SKILL_HEADLESS` or `KIT_FIREWALL_HEADLESS` is `1`/`true`, when any of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL` is set and not `0`/`false`, or when `/dev/tty` can't be opened for reading. Any signal turns it on; **nothing turns it off** (`KIT_FIREWALL_HEADLESS=0` and `CI=0` don't un-headless).
 2. When headless, every `ask` becomes a `deny`, with the reason naming the interactive route. Retire the kit's "silent when headless" for recoverable asks: the asks it silenced (devnet value moves, curl POST at Relaxed) no longer exist in the end state.
@@ -69,7 +69,7 @@ Test: a repo-scope `env` that sets `CI=0`, `KIT_FIREWALL_HEADLESS=0` or `CONFIRM
 
 Either way safe-ai-skill keeps denying raw agent reads of project `.env` at every tier. Its opt-in raw read (`safe-ai-skill tier --env-read ask|tier`) is user scope only and works only while the sandbox is declared on. Bash writes to `.env` are not covered by the plugin at any tier, so the sandbox rows are the only thing that can close them.
 
-### A5. `/firewall` lowers through the plugin's confirmation (Q6)
+### A5. `/firewall` lowers through the plugin's confirmation
 
 Proposed change to `.claude/commands/firewall.md` (exact current text not re-read for this draft [U]): after `firewall.sh apply <tier>` succeeds, run
 
@@ -77,18 +77,18 @@ Proposed change to `.claude/commands/firewall.md` (exact current text not re-rea
 safe-ai-skill tier <tier> --project
 ```
 
-when the `safe-ai-skill` binary is on `PATH` or resolvable from the plugin's `bin/`; otherwise print that command for the user to run. A raise applies at once. A lowering creates a pending request in the plugin: Claude Code shows the user a code in a hook message, and the lowering takes effect when the user's next prompt is exactly `safe-ai-skill confirm <code>`. The kit must not try to confirm it, and must not write any handoff file: the plugin's authenticated `tier.json` is the only user-scope tier store. Until this lands, the kit's hint stays raise-only and `/firewall` prints the command.
+when the `safe-ai-skill` binary is on `PATH` or resolvable from the plugin's `bin/`; otherwise print that command for the user to run. A raise applies at once. A lowering creates a pending request in the plugin: Claude Code shows the user a code in a hook message, and the lowering takes effect when the user's next prompt is exactly `safe-ai-skill confirm <code>`. The kit must not try to confirm it, and must not write any handoff file: the plugin's authenticated `tier.json` is the only user-scope tier store. Until this lands, the kit's hint stays raise-only, and `/firewall` would print the command (proposed behaviour).
 
 SessionStart and `/doctor` show `tier: <t> (<source>); sandbox: <state>` from the plugin next to the kit's own tier line, so a mismatch is visible.
 
-### A6. The irreversible set, and a fail-closed fallback hook (#264 item 8, contract M5 and M7)
+### A6. The irreversible set, and a fail-closed fallback hook (#264 item 8)
 
 After the corpus passes on the plugin:
 
 - Remove `solana transfer|close|authorize|withdraw-from-nonce-account` and `spl-token burn|close` from `DENY_IRREVERSIBLE_ONCHAIN`: the irreversible set now comes from `onchain-verbs.list`, and the counterparty verbs are gated by the plugin's cluster resolution, caps and grants (ask on mainnet or Unknown, deny at High).
 - Semantics, identical on both sides: **deny on mainnet or an Unknown cluster** (anything not positively identified as localnet or devnet, testnet included); **ask on a positively identified localnet or devnet**; never relaxable by a grant, tier, repo or env. Default-wallet `solana-keygen new|recover --force` stays a deny on every cluster.
 - Drop the devnet ask and `CONFIRM_MAINNET`; retire `onchain-guard`'s cluster parser and mainnet/devnet logic.
-- Keep one minimal hook, **fail-closed**: while safe-ai-skill is not enabled it denies every `irreversible` row from the vendored list on every cluster (it has no resolver, so every cluster is Unknown). While the plugin is enabled it defers `irreversible net` rows to the plugin (so an identified devnet asks) and still denies `irreversible any`. The Class U plain-form deny globs move into this hook, because a glob can't be conditional. SessionStart warns when the plugin is disabled that mainnet gating is off.
+- Keep one minimal hook, **fail-closed**: while safe-ai-skill is not enabled it denies every `irreversible` row from the vendored list on every cluster (it has no resolver, so every cluster is Unknown). While the plugin is enabled it defers `irreversible net` rows to the plugin (so an identified devnet asks) and still denies `irreversible any`. The plain-form deny globs for irreversible actions move into this hook, because a glob can't be conditional. SessionStart warns when the plugin is disabled that mainnet gating is off.
 - Open: how the hook knows the plugin is enabled, including when the plugin's engine can't run on the platform (PowerShell-only Windows, no prebuilt binary). Treat an unreadable `enabledPlugins` as disabled; consider a liveness signal.
 
 ### A7. Hooks fail closed; smaller kit fixes (#264 tasks 4 to 8)
@@ -129,8 +129,8 @@ R/M/H = Relaxed/Medium/High. "all" = every tier, Off included. "—" = this laye
 | Project keypairs (`target/deploy/*-keypair.json`) | — | `Bash(cat *keypair*.json)` only; the Read tool is allowed by design | — | read denied, all |
 | Project `.env` **read** | — | — | — (`egress-guard` blocks *sending* it, R/M/H) | denied by default, all; opt-in raw read is user scope only, with the sandbox declared on; `.env.example` and `.env.schema` readable |
 | Project `.env` **write** | — | — | — | Write/Edit/MultiEdit and agent `env set\|unset` denied M/H; Bash writes (`sed -i`, `python3 -c`) not covered |
-| Class U: `--final`, `program close`, `program-v4 finalize`, `spl-token authorize … --disable`, `close-mint`/`close`/`burn`, `anchor idl erase-authority`/`close`, `close-vote-account` | — | deny glob, all (plain form) | `onchain-guard` deny, all (wrapped forms) | deny on mainnet, Unknown and testnet; ask on an identified localnet or devnet; never grantable, all |
-| Class C: transfer, deploy, upgrade, buffer write/close, `extend`, authority change | — | deny glob for some plain forms | `onchain-guard`: Off silent; R/M ask on every cluster; H mainnet denied | mainnet or Unknown: ask, deny at High; a covering confirmed grant allows below High; within-cap devnet transfer allowed below High; `set_authority`, `account_close` never relaxable |
+| Irreversible actions: `--final`, `program close`, `program-v4 finalize`, `spl-token authorize … --disable`, `close-mint`/`close`/`burn`, `anchor idl erase-authority`/`close`, `close-vote-account` | — | deny glob, all (plain form) | `onchain-guard` deny, all (wrapped forms) | deny on mainnet, Unknown and testnet; ask on an identified localnet or devnet; never grantable, all |
+| Value-moving: transfer, deploy, upgrade, buffer write/close, `extend`, authority change | — | deny glob for some plain forms | `onchain-guard`: Off silent; R/M ask on every cluster; H mainnet denied | mainnet or Unknown: ask, deny at High; a covering confirmed grant allows below High; within-cap devnet transfer allowed below High; `set_authority`, `account_close` never relaxable |
 | `solana-keygen new`/`recover --force` without `-o` | — | — | `secrets-guard`, all | deny, all |
 | Spend caps, time-boxed grants | — | — | — | yes (state authenticated, lowering needs a typed confirmation) |
 | Value-moving calls on any MCP server | — | tool-name denies for `context-mode`, Cloudflare, Playwright executors (M/H) | `context-mode` only | every `mcp__*` server, by verb and payload: ask, deny at High |
@@ -201,7 +201,7 @@ Part of the kit's firewall is a separate Claude Code plugin, [safe-ai-skill](htt
 
 **Tier table cells** (README lines 171-174):
 
-- **Off, "On-chain and destructive".** Replace with: Two kit hooks still run. `secrets-guard` blocks credential reads and `solana-keygen new --force` over your default wallet. `onchain-guard` refuses the irreversible set (until A6 retires it in favour of the shared list). **The kit does not ask about mainnet or authority writes at Off**, and the egress and fetch-and-execute hooks do not run; with safe-ai-skill enabled, mainnet and Unknown-cluster writes still ask, and Class U denies. The deny rules apply here too: the git transport overrides, `gh issue delete`, `gh repo delete`, `git config alias.<name>`, `git --config-env`, `git reflog delete` and `git reflog drop` included.
+- **Off, "On-chain and destructive".** Replace with: Two kit hooks still run. `secrets-guard` blocks credential reads and `solana-keygen new --force` over your default wallet. `onchain-guard` refuses the irreversible set (until A6 retires it in favour of the shared list). **The kit does not ask about mainnet or authority writes at Off**, and the egress and fetch-and-execute hooks do not run; with safe-ai-skill enabled, mainnet and Unknown-cluster writes still ask, and irreversible actions deny on mainnet or Unknown. The deny rules apply here too: the git transport overrides, `gh issue delete`, `gh repo delete`, `git config alias.<name>`, `git --config-env`, `git reflog delete` and `git reflog drop` included.
 - **Relaxed, "Readable".** Leaves open to commands: `~/.config/solana/cli/config.yml`, the project's `.env` (safe-ai-skill blocks direct agent reads of it while installed), project keypairs, and registry and git-host tokens; the file tools are denied those token files at every tier. Denies the never-allowed set: SSH and GPG keys, `~/.aws`, `~/.config/solana/id.json`, keychains and keyrings, browser profiles and wallet extension stores, shell startup files, shell and REPL history, `~/.cargo/config.toml` and `~/.cargo/credentials*`, `~/.gitconfig`. A sandboxed command that loads the default wallet from `id.json` may fail at this tier [U]; point `wallet =` or `--keypair` at a file outside the denied set, or run it yourself (A1 proposes `sb=never`).
 - **Relaxed, "Writable".** Replace "Writes outside the repo are allowed." with "Shell writes outside these paths are refused by the sandbox."
 - **Medium, "Writable".** Replace the `.env` sentence with "Shell writes outside these paths are refused by the sandbox, as at Relaxed. [If A4 implements it: `.env` is `denyWrite`. Otherwise: no kit rule covers the project's `.env` at this tier.]"
@@ -231,7 +231,7 @@ The generator rewrites this file, so the strings probably live in `firewall.sh` 
 - [ ] The kit runs the shared conformance corpus in CI, and a cross job asserts `combined` from the real verdicts of both stacks. `onchain-guard.sh` cluster logic is removed only after the plugin passes it.
 - [ ] The agent cannot change the effective tier mid-session through `security.json`, by Edit or Bash, at any tier. The hooks read `enforced`. An unknown tier, or a missing or broken irreversible hook, results in deny.
 - [ ] Repo-scope `env` cannot turn headless off or satisfy `CONFIRM_*` for on-chain actions; headless asks become denies. A test proves it.
-- [ ] `/firewall` runs (or prints) `safe-ai-skill tier <t> --project`, and a lowering waits for the plugin's typed confirmation.
+- [ ] `/firewall` runs (or would print) `safe-ai-skill tier <t> --project`, and a lowering waits for the plugin's typed confirmation.
 - [ ] With safe-ai-skill disabled, the irreversible set and default-wallet `keygen --force` are still denied at every tier and on every cluster, Off included. With it enabled, the combined verdict is deny on mainnet or an Unknown cluster and ask on a positively identified localnet or devnet.
 - [ ] Either `.env` sandbox rows exist and are tested, or no doc or JSON comment claims one (grep the four generated tiers for `.env`).
 - [ ] `docs/firewall.md` has "Who enforces what" with the four columns; README, `docs/firewall.md` and FIREWALL-SPEC each say part of the firewall is the plugin, active only while installed and enabled, and link the install command. The README names the pinned plugin version and SHA, and a test or release checklist item fails when they disagree.

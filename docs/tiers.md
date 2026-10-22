@@ -2,8 +2,6 @@
 
 safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own) applies at every tier. Last updated for 1.1.0.
 
-The numbering below follows the sections the README's tier table points to (§3.1, §3.2, §4, §5, §6).
-
 ## Who owns what
 
 solana-ai-kit ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264)) and this plugin split the firewall by what each can structurally enforce.
@@ -16,15 +14,15 @@ solana-ai-kit ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264)) and 
 
 Defence in depth is kept only where the mechanisms differ (a hook against a syscall, a Rust parser against an awk one). The plugin does not reimplement sandbox semantics and does not promise what only a sandbox can do.
 
-## 1. Names, order, and Off
+## Names, order, and Off
 
-`off < relaxed < medium < high`. The default is `relaxed`. The old names are input aliases through 1.x: `strict` is `relaxed`, `paranoid` is `high`, `autopilot` is `relaxed` (see [9. Migration](#9-migration-from-profiles)).
+`off < relaxed < medium < high`. The default is `relaxed`. The old names are input aliases through 1.x: `strict` is `relaxed`, `paranoid` is `high`, `autopilot` is `relaxed` (see [Migration from profiles](#migration-from-profiles)).
 
-**Off is not `SAFE_AI_SKILL_DISABLE=1`.** At Off every `deny` row of the table in the [README](../README.md#firewall-tiers) still holds: key material and credential stores, key material sent to the network, raw project `.env` reads by default, Class U on mainnet or an unidentified cluster, default-wallet destruction, the tamper tripwire, the prompt guard and redaction. Off differs from Relaxed in exactly three rows: the exfil tripwire for project env files and for known exfil hosts (no opinion; key material to the network still denies), and the supply-chain deny for combination, drift, `lock_mismatch` and unscanned packs (reported instead). `SAFE_AI_SKILL_DISABLE=1` stays the only switch that turns the hooks off, and the shim ignores it in strict mode and when the project's committed `.claude/settings.json` mentions it.
+**Off is not `SAFE_AI_SKILL_DISABLE=1`.** At Off every `deny` row of the table in the [README](../README.md#firewall-tiers) still holds: key material and credential stores, key material sent to the network, raw project `.env` reads by default, irreversible on-chain actions on mainnet or an unidentified cluster, default-wallet destruction, the tamper tripwire, the prompt guard and redaction. Off differs from Relaxed in exactly three rows: the exfil tripwire for project env files and for known exfil hosts (no opinion; key material to the network still denies), and the supply-chain deny for combination, drift, `lock_mismatch` and unscanned packs (reported instead). `SAFE_AI_SKILL_DISABLE=1` stays the only switch that turns the hooks off, and the shim ignores it in strict mode and when the project's committed `.claude/settings.json` mentions it.
 
 No tier, grant, repo setting or env variable relaxes a `deny` row.
 
-### 1.2 How the tier is chosen
+### How the tier is chosen
 
 Per hook call, with the project root as the canonical git toplevel of the payload's `cwd`:
 
@@ -40,7 +38,7 @@ A forged or hand-edited `tier.json` fails its MAC and is ignored with a note, as
 
 SessionStart and `safe-ai-skill status` print `tier: <t> (<source>); sandbox: <state>` and each ignored hint. When the sandbox isn't `On` the label reads `relaxed (hooks only)`.
 
-### 1.3 Changing the tier: `safe-ai-skill tier`
+### Changing the tier: `safe-ai-skill tier`
 
 ```bash
 safe-ai-skill tier                      # show tier, source, sandbox state, ignored hints
@@ -54,9 +52,9 @@ safe-ai-skill tier --clear [--project]
 - The agent may run `safe-ai-skill tier` (it can only raise, or create a request it cannot confirm). The tamper tripwire keeps denying a Bash-invoked `confirm` and the hook subcommands.
 - Headless `claude -p` shows no hook messages, so nothing can be confirmed there.
 - `mode` is a deprecated alias for `tier`.
-- solana-ai-kit's `/firewall` reaches this only by running `safe-ai-skill tier <t> --project` (a proposed kit change, see [the kit draft](drafts/aikit-firewall-split.md)); there is no other handoff file. Until it lands, the kit prints the command.
+- solana-ai-kit's `/firewall` reaches this only by running `safe-ai-skill tier <t> --project` (a proposed kit change, see [the kit draft](drafts/aikit-firewall-split.md)); there is no other handoff file. Until the kit change lands, `/firewall` does not run it; run `safe-ai-skill tier <t> --project` yourself.
 
-### 1.4 Sandbox detection
+### Sandbox detection
 
 `sandbox::state(root)` reports `On`, `Off` or `Unknown` from the first `sandbox.enabled` found in Claude Code's settings precedence: managed, project local, project, then the user settings under `$CLAUDE_CONFIG_DIR` or the passwd home (never the `HOME` environment variable, which a repo can set). `On` also needs a supported platform: macOS, or Linux with `bwrap` at a fixed system path; never native Windows.
 
@@ -65,26 +63,24 @@ This is **declared configuration, not a runtime proof.** The plugin cannot see t
 - the user-scope raw `.env` opt-in (below) works only while the state is `On`; otherwise reads are denied;
 - the tier label, and the snippet `safe-ai-skill doctor` prints (the `denyRead` and `deniedDomains` entries to add).
 
-## 2. Behaviour per gate
+## Behaviour per gate
 
 The full table is in the [README](../README.md#firewall-tiers). It is the table the code is checked against; this page explains it. `n/o` is no opinion: empty stdout, and the call continues into Claude Code's own permission flow. `deny` rows are never relaxed by a grant, tier, repo setting or env variable. At High the engine never emits `allow`, and no tier emits `defer`.
 
-**Tags in the table.** `WS-A` is the Bash parser (it follows wrappers, `FOO=1` prefixes, `bash -c`, `eval`): an "unparseable/opaque/dynamic Solana-family command" is one whose Solana program or arguments it can't read. `WS-C ruling 200` is the value scrub: literal values from the project's env files are replaced with `«redacted:KEY»` in tool output. `D3.8.5` is the varlock value-printer list (§2.1). `§3.1`, `§3.2`, `§4`, `§5` and `§6` are the sections of this page.
-
-### 2.1 Project `.env` files
+### Project `.env` files
 
 - **Default (`env_read: deny`):** a raw read of `.env`, `.env.*`, `*.env`, `.envrc` or `.dev.vars` (Read, Grep with a file path, MCP path argument, Bash readers such as `cat`, `grep`, `source`, `git show REV:.env`) is denied at every tier. The message names `safe-ai-skill env keys|set|unset` and, when the project has a `.env.schema` or varlock, `varlock load --agent` and `varlock run -- <cmd>`.
-- **varlock value printers** (`varlock printenv`, `reveal`, `load --format json|env|shell` without `--agent`, the list the design notes call D3.8.5) follow the raw-read row.
+- **varlock value printers** (`varlock printenv`, `reveal`, `load --format json|env|shell` without `--agent`) follow the raw-read row.
 - **`.env.schema` and templates** (`.env.example|.sample|.template|.dist`) are readable, subject to the content guard: a schema holding key material, a literal credential, over 64 KiB or not a regular file is denied.
 - **Opt-in:** `safe-ai-skill tier --env-read ask|tier`, user scope only, only while the sandbox is `On`. `tier` follows the tier (no opinion at Off and Relaxed, deny at Medium and High); `ask` prompts at Off, Relaxed and Medium and denies at High. With the sandbox `Unknown`, `Off`, on Windows or on Linux without `bwrap` the opt-in is suspended and reads stay denied ("opt-in suspended: sandbox not on"). A repo's `policy.yaml` `env_read`, a kit file or an env variable can only tighten it. The response to an opted-in raw read isn't value-scrubbed.
-- **Writes:** Write, Edit and MultiEdit to a project env file, and an agent-run `env set|unset`, are allowed at Off and Relaxed and denied at Medium and High. A write through Bash (`sed -i`, `perl -pi`, `python3 -c`) is not covered at any tier (see [8](#8-known-holes-this-layer-cannot-close)). `env keys` is always open.
+- **Writes:** Write, Edit and MultiEdit to a project env file, and an agent-run `env set|unset`, are allowed at Off and Relaxed and denied at Medium and High. A write through Bash (`sed -i`, `perl -pi`, `python3 -c`) is not covered at any tier (see [Known holes](#known-holes)). `env keys` is always open.
 - **Redaction** of key, seed, PEM and vendor-token patterns, and the **value scrub** (literal values from the project's env files replaced with `«redacted:KEY»`), run at every tier. The one exception is the response of an opted-in raw read, so a read-then-Edit round trip keeps the real values in the file.
 
-## 3. On-chain: unrecoverable vs counterparty
+## On-chain: unrecoverable vs counterparty
 
 The axis is whether an action destroys a capability **even for its rightful owner** (Class U) or moves value or capability to a counterparty (Class C). Only Class U can be judged without knowing the counterparty. Class C is controlled by spend caps, grants and unrelaxable hard-guard asks, and denied at High.
 
-### 3.1 Class U
+### Class U: unrecoverable actions
 
 Defined by the `irreversible` rows of `onchain-verbs.list`:
 
@@ -96,7 +92,7 @@ The verdict is keyed on the resolved cluster (flag, then a `-C` config file, the
 
 **Wallet destruction (cluster-independent, deny at every tier):** `solana-keygen new|recover` with `--force`/`-f` and no `-o`, or an output resolving to `~/.config/solana/id.json` or the CLI config's `keypair_path`; Write, Edit and NotebookEdit to that file; Bash `rm`, `mv`, `cp`, `tee`, `dd of=` or `>` targeting it.
 
-### 3.2 Class C
+### Class C: value or capability to a counterparty
 
 Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, buffer close, `set-upgrade-authority` and `spl-token authorize` to a new key, `anchor idl set-authority`, stake/vote/nonce withdraws, `spl-token gc`.
 
@@ -106,15 +102,15 @@ Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, buffer
 
 A Solana command the parser can't read (a name inside `bash -c "solana $X"`, `eval`, a pipe into `sh`, a program spelled as an expansion) asks as a hard guard, and denies at High. An MCP tool that moves value or signs asks, and denies at High.
 
-### 3.3 Escapes
+### Escapes
 
 Only from user scope, by a confirmed grant where one applies. Repo or env escapes (`CONFIRM_MAINNET`-style) are ignored. Class U has no escape.
 
-## 4. Key material and home credential stores
+## Key material and home credential stores
 
 One shared list, `credentials.list`, with the classes `key_material`, `host_token`, `vault`, `browser_store` and `wallet_ext`. All of them hard-deny at **every tier**: this is deliberately not the kit's split that leaves host tokens readable below Medium, because a hook only sees agent reads, so subprocess `npm` and `gh` keep working.
 
-- **Surfaces:** Read, file Grep, directory Grep, MCP path arguments, Bash readers, and the network sinks of §5. Glob lists names only and stays ungated.
+- **Surfaces:** Read, file Grep, directory Grep, MCP path arguments, Bash readers, and the network sinks of the [exfil tripwire](#naive-exfil-tripwire-best-effort). Glob lists names only and stays ungated.
 - **Directory Grep:** exclusion globs for every credential class are appended to its `glob`. A Grep rooted at or above `$HOME` gets all of them (this closes the 1.0.1 leak where a directory-wide Grep could return `.env*` contents). A Grep rooted inside a credential store is denied.
 - **Command-form readers** (plugin-internal, not path globs): `gh auth token`, `git credential fill`, `security find-generic-password -w` and `find-internet-password -w`, `aws configure get *secret*` and `export-credentials`, `npm config get *_authToken`, `docker-credential-* get`, `secret-tool lookup`, `pass show`, `op read`, `bw get`.
 - **`~/.ssh/**`:** `config`, `known_hosts` and `*.pub` are readable; private keys and `authorized_keys` stay denied.
@@ -122,7 +118,7 @@ One shared list, `credentials.list`, with the classes `key_material`, `host_toke
 - `~` means the passwd home and `$HOME` (`%USERPROFILE%` on Windows), and matching is case-insensitive on macOS and Windows, on both the path as typed and the symlink-resolved path.
 - **Residual** (printed by `doctor`): subprocess, compiled or encoded reads. Only the sandbox closes them.
 
-## 5. Naive-exfil tripwire (best-effort)
+## Naive-exfil tripwire (best-effort)
 
 In `gate-bash-secrets` and in `gate-mcp` executor payloads. **Deny** when, in one statement or pipeline, a network-capable command (curl, wget, nc/ncat/socat, scp/sftp/rsync/ssh, ftp/telnet, httpie/xh, aria2c, `openssl s_client`, dig/nslookup/host, `git push` or `git remote add <url>`, `/dev/tcp|udp`, or an interpreter one-liner naming a URL, socket or HTTP module):
 
@@ -135,7 +131,7 @@ You can add hosts (`secrets.exfil_hosts_extra`, a union with the shared list); n
 
 It stops accidental and naive exfiltration. It does **not** stop values already in context, raw IP literals, redirects, DNS, cross-call indirection, or unlisted hosts.
 
-## 6. Supply chain
+## Supply chain
 
 Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the action varies by tier (the README table). **Deny** means the Skill tool, `/slash` expansion and Read, Grep and Bash access under the pack are refused in place. **Report** means SessionStart output naming the pack, the rule, `path:line` and the approve command.
 
@@ -143,39 +139,21 @@ Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the
 - A HIGH heuristic (`unreviewed`): report at Off, Relaxed and Medium; deny in place at High until `verify trust` or `verify approve` (user scope). A repo's `packs.lock` cannot clear it. On an ai-kit checkout at High, SessionStart prints one `verify trust` line listing them.
 - **Nothing is moved by default at any tier.** `supply_chain.on_block: move` is opt-in, never touches a git-tracked pack or a submodule path (it reads `.gitmodules` and `.git/index` and never runs git), and prints the origin and the restore command.
 
-## 7. Headless
+## Headless
 
 One rule, shared with the kit.
 
 1. Headless is on when any of these holds: `SAFE_AI_SKILL_HEADLESS` or `KIT_FIREWALL_HEADLESS` is `1` or `true`; any of `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL` is set and not `0` or `false`; `/dev/tty` cannot be opened for reading. Any signal turns it on; **nothing turns it off**, because a repo's settings `env` can set these signals.
-2. When headless, **every `ask` becomes a `deny`** (Class U on a devnet, mainnet Class C, hard-guard asks, opaque commands, MCP asks), with the reason "approve interactively, or run it yourself".
+2. When headless, **every `ask` becomes a `deny`** (irreversible actions on a devnet, value-moving actions on mainnet, hard-guard asks, opaque commands, MCP asks), with the reason "approve interactively, or run it yourself".
 3. The only thing that passes is a grant you confirmed interactively beforehand, for grantable Class C scopes, below High.
 4. Env escapes (`CONFIRM_MAINNET`, `CONFIRM_*`, anything repo-settable) are ignored. No `defer`, ever. Nothing can be confirmed in a headless session.
 5. Asks that would fail ordinary CI runs were removed rather than silenced (the `curl` POST ask below High), so a Relaxed localnet deploy passes headless.
 
-## 8. Known holes this layer cannot close
+## Known holes
 
-| Hole | Closed by |
-|---|---|
-| Subprocess, compiled or encoded reads of keys, `.env`, home stores | Kit sandbox `denyRead` (host tokens from Medium, High's `~/` fence) |
-| Values already in context: provider, transcripts, memory and index plugins, MCP args, files later committed | Nobody; the raw-read deny and redaction only reduce it |
-| Egress: inline bodies, unlisted hosts, IP literals, DNS, `git push` to a new remote, publish | Kit sandbox `deniedDomains` (Bash only), a user-scope `strictAllowlist`, the kit's egress and publish gates |
-| WebFetch and WebSearch URLs | Nobody today (whether `deniedDomains` applies is unverified) |
-| `.env` writes via `sed -i`, `python3 -c`, `perl -pi` | Kit sandbox `denyWrite` (not yet implemented by the kit) |
-| Cross-call write-then-run, variable and encoding indirection | Kit sandbox |
-| Same-UID tampering with plugin state, the shim or grants | Kit sandbox `denyWrite` on the data dir; the HMAC makes it evident only |
-| Test suites, `build.rs`, postinstall scripts stealing keys | The sandbox, but the kit's `excludedCommands` runs `anchor test*` and `surfpool *` unsandboxed; a container only |
-| MCP server processes; servers other than the path arguments we check | Kit tool-name denies for some executors; otherwise nobody |
-| A localhost RPC proxy that forwards to mainnet ("identified localnet") | Nobody; simulation and a guarded signer are out of scope |
-| The confidentiality gates fail open if the engine crashes (`onFailure: continue`) | Kit sandbox |
-| Heuristic evasion in non-kit packs | Nobody; pins and drift narrow it, and the kit's CI review covers kit packs only |
-| A repo's `.claude/settings.json` `env` (`PATH`, `LD_PRELOAD`) replacing hooks | Claude Code's folder trust only |
-| The PowerShell tool (Windows), your own `!` shell | Nobody |
-| Nonce secrecy if a hook `systemMessage` reaches the model | Release gate: a live check |
+The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
 
-The agent cannot read its own auto-memory with its tools (§4): a deliberate cost, not a hole.
-
-## 9. Migration from profiles
+## Migration from profiles
 
 | 1.0 / pre-tier value | Becomes | Applied |
 |---|---|---|
@@ -187,7 +165,7 @@ The agent cannot read its own auto-memory with its tools (§4): a deliberate cos
 
 `profiles:`, `ask_all`, the autopilot cap and the profile names as policy keys are removed; a policy that still has them loads, and SessionStart lists them as ignored. Raw `.env` reads stay denied for everyone after the upgrade, so no confidentiality loosening occurs.
 
-## 10. Shared lists
+## Shared lists
 
 Three line-oriented files at the root of this repository in `policy/shared/`, plus a `MANIFEST`:
 

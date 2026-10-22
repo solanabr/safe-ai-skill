@@ -153,7 +153,7 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 
 ---
 
-## Tiers, sandbox state, headless and shared lists (D8 v2)
+## Tiers, sandbox state, headless and shared lists
 
 The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permission rules and tier selection UX. User-facing behaviour is in `docs/tiers.md` and the README table; this section maps the modules. Signatures are in the source (rustdoc).
 
@@ -166,7 +166,7 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | `lists.rs` | Parses the embedded `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!`, `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
 | `gates/credpaths.rs`, `gates/creddump.rs` | Credential path classification and directory-Grep exclusion globs from `credentials.list`; the command-form readers (`gh auth token`, `git credential fill`, `security … -w`, `op read`, …). Deny at every tier. |
 | `gates/envread.rs`, `gates/envwrite.rs` | The raw project-env read verdict from `(tier, env_read, sandbox)`; the Write/Edit/MultiEdit and agent `env set\|unset` verdict (deny from Medium). The opt-in applies only with the sandbox `On`. |
-| `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); Class U (`irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and Class C (caps, grants, mainnet/Unknown ask, High deny). |
+| `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). |
 | `gates/exfil.rs` | The naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`: secret operand to a network-capable command, or a listed host, per the tier's list size. |
 | `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
 
@@ -217,6 +217,8 @@ pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()>;
 > assert against `render_*` so stdout never needs capturing.
 
 ### `policy`
+> The signatures below predate tiers: the profile fields, `PROFILE_ENV`, `load_with_mode` and `active_overlay` are being replaced by the tier resolution described above. See rustdoc for the current surface.
+
 ```rust
 pub const DEFAULT_POLICY_YAML: &str;     // embedded default (literal; crate is standalone)
 pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE" — may only pick a stricter profile
@@ -280,7 +282,7 @@ mainnet `ask`, profile `strict`). A *project override* that is not
 valid YAML (or not a mapping) is ignored; one with ill-typed values fails closed through the
 ratchet, so no other field ends up looser than the base. Either way it is noted.
 
-**Project ratchet (D1.10).** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
+**Project ratchet.** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
 tighten the base, field by field: caps take the lower value (and still bind under any
 profile); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
 `network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`,
@@ -289,11 +291,11 @@ profile); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
 `verify_skills_dirs` keeps every base dir and may add dirs strictly inside the project
 (lexically in `from_sources`, then canonicalized on disk in `load_with_mode`). Fields with no
 safe direction stay fixed: `catalog`, `swap.rugcheck_timeout_ms`, `supply_chain.ext_dir`,
-`supply_chain.verify_ext_submodules`. `active_profile` / `profiles` are ignored. Every refused
+`supply_chain.verify_ext_submodules`. A repo `tier` (or the legacy `active_profile`) is a raise-only tier hint, and `profiles:` is ignored. Every refused
 change lands in `ignored_overrides`, which `verify session` appends to the SessionStart
 `additionalContext`; the notes never echo repo text.
 
-**Profiles are gone (D8 v2).** `strict`, `paranoid` and `autopilot` are input aliases for the tiers `relaxed`, `high` and `relaxed` (`migrate.rs`, `policy::tier`); `profiles:`, `ask_all`, the autopilot cap, `KNOWN_PROFILES`, the `off` profile, `relax_transfer`, `relax_swap`, `disabled` and the never-read `gates`/`hard_guards` lists load as ignored notes. See "Tiers, sandbox state, headless and shared lists" below. Hard guards are set by the gates (`GateMeta::hard_guard`) and never relaxed.
+**Profiles are gone.** `strict`, `paranoid` and `autopilot` are input aliases for the tiers `relaxed`, `high` and `relaxed` (`migrate.rs`, `policy::tier`); `profiles:`, `ask_all`, the autopilot cap, `KNOWN_PROFILES`, the `off` profile, `relax_transfer`, `relax_swap`, `disabled` and the never-read `gates`/`hard_guards` lists load as ignored notes. See "Tiers, sandbox state, headless and shared lists" below. Hard guards are set by the gates (`GateMeta::hard_guard`) and never relaxed.
 
 **On-disk ⇄ embedded equivalence (invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
@@ -331,7 +333,7 @@ pub fn resolve_network(command: &str, cwd: &Path) -> Network;   // first solana-
 pub fn explicit_network(argv: &Argv, base: Option<&Path>) -> Option<Network>; // -u/--url, -C file
 pub fn cli_network(cwd: &Path) -> Network;                      // `solana config get`, 2 s timeout
 pub fn anchor_network(cwd: &Path, cli: impl FnOnce() -> Network) -> Network; // ANCHOR_PROVIDER_URL only tightens
-pub mod shell;  // parse(): quote-aware split, prefix/wrapper strip, recursion (D1.8)
+pub mod shell;  // parse(): quote-aware split, prefix/wrapper strip, recursion
 pub fn plugin_data_dir() -> PathBuf;                            // datadir::data_dir().path
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
@@ -382,7 +384,7 @@ pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
-> `tamper` is the self-grant tripwire (spec D4.3): `secrets::decide` runs `decide_bash_within`
+> `tamper` is the self-grant tripwire: `secrets::decide` runs `decide_bash_within`
 > first (with the hook payload's `cwd` as the session directory), sharing one work `Budget`
 > (units plus a 2 s deadline) with its own scan; exhausting it asks ("command too complex to
 > inspect"), never no opinion. `gate-tamper`
@@ -411,7 +413,7 @@ pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;
 `rugcheck::check_mint` (trusted mints, score threshold) is implemented but has no callers yet: `gate-mcp`
 records the mint, and swap tool calls get `ask`. `swap.rugcheck*` and `swap.trusted_mints` have no effect yet.
 
-### Relaxation (D4)
+### Relaxation
 ```rust
 // grants — grants.json is a statefile envelope
 pub struct grants::Grant { pub id, pub scope: Scope, pub programs, pub to, pub max_tx_sol, pub budget_sol,
@@ -446,7 +448,7 @@ and a within-cap allow falls back to no opinion, so Claude Code's own flow decid
 `natural` is not `Ask`, or `meta.hard_guard` is true, return it unchanged; otherwise the first live grant matching within budget/`max_tx_sol`
 is debited (a failed debit keeps the ask) and the result is `Allow`.
 
-**Confirmation flow (D4.1, fix round 1).** `allow` and `mode <looser>` call
+**Confirmation flow.** `allow` and a tier lowering (`tier <lower>`, or an `env_read` loosening) call
 `confirm::create_pending`, which stores an entry with a public id and **no code**; the CLI
 prints the id and summary only. `confirm::announce_pending` (via `relax::announce`) runs in the
 PostToolUse `pending-notice` hook (Bash), in `prompt-guard` and in `verify session`: it draws
@@ -456,7 +458,7 @@ puts the code in `systemMessage` only. `prompt-guard` passes `confirm::user_prom
 (`confirm::classify`, one whitespace rule) can confirm; a wrong code counts, and the third
 cancels every entry (audited `state_tamper`/`confirm_lockout`). A confirmed entry's payload is
 re-validated, stored, audited and echoed (no code). `verify trust|approve` kinds are not
-handled here (WS-D1). The tripwire (H5) denies Bash invocations of the hook subcommands and
+handled here. The tripwire denies Bash invocations of the hook subcommands and
 `confirm`.
 
 ### `verify`
