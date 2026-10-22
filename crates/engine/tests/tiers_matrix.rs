@@ -889,6 +889,28 @@ fn value_moving_mcp_calls_ask_below_high_and_deny_at_high() {
 }
 
 #[test]
+fn a_grant_never_covers_an_mcp_transfer_whose_amount_it_cannot_read() {
+    let w = World::new("mcp-amount");
+    w.grant_everything();
+    for (tool, input) in [
+        ("mcp__w__transfer", json!({ "to": D, "value": "999" })),
+        ("mcp__w__transfer_all", json!({ "to": D })),
+        ("mcp__w__transfer", json!({ "to": D, "amount": "all" })),
+    ] {
+        let row = format!("granted {tool} {input}");
+        check(&row, w.x4(tool, &input), ASK_HIGH_DENY);
+        let headless = w.x4_with(tool, &input, |t| Setup::at(t).headless());
+        check(&format!("headless {row}"), headless, DENY4);
+    }
+    // Control: a readable amount within the caps is covered below High.
+    check(
+        "granted mcp transfer 0.5",
+        w.x4("mcp__w__transfer", &json!({ "to": D, "amount": "0.5" })),
+        ["allow", "allow", "allow", "deny"],
+    );
+}
+
+#[test]
 fn raw_env_reads_behind_wrappers_and_shell_strings_deny_at_every_tier() {
     let w = env_world("env-wrapped");
     for cmd in [

@@ -86,11 +86,15 @@ impl Grant {
 
     /// Whether `amount_sol` is permitted by this grant's per-tx cap and remaining budget.
     ///
-    /// A missing amount (`None`) is treated as `0.0` (informational gate with no parseable
-    /// value): it passes the caps but consumes no budget. A non-finite or negative amount is
-    /// rejected.
+    /// A value scope (`transfer`, `swap`) needs a readable amount: without one the caps the
+    /// user confirmed cannot be checked, so the grant does not cover the action. Other scopes
+    /// carry no amount (`None` counts as `0.0`). A non-finite or negative amount is rejected.
     fn permits_amount(&self, amount_sol: Option<f64>) -> bool {
-        let amount = amount_sol.unwrap_or(0.0);
+        let amount = match amount_sol {
+            Some(amount) => amount,
+            None if matches!(self.scope, Scope::Transfer | Scope::Swap) => return false,
+            None => 0.0,
+        };
         if !amount.is_finite() || amount < 0.0 {
             return false;
         }
@@ -573,6 +577,32 @@ pub(crate) mod tests {
             hard_guard: false,
         };
         assert!(find_match_at(&grants, &swap, 100).is_none());
+    }
+
+    #[test]
+    fn a_value_grant_never_covers_an_unreadable_amount() {
+        let grants = Grants {
+            grants: vec![transfer_grant("g1", 10_000)],
+        };
+        assert!(find_match_at(&grants, &transfer_meta(None), 100).is_none());
+        let mut swap = transfer_grant("g2", 10_000);
+        swap.scope = Scope::Swap;
+        let grants = Grants { grants: vec![swap] };
+        let meta = GateMeta {
+            scope: Scope::Swap,
+            ..transfer_meta(None)
+        };
+        assert!(find_match_at(&grants, &meta, 100).is_none());
+        let mut destructive = transfer_grant("g3", 10_000);
+        destructive.scope = Scope::Destructive;
+        let grants = Grants {
+            grants: vec![destructive],
+        };
+        let meta = GateMeta {
+            scope: Scope::Destructive,
+            ..transfer_meta(None)
+        };
+        assert!(find_match_at(&grants, &meta, 100).is_some());
     }
 
     #[test]
