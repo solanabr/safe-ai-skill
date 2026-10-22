@@ -1,0 +1,8 @@
+# Engine tests known to fail on Windows (x86_64-pc-windows-msvc), one per line as
+# `<test binary>::<test name>`, the form scripts/windows-test-gate.py prints. The Windows
+# CI job fails on any failing test not listed here, so a new Windows failure can't ship.
+# Delete a line once its test passes (the job warns). Entries need a reason comment.
+#
+# Seeded empty: the suite has not run on Windows yet. If the first windows-latest run
+# fails, triage each failure: fix it, or list it here with the reason (unix-only fixture,
+# symlinks, FIFOs, modes) and a tracking issue.

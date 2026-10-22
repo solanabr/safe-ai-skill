@@ -157,6 +157,8 @@ impl<'a> Invocation<'a> {
         // The CLI resolves the hooks' data dir from these and HOME: never the real one.
         cmd.env_remove("CLAUDE_PLUGIN_DATA");
         cmd.env_remove("CLAUDE_CONFIG_DIR");
+        cmd.env_remove("CLAUDE_CODE_VERSION");
+        cmd.env_remove("CLAUDE_CODE_EXECPATH");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);

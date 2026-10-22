@@ -295,8 +295,26 @@ fn passwd_home() -> Option<PathBuf> {
 /// Canonicalize `path` even when its tail does not exist yet: canonicalize the deepest
 /// existing ancestor, then apply the remaining components lexically (a missing component
 /// cannot be a symlink, so `..` there just pops). A relative path is taken from the process
-/// cwd. `None` when nothing resolves.
+/// cwd. `None` when nothing resolves. The result is only ever compared, so on Windows it is
+/// case-folded ([`fold_case`]): the lexical tail keeps the caller's spelling.
 fn canonical_lenient(path: &Path) -> Option<PathBuf> {
+    canonical_lenient_cased(path).map(fold_case)
+}
+
+/// Windows paths compare case-insensitively; elsewhere `path` is returned unchanged.
+fn fold_case(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        lowercase_path(&path)
+    } else {
+        path
+    }
+}
+
+fn lowercase_path(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+fn canonical_lenient_cased(path: &Path) -> Option<PathBuf> {
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -361,6 +379,28 @@ mod tests {
             plugin_data: Some(pd),
             ..env
         }
+    }
+
+    #[test]
+    fn lowercase_path_folds_every_component() {
+        assert_eq!(
+            lowercase_path(Path::new("C:/Users/Me/.Claude/Plugins")),
+            PathBuf::from("c:/users/me/.claude/plugins")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_trust_ignores_case_in_the_missing_tail() {
+        let home = tmp("wincase");
+        let pd = data_root(&home)
+            .join("safe-ai-skill-x")
+            .to_string_lossy()
+            .replace(".claude", ".CLAUDE")
+            .replace("plugins", "Plugins");
+        let d = resolve(&with_plugin_data(env_home(&home), PathBuf::from(pd)), None).unwrap();
+        assert!(d.trusted);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

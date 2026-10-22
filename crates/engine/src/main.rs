@@ -29,7 +29,7 @@ use safe_ai_skill::policy::Policy;
 use safe_ai_skill::spend::{self, SpendLedger};
 use safe_ai_skill::statefile::Loaded;
 use safe_ai_skill::{
-    grants, migrate, mode, notice, promptguard, redact, registry, relax, session, verify,
+    grants, migrate, mode, notice, platform, promptguard, redact, registry, relax, session, verify,
 };
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
@@ -764,9 +764,11 @@ fn cmd_verify_session() -> ExitCode {
         sandbox: notice::sandbox_state(&project),
         now,
     });
+    // Then install and platform notices (duplicate install, old Claude Code, Windows scope).
     for text in [effective.ignored_notice(), loosenings]
         .into_iter()
         .flatten()
+        .chain(platform::session_notices())
     {
         for field in [&mut res.system_message, &mut res.additional_context] {
             if !field.is_empty() {

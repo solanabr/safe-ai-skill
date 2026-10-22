@@ -17,6 +17,7 @@
 //! - Shared contracts (1.1.0): [`datadir`] (where state lives, and whether it is trusted),
 //!   [`statefile`] (MAC'd state), [`confirm`] (prompt-nonce confirmation), and
 //!   [`gate::Verdict`].
+//! - Platform (1.1.0): [`platform`] (SessionStart install and platform notices).
 //!
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
@@ -34,6 +35,7 @@ pub mod io;
 pub mod migrate;
 pub mod mode;
 pub mod notice;
+pub mod platform;
 pub mod policy;
 pub mod promptguard;
 pub mod redact;

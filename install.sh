@@ -54,6 +54,13 @@ detect_platform() {
         *) return 1 ;;
       esac
       ;;
+    # Git Bash / MSYS2 / Cygwin. Windows on ARM runs the x64 build under emulation.
+    MINGW* | MSYS* | CYGWIN*)
+      case "${arch}" in
+        x86_64 | amd64 | aarch64 | arm64) echo "windows-x64" ;;
+        *) return 1 ;;
+      esac
+      ;;
     *)
       return 1
       ;;
@@ -90,7 +97,9 @@ sha256_of() {
 
 plat="$(detect_platform)" || fatal "unsupported platform $(uname -s)/$(uname -m). Install via: cargo install safe-ai-skill"
 
-binary_name="safe-ai-skill-${plat}"
+ext=""
+case "${plat}" in windows-*) ext=".exe" ;; esac
+binary_name="safe-ai-skill-${plat}${ext}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
 
@@ -112,7 +121,7 @@ if [ "${actual}" != "${expected}" ]; then
 fi
 
 mkdir -p "${BIN_DIR}"
-install_path="${BIN_DIR}/safe-ai-skill"
+install_path="${BIN_DIR}/safe-ai-skill${ext}"
 cp "${tmp_dir}/${binary_name}" "${install_path}"
 chmod 0755 "${install_path}"
 
