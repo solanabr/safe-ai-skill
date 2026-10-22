@@ -982,3 +982,38 @@ fn read_private_key_header_without_body_has_no_opinion() {
     );
     assert_eq!(sb.read("detector.rs"), "");
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn redact_explicit_sensitive_passphrase_is_scrubbed() {
+    let sb = Sandbox::new();
+    sb.write(
+        ".env",
+        "MASTER=correct-horse-battery-staple\nDB_HOST=postgres-main\n",
+    );
+    sb.write(
+        ".env.schema",
+        "# @defaultSensitive=true\n# ---\n# @sensitive\nMASTER=\nDB_HOST=\n",
+    );
+    let out = updated(&sb.redact(
+        "Bash",
+        json!({ "stdout": "pw correct-horse-battery-staple host postgres-main" }),
+    ));
+    assert_eq!(out["stdout"], "pw «redacted:MASTER» host postgres-main");
+}
+
+#[test]
+fn bash_npx_call_script_is_parsed() {
+    let sb = Sandbox::new();
+    for cmd in [
+        "npx -c 'varlock printenv K'",
+        "npx --call 'varlock reveal K'",
+        "npm exec --call='varlock load --format env'",
+    ] {
+        assert_eq!(decision_label(&sb.bash(cmd)), "deny", "{cmd}");
+    }
+    assert_silent(&sb.bash("npx -c 'varlock run -- node a.js'"), "run");
+}

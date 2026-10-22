@@ -301,7 +301,7 @@ pub fn sniff(path: &Path, limit: usize) -> Sniffed {
     let over = buf.len() > limit;
     buf.truncate(limit);
     let text = String::from_utf8_lossy(&buf);
-    if has_private_key_block(&text) {
+    if has_private_key_block(&text) || header_cut_off(&text, over) {
         return Sniffed::PrivateKey;
     }
     if over {
@@ -331,6 +331,23 @@ pub fn has_private_key_block(text: &str) -> bool {
                             .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
                 })
     })
+}
+
+/// A private-key header in the last 64 bytes of a window that was cut short: its body may lie
+/// past the bound, so fail closed.
+fn header_cut_off(text: &str, truncated: bool) -> bool {
+    if !truncated {
+        return false;
+    }
+    let Some(begin) = text.rfind("-----BEGIN") else {
+        return false;
+    };
+    if begin + 64 < text.len() {
+        return false;
+    }
+    let header = text[begin..].lines().next().unwrap_or_default().trim_end();
+    // A private-key header, or a header cut before its closing dashes (it may be one).
+    header.contains("PRIVATE KEY-----") || !header.ends_with("-----")
 }
 
 /// Whether the whole of `text` (trimmed) is a keypair: a JSON array of exactly 64 integers in
@@ -536,6 +553,13 @@ mod tests {
         let big = dir.join("big.json");
         std::fs::write(&big, vec![b' '; SNIFF_BYTES + 10]).unwrap();
         assert_eq!(sniff(&big, SNIFF_BYTES), Sniffed::TooLarge);
+        let cut = dir.join("cut.md");
+        let mut body = vec![b' '; SNIFF_BYTES - 40];
+        body.extend_from_slice(
+            b"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn\n",
+        );
+        std::fs::write(&cut, body).unwrap();
+        assert_eq!(sniff(&cut, SNIFF_BYTES), Sniffed::PrivateKey);
         assert_eq!(sniff(&dir.join("missing"), SNIFF_BYTES), Sniffed::Clean);
         assert_eq!(sniff(&dir, SNIFF_BYTES), Sniffed::Clean);
         std::fs::remove_dir_all(&dir).unwrap();

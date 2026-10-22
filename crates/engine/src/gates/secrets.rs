@@ -175,6 +175,14 @@ fn decide_segment(segment: &str, policy: &Policy, cwd: Option<&Path>) -> Decisio
         return Decision::Defer;
     }
 
+    // `npx -c 'varlock printenv K'` / `--call`: the script is a command line of its own.
+    if let Some(script) = runner_call_script(tokens) {
+        let inner = decide_in(script, policy, cwd);
+        if !matches!(inner, Decision::Defer) {
+            return inner;
+        }
+    }
+
     if let Some(args) = varlock_args(tokens) {
         return decide_varlock(args, &assignments, policy);
     }
@@ -433,6 +441,21 @@ fn varlock_args(tokens: &[String]) -> Option<&[String]> {
         i += 1;
     }
     None
+}
+
+/// The `-c` / `--call` script of an `npx` / `npm exec` invocation, if any.
+fn runner_call_script(tokens: &[String]) -> Option<&str> {
+    let prog = base_program(tokens.first()?);
+    if !matches!(prog.as_str(), "npx" | "npm" | "pnpx") {
+        return None;
+    }
+    tokens.iter().enumerate().skip(1).find_map(|(i, t)| {
+        if t == "-c" || t == "--call" {
+            tokens.get(i + 1).map(String::as_str)
+        } else {
+            t.strip_prefix("--call=")
+        }
+    })
 }
 
 /// varlock subcommands that print resolved values are treated like `cat .env`; turning off

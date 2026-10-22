@@ -87,8 +87,16 @@ fn is_binary_payload(value: &Value) -> bool {
     typed || map.get("isImage").and_then(Value::as_bool) == Some(true)
 }
 
-/// One unbroken base64 / base64url run longer than 1 KiB (an inline file, not text).
+/// One unbroken base64 / base64url run longer than 1 KiB (an inline file, not text), bare or
+/// as a `data:<mime>;base64,` URI.
 fn is_base64_blob(text: &str) -> bool {
+    let text = match text
+        .strip_prefix("data:")
+        .and_then(|r| r.split_once(";base64,"))
+    {
+        Some((mime, body)) if !mime.contains(char::is_whitespace) => body,
+        _ => text,
+    };
     text.len() > 1024
         && text
             .bytes()
@@ -145,17 +153,26 @@ fn replace_tokens(text: &str, value: &str, key: &str) -> Option<String> {
 /// Key names that announce a secret (`*_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …).
 /// Shared with the value scrub; H9's `contains_key_material` key-name set should merge here.
 pub(crate) fn is_secret_key_name(key: &str) -> bool {
-    let k = key.to_ascii_uppercase();
-    [
+    // Whole `_`/`-`/`.`-delimited segments: `KEY` hits `API_KEY`, not `MONKEY`/`KEYBOARD`;
+    // `AUTH` hits `GITHUB_AUTH`, not `AUTHOR`.
+    const WORDS: &[&str] = &[
         "KEY",
+        "KEYS",
+        "APIKEY",
         "SECRET",
+        "SECRETS",
         "TOKEN",
+        "TOKENS",
         "PASSWORD",
         "PASSWD",
+        "PASS",
         "PASSPHRASE",
         "PWD",
         "PRIVATE",
+        "PRIVKEY",
         "CREDENTIAL",
+        "CREDENTIALS",
+        "CREDS",
         "AUTH",
         "SEED",
         "MNEMONIC",
@@ -165,9 +182,9 @@ pub(crate) fn is_secret_key_name(key: &str) -> bool {
         "SESSION",
         "DSN",
         "WEBHOOK",
-    ]
-    .iter()
-    .any(|w| k.contains(w))
+    ];
+    let upper = key.to_ascii_uppercase();
+    upper.split(['_', '-', '.']).any(|seg| WORDS.contains(&seg))
 }
 
 /// A single redaction span: `[start, end)` byte range and the marker kind.
@@ -745,6 +762,32 @@ mod tests {
         }
         let blob = bs58::encode([9u8; 64]).into_string().repeat(20);
         assert_eq!(scrub_response(&json!(blob), &[]), None);
+        let uri = format!("data:image/png;base64,{blob}");
+        assert_eq!(scrub_response(&json!(uri), &[]), None);
+    }
+
+    #[test]
+    fn secret_key_names_by_segment() {
+        for k in [
+            "API_KEY",
+            "helius_api_key",
+            "DB_PASSWORD",
+            "GITHUB_AUTH",
+            "JWT",
+            "x.token",
+        ] {
+            assert!(is_secret_key_name(k), "{k}");
+        }
+        for k in [
+            "MONKEY",
+            "KEYBOARD_LAYOUT",
+            "AUTHOR",
+            "PASSPORT_ID",
+            "HOST",
+            "RPC_URL",
+        ] {
+            assert!(!is_secret_key_name(k), "{k}");
+        }
     }
 
     #[test]

@@ -120,7 +120,11 @@ pub fn collect(bytes: &[u8], schema: Option<&Schema>, out: &mut Vec<KnownValue>)
             continue;
         };
         let sensitive = schema.is_some_and(|s| s.is_sensitive(&entry.key));
-        if !scrubbable(&entry.key, &value, sensitive) {
+        let explicit = schema
+            .and_then(|s| s.item(&entry.key))
+            .and_then(|i| i.explicit_sensitive())
+            == Some(true);
+        if !scrubbable(&entry.key, &value, sensitive, explicit) {
             continue;
         }
         if let Ok(text) = String::from_utf8(value) {
@@ -132,15 +136,22 @@ pub fn collect(bytes: &[u8], schema: Option<&Schema>, out: &mut Vec<KnownValue>)
     }
 }
 
-/// Whether a literal value is scrubbed (fix round 1 ruling):
-/// - never: shorter than [`MIN_VALUE_LEN`], empty, a placeholder, a verbatim-safe word;
+/// Whether a literal value is scrubbed (fix rounds 1–2 rulings):
+/// - never: shorter than [`MIN_VALUE_LEN`], empty, a placeholder;
+/// - always (otherwise): the key carries an explicit item `@sensitive` (`explicit`);
+/// - never: a verbatim-safe word;
 /// - never, unless the key name announces a secret: a public URL (unless schema-sensitive),
 ///   a bare hostname or IP, a cloud region, a plain word;
 /// - otherwise only when the key is schema-sensitive, its name announces a secret, or the
 ///   value looks random (≥ 12 bytes and ≥ 3.0 bits/char of Shannon entropy).
-fn scrubbable(key: &str, value: &[u8], sensitive: bool) -> bool {
+fn scrubbable(key: &str, value: &[u8], sensitive: bool, explicit: bool) -> bool {
     if value.len() < MIN_VALUE_LEN {
         return false;
+    }
+    // An item's own `@sensitive` always scrubs; only `@defaultSensitive` yields to the
+    // exemptions below.
+    if explicit {
+        return !matches!(Shown::of(value), Shown::Empty | Shown::Placeholder);
     }
     let named = redact::is_secret_key_name(key);
     match Shown::of(value) {
@@ -274,9 +285,21 @@ mod tests {
             got,
             vec![("DB_PASSWORD".to_string(), "correcthorse".to_string())]
         );
-        // A schema marking them sensitive does not make plain identifiers secret.
+        // `@defaultSensitive` (here implied) does not make plain identifiers secret.
         let schema = values("DB_HOST=postgres\n", Some("# ---\nDB_HOST=\n"));
         assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn explicit_sensitive_always_scrubs() {
+        let env = "MASTER=correct-horse-battery-staple\nMODE=production\nEMPTY=\n";
+        let schema = "# @defaultSensitive=false\n# ---\n# @sensitive\nMASTER=\n# @sensitive\nMODE=\n# @sensitive\nEMPTY=\n";
+        let got: Vec<String> = values(env, Some(schema))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, vec!["MASTER", "MODE"]);
+        assert!(values(env, Some("# ---\nMASTER=\nMODE=\n")).is_empty());
     }
 
     #[test]
