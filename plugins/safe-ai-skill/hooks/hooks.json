@@ -23,6 +23,9 @@
     "PostToolUse": [
       { "matcher": "Bash|Read|Grep", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill redact", "timeout": 10, "onFailure": "continue" }
+      ]},
+      { "matcher": "Bash", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill pending-notice", "timeout": 10, "onFailure": "continue" }
       ]}
     ],
     "UserPromptSubmit": [

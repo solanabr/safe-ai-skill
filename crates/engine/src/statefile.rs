@@ -1,10 +1,24 @@
 //! Authenticated JSON state files in the plugin data dir (spec D4.2).
 //!
-//! Each file is an envelope `{"v": 1, "mac": "<hex>", "body": <state>}`. The MAC is
-//! HMAC-SHA256 under a 32-byte key in `${DATA}/key` (mode 0600, created on the first
-//! [`store`]) over `"safe-ai-skill/state/v1\0" + <file name> + "\0" + canonical(body)`, where
-//! the canonical form is compact JSON with object keys sorted. Binding the file name stops a
-//! valid `grants.json` body being replayed as another file.
+//! Each file is an envelope `{"v": 1, "gen": <n>, "mac": "<hex>", "body": <state>}`. The MAC
+//! is HMAC-SHA256 under a 32-byte key in `${DATA}/key` (mode 0600, created on the first
+//! [`store`]) over `"safe-ai-skill/state/v1\0" + <file name> + "\0" + <gen> + "\0" +
+//! canonical(body)`, where the canonical form is compact JSON with object keys sorted. Binding
+//! the file name stops a valid `grants.json` body being replayed as another file.
+//!
+//! ## Generations (restore resistance)
+//!
+//! Every [`store`] bumps the file's generation and records it in the authenticated index
+//! [`GEN_INDEX`]. [`load`] rejects (as [`Loaded::Tampered`]) an envelope whose generation is
+//! below the index's, so copying back an older valid `grants.json` (unspent budget) or
+//! `spend.json` (a lower total) does not verify. A missing or tampered index makes every
+//! file tampered. Residual: restoring a snapshot of the *whole* data dir (index included)
+//! is not detected. Writers write the file, then the index, under [`STATE_LOCK`]; readers
+//! read the index first, so a concurrent store never makes a reader see an old file with a
+//! new index.
+//!
+//! The first store that creates the key also starts the spend ledger
+//! ([`crate::spend::on_key_created`]): a ledger missing once the key exists means deleted.
 //!
 //! This is tamper-evident, not tamper-proof: anything that can read the key can forge a
 //! MAC. It stops the model hand-editing state through a tool that cannot read the key.
@@ -49,6 +63,15 @@ const DEBRIS_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 /// Domain-separation prefix of the MAC input.
 const MAC_DOMAIN: &[u8] = b"safe-ai-skill/state/v1\0";
 
+/// The authenticated generation index: `{file name: generation}`.
+pub const GEN_INDEX: &str = "generations.json";
+
+/// Lock file serializing stores (file + index update).
+pub(crate) const STATE_LOCK: &str = "state.lock";
+
+/// How long [`FileLock::acquire`] waits.
+pub(crate) const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Result of [`load`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Loaded<T> {
@@ -72,38 +95,67 @@ pub fn load<T: DeserializeOwned + Default>(dir: &DataDir, name: &str) -> Loaded<
     if !valid_name(name) {
         return Loaded::Tampered;
     }
-    let text = match read_regular(&dir.path.join(name), MAX_STATE_BYTES) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Missing,
-        Err(_) => return Loaded::Tampered,
+    // The index first: a store writes the file, then the index (see the module docs).
+    let index = read_envelope(&dir.path, GEN_INDEX);
+    let (gen, body) = match read_envelope(&dir.path, name) {
+        Envelope::Missing => return Loaded::Missing,
+        Envelope::Bad => return Loaded::Tampered,
+        Envelope::Good { gen, body } => (gen, body),
     };
-    let Ok(key) = read_key(&dir.path) else {
+    let Envelope::Good { body: index, .. } = index else {
         return Loaded::Tampered;
     };
-    let Ok(Value::Object(env)) = serde_json::from_slice::<Value>(&text) else {
-        return Loaded::Tampered;
-    };
-    if env.get("v").and_then(Value::as_u64) != Some(VERSION) {
-        return Loaded::Tampered;
+    match index.get(name).and_then(Value::as_u64) {
+        Some(floor) if gen >= floor => {}
+        _ => return Loaded::Tampered,
     }
-    let (Some(mac_hex), Some(body)) = (env.get("mac").and_then(Value::as_str), env.get("body"))
-    else {
-        return Loaded::Tampered;
-    };
-    let Some(mac) = hex_decode(mac_hex) else {
-        return Loaded::Tampered;
-    };
-    if !constant_time_eq(&mac, &state_mac(&key, name, body)) {
-        return Loaded::Tampered;
-    }
-    match T::deserialize(body) {
+    match T::deserialize(&body) {
         Ok(v) => Loaded::Valid(v),
         Err(_) => Loaded::Tampered,
     }
 }
 
-/// Write `v` to `${dir}/{name}` as a MAC'd envelope: a 0600 temp file in the same dir,
-/// fsync, then rename over the target. Creates the data dir and the key when missing.
+/// What [`read_envelope`] found.
+enum Envelope {
+    Missing,
+    Bad,
+    Good { gen: u64, body: Value },
+}
+
+/// Read and authenticate `${dir}/{name}` (no generation check).
+fn read_envelope(dir: &Path, name: &str) -> Envelope {
+    let text = match read_regular(&dir.join(name), MAX_STATE_BYTES) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Envelope::Missing,
+        Err(_) => return Envelope::Bad,
+    };
+    let Ok(key) = read_key(dir) else {
+        return Envelope::Bad;
+    };
+    let Ok(Value::Object(mut env)) = serde_json::from_slice::<Value>(&text) else {
+        return Envelope::Bad;
+    };
+    if env.get("v").and_then(Value::as_u64) != Some(VERSION) {
+        return Envelope::Bad;
+    }
+    let (Some(mac), Some(gen)) = (
+        env.get("mac").and_then(Value::as_str).and_then(hex_decode),
+        env.get("gen").and_then(Value::as_u64),
+    ) else {
+        return Envelope::Bad;
+    };
+    let Some(body) = env.remove("body") else {
+        return Envelope::Bad;
+    };
+    if !constant_time_eq(&mac, &state_mac(&key, name, gen, &body)) {
+        return Envelope::Bad;
+    }
+    Envelope::Good { gen, body }
+}
+
+/// Write `v` to `${dir}/{name}` as a MAC'd envelope with the next generation, then record
+/// that generation in [`GEN_INDEX`]: a 0600 temp file in the same dir, fsync, rename. Creates
+/// the data dir and the key when missing (and then starts the spend ledger).
 pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), EngineError> {
     if dir.is_unresolved() {
         return Err(Error::Other(
@@ -118,14 +170,56 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
             "refusing to store `{name}`: it holds a NaN or infinite number"
         )));
     }
+    let body = serde_json::to_value(v).map_err(|e| Error::Parse(e.to_string()))?;
     create_dir_private(&dir.path)?;
     sweep_debris(&dir.path, KEY_FILE);
-    let key = load_or_create_key(&dir.path)?;
-    let body = serde_json::to_value(v).map_err(|e| Error::Parse(e.to_string()))?;
-    let mac = hex_encode(&state_mac(&key, name, &body));
-    let envelope = serde_json::json!({ "v": VERSION, "mac": mac, "body": body });
+    let (key, created) = load_or_create_key(&dir.path)?;
+    if created {
+        crate::spend::on_key_created(dir, name);
+    }
+
+    let _lock = FileLock::acquire(&dir.path, STATE_LOCK)?;
+    let mut index = match read_envelope(&dir.path, GEN_INDEX) {
+        Envelope::Good {
+            body: Value::Object(map),
+            ..
+        } => map,
+        // A missing or bad index is rebuilt; files it no longer lists stay tampered.
+        _ => serde_json::Map::new(),
+    };
+    // The next generation exceeds both the index's and the file's own (unauthenticated, so
+    // it can only push the number up).
+    let on_disk = read_regular(&dir.path.join(name), MAX_STATE_BYTES)
+        .ok()
+        .and_then(|t| serde_json::from_slice::<Value>(&t).ok())
+        .and_then(|v| v.get("gen").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let floor = index.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let gen = floor.max(on_disk).saturating_add(1);
+    write_envelope(&dir.path, &key, name, gen, &body)?;
+    index.insert(name.to_string(), Value::from(gen));
+    write_envelope(&dir.path, &key, GEN_INDEX, 0, &Value::Object(index))
+}
+
+/// Serialize and atomically write one envelope.
+fn write_envelope(
+    dir: &Path,
+    key: &[u8],
+    name: &str,
+    gen: u64,
+    body: &Value,
+) -> Result<(), EngineError> {
+    let mac = hex_encode(&state_mac(key, name, gen, body));
+    let envelope = serde_json::json!({ "v": VERSION, "gen": gen, "mac": mac, "body": body });
     let bytes = serde_json::to_vec(&envelope).map_err(|e| Error::Parse(e.to_string()))?;
-    write_atomic(&dir.path, name, &bytes)
+    write_atomic(dir, name, &bytes)
+}
+
+/// A 32-byte value derived from the state key for `label` (HMAC(key, label)); errors when
+/// the key cannot be read. Used for salts that must not be computable without the key.
+pub(crate) fn derived_key(dir: &DataDir, label: &[u8]) -> Result<[u8; 32], EngineError> {
+    let key = read_key(&dir.path)?;
+    Ok(hmac_sha256(&key, label))
 }
 
 /// Whether `v` serializes any NaN or infinite float. serde_json would write those as `null`,
@@ -151,16 +245,19 @@ fn has_non_finite_float<T: Serialize>(v: &T) -> Result<bool, EngineError> {
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name != KEY_FILE
+        && name != GEN_INDEX
         && name != "."
         && name != ".."
         && !name.contains(['/', '\\', '\0'])
 }
 
-/// HMAC over the domain prefix, the file name and the canonical body.
-fn state_mac(key: &[u8], name: &str, body: &Value) -> [u8; 32] {
+/// HMAC over the domain prefix, the file name, the generation and the canonical body.
+fn state_mac(key: &[u8], name: &str, gen: u64, body: &Value) -> [u8; 32] {
     let mut msg = Vec::with_capacity(MAC_DOMAIN.len() + name.len() + 64);
     msg.extend_from_slice(MAC_DOMAIN);
     msg.extend_from_slice(name.as_bytes());
+    msg.push(0);
+    msg.extend_from_slice(gen.to_string().as_bytes());
     msg.push(0);
     canonical_json(body, &mut msg);
     hmac_sha256(key, &msg)
@@ -318,7 +415,8 @@ fn read_regular(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
 /// [`STALE_EMPTY_KEY_SECS`] it is replaced (no state can have been MAC'd under it). Any other
 /// bad key (wrong length, mode, owner, a symlink) is never replaced automatically: delete
 /// `${DATA}/key` together with the state files (they would no longer verify) to reset.
-fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
+/// Returns the key and whether this call created it.
+fn load_or_create_key(dir: &Path) -> Result<(Vec<u8>, bool), EngineError> {
     let path = dir.join(KEY_FILE);
     let mut replaced_stale = false;
     loop {
@@ -329,7 +427,7 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
                     .map_err(|e| Error::Other(format!("OS random source: {e}")))?;
                 f.write_all(&key)?;
                 f.sync_all()?;
-                return Ok(key.to_vec());
+                return Ok((key.to_vec(), true));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !replaced_stale && is_stale_empty_key(&path) {
@@ -340,7 +438,7 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
                 let mut last = Error::Other("state key refused: wrong length".to_string());
                 for _ in 0..50 {
                     match read_key(dir) {
-                        Ok(key) => return Ok(key),
+                        Ok(key) => return Ok((key, false)),
                         Err(e) => last = e,
                     }
                     // Only an empty or short key may still be being written.
@@ -354,6 +452,83 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// An exclusive lock on a lock file in the data dir, released on drop.
+pub(crate) struct FileLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// `flock(LOCK_EX)` on `dir/name`, retried for [`LOCK_WAIT`]. The kernel drops the lock
+    /// when the process exits, so a crash leaves no stale lock. Locks are taken in a fixed
+    /// order (a specific lock such as `pending.lock`, then [`STATE_LOCK`]), never reentrantly.
+    #[cfg(unix)]
+    pub(crate) fn acquire(dir: &Path, name: &str) -> Result<FileLock, EngineError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            // O_NONBLOCK: a planted FIFO fails open() instead of hanging the hook.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join(name))?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::Other(format!("{name} is not a regular file")));
+        }
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            // SAFETY: the fd is open for the lifetime of `file`.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(FileLock { _file: file });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Other(format!("{name} is busy")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// An `O_EXCL` lock file, removed on drop; one older than [`STALE_LOCK_AGE`] is taken as
+    /// stale and broken with [`break_stale`] (rename aside, then remove).
+    #[cfg(not(unix))]
+    pub(crate) fn acquire(dir: &Path, name: &str) -> Result<FileLock, EngineError> {
+        let path = dir.join(name);
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match open_new_private(&path) {
+                Ok(_) => return Ok(FileLock { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::symlink_metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|age| age > STALE_LOCK_AGE);
+                    if stale {
+                        break_stale(&path, STALE_LOCK_AGE)?;
+                        continue;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Other(format!("{name} is busy")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -647,7 +822,53 @@ pub(crate) mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        let mut names = names;
+        names.sort();
+        assert_eq!(
+            names,
+            [GEN_INDEX, "grants.json", KEY_FILE, "spend.json", STATE_LOCK],
+            "the first store also starts the spend ledger"
+        );
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn restoring_an_older_valid_file_is_tampered() {
+        let dir = tmp_data("restore");
+        store(&dir, "grants.json", &demo()).unwrap();
+        let old = std::fs::read(dir.path.join("grants.json")).unwrap();
+        let newer = Demo {
+            name: "g1".into(),
+            count: 0,
+        };
+        store(&dir, "grants.json", &newer).unwrap();
+        assert_eq!(
+            load::<Demo>(&dir, "grants.json"),
+            Loaded::Valid(newer.clone())
+        );
+        std::fs::write(dir.path.join("grants.json"), &old).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        // Storing again moves past both.
+        store(&dir, "grants.json", &newer).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Valid(newer));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_missing_or_edited_index_or_generation_is_tampered() {
+        let dir = tmp_data("index");
+        store(&dir, "grants.json", &demo()).unwrap();
+        // Bumping the generation by hand breaks the MAC.
+        rewrite(&dir, "grants.json", |v| v["gen"] = 99.into());
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        store(&dir, "grants.json", &demo()).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Valid(demo()));
+        // Deleting the index (to make any generation pass) makes every file tampered.
+        std::fs::remove_file(dir.path.join(GEN_INDEX)).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        // The index name is not storable from outside.
+        assert!(store(&dir, GEN_INDEX, &demo()).is_err());
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
@@ -786,7 +1007,10 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, ["grants.json", "key"]);
+        assert_eq!(
+            names,
+            [GEN_INDEX, "grants.json", KEY_FILE, "spend.json", STATE_LOCK]
+        );
         // Breaking a stale file someone else already removed is not an error.
         assert!(break_stale(&dir.path.join("gone"), STALE_LOCK_AGE).is_ok());
         let _ = std::fs::remove_dir_all(&dir.path);

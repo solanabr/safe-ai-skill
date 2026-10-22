@@ -1,31 +1,40 @@
-//! Active profile selection (`${CLAUDE_PLUGIN_DATA}/mode.json`).
+//! Active profile selection (`${DATA}/mode.json`, authenticated, spec D4.2).
 //!
 //! The runtime profile override. Precedence at load time (see
 //! [`crate::policy::Policy::load_with_mode`]): the value persisted here replaces the policy
 //! file's `active_profile`; the [`crate::policy::PROFILE_ENV`] env var may then only select a
 //! stricter profile.
 //!
-//! This module owns ONLY the grant/profile *name* persistence. The profile's *effect* (cap
-//! overrides, `relax_transfer`/`relax_swap` flags) lives in [`crate::policy::Policy::effective`]
-//! — `mode::get` supplies the active name, `policy.effective()` applies the overlay. The two
-//! never overlap.
-
-use std::path::Path;
+//! `mode.json` is a [`crate::statefile`] envelope. Moving to a stricter profile is written at
+//! once ([`set`]); a looser one (`autopilot`) goes through a confirmed prompt nonce first
+//! (spec D4.1, [`crate::relax::confirm_prompt`]). [`persisted`] is what gates read: `None`
+//! unless the file authenticates, the data dir is trusted, and the name is known.
+//!
+//! This module owns ONLY the profile *name* persistence. The profile's *effect* lives in
+//! [`crate::policy::Policy::effective`] and [`crate::relax`].
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::PROFILE_ENV;
+use crate::datadir::DataDir;
+use crate::error::{EngineError, Error};
+use crate::statefile::{self, Loaded};
 
-/// The known profile names. Any other value is rejected by [`set`].
-pub const KNOWN_PROFILES: [&str; 4] = ["strict", "autopilot", "paranoid", "off"];
+/// State file holding the active profile.
+pub const MODE_FILE: &str = "mode.json";
+
+/// The known profiles, loosest first. Any other value is rejected by [`set`].
+pub const KNOWN_PROFILES: [&str; 3] = ["autopilot", "strict", "paranoid"];
+
+/// The profile in effect when nothing selects another.
+pub const DEFAULT_PROFILE: &str = "strict";
 
 /// Persisted active-profile record.
-#[derive(Debug, Serialize, Deserialize)]
-struct ModeRecord {
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeRecord {
     /// Active profile name.
-    profile: String,
+    pub profile: String,
     /// When it was set (epoch seconds; informational).
-    set_at: u64,
+    pub set_at: u64,
 }
 
 /// Whether `profile` is one of the [`KNOWN_PROFILES`].
@@ -33,122 +42,126 @@ pub fn is_known_profile(profile: &str) -> bool {
     KNOWN_PROFILES.contains(&profile)
 }
 
-/// Read the requested profile.
-///
-/// Precedence: the [`PROFILE_ENV`] env var (when set to a known profile) overrides the
-/// persisted file; otherwise the value in `mode.json` is returned. `None` when neither a
-/// valid env override nor a persisted record exists, so the caller may fall back to the
-/// policy default. Not the profile gates use: there the env var may only tighten
-/// [`persisted`] (see [`crate::policy::Policy::load_with_mode`]).
-pub fn get(plugin_data: &Path) -> Option<String> {
-    get_with(plugin_data, std::env::var(PROFILE_ENV).ok().as_deref())
+/// Rank of a known profile, loosest = 0; `None` for an unknown name.
+pub fn strictness(profile: &str) -> Option<usize> {
+    KNOWN_PROFILES.iter().position(|p| *p == profile)
 }
 
-/// [`get`] with the [`PROFILE_ENV`] value passed in (tests never touch the process env).
-fn get_with(plugin_data: &Path, env_profile: Option<&str>) -> Option<String> {
-    if let Some(env_profile) = env_profile {
-        let trimmed = env_profile.trim();
-        if is_known_profile(trimmed) {
-            return Some(trimmed.to_string());
-        }
-    }
-    persisted(plugin_data)
-}
-
-/// Read the profile persisted in `mode.json` alone, ignoring the env override. `None` when
-/// absent or not a known profile.
-pub fn persisted(plugin_data: &Path) -> Option<String> {
-    let path = plugin_data.join("mode.json");
-    let text = std::fs::read_to_string(path).ok()?;
-    let record: ModeRecord = serde_json::from_str(&text).ok()?;
-    if is_known_profile(&record.profile) {
-        Some(record.profile)
-    } else {
-        None
+/// Whether moving from `current` to `target` loosens the policy, and so needs a confirmed
+/// nonce. An unknown `current` counts as [`DEFAULT_PROFILE`].
+pub fn is_looser(target: &str, current: &str) -> bool {
+    let current = strictness(current).or_else(|| strictness(DEFAULT_PROFILE));
+    match (strictness(target), current) {
+        (Some(t), Some(c)) => t < c,
+        _ => true,
     }
 }
 
-/// Persist `profile` as the active profile (write-temp + rename).
+/// Load and authenticate `mode.json`.
+pub fn load(dir: &DataDir) -> Loaded<ModeRecord> {
+    statefile::load(dir, MODE_FILE)
+}
+
+/// The profile persisted in `mode.json`, for gating: `None` unless the file authenticates,
+/// the data dir is trusted and the name is a known profile.
+pub fn persisted(dir: &DataDir) -> Option<String> {
+    match load(dir) {
+        Loaded::Valid(r) if dir.trusted && is_known_profile(&r.profile) => Some(r.profile),
+        _ => None,
+    }
+}
+
+/// Persist `profile` as the active profile. The caller decides whether it needed a
+/// confirmation ([`is_looser`]).
 ///
 /// Returns an error if `profile` is not one of the [`KNOWN_PROFILES`].
-pub fn set(plugin_data: &Path, profile: &str) -> std::io::Result<()> {
+pub fn set(dir: &DataDir, profile: &str, now: u64) -> Result<(), EngineError> {
     if !is_known_profile(profile) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "unknown profile '{profile}'; expected one of {}",
-                KNOWN_PROFILES.join("|")
-            ),
-        ));
+        return Err(Error::Other(unknown_profile(profile)));
     }
-    std::fs::create_dir_all(plugin_data)?;
     let record = ModeRecord {
         profile: profile.to_string(),
-        set_at: now_secs(),
+        set_at: now,
     };
-    let path = plugin_data.join("mode.json");
-    let tmp = plugin_data.join("mode.json.tmp");
-    let body = serde_json::to_string(&record).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)
+    statefile::store(dir, MODE_FILE, &record)
 }
 
-/// Current time in epoch seconds (0 on clock error; never panics).
-fn now_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// The error for a profile name outside [`KNOWN_PROFILES`] (the name is not echoed: it may
+/// be anything).
+pub fn unknown_profile(profile: &str) -> String {
+    let shown: String = profile
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .take(20)
+        .collect();
+    format!(
+        "unknown profile `{shown}`; expected one of {}",
+        KNOWN_PROFILES.join("|")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grants::tests::tmp_data;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "safe_ai_skill_mode_{}_{}_{}",
-            tag,
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    #[test]
+    fn set_then_persisted_roundtrip() {
+        let dir = tmp_data("mode_roundtrip");
+        set(&dir, "autopilot", 7).unwrap();
+        assert_eq!(persisted(&dir), Some("autopilot".to_string()));
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
-    fn set_then_get_roundtrip() {
-        let dir = tmp_dir("roundtrip");
-        set(&dir, "autopilot").unwrap();
-        assert_eq!(get_with(&dir, None), Some("autopilot".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn none_when_unset() {
+        let dir = tmp_data("mode_unset");
+        assert_eq!(persisted(&dir), None);
     }
 
     #[test]
-    fn get_none_when_unset() {
-        let dir = tmp_dir("unset");
-        assert_eq!(get_with(&dir, None), None);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn unknown_and_deleted_profiles_rejected() {
+        let dir = tmp_data("mode_invalid");
+        for bad in ["turbo", "off", "", "Strict"] {
+            assert!(set(&dir, bad, 0).is_err(), "{bad}");
+        }
+        assert!(!dir.path.join(MODE_FILE).exists());
     }
 
     #[test]
-    fn invalid_profile_rejected() {
-        let dir = tmp_dir("invalid");
-        assert!(set(&dir, "turbo").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_hand_written_mode_json_is_ignored() {
+        let dir = tmp_data("mode_forged");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        std::fs::write(
+            dir.path.join(MODE_FILE),
+            r#"{"profile":"autopilot","set_at":0}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&dir), Loaded::Tampered);
+        assert_eq!(persisted(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
-    fn env_overrides_file() {
-        let dir = tmp_dir("env");
-        set(&dir, "strict").unwrap();
-        assert_eq!(
-            get_with(&dir, Some("paranoid")),
-            Some("paranoid".to_string())
-        );
-        // Garbage env value is ignored; file value wins.
-        assert_eq!(get_with(&dir, Some("garbage")), Some("strict".to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn an_untrusted_data_dir_selects_nothing() {
+        let mut dir = tmp_data("mode_untrusted");
+        set(&dir, "autopilot", 0).unwrap();
+        dir.trusted = false;
+        assert_eq!(persisted(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn looser_means_toward_autopilot() {
+        assert!(is_looser("autopilot", "strict"));
+        assert!(is_looser("autopilot", "paranoid"));
+        assert!(is_looser("strict", "paranoid"));
+        assert!(!is_looser("strict", "autopilot"));
+        assert!(!is_looser("paranoid", "strict"));
+        assert!(!is_looser("strict", "strict"));
+        // An unknown current profile counts as strict; an unknown target is never "safe".
+        assert!(is_looser("autopilot", "off"));
+        assert!(!is_looser("paranoid", "garbage"));
+        assert!(is_looser("garbage", "strict"));
     }
 }

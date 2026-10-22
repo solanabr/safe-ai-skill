@@ -145,18 +145,48 @@ safe-ai-skill registry list          # list catalog entries with risk classifica
 safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
-safe-ai-skill verify                 # sweep installed skills and MCPs and pin new packs (what SessionStart runs)
+safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
 safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
-safe-ai-skill status                 # active profile, live grants, spend, recent decisions
-safe-ai-skill mode <profile>         # switch profile (strict / autopilot / paranoid / off); bare `mode` shows it
-safe-ai-skill allow --scope <scope> --for <duration> [--max-tx <SOL>] [--budget <SOL>]
-                                     # time-boxed grant for a soft gate (e.g. --scope transfer --for 30m)
-safe-ai-skill revoke                 # cancel grants early
-safe-ai-skill session                # show session keypair state
+safe-ai-skill status                 # pins, active profile, live grants, spend, recent decisions
+safe-ai-skill mode <profile>         # strict (default) | paranoid | autopilot (needs confirmation)
+safe-ai-skill allow --scope transfer --for 30m --max-tx 1 --budget 5 [--to <addr>]
+                                     # request a time-boxed grant (needs confirmation)
+safe-ai-skill revoke                 # drop every grant at once
+safe-ai-skill session                # show active session state
 ```
 
-`allow`, `revoke`, `mode <profile>`, `verify approve`, `install` and `add` change what the firewall permits or pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
+`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. The agent may run `allow` and `mode`: they only create a request it cannot confirm. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
+
+**Relaxations need your confirmation in the prompt.** `allow` and `mode autopilot` change
+nothing on their own: they record a request (`request r3fa91c`) and print no code. Claude Code
+then shows **you** a confirmation code in a hook message (right after the command, or at your
+next prompt or session start) that is never put in the agent's context. The request takes
+effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
+(within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
+pasted text is refused, and three wrong codes cancel every pending request. The agent may run
+`allow` itself: it only creates a request it cannot confirm. In headless `claude -p`, where
+hook messages aren't shown, nothing can be confirmed. A stricter `mode` and `revoke` apply at
+once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
+else is an error.
+
+**Profiles.** `strict` is the default. `paranoid` asks for every Solana CLI command and
+disables every automatic allow, grants included (it does not add prompts for MCP tools or file
+reads that otherwise have no opinion). `autopilot` raises the per-transaction cap
+to 2 SOL and applies only through a confirmed `safe-ai-skill mode autopilot`.
+`SAFE_AI_SKILL_PROFILE` can only pick a stricter profile. To turn the hooks off, set
+`SAFE_AI_SKILL_DISABLE=1`.
+
+**State is authenticated.** Grants, the mode, the daily spend ledger and session metadata are
+signed with a per-install key in the plugin data directory, and each file carries a
+generation, so a hand-edited file or an older copy put back is ignored, and a deleted or edited
+spend ledger counts as today's budget spent. This is tamper-evident, not tamper-proof: code
+running as you outside the Claude Code sandbox can read the key, run the hook commands itself
+or restore a snapshot of the whole directory. The sandbox is the hard boundary. At the first
+1.1.0 session, unexpired 1.0 grants and an `autopilot` mode become pending requests you can
+confirm with the codes shown then; the 1.0 spend ledger becomes today's exhausted budget. Every session start
+lists what is currently loosened: a profile env var, a non-default mode, live grants, ignored
+repo policy, state that failed authentication, and a Claude Code sandbox that is off.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 

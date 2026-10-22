@@ -37,6 +37,15 @@ fn decide(command: &str, network: Network) -> (Decision, GateMeta) {
     )
 }
 
+/// The always-on hook's prefilter for `command`, with a fresh data dir (the process env's
+/// would be the developer's real one, or none: a missing spend ledger then asks).
+fn prefilter(command: &str, policy: &Policy) -> Option<(Decision, GateMeta)> {
+    let dir = TempDir::new("prefilter");
+    let mut ctx = Context::build(command, Path::new("."));
+    ctx.plugin_data = dir.join("data");
+    bash::indirection_prefilter_in(command, &ctx, policy)
+}
+
 fn is_ask(d: &Decision) -> bool {
     matches!(d, Decision::Ask { .. })
 }
@@ -148,11 +157,7 @@ fn indirect_transfer_follows_spend_rules_but_the_prefilter_never_allows() {
             "{cmd}: {d:?}"
         );
         assert!(!meta.hard_guard, "{cmd}");
-        assert_eq!(
-            bash::indirection_prefilter(&cmd, Path::new("."), &policy),
-            None,
-            "{cmd}"
-        );
+        assert_eq!(prefilter(&cmd, &policy), None, "{cmd}");
     }
 }
 
@@ -396,18 +401,13 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
         "bash -c 'anchor deploy --provider.cluster mainnet'".to_string(),
         format!("FOO=1 solana transfer -um {DEST} 1"),
     ] {
-        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+        match prefilter(&cmd, &policy) {
             Some((Decision::Ask { .. }, _)) => {}
             other => panic!("{cmd}: {other:?}"),
         }
     }
     // A fully parsed routed command keeps the gate's own meta: a grant may relax it.
-    let (_, meta) = bash::indirection_prefilter(
-        &format!("sudo solana transfer -um {DEST} 0.5"),
-        Path::new("."),
-        &policy,
-    )
-    .unwrap();
+    let (_, meta) = prefilter(&format!("sudo solana transfer -um {DEST} 0.5"), &policy).unwrap();
     assert!(!meta.hard_guard);
     let (d, _) = decide(
         "bash -c 'solana program deploy -um --final p.so'",
@@ -415,11 +415,7 @@ fn prefilter_routes_indirect_solana_to_the_gate() {
     );
     assert!(is_deny(&d), "{d:?}");
     assert!(matches!(
-        bash::indirection_prefilter(
-            "bash -c 'solana program deploy -um --final p.so'",
-            Path::new("."),
-            &policy
-        ),
+        prefilter("bash -c 'solana program deploy -um --final p.so'", &policy),
         Some((Decision::Deny { .. }, _))
     ));
 }
@@ -445,11 +441,7 @@ fn prefilter_leaves_direct_and_unrelated_commands_alone() {
         "bash -c 'solana balance'".to_string(),
         format!("bash -c 'solana transfer -ud {DEST} 0.5'"),
     ] {
-        assert_eq!(
-            bash::indirection_prefilter(&cmd, Path::new("."), &policy),
-            None,
-            "{cmd}"
-        );
+        assert_eq!(prefilter(&cmd, &policy), None, "{cmd}");
     }
 }
 
@@ -495,7 +487,7 @@ fn probe_rows() -> Vec<String> {
 fn probe_rows_get_a_verdict_from_the_always_on_hook() {
     let policy = Policy::default();
     for cmd in probe_rows() {
-        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+        match prefilter(&cmd, &policy) {
             Some((Decision::Ask { .. } | Decision::Deny { .. }, _)) => {}
             other => panic!("{cmd}: {other:?}"),
         }
@@ -524,7 +516,7 @@ fn expansion_built_family_commands_ask_as_hard_guard() {
     for cmd in expansion_rows() {
         let (d, meta) = decide(&cmd, Network::Devnet);
         assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
-        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+        match prefilter(&cmd, &policy) {
             Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
             other => panic!("{cmd}: {other:?}"),
         }
@@ -570,7 +562,7 @@ fn round3_rows_ask_as_hard_guard_from_both_hooks() {
     for cmd in round3_rows() {
         let (d, meta) = decide(&cmd, Network::Devnet);
         assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
-        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+        match prefilter(&cmd, &policy) {
             Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
             other => panic!("{cmd}: {other:?}"),
         }
@@ -614,11 +606,7 @@ fn round4_quiet_rows_have_no_opinion() {
     for cmd in round4_quiet_rows() {
         let (d, _) = decide(cmd, Network::Mainnet);
         assert_eq!(d, Decision::Defer, "{cmd}");
-        assert_eq!(
-            bash::indirection_prefilter(cmd, Path::new("."), &policy),
-            None,
-            "{cmd}"
-        );
+        assert_eq!(prefilter(cmd, &policy), None, "{cmd}");
     }
 }
 
@@ -659,7 +647,7 @@ fn round4_ask_rows_ask_as_hard_guard_from_both_hooks() {
     for cmd in round4_ask_rows() {
         let (d, meta) = decide(&cmd, Network::Devnet);
         assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
-        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+        match prefilter(&cmd, &policy) {
             Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
             other => panic!("{cmd}: {other:?}"),
         }
@@ -704,11 +692,7 @@ fn data_mentions_have_no_opinion() {
     ] {
         let (d, _) = decide(cmd, Network::Devnet);
         assert_eq!(d, Decision::Defer, "{cmd}");
-        assert_eq!(
-            bash::indirection_prefilter(cmd, Path::new("."), &policy),
-            None,
-            "{cmd}"
-        );
+        assert_eq!(prefilter(cmd, &policy), None, "{cmd}");
     }
     // gate-bash's own rules decide these; the always-on hook defers to it.
     let (d, _) = decide("cd app && anchor test", Network::Devnet);

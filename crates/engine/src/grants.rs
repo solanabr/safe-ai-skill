@@ -1,18 +1,46 @@
-//! Scoped, expiring, audited grants (`${CLAUDE_PLUGIN_DATA}/grants.json`).
+//! Scoped, expiring, audited grants (`${DATA}/grants.json`, authenticated, spec D4.2).
 //!
 //! A grant is a user-issued escape hatch that lets the relaxation layer upgrade an `Ask`
 //! into an `Allow` for actions matching its scope, within a budget and before it expires.
 //! Hard guards are never relaxable, so a grant cannot cover them.
+//!
+//! `grants.json` is a [`crate::statefile`] envelope. A grant only ever reaches it through a
+//! confirmed prompt nonce (spec D4.1): `safe-ai-skill allow` builds a [`GrantRequest`] and
+//! parks it as a pending entry; the `UserPromptSubmit` hook turns it into a [`Grant`] when the
+//! user types the nonce ([`crate::relax::confirm_prompt`]). [`live`] is the only view the
+//! relaxation layer reads: it is empty unless the file authenticates and the data dir is
+//! trusted ([`DataDir::trusted`]).
 
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::datadir::DataDir;
+use crate::error::{EngineError, Error};
 use crate::gate::{GateMeta, Scope};
+use crate::statefile::{self, FileLock, Loaded};
+
+/// State file holding the grants.
+pub const GRANTS_FILE: &str = "grants.json";
+
+/// Lock serializing read-modify-writes of [`GRANTS_FILE`] (parallel hooks must not overspend).
+const GRANTS_LOCK: &str = "grants.lock";
+
+/// Longest a grant may run (30 days).
+const MAX_GRANT_SECS: u64 = 30 * 86_400;
+
+/// The scopes a grant may name. `other` is gone (spec D1.9) and `secret_read` is always a
+/// hard guard, so a grant could never apply to it.
+pub const GRANTABLE_SCOPES: [Scope; 5] = [
+    Scope::Transfer,
+    Scope::Swap,
+    Scope::Deploy,
+    Scope::Authority,
+    Scope::Destructive,
+];
 
 /// A single scoped grant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grant {
     /// Opaque grant id.
     pub id: String,
@@ -72,9 +100,10 @@ impl Grant {
         amount <= self.remaining_sol()
     }
 
-    /// Whether this grant matches `meta` ignoring expiry (caller checks expiry).
+    /// Whether this grant matches `meta` ignoring expiry (caller checks expiry). A scope
+    /// outside [`GRANTABLE_SCOPES`] never matches, whatever the file says.
     fn matches(&self, meta: &GateMeta) -> bool {
-        if self.scope != meta.scope {
+        if self.scope != meta.scope || !GRANTABLE_SCOPES.contains(&self.scope) {
             return false;
         }
         // Program restriction (empty = any).
@@ -94,11 +123,50 @@ impl Grant {
         self.permits_amount(meta.amount_sol)
     }
 
-    /// Build a grant from parsed `allow`-subcommand arguments.
+    /// One line for the user: what this grant permits and until when.
+    pub fn describe(&self, now: u64) -> String {
+        format!(
+            "grant {}: {}, {} of {} SOL left, at most {} SOL per tx, {}; {}, expires in {}{}",
+            self.id,
+            self.scope.label(),
+            self.remaining_sol(),
+            self.budget_sol,
+            self.max_tx_sol,
+            list_or_any("programs", &self.programs),
+            list_or_any("destinations", &self.to),
+            human_secs(self.expires_at.saturating_sub(now)),
+            if self.danger { " (danger)" } else { "" },
+        )
+    }
+}
+
+/// A grant the user asked for but has not confirmed yet: the payload of a
+/// [`crate::confirm::PendingKind::Grant`] entry. The clock starts at confirmation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GrantRequest {
+    /// Scope (one of [`GRANTABLE_SCOPES`]).
+    pub scope: Scope,
+    /// How long the grant runs once confirmed.
+    pub for_secs: u64,
+    /// Maximum SOL per matched transaction.
+    pub max_tx_sol: f64,
+    /// Total SOL budget.
+    pub budget_sol: f64,
+    /// Program ids (empty = any).
+    pub programs: Vec<String>,
+    /// Destination addresses (empty = any).
+    pub to: Vec<String>,
+    /// The user opted into a dangerous action.
+    pub danger: bool,
+}
+
+impl GrantRequest {
+    /// Validate `allow`-subcommand arguments.
     ///
-    /// `for_dur` is a human duration (`30m`, `2h`, `90s`, `1d`); `expires_at` is computed as
-    /// `now + parsed_seconds`. A CSV `programs`/`to` string is split on commas and trimmed;
-    /// empty entries are dropped. Returns `None` if the scope or duration cannot be parsed.
+    /// The scope must be one of [`GRANTABLE_SCOPES`]; the duration a positive human duration
+    /// (`30m`, `2h`, `90s`, `1d`) of at most 30 days; the amounts finite and non-negative;
+    /// each program/destination a base58 address. Everything here ends up in the message the
+    /// user confirms, so nothing free-form is accepted.
     #[allow(clippy::too_many_arguments)]
     pub fn from_args(
         scope: &str,
@@ -108,57 +176,169 @@ impl Grant {
         programs_csv: &str,
         to_csv: &str,
         danger: bool,
-        now: u64,
-    ) -> Option<Grant> {
-        let secs = parse_duration_secs(for_dur)?;
-        let expires_at = now.checked_add(secs)?;
-        let scope = Scope::from_label(scope);
-        Some(Grant {
-            id: new_id(now),
+    ) -> Result<GrantRequest, String> {
+        let scope = grantable_scope(scope)?;
+        let for_secs = parse_duration_secs(for_dur)
+            .filter(|s| *s > 0)
+            .ok_or_else(|| {
+                format!(
+                    "--for: expected a duration like 30m, 2h or 1d, got `{}`",
+                    printable(for_dur)
+                )
+            })?;
+        if for_secs > MAX_GRANT_SECS {
+            return Err("--for: a grant may run at most 30 days".to_string());
+        }
+        for (flag, v) in [("--max-tx", max_tx_sol), ("--budget", budget_sol)] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("{flag}: expected a non-negative SOL amount"));
+            }
+        }
+        Ok(GrantRequest {
             scope,
-            programs: split_csv(programs_csv),
-            to: split_csv(to_csv),
+            for_secs,
             max_tx_sol,
             budget_sol,
+            programs: addresses("--programs", programs_csv)?,
+            to: addresses("--to", to_csv)?,
+            danger,
+        })
+    }
+
+    /// The human summary shown when the request is created and echoed when it is confirmed.
+    pub fn summary(&self) -> String {
+        format!(
+            "grant {} for {}: at most {} SOL per tx, {} SOL budget, {}; {}{}",
+            self.scope.label(),
+            human_secs(self.for_secs),
+            self.max_tx_sol,
+            self.budget_sol,
+            list_or_any("programs", &self.programs),
+            list_or_any("destinations", &self.to),
+            if self.danger { " (danger)" } else { "" },
+        )
+    }
+
+    /// The grant this request becomes when confirmed at `now`. Re-validates, because the
+    /// payload came back from disk.
+    pub fn activate(&self, now: u64, id: String) -> Result<Grant, String> {
+        if !GRANTABLE_SCOPES.contains(&self.scope)
+            || self.for_secs == 0
+            || self.for_secs > MAX_GRANT_SECS
+            || !self.max_tx_sol.is_finite()
+            || self.max_tx_sol < 0.0
+            || !self.budget_sol.is_finite()
+            || self.budget_sol < 0.0
+            || !self.programs.iter().chain(&self.to).all(|a| is_address(a))
+        {
+            return Err("the pending grant is invalid".to_string());
+        }
+        let expires_at = now
+            .checked_add(self.for_secs)
+            .ok_or_else(|| "the grant expiry overflows".to_string())?;
+        Ok(Grant {
+            id,
+            scope: self.scope,
+            programs: self.programs.clone(),
+            to: self.to.clone(),
+            max_tx_sol: self.max_tx_sol,
+            budget_sol: self.budget_sol,
             spent_sol: 0.0,
             expires_at,
-            danger,
+            danger: self.danger,
         })
     }
 }
 
-/// All active grants, persisted as a JSON object under `grants.json`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// All grants, the body of `grants.json`.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Grants {
     /// The grants.
     pub grants: Vec<Grant>,
 }
 
-/// Load grants from `${plugin_data}/grants.json` (missing/corrupt → empty).
-pub fn load(plugin_data: &Path) -> Grants {
-    let path = plugin_data.join("grants.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Grants::default(),
+/// Parse a grant scope label: one of [`GRANTABLE_SCOPES`], else an error naming them.
+pub fn grantable_scope(label: &str) -> Result<Scope, String> {
+    GRANTABLE_SCOPES
+        .iter()
+        .copied()
+        .find(|s| s.label() == label)
+        .ok_or_else(|| {
+            let known: Vec<&str> = GRANTABLE_SCOPES.iter().map(Scope::label).collect();
+            let why = if label == Scope::SecretRead.label() {
+                "secret reads are a hard guard; no grant covers them".to_string()
+            } else {
+                format!("unknown scope `{}`", printable(label))
+            };
+            format!("--scope: {why}; expected one of {}", known.join("|"))
+        })
+}
+
+/// Load and authenticate `grants.json`. The caller picks the fail direction.
+pub fn load(dir: &DataDir) -> Loaded<Grants> {
+    statefile::load(dir, GRANTS_FILE)
+}
+
+/// The grants the relaxation layer may use: the authenticated file in a trusted data dir.
+/// Missing, tampered or untrusted → none.
+pub fn live(dir: &DataDir) -> Grants {
+    match load(dir) {
+        Loaded::Valid(g) if dir.trusted => g,
+        _ => Grants::default(),
     }
 }
 
-/// Persist grants to `${plugin_data}/grants.json` (write-temp + rename).
-pub fn save(plugin_data: &Path, grants: &Grants) -> std::io::Result<()> {
-    std::fs::create_dir_all(plugin_data)?;
-    let path = plugin_data.join("grants.json");
-    let tmp = plugin_data.join("grants.json.tmp");
-    let body = serde_json::to_string(grants).map_err(std::io::Error::other)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)
+/// Persist grants as an authenticated envelope (under the grants lock).
+pub fn save(dir: &DataDir, grants: &Grants) -> Result<(), EngineError> {
+    let _lock = lock(dir)?;
+    statefile::store(dir, GRANTS_FILE, grants)
+}
+
+fn lock(dir: &DataDir) -> Result<FileLock, EngineError> {
+    statefile::create_dir_private(&dir.path)?;
+    FileLock::acquire(&dir.path, GRANTS_LOCK)
+}
+
+/// Add a confirmed grant: expired grants are dropped first. A tampered file is replaced
+/// (none of its grants could apply); returns whether that happened.
+pub fn add(dir: &DataDir, grant: Grant, now: u64) -> Result<bool, EngineError> {
+    let _lock = lock(dir)?;
+    let (mut grants, replaced) = match load(dir) {
+        Loaded::Valid(g) => (g, false),
+        Loaded::Missing => (Grants::default(), false),
+        Loaded::Tampered => (Grants::default(), true),
+    };
+    grants.grants.retain(|g| !g.is_expired(now));
+    grants.grants.push(grant);
+    statefile::store(dir, GRANTS_FILE, &grants)?;
+    Ok(replaced)
+}
+
+/// A fresh grant id, distinct from every id in `grants.json`.
+pub fn new_id(dir: &DataDir, now: u64) -> String {
+    let taken = match load(dir) {
+        Loaded::Valid(g) => g.grants.into_iter().map(|g| g.id).collect(),
+        _ => Vec::new(),
+    };
+    let mut n = 0u32;
+    loop {
+        let id = if n == 0 {
+            format!("grant-{now:x}")
+        } else {
+            format!("grant-{now:x}-{n}")
+        };
+        if !taken.contains(&id) {
+            return id;
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 /// Find a non-expired grant matching `meta` (scope + program/destination + within caps).
 ///
 /// Returns the first matching grant. Expiry is checked against the current wall clock.
 pub fn find_match<'a>(grants: &'a Grants, meta: &GateMeta) -> Option<&'a Grant> {
-    let now = now_secs();
-    find_match_at(grants, meta, now)
+    find_match_at(grants, meta, now_secs())
 }
 
 /// [`find_match`] with an explicit `now`, for deterministic tests.
@@ -171,63 +351,124 @@ pub fn find_match_at<'a>(grants: &'a Grants, meta: &GateMeta, now: u64) -> Optio
 
 /// Debit `sol_amount` from the grant with `grant_id`, persisting the result.
 ///
-/// Uses checked floating-point accumulation: a non-finite or negative `sol_amount` is
-/// rejected, and the running `spent_sol` is clamped so it never exceeds the budget. A
-/// missing grant id is a no-op (returns `Ok`).
-pub fn debit(plugin_data: &Path, grant_id: &str, sol_amount: f64) -> std::io::Result<()> {
+/// Under the grants lock the grant is re-read and must still exist, be unexpired, and cover
+/// the amount (per-tx cap and remaining budget); otherwise it is an error and nothing is
+/// charged, so two parallel hooks cannot both spend the last of a budget. A non-finite or
+/// negative `sol_amount` is rejected. Only an authenticated file is debited.
+pub fn debit(dir: &DataDir, grant_id: &str, sol_amount: f64) -> Result<(), EngineError> {
     if !sol_amount.is_finite() || sol_amount < 0.0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "debit amount must be a finite, non-negative SOL value",
+        return Err(Error::Other(
+            "debit amount must be a finite, non-negative SOL value".to_string(),
         ));
     }
-    let mut grants = load(plugin_data);
-    let mut changed = false;
-    for g in &mut grants.grants {
-        if g.id == grant_id {
-            let prior = if g.spent_sol.is_finite() && g.spent_sol >= 0.0 {
-                g.spent_sol
-            } else {
-                0.0
-            };
-            // Saturating add then clamp to budget (never overshoot, never NaN).
-            let next = prior + sol_amount;
-            let next = if next.is_finite() { next } else { f64::MAX };
-            g.spent_sol = if g.budget_sol.is_finite() && g.budget_sol >= 0.0 {
-                next.min(g.budget_sol)
-            } else {
-                next
-            };
-            changed = true;
-            break;
-        }
-    }
-    if changed {
-        save(plugin_data, &grants)?;
-    }
-    Ok(())
+    let _lock = lock(dir)?;
+    let Loaded::Valid(mut grants) = load(dir) else {
+        return Err(Error::Other(
+            "grants.json is missing or failed authentication".to_string(),
+        ));
+    };
+    let now = now_secs();
+    let Some(g) = grants
+        .grants
+        .iter_mut()
+        .find(|g| g.id == grant_id && !g.is_expired(now) && g.permits_amount(Some(sol_amount)))
+    else {
+        return Err(Error::Other(format!(
+            "grant {grant_id} no longer covers {sol_amount} SOL"
+        )));
+    };
+    let prior = if g.spent_sol.is_finite() && g.spent_sol >= 0.0 {
+        g.spent_sol
+    } else {
+        0.0
+    };
+    // Saturating add then clamp to budget (never overshoot, never NaN).
+    let next = prior + sol_amount;
+    let next = if next.is_finite() { next } else { f64::MAX };
+    g.spent_sol = if g.budget_sol.is_finite() && g.budget_sol >= 0.0 {
+        next.min(g.budget_sol)
+    } else {
+        next
+    };
+    statefile::store(dir, GRANTS_FILE, &grants)
 }
 
-/// Drop expired grants and persist; returns the number removed.
-pub fn cleanup_expired(plugin_data: &Path) -> usize {
+/// Drop expired grants from an authenticated file and persist; returns the number removed.
+pub fn cleanup_expired(dir: &DataDir) -> usize {
+    let Ok(_lock) = lock(dir) else {
+        return 0;
+    };
     let now = now_secs();
-    let mut grants = load(plugin_data);
+    let Loaded::Valid(mut grants) = load(dir) else {
+        return 0;
+    };
     let before = grants.grants.len();
     grants.grants.retain(|g| !g.is_expired(now));
     let removed = before - grants.grants.len();
     if removed > 0 {
-        let _ = save(plugin_data, &grants);
+        let _ = statefile::store(dir, GRANTS_FILE, &grants);
     }
     removed
 }
 
-/// Split a CSV string into trimmed, non-empty entries.
-fn split_csv(csv: &str) -> Vec<String> {
-    csv.split(',')
+/// Split a CSV of base58 addresses; anything else is an error.
+fn addresses(flag: &str, csv: &str) -> Result<Vec<String>, String> {
+    let list: Vec<String> = csv
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .collect()
+        .collect();
+    match list.iter().find(|a| !is_address(a)) {
+        Some(bad) => Err(format!(
+            "{flag}: `{}` is not a base58 address",
+            printable(bad)
+        )),
+        None => Ok(list),
+    }
+}
+
+/// A base58 Solana address: 32 to 44 base58 characters.
+pub(crate) fn is_address(s: &str) -> bool {
+    (32..=44).contains(&s.len())
+        && s.chars().all(
+            |c| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z'),
+        )
+}
+
+/// `"<what> any"` or `"<what> a, b"`.
+fn list_or_any(what: &str, list: &[String]) -> String {
+    if list.is_empty() {
+        format!("{what} any")
+    } else {
+        format!("{what} {}", list.join(", "))
+    }
+}
+
+/// Echo user/model input in an error with control characters and length bounded.
+fn printable(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(40).collect()
+}
+
+/// `90s`, `30m`, `2h`, `1d`, or a mix for uneven values (`1h30m`).
+pub fn human_secs(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        secs % 86_400 / 3_600,
+        secs % 3_600 / 60,
+        secs % 60,
+    );
+    let mut out = String::new();
+    for (n, unit) in [(d, "d"), (h, "h"), (m, "m"), (s, "s")] {
+        if n > 0 {
+            out.push_str(&format!("{n}{unit}"));
+        }
+    }
+    if out.is_empty() {
+        "0s".to_string()
+    } else {
+        out
+    }
 }
 
 /// Parse a human duration like `30m`, `2h`, `90s`, `7d`, or a bare number (seconds).
@@ -251,11 +492,6 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     n.checked_mul(mult)
 }
 
-/// Generate a short, time-seeded grant id.
-fn new_id(now: u64) -> String {
-    format!("grant-{now:x}")
-}
-
 /// Current time in epoch seconds (0 on clock error; never panics).
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -265,21 +501,27 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "safe_ai_skill_grants_{}_{}_{}",
-            tag,
-            std::process::id(),
-            now_secs()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A fresh, trusted data dir under the temp dir.
+    pub(crate) fn tmp_data(tag: &str) -> DataDir {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        DataDir {
+            path: std::env::temp_dir().join(format!(
+                "safe_ai_skill_grants_{tag}_{}_{nanos}",
+                std::process::id()
+            )),
+            trusted: true,
+        }
     }
 
-    fn transfer_grant(id: &str, expires_at: u64) -> Grant {
+    pub(crate) const ADDR: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+
+    pub(crate) fn transfer_grant(id: &str, expires_at: u64) -> Grant {
         Grant {
             id: id.to_string(),
             scope: Scope::Transfer,
@@ -321,11 +563,8 @@ mod tests {
         let grants = Grants {
             grants: vec![transfer_grant("g1", 10_000)],
         };
-        // matching scope + amount within cap
         assert!(find_match_at(&grants, &transfer_meta(Some(0.5)), 100).is_some());
-        // amount over per-tx cap
         assert!(find_match_at(&grants, &transfer_meta(Some(2.0)), 100).is_none());
-        // wrong scope
         let swap = GateMeta {
             scope: Scope::Swap,
             amount_sol: Some(0.1),
@@ -337,11 +576,19 @@ mod tests {
     }
 
     #[test]
+    fn an_other_scope_grant_in_the_file_never_matches() {
+        let mut g = transfer_grant("g1", 10_000);
+        g.scope = Scope::Other;
+        let grants = Grants { grants: vec![g] };
+        let meta = GateMeta::unknown();
+        assert!(find_match_at(&grants, &meta, 100).is_none());
+    }
+
+    #[test]
     fn no_match_when_expired() {
         let grants = Grants {
             grants: vec![transfer_grant("g1", 50)],
         };
-        // now (100) is past expiry (50)
         assert!(find_match_at(&grants, &transfer_meta(Some(0.5)), 100).is_none());
     }
 
@@ -367,93 +614,241 @@ mod tests {
         g.budget_sol = 1.0;
         g.spent_sol = 1.0;
         let grants = Grants { grants: vec![g] };
-        // remaining is 0, so even a tiny amount fails the budget check
         assert!(find_match_at(&grants, &transfer_meta(Some(0.1)), 100).is_none());
     }
 
     #[test]
     fn debit_is_checked_and_clamped() {
-        let dir = tmp_dir("debit");
-        let grants = Grants {
-            grants: vec![transfer_grant("g1", 10_000)],
-        };
-        save(&dir, &grants).unwrap();
+        let dir = tmp_data("debit");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("g1", u64::MAX)],
+            },
+        )
+        .unwrap();
 
-        debit(&dir, "g1", 2.0).unwrap();
-        let after = load(&dir);
-        assert_eq!(after.grants[0].spent_sol, 2.0);
+        // max_tx 1.0, budget 5.0.
+        debit(&dir, "g1", 1.0).unwrap();
+        assert_eq!(live(&dir).grants[0].spent_sol, 1.0);
+        // Over the per-tx cap, or past the remaining budget: refused, nothing charged.
+        assert!(debit(&dir, "g1", 2.0).is_err());
+        for _ in 0..4 {
+            debit(&dir, "g1", 1.0).unwrap();
+        }
+        assert!(debit(&dir, "g1", 0.5).is_err());
+        assert_eq!(live(&dir).grants[0].spent_sol, 5.0);
 
-        // Debiting past the budget clamps to budget_sol, never overshoots.
-        debit(&dir, "g1", 100.0).unwrap();
-        let after = load(&dir);
-        assert_eq!(after.grants[0].spent_sol, 5.0);
-
-        // Negative / non-finite debits are rejected.
         assert!(debit(&dir, "g1", -1.0).is_err());
         assert!(debit(&dir, "g1", f64::NAN).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
-    fn debit_missing_grant_is_noop() {
-        let dir = tmp_dir("debit_missing");
+    fn debit_missing_grant_is_an_error() {
+        let dir = tmp_data("debit_missing");
         save(&dir, &Grants::default()).unwrap();
-        assert!(debit(&dir, "nope", 1.0).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(debit(&dir, "nope", 1.0).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn parallel_debits_never_overspend() {
+        let dir = tmp_data("parallel");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("g1", u64::MAX)],
+            },
+        )
+        .unwrap();
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || loop {
+                    match debit(&dir, "g1", 1.0) {
+                        Err(e) if e.to_string().contains("busy") => continue,
+                        other => break other.is_ok(),
+                    }
+                })
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(ok, 5, "budget 5 at 1 SOL each");
+        assert_eq!(live(&dir).grants[0].spent_sol, 5.0);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
     fn cleanup_drops_expired_only() {
-        let dir = tmp_dir("cleanup");
-        let grants = Grants {
-            grants: vec![transfer_grant("old", 50), transfer_grant("live", u64::MAX)],
-        };
-        save(&dir, &grants).unwrap();
-        let removed = cleanup_expired(&dir);
-        // "old" expired in the past; "live" survives.
-        assert_eq!(removed, 1);
-        let after = load(&dir);
-        assert_eq!(after.grants.len(), 1);
-        assert_eq!(after.grants[0].id, "live");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn from_args_builds_grant() {
-        let g = Grant::from_args(
-            "transfer",
-            "30m",
-            1.5,
-            10.0,
-            "ProgA, ProgB",
-            "DestA",
-            false,
-            1_000,
+        let dir = tmp_data("cleanup");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("old", 50), transfer_grant("live", u64::MAX)],
+            },
         )
         .unwrap();
-        assert_eq!(g.scope, Scope::Transfer);
-        assert_eq!(g.expires_at, 1_000 + 1_800);
-        assert_eq!(g.programs, vec!["ProgA".to_string(), "ProgB".to_string()]);
-        assert_eq!(g.to, vec!["DestA".to_string()]);
-        assert_eq!(g.max_tx_sol, 1.5);
-        assert_eq!(g.budget_sol, 10.0);
-        assert_eq!(g.spent_sol, 0.0);
-
-        // Bad duration → None.
-        assert!(Grant::from_args("transfer", "nope", 1.0, 1.0, "", "", false, 0).is_none());
+        assert_eq!(cleanup_expired(&dir), 1);
+        let after = live(&dir);
+        assert_eq!(after.grants.len(), 1);
+        assert_eq!(after.grants[0].id, "live");
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
-    fn save_load_roundtrip() {
-        let dir = tmp_dir("roundtrip");
+    fn save_load_roundtrip_is_authenticated() {
+        let dir = tmp_data("roundtrip");
         let grants = Grants {
             grants: vec![transfer_grant("g1", 999)],
         };
         save(&dir, &grants).unwrap();
-        let loaded = load(&dir);
-        assert_eq!(loaded.grants.len(), 1);
-        assert_eq!(loaded.grants[0].id, "g1");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(load(&dir), Loaded::Valid(grants));
+        // The file on disk is an envelope, not the bare grants.
+        let text = std::fs::read_to_string(dir.path.join(GRANTS_FILE)).unwrap();
+        assert!(text.contains("\"mac\""), "{text}");
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn hand_written_or_edited_grants_are_not_live() {
+        let dir = tmp_data("forged");
+        // A plain (1.0-style) grants.json written by hand.
+        std::fs::create_dir_all(&dir.path).unwrap();
+        let plain = serde_json::to_string(&Grants {
+            grants: vec![transfer_grant("forged", u64::MAX)],
+        })
+        .unwrap();
+        std::fs::write(dir.path.join(GRANTS_FILE), &plain).unwrap();
+        assert_eq!(load(&dir), Loaded::Tampered);
+        assert!(live(&dir).grants.is_empty());
+
+        // A genuine file whose budget is then raised by hand.
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("g1", u64::MAX)],
+            },
+        )
+        .unwrap();
+        let path = dir.path.join(GRANTS_FILE);
+        let edited = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"budget_sol\":5.0", "\"budget_sol\":5000.0");
+        std::fs::write(&path, edited).unwrap();
+        assert!(live(&dir).grants.is_empty());
+        assert!(debit(&dir, "g1", 0.1).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn an_untrusted_data_dir_has_no_live_grants() {
+        let mut dir = tmp_data("untrusted");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("g1", u64::MAX)],
+            },
+        )
+        .unwrap();
+        dir.trusted = false;
+        assert!(matches!(load(&dir), Loaded::Valid(_)));
+        assert!(live(&dir).grants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn add_drops_expired_and_replaces_a_tampered_file() {
+        let dir = tmp_data("add");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("old", 50)],
+            },
+        )
+        .unwrap();
+        assert!(!add(&dir, transfer_grant("new", 10_000), 100).unwrap());
+        let ids: Vec<String> = live(&dir).grants.into_iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec!["new".to_string()]);
+
+        std::fs::write(dir.path.join(GRANTS_FILE), "{\"grants\":[]}").unwrap();
+        assert!(add(&dir, transfer_grant("after", 10_000), 100).unwrap());
+        assert_eq!(live(&dir).grants.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn new_ids_do_not_collide() {
+        let dir = tmp_data("ids");
+        let first = new_id(&dir, 0x10);
+        add(&dir, transfer_grant(&first, u64::MAX), 0x10).unwrap();
+        let second = new_id(&dir, 0x10);
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn scopes_are_validated() {
+        for ok in ["transfer", "swap", "deploy", "authority", "destructive"] {
+            assert!(grantable_scope(ok).is_ok(), "{ok}");
+        }
+        for bad in ["other", "", "Transfer", "secret_read", "all", "transfer "] {
+            let err = grantable_scope(bad).unwrap_err();
+            assert!(err.contains("--scope"), "{bad}: {err}");
+        }
+        assert!(grantable_scope("secret_read")
+            .unwrap_err()
+            .contains("hard guard"));
+    }
+
+    #[test]
+    fn request_from_args_validates_everything() {
+        let r = GrantRequest::from_args("transfer", "30m", 1.5, 10.0, ADDR, ADDR, false).unwrap();
+        assert_eq!(r.scope, Scope::Transfer);
+        assert_eq!(r.for_secs, 1_800);
+        assert_eq!(r.programs, vec![ADDR.to_string()]);
+
+        let bad = [
+            GrantRequest::from_args("other", "30m", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("transfer", "nope", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("transfer", "0m", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("transfer", "31d", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("transfer", "1h", f64::NAN, 1.0, "", "", false),
+            GrantRequest::from_args("transfer", "1h", 1.0, -1.0, "", "", false),
+            GrantRequest::from_args("transfer", "1h", 1.0, 1.0, "x\nAPPROVED", "", false),
+            GrantRequest::from_args("transfer", "1h", 1.0, 1.0, "", "not an address", false),
+        ];
+        for (i, b) in bad.iter().enumerate() {
+            assert!(b.is_err(), "case {i}: {b:?}");
+        }
+    }
+
+    #[test]
+    fn request_activates_with_the_clock_starting_at_confirmation() {
+        let r = GrantRequest::from_args("swap", "2h", 1.0, 3.0, "", "", false).unwrap();
+        let g = r.activate(1_000, "grant-x".into()).unwrap();
+        assert_eq!(g.expires_at, 1_000 + 7_200);
+        assert_eq!(g.scope, Scope::Swap);
+        assert_eq!(g.spent_sol, 0.0);
+        assert!(r.summary().contains("swap") && r.summary().contains("2h"));
+
+        let mut forged = r.clone();
+        forged.scope = Scope::Other;
+        assert!(forged.activate(1_000, "g".into()).is_err());
+        forged = r.clone();
+        forged.programs = vec!["evil\ntext".into()];
+        assert!(forged.activate(1_000, "g".into()).is_err());
+    }
+
+    #[test]
+    fn human_durations() {
+        assert_eq!(human_secs(90), "1m30s");
+        assert_eq!(human_secs(1_800), "30m");
+        assert_eq!(human_secs(86_400), "1d");
+        assert_eq!(human_secs(0), "0s");
     }
 }

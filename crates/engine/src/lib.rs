@@ -10,7 +10,8 @@
 //! - Runtime gates: [`gates`].
 //! - Output / prompt guards: [`redact`], [`promptguard`].
 //! - Spend & swap: [`spend`], [`rugcheck`].
-//! - Relaxation layer: [`grants`], [`mode`], [`relax`].
+//! - Relaxation layer: [`grants`], [`mode`], [`relax`], plus [`migrate`] (1.0 state) and
+//!   [`notice`] (the SessionStart loosenings notice).
 //! - Supply chain & session: [`verify`], [`registry`], [`squads`], [`session`].
 //! - Shared contracts (1.1.0): [`datadir`] (where state lives, and whether it is trusted),
 //!   [`statefile`] (MAC'd state), [`confirm`] (prompt-nonce confirmation), and
@@ -27,7 +28,9 @@ pub mod gate;
 pub mod gates;
 pub mod grants;
 pub mod io;
+pub mod migrate;
 pub mod mode;
+pub mod notice;
 pub mod policy;
 pub mod promptguard;
 pub mod redact;

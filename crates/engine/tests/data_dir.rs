@@ -63,7 +63,7 @@ fn cli_without_any_data_dir_errors_with_guidance() {
     let cwd = TempDir::new("ddir-none-cwd");
     for args in [
         &["mode", "strict"][..],
-        &["allow", "--scope", "transfer"],
+        &["allow", "--scope", "transfer", "--for", "30m"],
         &["status"],
     ] {
         let run = Invocation::new(args)

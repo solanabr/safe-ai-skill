@@ -59,19 +59,46 @@ pub fn indirection_prefilter(
 ) -> Option<(Decision, GateMeta)> {
     // The parse is pure and fast; a substring pre-check would miss `$(echo sol)ana`.
     let parsed = shell::parse(command);
-    let routed = parsed.unparseable
+    if !is_routed(&parsed) {
+        return None;
+    }
+    let ctx = Context::build(command, cwd);
+    routed_decision(command, &parsed, &ctx, policy)
+}
+
+/// [`indirection_prefilter`] with a prepared [`Context`] (its network defaults and data dir).
+pub fn indirection_prefilter_in(
+    command: &str,
+    ctx: &Context,
+    policy: &Policy,
+) -> Option<(Decision, GateMeta)> {
+    let parsed = shell::parse(command);
+    if !is_routed(&parsed) {
+        return None;
+    }
+    routed_decision(command, &parsed, ctx, policy)
+}
+
+/// Whether the always-on hook decides `parsed` itself (see [`indirection_prefilter`]).
+fn is_routed(parsed: &Parsed) -> bool {
+    parsed.unparseable
         || parsed.opaque_mention
         || parsed.write_then_run
         || parsed.commands.iter().any(|c| {
             let dynamic_program = c.words.first().is_some_and(|w| w.dynamic);
             let dynamic_words = c.is_family() && c.words.iter().any(|w| w.dynamic);
             dynamic_program || dynamic_words || (c.is_family() && !c.canonical)
-        });
-    if !routed {
-        return None;
-    }
-    let ctx = Context::build(command, cwd);
-    match decide_parsed(command, &parsed, &ctx, policy) {
+        })
+}
+
+/// The gate's decision for a routed command, unless it would allow (never the prefilter's).
+fn routed_decision(
+    command: &str,
+    parsed: &Parsed,
+    ctx: &Context,
+    policy: &Policy,
+) -> Option<(Decision, GateMeta)> {
+    match decide_parsed(command, parsed, ctx, policy) {
         (decision @ (Decision::Ask { .. } | Decision::Deny { .. }), meta) => Some((decision, meta)),
         _ => None,
     }
@@ -969,11 +996,12 @@ mod tests {
             },
             total_sol: 4.8,
         };
-        std::fs::write(
-            ctx.plugin_data.join("spend.json"),
-            serde_json::to_string(&ledger).unwrap(),
-        )
-        .unwrap();
+        // The ledger is an authenticated state file (a plain one counts as exhausted).
+        let dir = crate::datadir::DataDir {
+            path: ctx.plugin_data.clone(),
+            trusted: false,
+        };
+        crate::statefile::store(&dir, crate::spend::SPEND_FILE, &ledger).unwrap();
 
         // 0.5 is under per-tx (1.0) but pushes daily to 5.3 > 5.0.
         let (d, _) = decide(&format!("solana transfer {DEST} 0.5"), &ctx, &policy());

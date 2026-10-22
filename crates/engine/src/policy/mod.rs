@@ -6,9 +6,13 @@
 //! CLOSED on any unrecoverable parse error.
 //!
 //! The relaxation layer is configured here: [`Policy::active_profile`] selects a
-//! [`ProfileOverlay`] (`strict`/`autopilot`/`paranoid`/`off`) applied by
-//! [`Policy::effective`]. [`Policy::hard_guards`] lists scopes that NO profile or grant
-//! may relax.
+//! [`ProfileOverlay`] (spec D1.11): `strict` (default, no overlay), `paranoid` (`ask_all`:
+//! every allow becomes an ask, enforced by [`crate::relax`]) and `autopilot` (raised
+//! per-tx cap, honoured only when it comes from a confirmed `mode.json`). Hard guards are
+//! set by the gates themselves ([`crate::gate::GateMeta::hard_guard`]); no profile, grant
+//! or policy relaxes them. The removed knobs (`off`, `relax_transfer`, `relax_swap`,
+//! `disabled`, `gates`, `hard_guards`) are ignored where an old policy still has them, and
+//! listed in [`Policy::ignored_overrides`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,16 +37,6 @@ spend:
   per_tx_sol_max: 1.0
   hard_tx_sol_max: 10.0
   daily_sol_max: 5.0
-gates:
-  - mainnet_deploy
-  - program_upgrade
-  - set_authority
-  - account_close
-hard_guards:
-  - mainnet_deploy
-  - set_authority
-  - account_close
-  - secret_read
 mcp:
   sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
 swap:
@@ -107,13 +101,9 @@ supply_chain:
 profiles:
   strict: {}
   autopilot:
-    relax_transfer: true
-    relax_swap: true
     per_tx_sol_max: 2.0
   paranoid:
     ask_all: true
-  off:
-    disabled: true
 "#;
 
 /// Environment variable that may select a profile stricter than the active one; a looser or
@@ -141,10 +131,6 @@ pub struct Policy {
     pub network: NetworkPolicy,
     /// Spend caps.
     pub spend: SpendPolicy,
-    /// Always-ask gate names.
-    pub gates: Vec<String>,
-    /// Scopes that may never be relaxed by any profile or grant.
-    pub hard_guards: Vec<String>,
     /// MCP gating policy.
     pub mcp: McpPolicy,
     /// Swap / rugcheck policy.
@@ -308,14 +294,9 @@ fn default_exec_install_scripts() -> String {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ProfileOverlay {
-    /// When `true`, transfers within caps become `Allow` instead of `Ask`.
-    pub relax_transfer: bool,
-    /// When `true`, swaps within caps become `Allow` instead of `Ask`.
-    pub relax_swap: bool,
-    /// When `true`, every soft-gated action becomes `Ask` (paranoid).
+    /// When `true`, no allow survives: every allow (within-cap transfer, grant) becomes an
+    /// `Ask`, and every Solana CLI command asks (paranoid).
     pub ask_all: bool,
-    /// When `true`, soft gates are disabled (off).
-    pub disabled: bool,
     /// Optional per-transaction cap override for this profile.
     pub per_tx_sol_max: Option<f64>,
 }
@@ -487,18 +468,6 @@ impl Default for Policy {
             active_profile: "strict".into(),
             network: NetworkPolicy::default(),
             spend: SpendPolicy::default(),
-            gates: vec![
-                "mainnet_deploy".into(),
-                "program_upgrade".into(),
-                "set_authority".into(),
-                "account_close".into(),
-            ],
-            hard_guards: vec![
-                "mainnet_deploy".into(),
-                "set_authority".into(),
-                "account_close".into(),
-                "secret_read".into(),
-            ],
             mcp: McpPolicy::default(),
             swap: SwapPolicy::default(),
             secrets: SecretsPolicy::default(),
@@ -520,8 +489,6 @@ fn default_profiles() -> BTreeMap<String, ProfileOverlay> {
     m.insert(
         "autopilot".to_string(),
         ProfileOverlay {
-            relax_transfer: true,
-            relax_swap: true,
             per_tx_sol_max: Some(2.0),
             ..ProfileOverlay::default()
         },
@@ -530,13 +497,6 @@ fn default_profiles() -> BTreeMap<String, ProfileOverlay> {
         "paranoid".to_string(),
         ProfileOverlay {
             ask_all: true,
-            ..ProfileOverlay::default()
-        },
-    );
-    m.insert(
-        "off".to_string(),
-        ProfileOverlay {
-            disabled: true,
             ..ProfileOverlay::default()
         },
     );
@@ -647,6 +607,8 @@ impl Policy {
             Err(_) => return Policy::fail_closed(),
         };
 
+        policy.ignored_overrides.extend(removed_settings(&base));
+
         if let Some(text) = project_src {
             apply_project_overlay(&mut policy, &base, text);
         }
@@ -676,18 +638,6 @@ impl Policy {
                 hard_tx_sol_max: 0.0,
                 daily_sol_max: 0.0,
             },
-            gates: vec![
-                "mainnet_deploy".into(),
-                "program_upgrade".into(),
-                "set_authority".into(),
-                "account_close".into(),
-            ],
-            hard_guards: vec![
-                "mainnet_deploy".into(),
-                "set_authority".into(),
-                "account_close".into(),
-                "secret_read".into(),
-            ],
             mcp: McpPolicy::default(),
             swap: SwapPolicy::default(),
             secrets: SecretsPolicy::default(),
@@ -713,17 +663,12 @@ impl Policy {
             && self.spend.daily_sol_max == 0.0
     }
 
-    /// Whether `scope_label` is a hard guard that may never be relaxed.
-    pub fn is_hard_guard(&self, scope_label: &str) -> bool {
-        self.hard_guards.iter().any(|g| g == scope_label)
-    }
-
     /// Apply the active profile overlay onto this base policy, producing the policy that
     /// gates should evaluate against.
     ///
     /// `strict` (or an unknown profile name) is a no-op. `autopilot` may raise
-    /// `per_tx_sol_max`, never above a cap the project overlay lowered. `paranoid`/`off` set
-    /// advisory flags consumed by the relaxation layer and gates. Hard guards are unaffected.
+    /// `per_tx_sol_max`, never above a cap the project overlay lowered. `paranoid` sets
+    /// `ask_all`, which [`crate::relax`] enforces. Hard guards are unaffected.
     pub fn effective(&self) -> Policy {
         let mut out = self.clone();
         // An unknown profile has no overlay → strict.
@@ -745,8 +690,8 @@ impl Policy {
             return None;
         }
         Some(format!(
-            "safe-ai-skill did not apply these policy overrides ({PROJECT_POLICY} and \
-             {PROFILE_ENV} may only tighten the policy):\n - {}",
+            "safe-ai-skill did not apply these policy settings ({PROJECT_POLICY} and \
+             {PROFILE_ENV} may only tighten the policy; removed settings are ignored):\n - {}",
             self.ignored_overrides.join("\n - ")
         ))
     }
@@ -759,6 +704,48 @@ impl Policy {
             .unwrap_or_default()
     }
 }
+
+/// Removed settings (spec D1.11) still present in the base policy `base`, one note each.
+/// They are ignored; the policy still loads.
+fn removed_settings(base: &Yaml) -> Vec<String> {
+    let mut notes = Vec::new();
+    for key in REMOVED_TOP_LEVEL {
+        if base.get(key).is_some() {
+            notes.push(format!("{key}: removed in 1.1.0; ignored"));
+        }
+    }
+    let Some(Yaml::Mapping(profiles)) = base.get("profiles") else {
+        return notes;
+    };
+    for (name, overlay) in profiles {
+        let name: String = name
+            .as_str()
+            .unwrap_or("?")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(20)
+            .collect();
+        if !crate::mode::is_known_profile(&name) {
+            notes.push(format!(
+                "profiles.{name}: removed in 1.1.0 (to turn the hooks off use \
+                 SAFE_AI_SKILL_DISABLE); ignored"
+            ));
+            continue;
+        }
+        for key in REMOVED_PROFILE_KEYS {
+            if overlay.get(key).is_some() {
+                notes.push(format!("profiles.{name}.{key}: removed in 1.1.0; ignored"));
+            }
+        }
+    }
+    notes
+}
+
+/// Top-level policy keys removed in 1.1.0 (never read before either).
+pub(crate) const REMOVED_TOP_LEVEL: [&str; 2] = ["gates", "hard_guards"];
+
+/// Profile overlay keys removed in 1.1.0.
+const REMOVED_PROFILE_KEYS: [&str; 3] = ["relax_transfer", "relax_swap", "disabled"];
 
 /// Read the plugin's on-disk default policy if `${CLAUDE_PLUGIN_ROOT}` points at one.
 fn plugin_default_src() -> Option<String> {
@@ -815,8 +802,6 @@ mod tests {
         assert_eq!(disk.spend.per_tx_sol_max, embedded.spend.per_tx_sol_max);
         assert_eq!(disk.spend.hard_tx_sol_max, embedded.spend.hard_tx_sol_max);
         assert_eq!(disk.spend.daily_sol_max, embedded.spend.daily_sol_max);
-        assert_eq!(disk.gates, embedded.gates);
-        assert_eq!(disk.hard_guards, embedded.hard_guards);
         assert_eq!(
             disk.mcp.sensitive_name_pattern,
             embedded.mcp.sensitive_name_pattern
@@ -889,8 +874,8 @@ mod tests {
         assert_eq!(p.spend.hard_tx_sol_max, 10.0);
         assert!(p.redact.enabled);
         assert!(p.audit.enabled);
-        assert!(p.hard_guards.contains(&"secret_read".to_string()));
         assert!(p.profiles.contains_key("autopilot"));
+        assert!(!p.profiles.contains_key("off"));
     }
 
     #[test]
@@ -899,7 +884,6 @@ mod tests {
         let p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
         assert_eq!(d.spend.per_tx_sol_max, p.spend.per_tx_sol_max);
         assert_eq!(d.mcp.sensitive_name_pattern, p.mcp.sensitive_name_pattern);
-        assert_eq!(d.hard_guards, p.hard_guards);
         assert_eq!(
             d.supply_chain.verify_ext_submodules,
             p.supply_chain.verify_ext_submodules
@@ -984,7 +968,7 @@ mod tests {
         assert!(p.is_fail_closed());
         assert_eq!(p.network.mainnet, "ask");
         assert_eq!(p.active_profile, "strict");
-        assert!(p.is_hard_guard("secret_read"));
+        assert!(!p.active_overlay().ask_all);
     }
 
     #[test]
@@ -993,7 +977,50 @@ mod tests {
         p.active_profile = "autopilot".into();
         let eff = p.effective();
         assert_eq!(eff.spend.per_tx_sol_max, 2.0);
-        assert!(eff.active_overlay().relax_transfer);
+        assert!(!eff.active_overlay().ask_all);
+    }
+
+    #[test]
+    fn paranoid_sets_ask_all() {
+        let p = Policy::from_sources(DEFAULT_POLICY_YAML, None, Some("paranoid"), None);
+        assert!(p.effective().active_overlay().ask_all);
+    }
+
+    #[test]
+    fn the_shipped_policy_has_no_removed_settings() {
+        let p = Policy::from_sources(DEFAULT_POLICY_YAML, None, None, None);
+        assert!(p.ignored_overrides.is_empty(), "{:?}", p.ignored_overrides);
+    }
+
+    #[test]
+    fn removed_settings_in_an_old_policy_are_listed_not_fatal() {
+        let old = format!(
+            "{DEFAULT_POLICY_YAML}gates: [mainnet_deploy]\nhard_guards: [secret_read]\n"
+        )
+        .replace(
+            "  autopilot:\n    per_tx_sol_max: 2.0\n",
+            "  autopilot:\n    relax_transfer: true\n    relax_swap: true\n    per_tx_sol_max: 2.0\n  off:\n    disabled: true\n",
+        );
+        let p = Policy::from_sources(&old, None, None, None);
+        assert!(!p.is_fail_closed());
+        assert_eq!(p.spend.per_tx_sol_max, 1.0);
+        for note in [
+            "gates:",
+            "hard_guards:",
+            "profiles.autopilot.relax_transfer",
+            "profiles.autopilot.relax_swap",
+            "profiles.off",
+        ] {
+            assert!(
+                p.ignored_overrides.iter().any(|n| n.starts_with(note)),
+                "{note}: {:?}",
+                p.ignored_overrides
+            );
+        }
+        // `off` is not a profile any more: selecting it is strict.
+        let off = Policy::from_sources(&old, None, Some("off"), None);
+        assert!(!off.effective().active_overlay().ask_all);
+        assert_eq!(off.effective().spend.per_tx_sol_max, 1.0);
     }
 
     #[test]

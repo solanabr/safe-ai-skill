@@ -622,7 +622,9 @@ fn gate_bash_malformed_stdin_asks() {
 
 #[test]
 fn unreadable_ask_is_not_relaxed_by_a_grant() {
-    // An `other` grant relaxes unclassified asks; the unreadable-payload ask is a hard guard.
+    // The unreadable-payload ask runs under a hard-guard meta, which no grant relaxes (unit:
+    // `relax::tests::hard_guard_never_relaxed_even_with_grant`). The catch-all `other` scope
+    // that used to cover unclassified asks is gone (spec D1.9): asking for it is an error.
     let data = TempDir::new("unread-grant-data");
     let home = TempDir::new("unread-grant-home");
     let grant = Invocation::new(&["allow", "--scope", "other", "--for", "1h"])
@@ -630,7 +632,7 @@ fn unreadable_ask_is_not_relaxed_by_a_grant() {
         .home(home.path())
         .cwd(home.path())
         .run();
-    assert_eq!(grant.json()["status"], "granted", "{}", grant.stdout);
+    assert_eq!(grant.json()["status"], "error", "{}", grant.stdout);
     let padded_mcp = oversized(serde_json::json!({
         "tool_name": "mcp__helius__getBalance",
         "tool_input": { "address": DEST }

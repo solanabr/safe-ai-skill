@@ -1,11 +1,11 @@
 # safe-ai-skill default policy — the FULL schema (kept equivalent to the embedded
-# DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project's
+# DEFAULT_POLICY_YAML in crates/engine/src/policy/mod.rs). A project's
 # <cwd>/.safe-ai-skill/policy.yaml may only tighten it, field by field: caps take the lower
 # value, deny-lists add entries, allow-lists drop them; anything looser (and any profile
 # setting) is ignored and listed at SessionStart. Every field below has a serde default so a
 # partial override still parses.
 version: 1
-active_profile: strict    # strict | autopilot | paranoid | off; `safe-ai-skill mode` sets it; env SAFE_AI_SKILL_PROFILE may only pick a stricter one
+active_profile: strict    # strict | paranoid; autopilot only via a confirmed `safe-ai-skill mode autopilot`; env SAFE_AI_SKILL_PROFILE may only pick a stricter one
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
@@ -13,16 +13,6 @@ spend:
   per_tx_sol_max: 1.0     # above → ask; above hard_max → deny
   hard_tx_sol_max: 10.0
   daily_sol_max: 5.0
-gates:                    # always ask regardless of caps
-  - mainnet_deploy
-  - program_upgrade
-  - set_authority         # solana program set-upgrade-authority, spl-token authorize
-  - account_close         # solana close, spl-token close
-hard_guards:              # scopes NO profile or grant may ever relax
-  - mainnet_deploy
-  - set_authority
-  - account_close
-  - secret_read
 mcp:
   # value-moving verbs matched in MCP tool names (expanded for heliusWrite staking + future tools)
   sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
@@ -69,13 +59,12 @@ supply_chain:
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny
+# Hard guards (mainnet deploy, authority changes, account close, secret reads, irreversible
+# flags) are built into the gates: no profile, grant or policy relaxes them. To turn the
+# hooks off, set SAFE_AI_SKILL_DISABLE=1 (reported at SessionStart).
 profiles:
-  strict: {}
-  autopilot:
-    relax_transfer: true
-    relax_swap: true
+  strict: {}                # the default
+  autopilot:                # raised per-tx cap; needs a confirmed `safe-ai-skill mode autopilot`
     per_tx_sol_max: 2.0
-  paranoid:
+  paranoid:                 # every allow becomes an ask; every Solana CLI command asks
     ask_all: true
-  off:
-    disabled: true
