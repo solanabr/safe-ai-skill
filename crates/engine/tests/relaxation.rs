@@ -484,6 +484,22 @@ fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
 }
 
 #[test]
+fn pending_notice_needs_a_post_tool_use_bash_payload() {
+    let sb = Sandbox::new("relax-notice-shape");
+    allow_transfer(&sb);
+    for payload in [
+        json!({"hook_event_name":"UserPromptSubmit","prompt":"hi","cwd": sb.proj.path()}),
+        json!({"hook_event_name":"PostToolUse","tool_name":"Read","cwd": sb.proj.path()}),
+        json!({"cwd": sb.proj.path()}),
+    ] {
+        let run = sb.hook(&["pending-notice"], payload, &[]);
+        assert_eq!(run.stdout.trim(), "", "{}", run.stdout);
+    }
+    // The code is still there for the real hook.
+    assert_eq!(sb.code_shown().len(), 8);
+}
+
+#[test]
 fn the_code_is_announced_once_in_system_message_only() {
     let sb = Sandbox::new("relax-announce");
     allow_transfer(&sb);

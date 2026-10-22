@@ -692,8 +692,17 @@ fn cmd_prompt_guard() -> ExitCode {
 /// `pending-notice` — the PostToolUse (Bash) hook that shows the user the confirmation code
 /// of a request the tool call just made. The code goes in `systemMessage` only (never
 /// `additionalContext`), and each request is announced once. Nothing pending → no output.
+/// `pending-notice` — the PostToolUse hook on Bash: show the user (in `systemMessage` only) the
+/// codes of requests a Bash call just made. Anything but a PostToolUse/Bash payload gets nothing.
 fn cmd_pending_notice() -> ExitCode {
-    let input = read_input().1.unwrap_or_default();
+    let Ok(input) = read_input().1 else {
+        return ExitCode::SUCCESS;
+    };
+    if input.hook_event_name.as_deref() != Some("PostToolUse")
+        || input.tool_name.as_deref() != Some("Bash")
+    {
+        return ExitCode::SUCCESS;
+    }
     let dir = state_dir(&cwd_of(&input));
     if let Some(codes) = relax::announce(&dir, now_secs()) {
         print_json(&serde_json::json!({ "systemMessage": codes }));
