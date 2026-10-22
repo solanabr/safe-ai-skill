@@ -17,16 +17,26 @@
 //!   inside a blocked pack, or when a command runs with its working dir inside one.
 //!
 //! The read and Bash checks only consult the stored state (no hashing), so they stay cheap.
+//!
+//! Tiers (D8 v2 spec §6). A pack is in one of two classes. A **hard** pack is blocked (combo,
+//! drift, `packs.lock` mismatch) or was never fully scanned: its verdict is `Deny`, which
+//! [`super::tier_action`] keeps at every tier but Off (Off only reports it). A **high** pack has
+//! a first-seen HIGH heuristic finding nobody reviewed (also when a committed `packs.lock`
+//! matches it, Q4): its verdict is `Ask`, a marker [`super::tier_action`] turns into a denial at
+//! High and drops below. The functions here never look at the tier; callers apply
+//! [`super::tier_action`].
 
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::state::{self, PackStatus, State};
+use super::state::{self, PackEntry, PackStatus, State};
+use super::trust::{self, TrustStore};
 use super::{expand_home, grading, project_root, swept_packs, Env, Scanner, USER_SKILLS_DIR};
 use crate::datadir::DataDir;
 use crate::gate::Verdict;
+use crate::policy::tier::Tier;
 use crate::policy::Policy;
 
 /// Time the Skill and slash gates may spend re-hashing packs before denying.
@@ -38,6 +48,15 @@ const MAX_GLOB_MATCHES: usize = 512;
 /// Words examined per command.
 const MAX_WORDS: usize = 4096;
 
+/// How a gated pack is denied (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// Blocked or never fully scanned.
+    Hard,
+    /// An unreviewed HIGH heuristic finding: denied at tier High only.
+    High,
+}
+
 /// A blocked pack as the gates see it.
 struct BlockedPack {
     /// Canonical paths whose contents are denied (the pack, and where `on_block: move` put it).
@@ -46,28 +65,61 @@ struct BlockedPack {
     shown: String,
     /// Why it is blocked.
     why: &'static str,
+    class: Class,
 }
 
-/// Every pack in `st` whose paths the gates deny: blocked packs, and packs left unreviewed
-/// because they were not fully scanned (a pack unreviewed only for a first-seen HIGH finding is
-/// a warning, not denied).
-fn blocked_packs(st: &State) -> Vec<BlockedPack> {
+/// `e` has a HIGH heuristic finding the user has not reviewed: unreviewed, or downgraded to a
+/// warning only because a committed `packs.lock` pins this content (which never clears it at
+/// High). Approved or trusted content is clean, and a pack the budget cut short is a hard pack.
+pub(super) fn high_pending(e: &PackEntry, trust: &TrustStore) -> bool {
+    let pending = e.state == PackStatus::Unreviewed
+        || (e.state == PackStatus::Warned && !e.flagged_rules.is_empty());
+    pending
+        && !e.unscanned()
+        && !e.approved
+        && !(!e.last_scanned_hash.is_empty()
+            && trust::covers(trust, &e.last_scanned_hash, &e.flagged_rules))
+}
+
+const HIGH_WHY: &str = "it has a high-severity finding nobody has reviewed";
+
+/// Every pack in `st` whose paths the gates deny: blocked packs, packs the sweep could not fully
+/// scan in its budget, and (as [`Class::High`]) packs with an unreviewed HIGH heuristic finding.
+fn blocked_packs(dir: &DataDir, st: &State) -> Vec<BlockedPack> {
+    let mut trust: Option<TrustStore> = None;
     st.packs
         .iter()
-        .filter(|(_, e)| e.state == PackStatus::Blocked || e.unscanned())
-        .map(|(key, e)| {
+        .filter_map(|(key, e)| {
+            let (class, why) = if e.state == PackStatus::Blocked {
+                (Class::Hard, why_label(e.reason))
+            } else if e.unscanned() {
+                (
+                    Class::Hard,
+                    "it could not be fully scanned within the time budget; `safe-ai-skill verify \
+                     check <dir>` scans it",
+                )
+            } else if e.state >= PackStatus::Warned
+                && high_pending(e, trust.get_or_insert_with(|| trust::load_honoured(dir)))
+            {
+                (Class::High, HIGH_WHY)
+            } else {
+                return None;
+            };
             let mut roots = vec![state::path_of(key)];
-            roots.extend(e.quarantined_to.iter().map(PathBuf::from));
-            BlockedPack {
+            // Where it was moved, as recorded and with symlinks resolved (a data dir under
+            // a symlinked temp dir is compared by its real path).
+            for moved in e.quarantined_to.iter().map(PathBuf::from) {
+                if let Ok(real) = moved.canonicalize() {
+                    roots.push(real);
+                }
+                roots.push(moved);
+            }
+            Some(BlockedPack {
                 roots,
                 shown: key.clone(),
-                why: if e.state == PackStatus::Blocked {
-                    why_label(e.reason)
-                } else {
-                    "it could not be fully scanned within the time budget; `safe-ai-skill verify \
-                     check <dir>` scans it"
-                },
-            }
+                why,
+                class,
+            })
         })
         .collect()
 }
@@ -81,12 +133,24 @@ fn why_label(reason: Option<state::Reason>) -> &'static str {
     }
 }
 
-fn denial(subject: &str, shown: &str, why: &str) -> Verdict {
-    Verdict::Deny(format!(
-        "safe-ai-skill: {subject} the skill pack {shown}, which is blocked ({why}). The user \
-         must review it and run `safe-ai-skill verify approve {shown}` in a terminal, then \
-         confirm it."
-    ))
+/// The verdict for `class`: `Deny` for a hard pack, the `Ask` marker for a high one.
+fn denial(subject: &str, shown: &str, why: &str, class: Class) -> Verdict {
+    match class {
+        Class::Hard => Verdict::Deny(format!(
+            "safe-ai-skill: {subject} the skill pack {shown}, which is blocked ({why}). The user \
+             must review it and run `safe-ai-skill verify approve {shown}` in a terminal, then \
+             confirm it."
+        )),
+        Class::High => Verdict::Ask(format!(
+            "safe-ai-skill: {subject} the skill pack {shown}, which tier high denies until it is \
+             trusted ({why}). The user must review it and run `safe-ai-skill verify trust \
+             {shown}` in a terminal, then confirm it."
+        )),
+    }
+}
+
+fn denial_of(subject: &str, b: &BlockedPack) -> Verdict {
+    denial(subject, &b.shown, b.why, b.class)
 }
 
 /// The directories a hook's packs are looked up under: the hook `cwd`, its repository root,
@@ -173,6 +237,8 @@ pub(super) fn skill_verdict_in(
     // A pack that may provide the name but could not be verified in time (or was left
     // unscanned by the sweep).
     let mut unverified: Option<String> = None;
+    // A pack with an unreviewed HIGH heuristic finding: denied at tier High only.
+    let mut high: Option<String> = None;
     let projects = project_dirs(cwd);
     let envs: Vec<Env> = projects
         .iter()
@@ -253,6 +319,8 @@ pub(super) fn skill_verdict_in(
                 });
             } else if e.unscanned() {
                 unverified.get_or_insert_with(|| pack.display.clone());
+            } else if high_pending(e, &env.trust) {
+                high.get_or_insert_with(|| pack.display.clone());
             }
             continue;
         }
@@ -309,17 +377,56 @@ pub(super) fn skill_verdict_in(
                 blocked.get_or_insert_with(|| (pack.display.clone(), why_label(e.reason)));
             } else if e.unscanned() {
                 unverified.get_or_insert_with(|| pack.display.clone());
+            } else if high_pending(e, &env.trust) {
+                high.get_or_insert_with(|| pack.display.clone());
             }
         }
     }
     if evaluated {
         let _ = state::store(dir, &st);
     }
+    // A pack `on_block: move` took out of scope is no longer on disk to be found above, but
+    // its skill names stay denied.
+    if blocked.is_none() {
+        let user = user_skills
+            .canonicalize()
+            .unwrap_or_else(|_| user_skills.to_path_buf());
+        blocked = st
+            .packs
+            .iter()
+            .filter(|(key, e)| {
+                e.quarantined_to.is_some()
+                    && e.state == PackStatus::Blocked
+                    && e.names.iter().any(|n| is_wanted(n))
+                    && {
+                        let origin = state::path_of(key);
+                        projects
+                            .iter()
+                            .chain([&user])
+                            .any(|p| origin.starts_with(p))
+                    }
+            })
+            .map(|(key, e)| (key.clone(), why_label(e.reason)))
+            .next();
+    }
     if let Some((shown, why)) = blocked {
-        return denial(&format!("skill `{skill}` comes from"), &shown, why);
+        return denial(
+            &format!("skill `{skill}` comes from"),
+            &shown,
+            why,
+            Class::Hard,
+        );
     }
     if let Some(shown) = unverified {
         return over_budget_pack(skill, &shown);
+    }
+    if let Some(shown) = high {
+        return denial(
+            &format!("skill `{skill}` comes from"),
+            &shown,
+            HIGH_WHY,
+            Class::High,
+        );
     }
     if seen.is_empty() && !plugin {
         if let Some(shown) = unsure {
@@ -328,6 +435,7 @@ pub(super) fn skill_verdict_in(
                 &shown,
                 "a SKILL.md links outside the pack, its frontmatter does not parse, or it is \
                  too large to list its skills, so its skill names are unknown",
+                Class::Hard,
             );
         }
     }
@@ -414,14 +522,20 @@ fn raw_string(raw: &[u8], key: &str) -> Option<String> {
 
 /// Block reason for a prompt-time payload the engine could not parse: block a slash command
 /// whose skill is blocked, and one whose name cannot be read while any pack in scope is blocked.
+/// Judged at the policy's tier: Off blocks nothing, and a pack only High denies is blocked at
+/// High only.
 pub fn unreadable_prompt_verdict(
     dir: &DataDir,
     cwd: &Path,
     policy: &Policy,
     raw: &[u8],
 ) -> Option<String> {
-    let reason = |v: Verdict| match v {
-        Verdict::Deny(r) | Verdict::Ask(r) => Some(r),
+    let tier = policy.tier();
+    if tier == Tier::Off {
+        return None;
+    }
+    let reason = |v: Verdict| match super::tier_action(v, tier) {
+        Verdict::Deny(r) => Some(r),
         _ => None,
     };
     match slash_name_from_raw(raw)? {
@@ -432,10 +546,11 @@ pub fn unreadable_prompt_verdict(
             // User-level packs load in every project.
             let user = expand_home(USER_SKILLS_DIR);
             scope.push(user.canonicalize().unwrap_or(user));
-            let blocked = blocked_packs(&st).into_iter().find(|b| {
-                b.roots
-                    .iter()
-                    .any(|r| scope.iter().any(|p| r.starts_with(p)))
+            let blocked = blocked_packs(dir, &st).into_iter().find(|b| {
+                (b.class == Class::Hard || tier == Tier::High)
+                    && b.roots
+                        .iter()
+                        .any(|r| scope.iter().any(|p| r.starts_with(p)))
             })?;
             Some(format!(
                 "safe-ai-skill: this prompt could not be read, and the skill pack {} is \
@@ -469,10 +584,11 @@ pub fn slash_skill_name(payload: &Value) -> Option<String> {
 
 /// Read/Grep/Glob enforcement: deny a Read whose file resolves inside a blocked pack, and a
 /// Grep or Glob whose search root (`path`, else the hook `cwd`, narrowed by the literal prefix
-/// of a Glob `pattern` or a Grep `glob`) lies inside a blocked pack or contains one.
+/// of a Glob `pattern` or a Grep `glob`) lies inside a blocked pack or contains one. A pack only
+/// tier High denies yields `Ask` (see the module docs); a hard pack anywhere in the call wins.
 pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Path) -> Verdict {
     let st = state::load(dir).state;
-    let blocked = blocked_packs(&st);
+    let blocked = blocked_packs(dir, &st);
     if blocked.is_empty() {
         return Verdict::NoOpinion;
     }
@@ -483,7 +599,7 @@ pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Pa
         .map(|p| absolute(cwd, p))
     {
         if let Some(b) = inside_blocked(&target, &blocked) {
-            return denial(&format!("{} is inside", target.display()), &b.shown, b.why);
+            return denial_of(&format!("{} is inside", target.display()), b);
         }
     }
     let search = match tool_name {
@@ -508,40 +624,58 @@ pub fn read_verdict(dir: &DataDir, tool_name: &str, tool_input: &Value, cwd: &Pa
             root = absolute(&root, &literal.join("/"));
         }
     }
-    if let Some(b) = inside_blocked(&root, &blocked).or_else(|| contains_blocked(&root, &blocked)) {
-        return denial(
-            &format!("this search of {} reaches", root.display()),
-            &b.shown,
-            b.why,
-        );
+    let hit = match (
+        inside_blocked(&root, &blocked),
+        contains_blocked(&root, &blocked),
+    ) {
+        (Some(inside), Some(contains)) => Some(if inside.class == Class::Hard {
+            inside
+        } else if contains.class == Class::Hard {
+            contains
+        } else {
+            inside
+        }),
+        (inside, contains) => inside.or(contains),
+    };
+    match hit {
+        Some(b) => denial_of(&format!("this search of {} reaches", root.display()), b),
+        None => Verdict::NoOpinion,
     }
-    Verdict::NoOpinion
 }
 
-/// The blocked pack that lies inside the directory `root`.
+/// The blocked pack that lies inside the directory `root` (a hard pack before a high one).
 fn contains_blocked<'a>(root: &Path, blocked: &'a [BlockedPack]) -> Option<&'a BlockedPack> {
     let mut forms = vec![lenient_canonical(root)];
     if let Ok(real) = root.canonicalize() {
         forms.push(real);
     }
-    blocked.iter().find(|b| {
+    first_hit(blocked, |b| {
         b.roots
             .iter()
             .any(|r| forms.iter().any(|f| r.starts_with(f)))
     })
 }
 
+/// The first pack matching `hit`, a hard pack before a high one.
+fn first_hit(blocked: &[BlockedPack], hit: impl Fn(&BlockedPack) -> bool) -> Option<&BlockedPack> {
+    [Class::Hard, Class::High]
+        .into_iter()
+        .find_map(|class| blocked.iter().find(|b| b.class == class && hit(b)))
+}
+
 /// Bash enforcement (best effort): deny when a word of the command resolves inside a blocked
 /// pack, or a command runs with its working dir inside one.
 pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
     let st = state::load(dir).state;
-    let blocked = blocked_packs(&st);
+    let blocked = blocked_packs(dir, &st);
     if blocked.is_empty() {
         return Verdict::NoOpinion;
     }
     let home = super::home_dir();
     let mut wd = cwd.to_path_buf();
     let mut words_seen = 0usize;
+    // The first hit on a pack only tier High denies: kept while a hard pack may still follow.
+    let mut soft: Option<Verdict> = None;
     for segment in segments(command) {
         // A quoted inner command (`sh -c 'cd x; …'`) is split at its `;` by [`segments`], so
         // its words may hold spaces: each piece counts as a word of its own.
@@ -555,7 +689,9 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
             continue;
         }
         if let Some(b) = inside_blocked(&wd, &blocked) {
-            return denial("this command runs inside", &b.shown, b.why);
+            if let Some(hard) = note(&mut soft, "this command runs inside", b) {
+                return hard;
+            }
         }
         let mut i = 0;
         while i < words.len() {
@@ -563,7 +699,7 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
             i += 1;
             words_seen += 1;
             if words_seen > MAX_WORDS {
-                return Verdict::NoOpinion;
+                return soft.unwrap_or(Verdict::NoOpinion);
             }
             if matches!(word.as_str(), "cd" | "pushd") {
                 // Options (`-P`, `-L`, `--`, …) come before the target; `-` alone is one.
@@ -581,7 +717,9 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
                 };
                 i += 1;
                 if let Some(b) = inside_blocked(&wd, &blocked) {
-                    return denial("this command enters", &b.shown, b.why);
+                    if let Some(hard) = note(&mut soft, "this command enters", b) {
+                        return hard;
+                    }
                 }
                 continue;
             }
@@ -592,16 +730,26 @@ pub fn bash_verdict(dir: &DataDir, command: &str, cwd: &Path) -> Verdict {
             };
             for path in expand(&wd, candidate, home.as_deref()) {
                 if let Some(b) = inside_blocked(&path, &blocked) {
-                    return denial(
-                        &format!("this command touches {}, inside", path.display()),
-                        &b.shown,
-                        b.why,
-                    );
+                    let subject = format!("this command touches {}, inside", path.display());
+                    if let Some(hard) = note(&mut soft, &subject, b) {
+                        return hard;
+                    }
                 }
             }
         }
     }
-    Verdict::NoOpinion
+    soft.unwrap_or(Verdict::NoOpinion)
+}
+
+/// A hit on `b`: the verdict at once for a hard pack, else kept in `soft` (the first one) so a
+/// hard pack later in the command still wins.
+fn note(soft: &mut Option<Verdict>, subject: &str, b: &BlockedPack) -> Option<Verdict> {
+    let verdict = denial_of(subject, b);
+    if b.class == Class::Hard {
+        return Some(verdict);
+    }
+    soft.get_or_insert(verdict);
+    None
 }
 
 /// A shell word with grouping and quoting characters removed (`$`, `{`, `}` are kept, so
@@ -681,13 +829,14 @@ fn absolute(base: &Path, p: &str) -> PathBuf {
 }
 
 /// The blocked pack `path` lies inside, judged both by the real path (symlinks resolved) and by
-/// the lexically normalized path resolved through its deepest existing ancestor.
+/// the lexically normalized path resolved through its deepest existing ancestor. A hard pack
+/// comes before a high one.
 fn inside_blocked<'a>(path: &Path, blocked: &'a [BlockedPack]) -> Option<&'a BlockedPack> {
     let mut forms = vec![lenient_canonical(path)];
     if let Ok(real) = path.canonicalize() {
         forms.push(real);
     }
-    blocked.iter().find(|b| {
+    first_hit(blocked, |b| {
         forms
             .iter()
             .any(|f| b.roots.iter().any(|r| f.starts_with(r)))
