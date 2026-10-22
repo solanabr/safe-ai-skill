@@ -1,6 +1,7 @@
 //! The SessionStart notices: the tier line and the loosenings notice (spec D4.4, D8 v2 §1.3).
 //!
-//! [`tier_line`] is printed at every SessionStart and by `status`:
+//! [`tier_line`] is printed by `status`, and at SessionStart whenever there is anything else to
+//! say or the tier is not the plain default (a clean default session stays silent):
 //! `tier: <t> (<source>); sandbox: <state>`, with `(hooks only)` after the tier when the
 //! sandbox is not on, and the shared lists' contract version.
 //!
@@ -80,10 +81,19 @@ pub fn loosenings(inputs: &Inputs<'_>) -> Option<String> {
                 ));
             }
             if let Some(env_read) = choice.env_read.filter(|e| *e != EnvRead::Deny) {
-                lines.push(format!(
-                    "secrets env_read {} is active (raw .env reads; only while the sandbox is on)",
-                    env_read.label()
-                ));
+                lines.push(if crate::gates::envread::OPT_IN_AVAILABLE {
+                    format!(
+                        "secrets env_read {} is active (raw .env reads; only while the sandbox \
+                         is on)",
+                        env_read.label()
+                    )
+                } else {
+                    format!(
+                        "secrets env_read {} is stored but inactive in this build (raw .env \
+                         reads stay denied)",
+                        env_read.label()
+                    )
+                });
             }
         }
         Loaded::Tampered => lines.push(
@@ -212,7 +222,11 @@ mod tests {
         let text = loosenings(&i).unwrap();
         for needle in [
             "tier off is active",
-            "env_read ask is active",
+            if crate::gates::envread::OPT_IN_AVAILABLE {
+                "env_read ask is active"
+            } else {
+                "env_read ask is stored but inactive in this build"
+            },
             "live grant g1",
             "spend.json was missing",
             "tier high (applied)",

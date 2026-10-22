@@ -437,8 +437,9 @@ pub fn kit_hints_from(text: &str) -> Option<Vec<RawHint>> {
     )
 }
 
-/// The spec §2 table (per gate, Off / Relaxed / Medium / High), the single source the README
-/// tier table is checked against.
+/// The shipped per-gate table (Off / Relaxed / Medium / High), the single source the README
+/// tier table is checked against (`tests/readme_tier_table.rs`). The exfil host-list tripwire
+/// is deferred (#19) and has no row.
 pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
     (
         "Key material + home credential stores, path or command-form read",
@@ -519,16 +520,12 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["ask", "ask", "ask", "deny"],
     ),
     (
-        "Exfil tripwire: project env file to network",
-        ["n/o", "deny", "deny", "deny"],
-    ),
-    (
-        "Exfil tripwire: known exfil host (list size)",
-        ["n/o", "deny (70)", "deny (79)", "deny (84)"],
+        "Project env file as a network command's input (a raw read)",
+        ["deny", "deny", "deny", "deny"],
     ),
     (
         "Inline curl/wget POST body to non-localhost",
-        ["n/o", "n/o", "n/o", "ask"],
+        ["ask", "ask", "ask", "ask"],
     ),
     (
         "Supply chain: combo, drift, lock_mismatch, unscanned",

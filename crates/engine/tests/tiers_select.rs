@@ -428,7 +428,7 @@ fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
 #[test]
 fn v1_profiles_migrate_to_tiers_once() {
     for (profile, tier, needle) in [
-        ("strict", Tier::Relaxed, "curl POST no longer asks"),
+        ("strict", Tier::Relaxed, "now deny"),
         ("paranoid", Tier::High, "tier high"),
         ("autopilot", Tier::Relaxed, "allow --scope transfer"),
         ("off", Tier::Relaxed, "safe-ai-skill tier off"),

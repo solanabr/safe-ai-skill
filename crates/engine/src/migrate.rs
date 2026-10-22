@@ -48,8 +48,8 @@ pub const MIGRATED_FILE: &str = "migrated.json";
 const MAX_GRANT_SECS: u64 = 30 * 86_400;
 
 /// The one-time line for users of the former default profile.
-pub const STRICT_LINE: &str = "profile strict is now tier relaxed: a curl POST no longer asks \
-     below High, and mainnet --final, program close and spl-token close/burn now deny";
+pub const STRICT_LINE: &str = "profile strict is now tier relaxed: mainnet --final, program close \
+     and spl-token close/burn now deny";
 
 /// State files 1.1.0 writes as envelopes: one of them existing means 1.1.0 has run.
 const ENVELOPE_FILES: [&str; 9] = [
