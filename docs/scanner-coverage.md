@@ -12,7 +12,7 @@ context:
 
 | Context | What it covers |
 |---|---|
-| `code` | Executable source, decided by extension, shebang or exec bit, plus `` !`cmd` `` lines. A lexer marks strings, regex literals, comments and interpolations; lines end at `\n`, `\r`, U+2028 or U+2029, and block comments, Python triple-quoted strings and JS template text carry across lines. Lines are joined into statements (open brackets, `\` continuations), and a tool and its marker must appear in the same command. |
+| `code` | Executable source, decided by extension, shebang or exec bit, plus `` !`cmd` `` lines. A lexer marks strings, regex literals, comments and interpolations; lines end at `\n`, `\r`, U+2028 or U+2029. Its whole state carries across lines: block comments, Python triple-quoted strings (f-string flag included), JS template text, backslash-continued strings, and every open interpolation with its bracket depth (nesting past 64 is lexed as code). Lines are joined into statements (open brackets, `\` continuations), and a tool and its marker must appear in the same command. |
 | `doc` | Markdown prose, fenced blocks and inline code, and any other text file (JSON, YAML, HTML …). |
 | `meta` | Pack structure: manifests, harness config, `SKILL.md` frontmatter, symlinks and binaries. |
 
@@ -35,10 +35,16 @@ string around a placeholder, stays WARN.
 
 ### What is read
 
-* **Text decoding.** UTF-8 (a leading BOM dropped) and UTF-16 (by its BOM) are decoded. A text
-  or code file (known extension or shebang) with NUL bytes is read with the NULs stripped and gets
-  `nul_bytes` WARN. Only archive or executable magic, `.pyc`, or NULs in a file of no known text
-  type make a file binary.
+* **Text decoding.**
+  * UTF-8 is decoded with a leading BOM dropped.
+  * UTF-16 and UTF-32 are decoded by their byte-order mark, but only when the content is
+    plausible for that encoding: no invalid unit, and at least half the characters ASCII. Behind
+    an implausible mark (a forged one in front of ASCII), the bytes are also read as UTF-8, both
+    readings are scanned, and the worse result counts.
+  * A text or code file (known extension or shebang) with NUL bytes is read with the NULs
+    stripped and gets `nul_bytes` WARN. So is UTF-16/32 text with no mark and no extension:
+    NULs make up a quarter of its bytes and the rest is printable ASCII.
+  * Only archive or executable magic, `.pyc`, or other NUL-bearing data make a file binary.
 * **What is skipped.** The pack's own top-level `.git` (a nested one is scanned), and lockfiles by
   exact name (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`,
   `bun.lock(b)`, `deno.lock`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `pdm.lock`, `uv.lock`,
@@ -89,8 +95,8 @@ The checklist from ai-kit's `docs/skill-packs.md` ("Non-official pack provenance
 | Checklist item | Rules (code / doc severity) | Stays manual |
 |---|---|---|
 | Lines over 500 characters (payload hidden behind padding) | `padding_horizontal` HIGH / WARN; `padding_vertical` HIGH / WARN; `long_line` INFO; `encoded_blob` WARN (a long base64 run that decodes to text, i.e. printable ratio ≥ 0.75; data such as account state sits near 0.34); combo `padding_sink` | Reading what a long data line encodes |
-| `eval` / `atob` / `new Function` / `createRequire` | `eval` HIGH; `obfuscated_sink` HIGH (computed eval, `constructor.constructor`, `data:` imports, string timers, `vm`, Python `exec`/`pickle`/`marshal`/`__import__`); `exec_decode` HIGH; `decoder` INFO; `create_require` INFO; combos `exec_b64_literal`, `eval_decoder` | Deobfuscating anything beyond these shapes |
-| `child_process` | `child_process` INFO (also a sink for `padding_sink`); `shell_eval` INFO | What each spawned command does |
+| `eval` / `atob` / `new Function` / `createRequire` | `eval` HIGH; `obfuscated_sink` HIGH (computed eval; the `Function` constructor reached through `constructor.constructor`, `Function.prototype.constructor` or a function expression's `.constructor(`; `data:` imports; timers given a string or a decoded string; `vm`; Python `exec`/`pickle`/`marshal`/`__import__`); `exec_decode` HIGH; `decoder` INFO; `create_require` INFO; combos `exec_b64_literal`, `eval_decoder` | Deobfuscating anything beyond these shapes |
+| `child_process` | `child_process` INFO, also a sink for `padding_sink`. Bracket members (`cp['exec'](…)`) count, and so does a module named in `require` / `import(…)` / `from` (`node:` prefix included), at the keyword rather than inside the quotes. `shell_eval` INFO | What each spawned command does |
 | Env-var and keypair reads | `secret_read` HIGH / WARN (keypair, `.config/solana`, `.ssh`, `.aws/credentials`, `.netrc`, `.env*` except templates; a read call or a read command next to the path); `env_dump` INFO; `embedded_secret_key` INFO | Reading individual env-var names |
 | Hardcoded URLs and IPs in source | `telemetry_post` HIGH / WARN (a POST carrying usage words or local data to an external host); `network_post` WARN / INFO; `ip_literal` WARN / INFO (public IPv4 destinations) | Judging whether each endpoint is the vendor's own |
 | Pipe-to-shell installers | `download_and_run` HIGH / WARN (`curl … \| sh`, `sh -c "$(curl …)"`, `bash <(curl …)`, `iex (iwr …)`, eval of fetched content) | — |
@@ -127,6 +133,26 @@ dependency data. They are inventoried at `verify add|check` (spec D7.2), not tex
 `build.rs`, proc-macro crates, `.cargo/config.toml`, `binding.gyp` and npm `hasInstallScript` are
 build-time execution, reported at `verify add|check` (D7.2), not at SessionStart.
 
+## Scan budget
+
+SessionStart must stay fast, so a crafted pack cannot stall it:
+
+* **Per rule.** In one file, a rule stops being evaluated after 50 hits
+  (`rules::MAX_HITS_PER_RULE`). `PackReport::capped` records each such rule, file and count.
+  Stored findings stay capped at five per rule and severity.
+* **Per pack and per sweep.** `rules::scan_pack_within` takes a `ScanBudget`: 2 s per pack, and
+  4 s for every pack of one SessionStart sweep (`ScanBudget::session`, used by the verify
+  sweep). The clock is checked between files, every 256 lines, statements or commands.
+* **When the budget runs out.** The pack stops with `scan_budget_exceeded` HIGH: never clean,
+  graded unreviewed with the findings and combos found so far. The sweep moves on to the next
+  pack. The v1 compatibility shim maps the finding to Medium, because v1 quarantines on High and
+  a slow machine must not quarantine packs.
+
+`tests/rules_perf.rs` replays the 23 performance probes from the round-2 review, at 16 MiB each in
+release builds and 256 KiB in debug builds. Each must return within the pack budget plus 3 s of
+slack (reading and splitting a 16 MiB file is not interruptible). A pack that was cut must grade
+HIGH or worse.
+
 ## External scanners (spec D7.1)
 
 | | safe-ai-skill | SkillSpector | Sentry skill-scanner | Cisco skill-scanner |
@@ -151,11 +177,17 @@ rule ideas were reimplemented here; no rule lists were copied.
   issue #10 stealer, the scanner-research demo pack, harness bypass and bang exfil all **BLOCK**.
   Google's `exec(base64.b64decode('{encoded_script}'))` (built as a string) is **WARN**. Fixtures
   are inert: payloads decode to a `console.log`, and hosts are `example.invalid`.
-* **Evasions** (always run, `tests/rules_evasion.rs`): 42 cases from the WS-D2 review. They cover
-  interpolations, regex literals, line terminators, NUL/BOM/UTF-16, lockfile and `.git` scope,
-  split payloads in `build/`, `package.json` BOM, hooks and parse failures, escaped settings,
-  frontmatter forms, description URLs, indirect and fenced bangs, and symlink chains. Each
-  gets the verdict it must have.
+* **Evasions** (always run, `tests/rules_evasion.rs`): 47 tests covering every probe of the two
+  WS-D2 reviews, each with the verdict it must have. They cover:
+  * interpolations, including frames, f-strings and depth carried across lines;
+  * regex literals and division, line terminators, shell quoting;
+  * NUL bytes, BOMs, plausible and forged UTF-16/32;
+  * lockfile and `.git` scope, split payloads in `build/`;
+  * `package.json` BOM, hooks and parse failures, escaped settings;
+  * frontmatter forms, description URLs;
+  * indirect and fenced bangs, symlink chains;
+  * indirect sinks (`Function` constructors, decoded timers, `child_process` spellings).
+* **Performance** (always run, `tests/rules_perf.rs`): see [Scan budget](#scan-budget).
 * **ai-kit** (opt-in): the 46 packs at the commit pinned in `aikit.manifest.tsv` give **0 BLOCK and
   13 HIGH** (limit 14), each HIGH a true behaviour, and every pack matches its expected grade. Run it with:
 
@@ -166,9 +198,17 @@ rule ideas were reimplemented here; no rule lists were copied.
   ```
 
   Release builds also assert that the scan stays under 5 s, taking the faster of two passes so
-  that a cold page cache (a fresh clone, or a rebuild that evicted it) does not count. A warm
-  scan of the 106 MB of text across 13.5k files takes about 2.5 s. The lexer adds about 10% over
-  the pre-lexer engine, which took 2.3 s in the same runs.
+  that a cold page cache (a fresh clone, or a rebuild that evicted it) does not count. The scan
+  covers 106 MB of text across 13.5k files.
+
+  Timing depends on machine load; record the load average with any number.
+  * About 2.5 s warm, against 2.3 s for the pre-lexer engine, interleaved on a quiet machine
+    (load average ~11, before the round-2 fixes).
+  * After the round-2 fixes: 3.5–3.6 s against 3.0–3.2 s, interleaved at load average 33–39,
+    about 10% more CPU per pass.
+
+  At load average 20 and above, the same binaries vary two- to threefold from run to run. At
+  50–200, the 5 s assertion fails for both engines.
 
 ## Known limits
 
@@ -182,6 +222,9 @@ rule ideas were reimplemented here; no rule lists were copied.
 * **Bundle exemption.** A file can pose as a bundle (bundler helper names, a minified shape) to
   stay out of the cross-file `eval_decoder` rule. It still grades HIGH for its own `eval`, and
   in-statement combos still apply.
+* **Budget cut-offs.** After a rule's 50th hit in a file, later lines no longer feed combos
+  through that rule. That file is already HIGH, and a later decoder still meets the earlier
+  `eval` in `eval_decoder`. A pack cut by the time budget is HIGH with partial findings.
 * **Indirect load-time commands.** A `` !`cmd` `` is followed into a pack script one level deep,
   and only when the script is named directly (an interpreter and a path, or a path).
 * **Descriptions.** Only `SKILL.md` frontmatter is checked, not the frontmatter of agent or
