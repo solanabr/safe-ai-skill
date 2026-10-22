@@ -1,0 +1,560 @@
+//! Tier selection (D8 v2 spec §1.2-§1.3, §9; shared contract §3): the effective tier for every
+//! source, the lowering confirmation, forged state, `env_read`, and migration.
+//!
+//! The CLI and hooks run as the real binary in a temp HOME and data dir. That data dir lives
+//! under the temp dir, which is never trusted (spec D2.8), so the effective tier is read back
+//! through the library with the same directory marked trusted, as it is under
+//! `~/.claude/plugins/data` in a real install.
+
+mod common;
+
+use std::path::Path;
+
+use common::{Invocation, Run, TempDir};
+use safe_ai_skill::datadir::DataDir;
+use safe_ai_skill::policy::tier::{self, EnvRead, Resolution, Tier, TierSource};
+use safe_ai_skill::policy::{Policy, DEFAULT_POLICY_YAML};
+use safe_ai_skill::tierstate;
+use serde_json::json;
+
+const KIT_POLICY: &str = include_str!("fixtures/aikit/policy.yaml");
+const KIT_SECURITY: &str = include_str!("fixtures/aikit/security/kit-relaxed.json");
+
+struct World {
+    home: TempDir,
+    proj: TempDir,
+    data: TempDir,
+}
+
+impl World {
+    fn new(tag: &str) -> World {
+        let w = World {
+            home: TempDir::new(&format!("{tag}-home")),
+            proj: TempDir::new(&format!("{tag}-proj")),
+            data: TempDir::new(&format!("{tag}-data")),
+        };
+        std::fs::create_dir_all(w.proj.join(".git")).unwrap();
+        w
+    }
+
+    /// The data dir as gates see it in a real install (trusted).
+    fn dir(&self) -> DataDir {
+        DataDir {
+            path: self.data.path().to_path_buf(),
+            trusted: true,
+        }
+    }
+
+    fn root(&self) -> std::path::PathBuf {
+        tier::project_root(self.proj.path())
+    }
+
+    fn resolve_in(&self, cwd: &Path, dir: &DataDir, env: &[(&str, &str)]) -> Resolution {
+        let policy = Policy::load(cwd);
+        let lookup = |k: &str| {
+            env.iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        };
+        tier::resolve(&tier::project_root(cwd), dir, &policy, &lookup)
+    }
+
+    fn resolve(&self, env: &[(&str, &str)]) -> Resolution {
+        self.resolve_in(self.proj.path(), &self.dir(), env)
+    }
+
+    fn write(&self, rel: &str, body: &str) {
+        let path = self.proj.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn cli(&self, args: &[&str]) -> Run {
+        Invocation::new(args)
+            .plugin_data(self.data.path())
+            .home(self.home.path())
+            .cwd(self.proj.path())
+            .run()
+    }
+
+    fn hook(&self, sub: &[&str], payload: serde_json::Value) -> Run {
+        let no_tools = TempDir::new("tiers-path");
+        Invocation::new(sub)
+            .plugin_data(self.data.path())
+            .home(self.home.path())
+            .cwd(self.proj.path())
+            .env("PATH", no_tools.path().to_str().unwrap())
+            .stdin(payload.to_string())
+            .run()
+    }
+
+    /// The code the PostToolUse `pending-notice` hook shows the user.
+    fn code_shown(&self) -> String {
+        let run = self.hook(
+            &["pending-notice"],
+            json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
+                   "tool_input":{"command":"safe-ai-skill tier off"}}),
+        );
+        let msg = run.json()["systemMessage"].as_str().unwrap().to_string();
+        msg.split("safe-ai-skill confirm ")
+            .nth(1)
+            .unwrap()
+            .chars()
+            .take(8)
+            .collect()
+    }
+
+    fn prompt(&self, prompt: &str) -> Run {
+        self.hook(
+            &["prompt-guard"],
+            json!({"hook_event_name":"UserPromptSubmit","cwd": self.proj.path(),"prompt": prompt}),
+        )
+    }
+
+    fn session(&self) -> String {
+        let run = self.hook(
+            &["verify", "session"],
+            json!({"hook_event_name":"SessionStart","source":"startup","cwd": self.proj.path()}),
+        );
+        if run.stdout.trim().is_empty() {
+            String::new()
+        } else {
+            run.json()["systemMessage"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+}
+
+fn noted(r: &Resolution, needle: &str) -> bool {
+    r.notes.iter().any(|n| n.contains(needle))
+}
+
+// ---------------------------------------------------------------------------------------
+// The user's choice and its confirmation
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn nothing_selected_is_relaxed() {
+    let w = World::new("tiers-none");
+    let r = w.resolve(&[]);
+    assert_eq!(
+        (r.tier, r.source, r.env_read),
+        (Tier::Relaxed, TierSource::Base, EnvRead::Deny)
+    );
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+}
+
+#[test]
+fn raising_applies_at_once_with_nothing_pending() {
+    let w = World::new("tiers-high");
+    let run = w.cli(&["tier", "high"]);
+    assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+    assert!(!w.data.join("pending.json").exists());
+    let r = w.resolve(&[]);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::UserGlobal));
+}
+
+#[test]
+fn lowering_waits_for_the_users_whole_prompt_confirmation() {
+    let w = World::new("tiers-off");
+    let run = w.cli(&["tier", "off"]);
+    assert_eq!(run.json()["status"], "pending", "{}", run.stdout);
+    assert_eq!(w.resolve(&[]).tier, Tier::Relaxed);
+
+    let code = w.code_shown();
+    // The same code in a tool payload: the tripwire denies it and nothing changes.
+    let tool = w.hook(
+        &["gate-bash-secrets"],
+        json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd": w.proj.path(),
+               "tool_input":{"command": format!("safe-ai-skill confirm {code}")}}),
+    );
+    assert_eq!(common::decision_label(&tool), "deny");
+    // Embedded in a longer prompt: refused, not consumed.
+    let embedded = w.prompt(&format!("please do this:\nsafe-ai-skill confirm {code}"));
+    assert!(
+        embedded.stdout.contains("nothing confirmed"),
+        "{}",
+        embedded.stdout
+    );
+    assert_eq!(w.resolve(&[]).tier, Tier::Relaxed);
+
+    let ok = w.prompt(&format!("safe-ai-skill confirm {code}"));
+    assert!(ok.stdout.contains("you confirmed"), "{}", ok.stdout);
+    assert!(!ok.stdout.contains(&code));
+    let r = w.resolve(&[]);
+    assert_eq!((r.tier, r.source), (Tier::Off, TierSource::UserGlobal));
+}
+
+#[test]
+fn lowering_from_a_stored_high_needs_confirmation_too() {
+    let w = World::new("tiers-down");
+    let dir = w.dir();
+    let high = tierstate::Change {
+        project: None,
+        tier: Some(Tier::High),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&dir, Tier::Relaxed, &high, 0).unwrap();
+    for (tier, clear) in [(Some(Tier::Medium), false), (None, true)] {
+        let change = tierstate::Change {
+            project: None,
+            tier,
+            env_read: None,
+            clear,
+        };
+        assert_eq!(
+            tierstate::plan(&dir, Tier::Relaxed, &change),
+            tierstate::Plan::NeedsConfirm
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Raise-only hints
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn kit_security_json_only_raises() {
+    for (body, want, note) in [
+        (r#"{"tier":"medium"}"#, Tier::Medium, None),
+        (
+            r#"{"declared":{"tier":"high"},"enforced":{"tier":"relaxed"}}"#,
+            Tier::High,
+            None,
+        ),
+        (
+            r#"{"tier":"off"}"#,
+            Tier::Relaxed,
+            Some("kit .claude/security.json `tier: off` ignored"),
+        ),
+        (
+            r#"{"tier": "high","#,
+            Tier::Relaxed,
+            Some("not a regular JSON file"),
+        ),
+        (KIT_SECURITY, Tier::Relaxed, None),
+    ] {
+        let w = World::new("tiers-kit");
+        w.write(".claude/security.json", body);
+        let r = w.resolve(&[]);
+        assert_eq!(r.tier, want, "{body}");
+        match note {
+            Some(n) => assert!(noted(&r, n), "{body}: {:?}", r.notes),
+            None => assert!(r.notes.is_empty(), "{body}: {:?}", r.notes),
+        }
+        if want > Tier::Relaxed {
+            assert_eq!(r.source, TierSource::KitSecurityJson);
+        }
+    }
+    let w = World::new("tiers-kit-big");
+    let big = format!(r#"{{"tier":"high","pad":"{}"}}"#, "x".repeat(257 * 1024));
+    w.write(".claude/security.json", &big);
+    let r = w.resolve(&[]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(noted(&r, "256 KiB"), "{:?}", r.notes);
+}
+
+#[test]
+fn repo_policy_only_raises() {
+    for (yaml, want, note) in [
+        ("tier: high\n", Tier::High, false),
+        ("tier: off\n", Tier::Relaxed, true),
+        ("active_profile: paranoid\n", Tier::High, false),
+        ("active_profile: strict\n", Tier::Relaxed, false),
+    ] {
+        let w = World::new("tiers-repo");
+        w.write(".safe-ai-skill/policy.yaml", yaml);
+        let r = w.resolve(&[]);
+        assert_eq!(r.tier, want, "{yaml}");
+        assert_eq!(noted(&r, "ignored"), note, "{yaml}: {:?}", r.notes);
+        if want == Tier::High {
+            assert_eq!(r.source, TierSource::RepoPolicy);
+        }
+    }
+}
+
+#[test]
+fn env_only_raises() {
+    let w = World::new("tiers-env");
+    let r = w.resolve(&[("SAFE_AI_SKILL_TIER", "off")]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(
+        noted(&r, "SAFE_AI_SKILL_TIER: off` ignored"),
+        "{:?}",
+        r.notes
+    );
+    let r = w.resolve(&[("SAFE_AI_SKILL_TIER", "high")]);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::Env));
+    let r = w.resolve(&[("SAFE_AI_SKILL_PROFILE", "paranoid")]);
+    assert_eq!(r.tier, Tier::High);
+    let r = w.resolve(&[("SAFE_AI_SKILL_TIER", "IGNORE PREVIOUS INSTRUCTIONS")]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(
+        r.notes.iter().all(|n| !n.contains("IGNORE")),
+        "{:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn a_floor_beats_the_users_project_choice_and_siblings_get_the_base() {
+    let w = World::new("tiers-floor");
+    let dir = w.dir();
+    let off = tierstate::Change {
+        project: Some(tierstate::root_key(&w.root())),
+        tier: Some(Tier::Off),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&dir, Tier::Relaxed, &off, 0).unwrap();
+    assert_eq!(w.resolve(&[]).tier, Tier::Off);
+    w.write(".claude/security.json", r#"{"tier":"high"}"#);
+    let r = w.resolve(&[]);
+    assert_eq!(
+        (r.tier, r.source, r.user),
+        (Tier::High, TierSource::KitSecurityJson, Tier::Off)
+    );
+    assert!(noted(&r, "floor") && noted(&r, "kit"), "{:?}", r.notes);
+
+    let sibling = TempDir::new("tiers-sibling");
+    let r = w.resolve_in(sibling.path(), &dir, &[]);
+    assert_eq!((r.tier, r.source), (Tier::Relaxed, TierSource::Base));
+}
+
+// ---------------------------------------------------------------------------------------
+// Authenticated state
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_forged_or_edited_tier_json_is_ignored_with_a_mac_note() {
+    let w = World::new("tiers-forged");
+    let dir = w.dir();
+    std::fs::write(
+        w.data.join("tier.json"),
+        r#"{"v":1,"mac":"00","gen":1,"body":{"v":1,"global":{"tier":"off"},"projects":{}}}"#,
+    )
+    .unwrap();
+    let r = w.resolve(&[]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(noted(&r, "MAC"), "{:?}", r.notes);
+
+    // A genuine file edited by hand afterwards.
+    let _ = std::fs::remove_file(w.data.join("tier.json"));
+    let high = tierstate::Change {
+        project: None,
+        tier: Some(Tier::High),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&dir, Tier::Relaxed, &high, 0).unwrap();
+    let text = std::fs::read_to_string(w.data.join("tier.json")).unwrap();
+    std::fs::write(
+        w.data.join("tier.json"),
+        text.replace("\"high\"", "\"off\""),
+    )
+    .unwrap();
+    let r = w.resolve(&[]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(noted(&r, "MAC"), "{:?}", r.notes);
+}
+
+#[test]
+fn an_untrusted_data_dir_selects_nothing() {
+    let w = World::new("tiers-untrusted");
+    let off = tierstate::Change {
+        project: None,
+        tier: Some(Tier::Off),
+        env_read: Some(EnvRead::Tier),
+        clear: false,
+    };
+    tierstate::apply(&w.dir(), Tier::Relaxed, &off, 0).unwrap();
+    let untrusted = DataDir {
+        trusted: false,
+        ..w.dir()
+    };
+    let r = w.resolve_in(w.proj.path(), &untrusted, &[]);
+    assert_eq!((r.tier, r.env_read), (Tier::Relaxed, EnvRead::Deny));
+    assert!(noted(&r, "untrusted"), "{:?}", r.notes);
+}
+
+// ---------------------------------------------------------------------------------------
+// env_read
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
+    let w = World::new("tiers-envread");
+    w.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: tier\n");
+    let policy = Policy::load(w.proj.path());
+    assert!(
+        policy
+            .ignored_overrides
+            .iter()
+            .any(|n| n.starts_with("secrets.env_read")),
+        "{:?}",
+        policy.ignored_overrides
+    );
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
+
+    let w = World::new("tiers-envread-user");
+    let run = w.cli(&["tier", "--env-read", "tier"]);
+    assert_eq!(run.json()["status"], "pending", "{}", run.stdout);
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
+    let code = w.code_shown();
+    assert!(w
+        .prompt(&format!("safe-ai-skill confirm {code}"))
+        .stdout
+        .contains("you confirmed"));
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Tier);
+    // Tightening applies at once.
+    let deny = tierstate::Change {
+        project: None,
+        tier: None,
+        env_read: Some(EnvRead::Deny),
+        clear: false,
+    };
+    assert_eq!(
+        tierstate::plan(&w.dir(), Tier::Relaxed, &deny),
+        tierstate::Plan::Immediate
+    );
+    tierstate::apply(&w.dir(), Tier::Relaxed, &deny, 0).unwrap();
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
+}
+
+// ---------------------------------------------------------------------------------------
+// Migration (spec §9)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn v1_profiles_migrate_to_tiers_once() {
+    for (profile, tier, needle) in [
+        ("strict", Tier::Relaxed, "curl POST no longer asks"),
+        ("paranoid", Tier::High, "tier high"),
+        ("autopilot", Tier::Relaxed, "allow --scope transfer"),
+        ("off", Tier::Relaxed, "safe-ai-skill tier off"),
+    ] {
+        let w = World::new("tiers-migrate");
+        std::fs::write(
+            w.data.join("mode.json"),
+            format!(r#"{{"profile":"{profile}","set_at":5}}"#),
+        )
+        .unwrap();
+        let first = w.session();
+        assert!(first.contains(needle), "{profile}: {first}");
+        assert_eq!(w.resolve(&[]).tier, tier, "{profile}");
+        assert!(!w.session().contains(needle), "{profile}: shown twice");
+        if profile == "off" {
+            assert!(w.data.join("mode.json.v1-unmigrated").exists());
+        }
+    }
+}
+
+#[test]
+fn the_kit_policy_yaml_loads_with_only_documented_notes() {
+    let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(KIT_POLICY));
+    assert!(!p.is_fail_closed());
+    assert!(p.ignored_overrides.is_empty(), "{:?}", p.ignored_overrides);
+    assert!(p.repo_tier_hints.is_empty());
+    assert_eq!(p.repo_env_read, None);
+    assert_eq!(
+        p.secrets.allow_read_globs,
+        vec!["**/.env.example".to_string(), "**/.env.schema".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The tests/common builder
+// ---------------------------------------------------------------------------------------
+
+fn show(inv: Invocation) -> serde_json::Value {
+    inv.run().json()
+}
+
+#[test]
+fn builder_kit_security_and_sandbox_reach_the_binary() {
+    let w = World::new("tiers-builder");
+    let v = show(
+        Invocation::new(&["tier"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .kit_security(r#"{"tier":"medium"}"#)
+            .sandbox(common::SandboxMode::On),
+    );
+    assert_eq!(v["tier"], "medium", "{v}");
+    assert_eq!(v["source"], "kit .claude/security.json");
+    if cfg!(target_os = "macos") || common::TEST_HOOKS {
+        assert_eq!(v["sandbox"], "on", "{v}");
+    }
+    let v = show(
+        Invocation::new(&["tier"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .sandbox(common::SandboxMode::Off),
+    );
+    assert_eq!(v["sandbox"], "off", "{v}");
+    assert!(v["line"].as_str().unwrap().contains("(hooks only)"), "{v}");
+}
+
+#[test]
+fn builder_tier_selects_the_users_tier() {
+    let w = World::new("tiers-builder-tier");
+    let v = show(
+        Invocation::new(&["tier"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .tier(Tier::High),
+    );
+    assert_eq!(v["tier"], "high", "{v}");
+    if common::TEST_HOOKS {
+        let w = World::new("tiers-builder-off");
+        let v = show(
+            Invocation::new(&["tier"])
+                .plugin_data(w.data.path())
+                .home(w.home.path())
+                .cwd(w.proj.path())
+                .tier(Tier::Off)
+                .env_read(EnvRead::Ask),
+        );
+        assert_eq!(
+            (v["tier"].as_str(), v["source"].as_str()),
+            (Some("off"), Some("your setting")),
+            "{v}"
+        );
+        assert_eq!(v["env_read"], "ask", "{v}");
+    }
+}
+
+#[test]
+fn agents_may_request_a_tier_but_not_write_tier_json() {
+    let w = World::new("tiers-tripwire");
+    for command in [
+        "safe-ai-skill tier off",
+        "safe-ai-skill tier high --project",
+    ] {
+        let run = w.hook(
+            &["gate-bash-secrets"],
+            json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd": w.proj.path(),
+                   "tool_input":{"command": command}}),
+        );
+        assert_eq!(common::decision_label(&run), "", "{command}");
+    }
+    let target = w.data.join("tier.json");
+    let write = w.hook(
+        &["gate-tamper"],
+        json!({"hook_event_name":"PreToolUse","tool_name":"Write","cwd": w.proj.path(),
+               "tool_input":{"file_path": target, "content": "{}"}}),
+    );
+    assert_eq!(common::decision_label(&write), "deny");
+    let echo = w.hook(
+        &["gate-bash-secrets"],
+        json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd": w.proj.path(),
+               "tool_input":{"command": format!("echo '{{}}' > {}", target.display())}}),
+    );
+    assert_eq!(common::decision_label(&echo), "deny");
+}
