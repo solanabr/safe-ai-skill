@@ -98,6 +98,9 @@ fn decide_text(command: &str, text: &str, cwd: &Path, depth: usize) -> Option<Ve
         if let Some(reason) = clobber(cmd, &dirs, &homes, &wallets) {
             return Some(deny(reason, command));
         }
+        if let Some(reason) = xargs_clobber(cmd, text, &dirs, &homes, &wallets) {
+            return Some(deny(reason, command));
+        }
     }
     if redirects {
         if let Some(target) = redirect_target(text, &dirs, &homes, &wallets) {
@@ -716,6 +719,33 @@ fn clobber(cmd: &SimpleCommand, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -
             .map(|t| format!("`{program}` overwrites {t}"));
     }
     None
+}
+
+/// A file-clobbering program fed its operands by `xargs` (the parser's `$XARGS` word): when
+/// any word of the line resolves to a protected wallet (or, for a delete or move, a directory
+/// holding one), it may be among them (`echo ~/.config/solana/id.json | xargs rm`).
+fn xargs_clobber(
+    cmd: &SimpleCommand,
+    text: &str,
+    dirs: &Dirs,
+    homes: &Homes,
+    wallets: &Wallets,
+) -> Option<String> {
+    let program = cmd.program();
+    if !cmd.words.iter().any(|w| w.dynamic && w.text == "$XARGS") {
+        return None;
+    }
+    let ancestors = DELETE_OR_MOVE.contains(&program.as_str());
+    crate::context::tokenize(text).iter().find_map(|token| {
+        let raw = token.trim_matches(|c| matches!(c, ';' | '|' | '&' | '(' | ')'));
+        if raw.is_empty() || raw.starts_with('-') {
+            return None;
+        }
+        match path_hit(raw, false, dirs, homes, wallets, ancestors) {
+            Some(Hit::Wallet(t)) => Some(format!("`xargs {program}` may receive {t}")),
+            _ => None,
+        }
+    })
 }
 
 /// The wallet a `>`/`>>`/`>|`/`&>` redirection in `command` writes, if any. The parser drops

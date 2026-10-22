@@ -117,13 +117,19 @@ pub fn over_cap(policy: &Policy) -> (Decision, GateMeta) {
 const TRIGGERS: &[&str] = &["solana", "spl-token", "anchor", "keygen", "xargs"];
 
 /// Whether `command` could concern this gate or the wallet gate. Conservative: when in doubt,
-/// the full gate runs. It does when the command is over the work cap; holds ANSI-C quoting or
+/// the full gate runs. It does when the command is over the work cap (any size over
+/// [`MAX_PARSE_BYTES`], trigger or not); holds ANSI-C quoting or
 /// a redirection; contains a [`TRIGGERS`] word once `\`+newline, quotes and backslashes are
 /// removed; or its parse is unreadable, opaque, writes or runs script text, or has a command
 /// whose program is a family program, `solana-keygen`, a file-clobbering program (the wallet
 /// gate's), an expansion or an unquoted glob. `false` lets `gate-bash`, wired for every Bash
 /// call, answer no opinion before loading policy, lists or state. It parses the command once.
 pub fn may_concern(command: &str) -> bool {
+    // Too large to parse: the gate asks, whatever the text names (padding must not switch off
+    // the parse-based routing below).
+    if command.len() > MAX_PARSE_BYTES {
+        return true;
+    }
     let lower = command.to_ascii_lowercase();
     let joined = lower.replace("\\\r\n", "").replace("\\\n", "");
     let plain: String = joined
@@ -132,11 +138,6 @@ pub fn may_concern(command: &str) -> bool {
         .collect();
     if lower.contains("$'") || TRIGGERS.iter().any(|w| plain.contains(w)) {
         return true;
-    }
-    // Nothing names a trigger: an oversized command (a large here-doc, say) is ruled out
-    // without parsing; a deeply nested one could build a program name, so it asks.
-    if command.len() > MAX_PARSE_BYTES {
-        return false;
     }
     if over_work_cap(command) || lower.contains('>') {
         return true;

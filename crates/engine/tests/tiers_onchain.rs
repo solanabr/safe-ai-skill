@@ -1295,22 +1295,68 @@ fn unreadable_high_reason_does_not_ask() {
 }
 
 #[test]
-fn the_size_cap_applies_only_when_the_fast_path_cannot_rule_out() {
+fn any_command_over_the_size_cap_asks_whatever_it_names() {
     let body = "x".repeat(bash::MAX_PARSE_BYTES);
+    let pad = format!(" #{body}");
+    let w = World::new("onchain-cap-pad");
+    // A large here-doc is a false positive the size cap accepts.
     let heredoc = format!("cat > notes.txt <<'EOF'\n{body}\nEOF");
-    assert!(!bash::may_concern(&heredoc));
-    let w = World::new("onchain-heredoc");
-    let run = w.run("gate-bash", &heredoc, Tier::High, &[]);
-    assert_eq!(decision_label(&run), "");
-    // With a trigger it reaches the gate, which asks without parsing (deny at High).
-    let named = format!("cat > notes.txt <<'EOF'\nsolana {body}\nEOF");
-    assert!(bash::may_concern(&named));
-    assert_eq!(
-        decision_label(&w.run("gate-bash", &named, Tier::Relaxed, &[])),
-        "ask"
-    );
+    // Padding must not switch off the parse-based routing (re-review 2, R7).
+    let padded = [
+        format!("/usr/local/bin/sol*a program close P --bypass-warning -um{pad}"),
+        format!(
+            r"find /usr/local/bin -name 'sol*a' -exec {{}} program close P --bypass-warning -um \;{pad}"
+        ),
+        format!(r#"eval "$S program close P --bypass-warning -um"{pad}"#),
+        format!("x=sol; ${{x}}ana program close P --bypass-warning -um{pad}"),
+        format!("rm -rf ~/.c*{pad}"),
+        format!("spl-token burn A 1 -um{pad}"),
+        heredoc,
+    ];
+    for cmd in &padded {
+        let head: String = cmd.chars().take(60).collect();
+        assert!(bash::over_work_cap(cmd), "{head}");
+        assert!(bash::may_concern(cmd), "{head}");
+        assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{head}");
+        assert_eq!(
+            decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[])),
+            "ask",
+            "{head}"
+        );
+        assert_eq!(
+            decision_label(&w.run("gate-bash", cmd, Tier::High, &[])),
+            "deny",
+            "{head}"
+        );
+        assert_eq!(
+            decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[("CI", "1")])),
+            "deny",
+            "{head}"
+        );
+    }
     // `>` still routes a small command to the full gate.
     assert!(bash::may_concern("make 2>&1"));
+}
+
+#[test]
+fn e2e_xargs_fed_wallet_paths_deny() {
+    let w = World::new("onchain-wallet-xargs");
+    for cmd in [
+        "echo ~/.config/solana/id.json | xargs rm",
+        "echo ~/.config/solana | xargs rm -rf",
+        "printf '%s\\n' ~/.config/solana/id.json | xargs -I{} mv {} /tmp/",
+        "echo k.json ~/.config/solana/id.json | xargs cp",
+    ] {
+        assert_eq!(w.bash(cmd, Tier::Relaxed), "deny", "{cmd}");
+        assert_eq!(
+            decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[])),
+            "deny",
+            "gate-bash: {cmd}"
+        );
+    }
+    for cmd in ["ls build | xargs rm -rf", "echo id.json | xargs cat"] {
+        assert_eq!(w.bash(cmd, Tier::Relaxed), "", "{cmd}");
+    }
 }
 
 #[test]
