@@ -1172,10 +1172,7 @@ fn work_for(rows: &[Row], filter: &[String]) -> Vec<(usize, usize)> {
 const KNOWN_FEATURES: [&str; 1] = ["env-read-opt-in"];
 
 fn built_with(feature: &str) -> bool {
-    match feature {
-        "env-read-opt-in" => cfg!(feature = "env-read-opt-in"),
-        _ => false,
-    }
+    feature == "env-read-opt-in" && cfg!(feature = "env-read-opt-in")
 }
 
 /// The plugin verdict this build must give: the interim one while the row says the shipped
