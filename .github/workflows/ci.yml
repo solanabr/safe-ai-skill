@@ -218,8 +218,9 @@ jobs:
   # SHA256SUMS sits next to the binaries it hashes, so it only catches
   # accidents. Every committed binary must have a build-provenance attestation
   # from this repo's release.yml. The four 1.0.0 binaries predate attestations
-  # and pass by exact hash until the 1.0.1 vendor commit replaces them; delete
-  # the list then (docs/RELEASING.md).
+  # and pass by exact hash until the 1.0.1 vendor commit replaces them. Once no
+  # committed binary matches the list any more, the job fails until the list is
+  # deleted (docs/RELEASING.md), so the exemption can't outlive its binaries.
   verify-attestations:
     name: Verify binary provenance
     needs: lint
@@ -244,8 +245,11 @@ jobs:
             0841177e292792483d1de26d8fbd94136f8cd5f6b8ff9d7c8245ccc9bf89fec4
             3ca82dd64be0ae18898230a8d938b9c3f6e20f1adc31f80aa0218e8534c5890e
           "
-          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            f="safe-ai-skill-$p"
+          legacy_hits=0
+          for f in safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 \
+            safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 safe-ai-skill-windows-x64.exe; do
+            # The Windows binary first ships in 1.1.0.
+            if [ ! -e "$f" ] && [ "$f" = safe-ai-skill-windows-x64.exe ]; then continue; fi
             h=$(sha256sum "$f" | cut -d' ' -f1)
             if [ "${#h}" -ne 64 ]; then
               echo "::error::could not hash $f"
@@ -254,6 +258,7 @@ jobs:
             case "$legacy_1_0_0" in
               *"$h"*)
                 echo "::notice::$f is the 1.0.0 build (released before attestations)"
+                legacy_hits=$((legacy_hits + 1))
                 continue ;;
             esac
             gh attestation verify "$f" \
@@ -261,6 +266,10 @@ jobs:
               --signer-workflow "$RELEASE_REPO/.github/workflows/release.yml" \
               --source-ref refs/heads/main
           done
+          if [ -n "$(printf '%s' "$legacy_1_0_0" | tr -d ' \n')" ] && [ "$legacy_hits" -eq 0 ]; then
+            echo "::error::no committed binary is a 1.0.0 build any more: delete legacy_1_0_0 from this job"
+            exit 1
+          fi
 
   # ── plugin binary checksum + shim syntax ─────────────────────────────────
   verify-plugin-bin:
@@ -283,6 +292,10 @@ jobs:
       - name: Shim passes sh -n (syntax check)
         run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill
 
+      # The shim refuses a prebuilt whose sha256 isn't its stamped constant (D6.1).
+      - name: Shim sha256 constants match the committed binaries
+        run: sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin
+
   # ── shim failure contract (fake uname + fake engines, no build) ─────────
   # /bin/sh is dash on Ubuntu and bash 3.2 on macOS; the script also runs dash and
   # bash --posix wherever they exist.
@@ -298,10 +311,92 @@ jobs:
 
       - name: shellcheck (shim + test)
         if: runner.os == 'Linux'
-        run: shellcheck plugins/safe-ai-skill/bin/safe-ai-skill scripts/test-shim.sh
+        run: shellcheck plugins/safe-ai-skill/bin/safe-ai-skill scripts/test-shim.sh scripts/stamp-shim.sh
 
       - name: scripts/test-shim.sh
         run: sh scripts/test-shim.sh
+
+  # ── Windows (1.1.0 tier: Git Bash) — build + engine tests ────────────────
+  # release.yml ships safe-ai-skill-windows-x64.exe built with +crt-static; this
+  # builds the same way and runs the engine suite. The platform notices and the
+  # Windows trust-path tests must pass. The full suite is not yet Windows-clean (fixtures assume
+  # unix paths, symlinks, FIFOs and modes), so it reports without failing the
+  # run until it is.
+  windows:
+    name: Windows / x86_64-pc-windows-msvc
+    needs: lint
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: cargo build --release --locked
+        run: cargo build --manifest-path "$MANIFEST" --release --locked
+
+      - name: --version runs
+        run: crates/engine/target/release/safe-ai-skill.exe --version
+
+      - name: Platform notices and case-insensitive trust paths
+        run: |
+          cargo test --manifest-path "$MANIFEST" --lib platform::
+          cargo test --manifest-path "$MANIFEST" --lib datadir::tests::windows_
+          cargo test --manifest-path "$MANIFEST" --lib datadir::tests::lowercase_
+
+      - name: Full engine suite (not yet required on Windows)
+        continue-on-error: true
+        run: cargo test --manifest-path "$MANIFEST"
+
+  # ── latency budget (spec D5, cold gate < 50 ms, sweep <= 2x baseline) ─────
+  # The cold gate-read goes through the real shim with the static musl build;
+  # the SessionStart sweep is compared with the shipped linux-x64 binary on the
+  # same runner, so the bound tracks the hardware.
+  latency:
+    name: Latency budget
+    needs: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build (release, musl)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --manifest-path "$MANIFEST" --release --locked --target x86_64-unknown-linux-musl
+
+      - name: scripts/latency-budget.py
+        run: |
+          python3 -I scripts/latency-budget.py \
+            --engine crates/engine/target/x86_64-unknown-linux-musl/release/safe-ai-skill \
+            --baseline plugins/safe-ai-skill/bin/safe-ai-skill-linux-x64
 
   # ── package + script checks (npm wrapper, install.sh, version consistency) ─
   package-checks:
@@ -316,7 +411,7 @@ jobs:
           node --check npm/scripts/postinstall.js
 
       - name: shellcheck (install.sh + scripts)
-        run: shellcheck install.sh scripts/check-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh
+        run: shellcheck install.sh scripts/check-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh
 
       - name: sh -n (install.sh + scripts)
         run: |
@@ -324,6 +419,8 @@ jobs:
           sh -n scripts/check-versions.sh
           sh -n scripts/smoke-static-linux.sh
           sh -n scripts/test-smoke-static-linux.sh
+          sh -n scripts/stamp-shim.sh
+          python3 -I -m py_compile scripts/latency-budget.py
 
       - name: smoke-static-linux.sh logic (stubbed readelf + docker)
         run: sh scripts/test-smoke-static-linux.sh
