@@ -10,82 +10,52 @@ pub(super) fn evaluate(outs: &[FileOut], facts: &PackFacts) -> Vec<ComboHit> {
     let mut hits: Vec<ComboHit> = Vec::new();
     let mut first_eval: Option<(&Path, u32)> = None;
     let mut any_decoder = false;
+    // Each per-file combo with the signal it needs and the parts it reports.
+    let single: [(&'static str, Signal, &[&'static str]); 7] = [
+        (
+            "exec_b64_literal",
+            Signal::ExecB64(0),
+            &["exec_sink", "b64_literal"],
+        ),
+        (
+            "bang_exfil",
+            Signal::BangExfil(0),
+            &["bang_cmd", "network_or_secret"],
+        ),
+        (
+            "description_injection",
+            Signal::DescInjection(0),
+            &["description_injection"],
+        ),
+        (
+            "lifecycle_network",
+            Signal::LifecycleNet(0),
+            &["lifecycle_script", "network_or_eval"],
+        ),
+        (
+            "harness_bypass",
+            Signal::HarnessBypass(0),
+            &["harness_settings", "bypass_permissions"],
+        ),
+        ("symlink_escape", Signal::SymlinkEscape, &["symlink_escape"]),
+        ("native_binary", Signal::NativeBinary, &["native_binary"]),
+    ];
     for out in outs {
-        let mut sinks: Vec<u32> = Vec::new();
-        let mut pads_h: Vec<u32> = Vec::new();
-        let mut pads_v: Vec<u32> = Vec::new();
-        let mut registry_write: Option<u32> = None;
-        let mut registry_host = false;
-        for signal in &out.signals {
-            match *signal {
-                Signal::Sink(l) => sinks.push(l),
-                Signal::PadH(l) => pads_h.push(l),
-                Signal::PadV(l) => pads_v.push(l),
-                // A bundle concatenates unrelated modules, so it never feeds the cross-file
-                // split-payload rule (in-statement combos still apply to it).
-                Signal::Eval(l) if !generated(out) => {
-                    first_eval.get_or_insert((&out.path, l));
-                }
-                Signal::Decoder(_) if !generated(out) => any_decoder = true,
-                Signal::Eval(_) | Signal::Decoder(_) => {}
-                Signal::ExecB64(l) => push(
-                    &mut hits,
-                    "exec_b64_literal",
-                    out,
-                    Some(l),
-                    &["exec_sink", "b64_literal"],
-                ),
-                Signal::BangExfil(l) => push(
-                    &mut hits,
-                    "bang_exfil",
-                    out,
-                    Some(l),
-                    &["bang_cmd", "network_or_secret"],
-                ),
-                Signal::DescInjection(l) => push(
-                    &mut hits,
-                    "description_injection",
-                    out,
-                    Some(l),
-                    &["description_injection"],
-                ),
-                Signal::LifecycleNet(l) => push(
-                    &mut hits,
-                    "lifecycle_network",
-                    out,
-                    Some(l),
-                    &["lifecycle_script", "network_or_eval"],
-                ),
-                Signal::HarnessBypass(l) => push(
-                    &mut hits,
-                    "harness_bypass",
-                    out,
-                    Some(l),
-                    &["harness_settings", "bypass_permissions"],
-                ),
-                Signal::RegistryWrite(l) => {
-                    registry_write.get_or_insert(l);
-                }
-                Signal::RegistryHost(_) => registry_host = true,
-                Signal::SymlinkEscape => {
-                    push(&mut hits, "symlink_escape", out, None, &["symlink_escape"])
-                }
-                Signal::NativeBinary => {
-                    push(&mut hits, "native_binary", out, None, &["native_binary"])
-                }
+        let signals = &out.signals;
+        // A bundle concatenates unrelated modules, so it never feeds the cross-file
+        // split-payload rule (in-statement combos still apply to it).
+        if !generated(out) {
+            if let Some(line) = signals.seen(Signal::Eval(0)).and_then(|s| s.line) {
+                first_eval.get_or_insert((&out.path, line));
+            }
+            any_decoder |= signals.seen(Signal::Decoder(0)).is_some();
+        }
+        for (rule, signal, parts) in single {
+            if let Some(seen) = signals.seen(signal) {
+                push(&mut hits, rule, out, seen.line, parts);
             }
         }
-        let padded = pads_h
-            .iter()
-            .copied()
-            .find(|l| sinks.contains(l))
-            .or_else(|| {
-                pads_v
-                    .iter()
-                    .filter_map(|after| sinks.iter().copied().filter(|l| l >= after).min())
-                    .min()
-            });
-        if let Some(l) = padded {
+        if let Some(l) = signals.padding_sink() {
             push(
                 &mut hits,
                 "padding_sink",
@@ -94,12 +64,15 @@ pub(super) fn evaluate(outs: &[FileOut], facts: &PackFacts) -> Vec<ComboHit> {
                 &["padding", "sink"],
             );
         }
-        if let (Some(l), true) = (registry_write, registry_host) {
+        if let (Some(write), Some(_)) = (
+            signals.seen(Signal::RegistryWrite(0)),
+            signals.seen(Signal::RegistryHost(0)),
+        ) {
             push(
                 &mut hits,
                 "registry_hijack",
                 out,
-                Some(l),
+                write.line,
                 &["registry_write", "registry_host"],
             );
         }

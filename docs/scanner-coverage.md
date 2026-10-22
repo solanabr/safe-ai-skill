@@ -142,8 +142,14 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
     count, so they cannot be used to pad the cap.
   * After 50 live hits in one file (`rules::MAX_HITS_PER_RULE`), a rule stops creating findings
     there. Detection and combo signals carry on, so a payload after the cap still blocks.
-  * `PackReport::capped` records each such rule, file and true hit count, and any entry grades
-    the pack at least HIGH.
+  * `PackReport::capped` records each such rule, file and true hit count. An entry for a WARN
+    or HIGH rule grades the pack at least HIGH; a capped INFO inventory rule (`decoder`,
+    `child_process`, …) stays INFO.
+  * Combo inputs are never dropped at a store limit. Each file keeps, per signal kind, the first
+    line and a count (enough for the cross-file and pack-level combos). The line-local
+    `padding_sink` is resolved from line bitsets, bounded by the file's line count and freed
+    once the file is scanned, so flooding a file with thousands of sinks or padded lines hides
+    nothing.
   * Stored findings stay capped at five per rule and severity.
 * **Per pack and per sweep.** `rules::scan_pack_within` takes a `ScanBudget`: 2 s per pack, and
   4 s for every pack of one SessionStart sweep (`ScanBudget::session`, used by the verify
@@ -157,9 +163,17 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
   * The session context lists it as "not fully scanned — rerun `safe-ai-skill verify check
     <dir>`" (`verify check` scans without a budget).
   * Once the sweep's budget is spent, the remaining unpinned packs are **deferred**: not
-    scanned, not pinned, and listed in the session context. They are scanned at the next
-    session.
-  * Pinned packs still get their drift check when deferred.
+    scanned, not pinned, and listed in the session context. They are scanned first at the
+    next session (see Rotation).
+  * Pinned packs still get their drift check when deferred. Hashing a pack (drift check or the
+    hash a new pin records) is bounded by the per-pack allowance; a hash that runs out leaves
+    the pack unreviewed, never passed. A high finding from the scan still quarantines it.
+  * **Rotation.** The lockfile records which packs the sweep deferred (`sweep_deferred`) and
+    left unreviewed (`sweep_unreviewed`). The next sweep scans the deferred packs first, then
+    the unreviewed ones, then the rest, each group in walk order (roots in order, skill
+    directories and ext submodules sorted by name). A pack that spends the whole budget every
+    session cannot starve the packs after it: a deferred pack is scanned at the next session
+    unless other deferred packs ahead of it spend that session's budget too.
   * The v1 shim reports a cut scan as incomplete rather than as a finding (the marker maps to
     High wherever it appears).
 
@@ -240,9 +254,11 @@ rule ideas were reimplemented here; no rule lists were copied.
 * **Budget cut-offs.** A pack cut by the time budget is graded on what was scanned before the
   cut: HIGH at least, BLOCK if a payload was already found. At SessionStart it stays unreviewed
   until `verify check` scans it in full.
-* **Hit-cap escalation.** Any rule with more than 50 live hits in one file makes the pack HIGH,
-  INFO rules included. None of the ai-kit packs reaches the cap, but a very large legitimate
-  file could (for example, more than 50 `child_process` calls).
+* **Hit-cap escalation.** A WARN or HIGH rule with more than 50 live hits in one file makes the
+  pack HIGH. None of the ai-kit packs reaches the cap. Capped INFO rules do not escalate.
+* **Packs that never fit the budget.** A pack too large to scan within the per-pack allowance
+  stays unreviewed every session (retried right after the deferred packs) until `verify check`
+  scans it in full.
 * **Indirect load-time commands.** A `` !`cmd` `` is followed into a pack script one level deep,
   and only when the script is named directly (an interpreter and a path, or a path).
 * **Descriptions.** Only `SKILL.md` frontmatter is checked, not the frontmatter of agent or

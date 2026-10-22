@@ -41,7 +41,12 @@ pub struct BudgetedScan {
 
 /// [`scan`] under a wall-clock budget shared across a sweep (SessionStart).
 pub fn scan_within(path: &Path, budget: &rules::ScanBudget) -> BudgetedScan {
-    let mut pack = rules::scan_pack_within(path, budget);
+    scan_until(path, budget.pack_deadline())
+}
+
+/// [`scan`] that stops at `deadline` (`None`: unbounded).
+pub fn scan_until(path: &Path, deadline: Option<std::time::Instant>) -> BudgetedScan {
+    let mut pack = rules::scan_pack_until(path, deadline);
     let before = pack.findings.len();
     pack.findings.retain(|f| f.rule != "scan_budget_exceeded");
     BudgetedScan {

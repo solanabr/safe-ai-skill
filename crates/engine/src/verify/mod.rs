@@ -498,95 +498,84 @@ pub fn run_session_with_budget(
     let mut warnings: Vec<String> = Vec::new();
 
     // The ext dir name (e.g. `ext`) is skipped as a top-level skill child: its submodules are
-    // verified individually below, so the `ext/` blob is never pinned as one unit.
+    // verified individually, so the `ext/` blob is never pinned as one unit.
     let ext_name = ext_component(&policy.supply_chain.ext_dir);
 
+    let mut units: Vec<Unit> = Vec::new();
     for root in skill_dirs {
         let root_path = expand_home(root);
         if !root_path.is_dir() {
             continue;
         }
-        let entries = match std::fs::read_dir(&root_path) {
-            Ok(e) => e,
+        let mut skills: Vec<PathBuf> = match std::fs::read_dir(&root_path) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect(),
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
+        // Deterministic order, like the ext submodules.
+        skills.sort();
+        for dir in skills {
+            let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
                 continue;
-            }
-            let name = match dir.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
             };
-
             // When ext-submodule verification is on, the `ext/` dir is decomposed into its
-            // submodules (handled per-root below), never scanned as a single skill.
+            // submodules, never scanned as a single skill.
             if policy.supply_chain.verify_ext_submodules && name == ext_name {
                 continue;
             }
-
-            if budget.exhausted() && !lock.skills.contains_key(&name) {
-                defer(&mut result, &mut warnings, "skill", &name, &dir);
-                continue;
-            }
-            let hash = lockfile::hash_tree(&dir);
-            let drift = lock.skill_drift(&name, &hash);
-            let scan = (!budget.exhausted()).then(|| heuristics::scan_within(&dir, budget));
-            let unscanned = Report::default();
-            let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
-            let eval = eval_skill(&name, hash.clone(), drift, report);
-
-            if eval.quarantine {
-                match quarantine_dir(plugin_data, &name, &dir) {
-                    Ok(_) => {
-                        let why = if drift == lockfile::DriftStatus::Drifted {
-                            "content drifted from its pinned hash".to_string()
-                        } else {
-                            "high-severity supply-chain finding".to_string()
-                        };
-                        warnings.push(format!("quarantined skill `{name}` ({why})"));
-                        result.quarantined.push(name.clone());
-                        lock.skills.remove(&name);
-                    }
-                    Err(e) => {
-                        warnings.push(format!("failed to quarantine `{name}`: {e}"));
-                    }
-                }
-            } else if scan.is_none() {
-                defer(&mut result, &mut warnings, "skill", &name, &dir);
-            } else if scan.as_ref().is_some_and(|s| !s.complete) {
-                unreviewed(&mut result, &mut warnings, "skill", &name, &dir);
-            } else if drift == lockfile::DriftStatus::Unpinned {
-                lock.pin_skill(
-                    &name,
-                    lockfile::SkillPin {
-                        sha256: hash,
-                        source: String::new(),
-                        verified_at: now_secs(),
-                        scan: eval
-                            .max_severity
-                            .map(severity_label)
-                            .unwrap_or("")
-                            .to_string(),
-                    },
-                );
-                result.pinned.push(name.clone());
-            }
-
-            result.evals.push(eval);
+            units.push(Unit {
+                kind: UnitKind::Skill,
+                name,
+                dir,
+            });
         }
-
         // Verify each `ext/<name>` submodule under this root as its own unit.
-        for sub in ext_submodules(&root_path, policy) {
-            process_ext_submodule(
-                plugin_data,
-                &sub,
-                budget,
-                &mut lock,
-                &mut result,
-                &mut warnings,
-            );
+        for dir in ext_submodules(&root_path, policy) {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) {
+                units.push(Unit {
+                    kind: UnitKind::Ext,
+                    name,
+                    dir,
+                });
+            }
+        }
+    }
+
+    // Packs the last sweep deferred go first, then the ones it left unreviewed, so a pack that
+    // spends the whole budget every session cannot starve the packs after it. Stable sort:
+    // within each group the walk order above holds.
+    let previous_deferred = std::mem::take(&mut lock.sweep_deferred);
+    let previous_unreviewed = std::mem::take(&mut lock.sweep_unreviewed);
+    units.sort_by_key(|u| {
+        let key = u.key();
+        if previous_deferred.contains(&key) {
+            0
+        } else if previous_unreviewed.contains(&key) {
+            1
+        } else {
+            2
+        }
+    });
+
+    for unit in &units {
+        match process_unit(
+            plugin_data,
+            unit,
+            budget,
+            &mut lock,
+            &mut result,
+            &mut warnings,
+        ) {
+            Outcome::Deferred => {
+                lock.sweep_deferred.insert(unit.key());
+            }
+            Outcome::Unreviewed => {
+                lock.sweep_unreviewed.insert(unit.key());
+            }
+            Outcome::Done => {}
         }
     }
 
@@ -602,7 +591,179 @@ pub fn run_session_with_budget(
     result
 }
 
-/// A pack the sweep did not scan this session: never pinned, surfaced, scanned next session.
+/// What kind of pack one sweep unit is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitKind {
+    /// An immediate child of a skills root, pinned by content hash.
+    Skill,
+    /// An `ext/<name>` submodule, pinned by commit SHA (content-hash fallback).
+    Ext,
+}
+
+/// One pack the sweep verifies.
+struct Unit {
+    kind: UnitKind,
+    name: String,
+    dir: PathBuf,
+}
+
+impl Unit {
+    /// Key in the lockfile's sweep queues.
+    fn key(&self) -> String {
+        match self.kind {
+            UnitKind::Skill => format!("skill:{}", self.name),
+            UnitKind::Ext => format!("ext:{}", self.name),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            UnitKind::Skill => "skill",
+            UnitKind::Ext => "ext submodule",
+        }
+    }
+}
+
+/// How one unit left the sweep (for the next sweep's order).
+enum Outcome {
+    Deferred,
+    Unreviewed,
+    Done,
+}
+
+/// Verify one unit: identity and drift vs the lockfile, then the heuristic scan.
+///
+/// Quarantines on a High finding or drift; TOFU-pins a complete, clean, unpinned pack. Once the
+/// sweep's budget is spent an unpinned pack is deferred; a pinned one still gets its drift
+/// check, bounded by the per-pack allowance. A drift hash or scan cut by the budget leaves the
+/// pack unreviewed (never pinned, never passed). Mutates `lock`/`result`/`warnings`; never
+/// panics.
+fn process_unit(
+    plugin_data: &Path,
+    unit: &Unit,
+    budget: &rules::ScanBudget,
+    lock: &mut lockfile::Lockfile,
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+) -> Outcome {
+    let (name, dir, what) = (unit.name.as_str(), unit.dir.as_path(), unit.label());
+    let pinned = match unit.kind {
+        UnitKind::Skill => lock.skills.contains_key(name),
+        UnitKind::Ext => lock.ext.contains_key(name),
+    };
+    if budget.exhausted() && !pinned {
+        defer(result, warnings, what, name, dir);
+        return Outcome::Deferred;
+    }
+    let scan = (!budget.exhausted()).then(|| heuristics::scan_until(dir, budget.pack_deadline()));
+    let unscanned = Report::default();
+    let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
+    // The identity hash gets its own per-pack allowance, even past the sweep's deadline (every
+    // pinned pack gets its drift check); an overrun leaves the pack unverified, never passed.
+    let deadline = budget.drift_deadline();
+    let identity = match unit.kind {
+        UnitKind::Skill => lockfile::hash_tree_until(dir, deadline).map(|sha| (sha, "")),
+        UnitKind::Ext => {
+            lockfile::resolve_ext_identity_until(dir, deadline).map(|i| (i.sha, i.kind))
+        }
+    };
+    let Some((sha, id_kind)) = identity else {
+        if report.max_severity() == Some(Severity::High) {
+            quarantine_unit(plugin_data, unit, false, lock, result, warnings);
+            return Outcome::Done;
+        }
+        unreviewed(result, warnings, what, name, dir);
+        return Outcome::Unreviewed;
+    };
+    let drift = match unit.kind {
+        UnitKind::Skill => lock.skill_drift(name, &sha),
+        UnitKind::Ext => lock.ext_drift(name, &sha),
+    };
+    let eval = eval_skill(name, sha.clone(), drift, report);
+
+    let mut outcome = Outcome::Done;
+    if eval.quarantine {
+        let drifted = drift == lockfile::DriftStatus::Drifted;
+        quarantine_unit(plugin_data, unit, drifted, lock, result, warnings);
+    } else if scan.is_none() {
+        defer(result, warnings, what, name, dir);
+        outcome = Outcome::Deferred;
+    } else if scan.as_ref().is_some_and(|s| !s.complete) {
+        unreviewed(result, warnings, what, name, dir);
+        outcome = Outcome::Unreviewed;
+    } else if drift == lockfile::DriftStatus::Unpinned {
+        let scan_label = eval
+            .max_severity
+            .map(severity_label)
+            .unwrap_or("")
+            .to_string();
+        match unit.kind {
+            UnitKind::Skill => lock.pin_skill(
+                name,
+                lockfile::SkillPin {
+                    sha256: sha,
+                    source: String::new(),
+                    verified_at: now_secs(),
+                    scan: scan_label,
+                },
+            ),
+            UnitKind::Ext => lock.pin_ext(
+                name,
+                lockfile::ExtPin {
+                    sha,
+                    kind: id_kind.to_string(),
+                    verified_at: now_secs(),
+                    scan: scan_label,
+                },
+            ),
+        }
+        result.pinned.push(name.to_string());
+    }
+
+    result.evals.push(eval);
+    outcome
+}
+
+/// Quarantine one unit (for drift, or for a high-severity finding) and drop its pin.
+fn quarantine_unit(
+    plugin_data: &Path,
+    unit: &Unit,
+    drifted: bool,
+    lock: &mut lockfile::Lockfile,
+    result: &mut SessionResult,
+    warnings: &mut Vec<String>,
+) {
+    let (name, what) = (unit.name.as_str(), unit.label());
+    match quarantine_dir(plugin_data, name, &unit.dir) {
+        Ok(_) => {
+            let why = match (drifted, unit.kind) {
+                (true, UnitKind::Skill) => "content drifted from its pinned hash",
+                (true, UnitKind::Ext) => "submodule SHA drifted from its pin",
+                (false, _) => "high-severity supply-chain finding",
+            };
+            warnings.push(format!("quarantined {what} `{name}` ({why})"));
+            result.quarantined.push(name.to_string());
+            match unit.kind {
+                UnitKind::Skill => {
+                    lock.skills.remove(name);
+                }
+                UnitKind::Ext => {
+                    lock.ext.remove(name);
+                }
+            }
+        }
+        Err(e) => {
+            let short = match unit.kind {
+                UnitKind::Skill => "",
+                UnitKind::Ext => "ext ",
+            };
+            warnings.push(format!("failed to quarantine {short}`{name}`: {e}"));
+        }
+    }
+}
+
+/// A pack the sweep did not scan this session: never pinned, surfaced, scanned first next
+/// session.
 fn defer(
     result: &mut SessionResult,
     warnings: &mut Vec<String>,
@@ -612,13 +773,14 @@ fn defer(
 ) {
     warnings.push(format!(
         "{what} `{name}` deferred: the SessionStart scan budget ran out before it; not pinned, \
-         scanned next session (now: `safe-ai-skill verify check {}`)",
+         scanned first next session (now: `safe-ai-skill verify check {}`)",
         dir.display()
     ));
     result.deferred.push(name.to_string());
 }
 
-/// A pack whose scan the time budget cut short: unreviewed, never pinned, surfaced.
+/// A pack whose drift hash or scan the time budget cut short: unreviewed, never pinned,
+/// surfaced.
 fn unreviewed(
     result: &mut SessionResult,
     warnings: &mut Vec<String>,
@@ -631,76 +793,6 @@ fn unreviewed(
         dir.display()
     ));
     result.unreviewed.push(name.to_string());
-}
-
-/// Verify one `ext/<name>` submodule as an individual unit: SHA/hash pin, drift, heuristics.
-///
-/// Pins at the checked-out git commit SHA when `dir` is a git submodule (content-hash fallback
-/// otherwise). Quarantines on a High heuristic finding **or** SHA/hash drift (e.g. after
-/// `resync.sh` bumps the submodule); TOFU-pins a clean, previously-unpinned submodule. Mutates
-/// `lock`/`result`/`warnings` in place; never panics.
-fn process_ext_submodule(
-    plugin_data: &Path,
-    dir: &Path,
-    budget: &rules::ScanBudget,
-    lock: &mut lockfile::Lockfile,
-    result: &mut SessionResult,
-    warnings: &mut Vec<String>,
-) {
-    let name = match dir.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n.to_string(),
-        None => return,
-    };
-
-    if budget.exhausted() && !lock.ext.contains_key(&name) {
-        defer(result, warnings, "ext submodule", &name, dir);
-        return;
-    }
-    let identity = lockfile::resolve_ext_identity(dir);
-    let drift = lock.ext_drift(&name, &identity.sha);
-    let scan = (!budget.exhausted()).then(|| heuristics::scan_within(dir, budget));
-    let unscanned = Report::default();
-    let report = scan.as_ref().map_or(&unscanned, |s| &s.report);
-    let eval = eval_skill(&name, identity.sha.clone(), drift, report);
-
-    if eval.quarantine {
-        match quarantine_dir(plugin_data, &name, dir) {
-            Ok(_) => {
-                let why = if drift == lockfile::DriftStatus::Drifted {
-                    "submodule SHA drifted from its pin".to_string()
-                } else {
-                    "high-severity supply-chain finding".to_string()
-                };
-                warnings.push(format!("quarantined ext submodule `{name}` ({why})"));
-                result.quarantined.push(name.clone());
-                lock.ext.remove(&name);
-            }
-            Err(e) => {
-                warnings.push(format!("failed to quarantine ext `{name}`: {e}"));
-            }
-        }
-    } else if scan.is_none() {
-        defer(result, warnings, "ext submodule", &name, dir);
-    } else if scan.as_ref().is_some_and(|s| !s.complete) {
-        unreviewed(result, warnings, "ext submodule", &name, dir);
-    } else if drift == lockfile::DriftStatus::Unpinned {
-        lock.pin_ext(
-            &name,
-            lockfile::ExtPin {
-                sha: identity.sha,
-                kind: identity.kind.to_string(),
-                verified_at: now_secs(),
-                scan: eval
-                    .max_severity
-                    .map(severity_label)
-                    .unwrap_or("")
-                    .to_string(),
-            },
-        );
-        result.pinned.push(name.clone());
-    }
-
-    result.evals.push(eval);
 }
 
 /// Stable lowercase label for a severity.
@@ -1157,6 +1249,110 @@ mod orchestration_tests {
             "{result:?}"
         );
         assert!(lockfile::load(&data).skills.is_empty());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_starved_pack_is_scanned_first_next_session() {
+        // `starve.rs`: two dense packs spend the whole sweep every session; the malicious pack
+        // sorted after them must not be deferred forever.
+        let data = tempdir("starve-data");
+        let mib = if cfg!(debug_assertions) { 2 } else { 8 };
+        let dense = "curl x;".repeat(mib * 1024 * 1024 / 7);
+        let root = seed_packs(
+            "starve-skills",
+            &[
+                ("aaa-big", vec![("a.sh", dense.clone())]),
+                ("bbb-big", vec![("a.sh", dense)]),
+                ("zzz-mal", vec![("z.js", mal_js())]),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let session = || {
+            let budget = rules::ScanBudget::new(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(600),
+            );
+            run_session_with_budget(&data, &dirs, &ext_policy(false), &budget)
+        };
+        let first = session();
+        // `bbb-big` is unreviewed or, if hashing `aaa-big` ate the sweep, deferred too.
+        assert_eq!(
+            first.unreviewed.first().map(String::as_str),
+            Some("aaa-big")
+        );
+        assert_eq!(first.deferred.last().map(String::as_str), Some("zzz-mal"));
+        assert!(first.pinned.is_empty(), "{first:?}");
+        let second = session();
+        assert!(
+            second.quarantined.contains(&"zzz-mal".to_string()),
+            "{second:?}"
+        );
+        let third = session();
+        assert!(third.pinned.is_empty(), "{third:?}");
+        assert!(lockfile::load(&data).skills.is_empty());
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn packs_left_unreviewed_go_before_packs_scanned_in_full() {
+        // A cut pack is retried ahead of the packs that were fully scanned last session.
+        let data = tempdir("rotate-data");
+        let mib = if cfg!(debug_assertions) { 2 } else { 8 };
+        let root = seed_packs(
+            "rotate-skills",
+            &[
+                ("aaa", vec![("SKILL.md", "# a\n".to_string())]),
+                (
+                    "zzz-big",
+                    vec![("a.sh", "curl x;".repeat(mib * 1024 * 1024 / 7))],
+                ),
+            ],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let budget = rules::ScanBudget::new(std::time::Duration::from_millis(300), secs(60));
+        let first = run_session_with_budget(&data, &dirs, &ext_policy(false), &budget);
+        assert_eq!(first.unreviewed, ["zzz-big"], "{first:?}");
+        assert!(first.pinned.contains(&"aaa".to_string()), "{first:?}");
+        fs::create_dir_all(root.join("bbb-new")).unwrap();
+        fs::write(root.join("bbb-new").join("SKILL.md"), "# b\n").unwrap();
+        // Room for one pack only: the retried `zzz-big` goes first and the new pack waits.
+        let first_pack_only = rules::ScanBudget::new(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        );
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &first_pack_only);
+        assert_eq!(second.unreviewed, ["zzz-big"], "{second:?}");
+        // Fully scanned last time (`aaa`) or new (`bbb-new`): both wait for the next session.
+        assert_eq!(second.deferred, ["aaa", "bbb-new"], "{second:?}");
+        fs::remove_dir_all(&data).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_pinned_pack_whose_drift_hash_overruns_is_unreviewed() {
+        let data = tempdir("hash-overrun-data");
+        let root = seed_packs(
+            "hash-overrun-skills",
+            &[("clean", vec![("SKILL.md", "# Clean\n".to_string())])],
+        );
+        let dirs = vec![root.to_string_lossy().into_owned()];
+        let first = run_session_with_policy(&data, &dirs, &ext_policy(false));
+        assert!(first.pinned.contains(&"clean".to_string()));
+        fs::write(root.join("clean").join("run.sh"), "echo changed\n").unwrap();
+        // No time to hash at all: the drift check cannot finish, so the pack never passes.
+        let none = rules::ScanBudget::new(std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let second = run_session_with_budget(&data, &dirs, &ext_policy(false), &none);
+        assert_eq!(second.unreviewed, ["clean"], "{second:?}");
+        assert!(second.quarantined.is_empty() && second.deferred.is_empty());
+        // With time again, the drift is found.
+        let third = run_session_with_policy(&data, &dirs, &ext_policy(false));
+        assert!(
+            third.quarantined.contains(&"clean".to_string()),
+            "{third:?}"
+        );
         fs::remove_dir_all(&data).ok();
         fs::remove_dir_all(&root).ok();
     }

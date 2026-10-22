@@ -23,7 +23,11 @@
 //!   pack scans past [`SWEEP_BUDGET`] from the budget's creation.
 //! * Per file, a rule stops creating findings after [`MAX_HITS_PER_RULE`] live hits (code, not
 //!   inside a string or comment); detection and combo signals carry on, [`PackReport::capped`]
-//!   records each such rule with its true count, and [`grade`] treats any entry as HIGH.
+//!   records each such rule with its true count, and [`grade`] treats an entry for a WARN or
+//!   HIGH rule as HIGH (a capped INFO inventory rule stays INFO).
+//! * Combo inputs are never dropped: each file keeps, per signal kind, the first line and a
+//!   count, and resolves the line-local `padding_sink` from line bitsets (bounded by the file's
+//!   line count, freed once the file is scanned).
 //!
 //! Every finding carries a pack-relative `path` and, when it is line-addressable, a 1-based
 //! `line`.
@@ -61,8 +65,6 @@ pub const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 const SNIFF_BYTES: u64 = 8 * 1024;
 /// WARN/HIGH findings kept per (rule, severity) in one file; INFO findings are kept once.
 const MAX_PER_RULE_FILE: u16 = 5;
-/// Combo inputs kept per file.
-const MAX_SIGNALS_PER_FILE: usize = 4096;
 /// Bytes of each `SKILL.md` kept for the "referenced by SKILL.md" combo.
 const MAX_SKILL_MD_BYTES: usize = 1024 * 1024;
 /// Live code hits of one rule in one file after which that rule stops creating findings there
@@ -146,7 +148,8 @@ pub struct PackReport {
     /// Pack-level combination hits.
     pub combos: Vec<ComboHit>,
     /// Rules that went past [`MAX_HITS_PER_RULE`] live hits in a file and stopped creating
-    /// findings there (combo signals carry on). Any entry makes the pack at least HIGH.
+    /// findings there (combo signals carry on). An entry for a WARN or HIGH rule makes the pack
+    /// at least HIGH; a capped INFO rule stays INFO.
     pub capped: Vec<RuleCount>,
 }
 
@@ -187,8 +190,14 @@ impl ScanBudget {
         self.sweep_deadline.is_some_and(|d| Instant::now() >= d)
     }
 
-    /// The deadline of a pack that starts now.
-    fn pack_deadline(&self) -> Option<Instant> {
+    /// The latest instant a drift check that starts now may run to: the per-pack allowance,
+    /// even past the sweep's deadline (drift is checked on every pinned pack).
+    pub fn drift_deadline(&self) -> Option<Instant> {
+        Instant::now().checked_add(self.per_pack)
+    }
+
+    /// The deadline of a pack that starts now: its allowance, within the sweep's deadline.
+    pub fn pack_deadline(&self) -> Option<Instant> {
         let pack = Instant::now().checked_add(self.per_pack);
         match (pack, self.sweep_deadline) {
             (Some(p), Some(s)) => Some(p.min(s)),
@@ -216,8 +225,13 @@ pub fn grade(report: &PackReport) -> Grade {
     if !report.combos.is_empty() {
         return Grade::Block;
     }
-    // A rule past its hit cap stopped creating findings: never grade below HIGH on that.
-    if !report.capped.is_empty() {
+    // A WARN-or-above rule past its hit cap stopped creating findings: never grade below HIGH
+    // on that. Capped INFO inventory rules stay INFO.
+    if report
+        .capped
+        .iter()
+        .any(|c| code_severity(c.rule).is_some_and(|s| s >= Severity::Warn))
+    {
         return Grade::High;
     }
     match report.findings.iter().map(Finding::effective_sev).max() {
@@ -395,11 +409,180 @@ pub(crate) enum Signal {
     NativeBinary,
 }
 
+impl Signal {
+    /// Number of signal kinds (the length of [`Signals`]' per-kind table).
+    const KINDS: usize = 14;
+
+    /// Index of this signal's kind in [`Signals`]' per-kind table.
+    fn kind(self) -> usize {
+        match self {
+            Signal::PadH(_) => 0,
+            Signal::PadV(_) => 1,
+            Signal::Sink(_) => 2,
+            Signal::Eval(_) => 3,
+            Signal::Decoder(_) => 4,
+            Signal::ExecB64(_) => 5,
+            Signal::BangExfil(_) => 6,
+            Signal::DescInjection(_) => 7,
+            Signal::LifecycleNet(_) => 8,
+            Signal::HarnessBypass(_) => 9,
+            Signal::RegistryWrite(_) => 10,
+            Signal::RegistryHost(_) => 11,
+            Signal::SymlinkEscape => 12,
+            Signal::NativeBinary => 13,
+        }
+    }
+
+    /// The line this signal was made on, when it is line-addressed.
+    fn line(self) -> Option<u32> {
+        match self {
+            Signal::PadH(l)
+            | Signal::PadV(l)
+            | Signal::Sink(l)
+            | Signal::Eval(l)
+            | Signal::Decoder(l)
+            | Signal::ExecB64(l)
+            | Signal::BangExfil(l)
+            | Signal::DescInjection(l)
+            | Signal::LifecycleNet(l)
+            | Signal::HarnessBypass(l)
+            | Signal::RegistryWrite(l)
+            | Signal::RegistryHost(l) => Some(l),
+            Signal::SymlinkEscape | Signal::NativeBinary => None,
+        }
+    }
+}
+
+/// First occurrence and count of one signal kind in a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Seen {
+    /// Line of the first occurrence, when line-addressed.
+    pub(crate) line: Option<u32>,
+    /// Occurrences in the file.
+    pub(crate) count: u32,
+}
+
+/// Lines of one file holding a signal (a bitset, so its size is bounded by the line count).
+#[derive(Debug, Default)]
+struct LineSet(Vec<u64>);
+
+impl LineSet {
+    fn insert(&mut self, line: u32) {
+        let (word, bit) = (line as usize / 64, line % 64);
+        if self.0.len() <= word {
+            self.0.resize(word.saturating_add(1), 0);
+        }
+        if let Some(w) = self.0.get_mut(word) {
+            *w |= 1 << bit;
+        }
+    }
+
+    /// The smallest line at or after `from`.
+    fn first_from(&self, from: u32) -> Option<u32> {
+        let start = from as usize / 64;
+        for (k, &w) in self.0.iter().enumerate().skip(start) {
+            let masked = if k == start {
+                w & (u64::MAX << (from % 64))
+            } else {
+                w
+            };
+            if masked != 0 {
+                let line = k
+                    .saturating_mul(64)
+                    .saturating_add(masked.trailing_zeros() as usize);
+                return u32::try_from(line).ok();
+            }
+        }
+        None
+    }
+
+    /// The smallest line in both sets.
+    fn first_common(&self, other: &LineSet) -> Option<u32> {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .enumerate()
+            .find_map(|(k, (a, b))| {
+                let both = a & b;
+                (both != 0).then(|| {
+                    let line = k
+                        .saturating_mul(64)
+                        .saturating_add(both.trailing_zeros() as usize);
+                    u32::try_from(line).unwrap_or(u32::MAX)
+                })
+            })
+    }
+}
+
+/// Combo inputs of one file, summarised as they arrive so nothing is ever dropped at a store
+/// limit: per kind, the first line and a count (enough for every pack-level combo), and for the
+/// line-local `padding_sink` the padded and sink lines as bitsets until the file is sealed.
+#[derive(Debug, Default)]
+pub(crate) struct Signals {
+    seen: [Option<Seen>; Signal::KINDS],
+    pad_h: LineSet,
+    sinks: LineSet,
+    /// Smallest line after a vertical padding run.
+    pad_v: Option<u32>,
+    /// `padding_sink`'s line once the file is sealed.
+    sealed: Option<Option<u32>>,
+}
+
+impl Signals {
+    fn record(&mut self, signal: Signal) {
+        if let Some(slot) = self.seen.get_mut(signal.kind()) {
+            match slot {
+                Some(s) => s.count = s.count.saturating_add(1),
+                None => {
+                    *slot = Some(Seen {
+                        line: signal.line(),
+                        count: 1,
+                    })
+                }
+            }
+        }
+        if self.sealed.is_some() {
+            return;
+        }
+        match signal {
+            Signal::PadH(l) => self.pad_h.insert(l),
+            Signal::Sink(l) => self.sinks.insert(l),
+            Signal::PadV(l) => self.pad_v = Some(self.pad_v.map_or(l, |v| v.min(l))),
+            _ => {}
+        }
+    }
+
+    /// First occurrence and count of the kind `signal` belongs to (its payload is ignored).
+    pub(crate) fn seen(&self, signal: Signal) -> Option<Seen> {
+        self.seen.get(signal.kind()).copied().flatten()
+    }
+
+    /// Line of the `padding_sink` combo: a sink on a horizontally padded line, else the first
+    /// sink at or after a vertical padding run.
+    pub(crate) fn padding_sink(&self) -> Option<u32> {
+        if let Some(line) = self.sealed {
+            return line;
+        }
+        self.pad_h
+            .first_common(&self.sinks)
+            .or_else(|| self.pad_v.and_then(|v| self.sinks.first_from(v)))
+    }
+
+    /// Resolve the line-local combo and free the line sets (the file is fully scanned).
+    fn seal(&mut self) {
+        if self.sealed.is_none() {
+            self.sealed = Some(self.padding_sink());
+            self.pad_h = LineSet::default();
+            self.sinks = LineSet::default();
+        }
+    }
+}
+
 /// Findings and combo inputs for one walked entry.
 pub(crate) struct FileOut {
     pub(crate) path: PathBuf,
     pub(crate) findings: Vec<Finding>,
-    pub(crate) signals: Vec<Signal>,
+    pub(crate) signals: Signals,
     /// Bundler or minifier output (decided only when the file has an eval or decoder signal).
     pub(crate) generated: bool,
     counts: Vec<(&'static str, Severity, u16)>,
@@ -416,7 +599,7 @@ impl FileOut {
         FileOut {
             path: path.to_path_buf(),
             findings: Vec::new(),
-            signals: Vec::new(),
+            signals: Signals::default(),
             generated: false,
             counts: Vec::new(),
             hits: Vec::new(),
@@ -510,8 +693,8 @@ impl FileOut {
 
     /// Record a combo input. Docs never feed a combo (they are capped at WARN).
     pub(crate) fn signal(&mut self, signal: Signal, ctx: Ctx) {
-        if ctx != Ctx::Doc && self.signals.len() < MAX_SIGNALS_PER_FILE {
-            self.signals.push(signal);
+        if ctx != Ctx::Doc {
+            self.signals.record(signal);
         }
     }
 }
@@ -544,7 +727,13 @@ pub fn scan_pack(root: &Path) -> PackReport {
 /// [`scan_pack`] under `budget`: a pack that runs out of time is cut short and graded HIGH by
 /// `scan_budget_exceeded`, with the findings and combos gathered so far.
 pub fn scan_pack_within(root: &Path, budget: &ScanBudget) -> PackReport {
-    scan_pack_inner(root, MAX_SCAN_BYTES, budget.pack_deadline())
+    scan_pack_until(root, budget.pack_deadline())
+}
+
+/// [`scan_pack_within`] against an explicit deadline (`None`: unbounded), so a caller can share
+/// one pack allowance between hashing the pack and scanning it.
+pub fn scan_pack_until(root: &Path, deadline: Option<Instant>) -> PackReport {
+    scan_pack_inner(root, MAX_SCAN_BYTES, deadline)
 }
 
 /// [`scan_pack`] with an explicit per-file byte cap (tests shrink it).
@@ -595,7 +784,7 @@ fn scan_pack_inner(root: &Path, cap: u64, deadline: Option<Instant>) -> PackRepo
         } else if file_type.is_file() {
             let meta = entry.metadata().ok();
             facts.files.insert(rel.clone());
-            let out = scan_file(
+            let mut out = scan_file(
                 entry.path(),
                 &rel,
                 meta.as_ref(),
@@ -604,6 +793,7 @@ fn scan_pack_inner(root: &Path, cap: u64, deadline: Option<Instant>) -> PackRepo
                 &mut buf,
                 &mut facts,
             );
+            out.signals.seal();
             let expired = out.expired;
             outs.push(out);
             if expired {
@@ -883,10 +1073,8 @@ fn scan_text(
         harness_config::scan_settings(doc, out);
     }
     if doc.class == FileClass::Code(Lang::Js)
-        && out
-            .signals
-            .iter()
-            .any(|s| matches!(s, Signal::Eval(_) | Signal::Decoder(_)))
+        && (out.signals.seen(Signal::Eval(0)).is_some()
+            || out.signals.seen(Signal::Decoder(0)).is_some())
     {
         out.generated = generated_js(doc);
     }
@@ -1150,8 +1338,28 @@ mod tests {
         let r = scan_one("w.js", &body);
         assert!(combo(&r, "padding_sink").is_some(), "{r:?}");
         assert_eq!(r.capped[0].hits, 61);
-        // A hand-built report with only a capped INFO rule is still HIGH.
-        let capped_only = PackReport {
+        // A hand-built report with only a capped WARN-or-above rule is still HIGH.
+        let capped_only = |rule| PackReport {
+            capped: vec![RuleCount {
+                rule,
+                path: PathBuf::from("w.js"),
+                hits: 60,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(grade(&capped_only("eval")), Grade::High);
+        assert_eq!(grade(&capped_only("network_post")), Grade::High);
+    }
+
+    #[test]
+    fn a_capped_info_rule_stays_info() {
+        // Controller ruling: inventory rules that cap do not raise the grade.
+        for body in ["y = atob(x);\n", "require('child_process').spawn(c);\n"] {
+            let r = scan_one("w.js", &body.repeat(60));
+            assert!(!r.capped.is_empty(), "{body}: {r:?}");
+            assert_eq!(grade(&r), Grade::Clean, "{body}: {r:?}");
+        }
+        let hand_built = PackReport {
             capped: vec![RuleCount {
                 rule: "decoder",
                 path: PathBuf::from("w.js"),
@@ -1159,7 +1367,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(grade(&capped_only), Grade::High);
+        assert_eq!(grade(&hand_built), Grade::Clean);
     }
 
     #[test]

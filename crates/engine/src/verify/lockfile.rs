@@ -7,8 +7,10 @@
 //! Pure, hermetic helpers ([`hash_tree`], [`detect_drift`], the (de)serialization round-trip)
 //! are unit-tested against tempdir fixtures; the only side effects are the atomic [`save`].
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,6 +81,14 @@ pub struct Lockfile {
     /// Pinned `ext/<name>` git submodules, keyed by submodule name.
     #[serde(default)]
     pub ext: BTreeMap<String, ExtPin>,
+    /// Packs the last SessionStart sweep deferred (`skill:<name>` / `ext:<name>`): scanned
+    /// first by the next sweep, so a budget-hungry pack cannot starve the ones after it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub sweep_deferred: BTreeSet<String>,
+    /// Packs the last sweep left unreviewed (scan or drift hash cut by the time budget):
+    /// retried right after [`Lockfile::sweep_deferred`].
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub sweep_unreviewed: BTreeSet<String>,
 }
 
 /// Result of comparing a current hash against the lockfile.
@@ -168,13 +178,22 @@ pub fn save(plugin_data: &Path, lockfile: &Lockfile) -> std::io::Result<()> {
 /// A single file `path` hashes just that file. Unreadable files are skipped (best effort);
 /// the hash still reflects every readable file deterministically.
 pub fn hash_tree(path: &Path) -> String {
+    hash_tree_until(path, None).unwrap_or_default()
+}
+
+/// Bytes read or hashed between clock reads in [`hash_tree_until`].
+const HASH_CHUNK: usize = 1024 * 1024;
+
+/// [`hash_tree`] that gives up at `deadline`: `None` when the time ran out first (the caller
+/// must then treat the tree as unverified, never as unchanged). The digest is identical.
+pub fn hash_tree_until(path: &Path, deadline: Option<Instant>) -> Option<String> {
     if !path.exists() {
-        return String::new();
+        return Some(String::new());
     }
+    let late = || deadline.is_some_and(|d| Instant::now() >= d);
 
-    // Collect (relative-path-bytes, content) pairs, then sort by path for stable ordering.
-    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
+    // Sorted by relative path for a stable digest; contents are read one file at a time.
+    let mut entries: Vec<(Vec<u8>, PathBuf)> = Vec::new();
     for entry in WalkDir::new(path).follow_links(false).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -185,26 +204,57 @@ pub fn hash_tree(path: &Path) -> String {
             Err(_) => Path::new(entry.file_name()),
         };
         let rel_bytes = rel.to_string_lossy().replace('\\', "/").into_bytes();
-        if let Ok(content) = std::fs::read(entry.path()) {
-            entries.push((rel_bytes, content));
-        }
+        entries.push((rel_bytes, entry.path().to_path_buf()));
     }
-
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut hasher = Sha256::new();
-    for (rel, content) in &entries {
+    let mut content: Vec<u8> = Vec::new();
+    for (rel, abs) in &entries {
+        if late() {
+            return None;
+        }
+        content.clear();
+        // Unreadable files are skipped (best effort), as before.
+        let Ok(mut file) = std::fs::File::open(abs) else {
+            continue;
+        };
+        let mut unreadable = false;
+        loop {
+            let before = content.len();
+            match Read::by_ref(&mut file)
+                .take(HASH_CHUNK as u64)
+                .read_to_end(&mut content)
+            {
+                Ok(0) => break,
+                Ok(_) if late() => return None,
+                Ok(_) => {}
+                Err(_) => {
+                    content.truncate(before);
+                    unreadable = true;
+                    break;
+                }
+            }
+        }
+        if unreadable {
+            continue;
+        }
         hasher.update((rel.len() as u64).to_le_bytes());
         hasher.update(rel);
         hasher.update((content.len() as u64).to_le_bytes());
-        hasher.update(content);
+        for chunk in content.chunks(HASH_CHUNK) {
+            if late() {
+                return None;
+            }
+            hasher.update(chunk);
+        }
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
     }
-    out
+    Some(out)
 }
 
 /// Detect drift for a skill directory at `dir` (name `name`) against `lockfile`.
@@ -236,13 +286,21 @@ pub struct ExtIdentity {
 /// git checkout (no resolvable SHA), we fall back to [`hash_tree`] so drift detection still
 /// works on plain directories.
 pub fn resolve_ext_identity(dir: &Path) -> ExtIdentity {
-    if let Some(sha) = resolve_git_sha(dir) {
-        return ExtIdentity { sha, kind: "git" };
-    }
-    ExtIdentity {
-        sha: hash_tree(dir),
+    resolve_ext_identity_until(dir, None).unwrap_or(ExtIdentity {
+        sha: String::new(),
         kind: "hash",
+    })
+}
+
+/// [`resolve_ext_identity`] whose content-hash fallback gives up at `deadline` (`None`).
+pub fn resolve_ext_identity_until(dir: &Path, deadline: Option<Instant>) -> Option<ExtIdentity> {
+    if let Some(sha) = resolve_git_sha(dir) {
+        return Some(ExtIdentity { sha, kind: "git" });
     }
+    Some(ExtIdentity {
+        sha: hash_tree_until(dir, deadline)?,
+        kind: "hash",
+    })
 }
 
 /// Resolve a git checkout's `HEAD` commit SHA from its working directory `dir`.
@@ -363,6 +421,34 @@ mod tests {
         let h2 = hash_tree(&dir);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hash_tree_until_keeps_the_pinned_digest_and_gives_up_at_its_deadline() {
+        let dir = tempdir("until");
+        fs::write(dir.join("b.txt"), b"world").unwrap();
+        fs::write(dir.join("a.txt"), vec![7u8; 3 * HASH_CHUNK + 5]).unwrap();
+        // The digest existing pins were made with: sorted `len|path|len|content` records.
+        let mut expected = Sha256::new();
+        for (rel, body) in [
+            ("a.txt", vec![7u8; 3 * HASH_CHUNK + 5]),
+            ("b.txt", b"world".to_vec()),
+        ] {
+            expected.update((rel.len() as u64).to_le_bytes());
+            expected.update(rel.as_bytes());
+            expected.update((body.len() as u64).to_le_bytes());
+            expected.update(&body);
+        }
+        let hex: String = expected
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hash_tree(&dir), hex);
+        let ample = Instant::now().checked_add(std::time::Duration::from_secs(60));
+        assert_eq!(hash_tree_until(&dir, ample), Some(hex));
+        assert_eq!(hash_tree_until(&dir, Some(Instant::now())), None);
         fs::remove_dir_all(&dir).ok();
     }
 
