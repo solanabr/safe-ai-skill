@@ -233,7 +233,7 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
     let below = |parent: &str, child: &str| {
         parent == "/" || child == parent || child.starts_with(&format!("{parent}/"))
     };
-    if let Some(rest) = tree_rest(&rooted, "plugins/data") {
+    if let Some(rest) = tree_rest(&rooted, ".claude/plugins/data") {
         if rest
             .split('/')
             .next()
@@ -258,6 +258,14 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
         }
         if below(&rooted, &data) {
             return Some(DataDirReach::Above);
+        }
+    }
+    if let Some(config) = env_dir("CLAUDE_CONFIG_DIR") {
+        let inside = rooted
+            .strip_prefix(&format!("{config}/plugins/data/"))
+            .is_some_and(|rest| rest.starts_with("safe-ai-skill-"));
+        if inside {
+            return Some(DataDirReach::Inside);
         }
     }
     let parents = homes
@@ -551,7 +559,7 @@ mod tests {
         for d in [
             "/home/u/.claude/plugins/data/safe-ai-skill-stbr",
             "/home/u/.claude/plugins/data/safe-ai-skill-stbr/sub",
-            "/x/plugins/data/safe-ai-skill-a/",
+            "/x/.claude/plugins/data/safe-ai-skill-a/",
         ] {
             assert_eq!(reach(d), Some(DataDirReach::Inside), "{d}");
         }
@@ -567,6 +575,8 @@ mod tests {
         for d in [
             "/home/u/dev/app",
             "/home/u/.claude/plugins/data/other-plugin",
+            "/home/u/dev/app/src/plugins/data",
+            "/home/u/dev/app/plugins/data/safe-ai-skill-x",
         ] {
             assert_eq!(reach(d), None, "{d}");
         }
