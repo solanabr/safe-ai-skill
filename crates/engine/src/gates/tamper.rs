@@ -10,19 +10,22 @@
 //!   protected state, checked as given and with symlinks resolved.
 //!
 //! Protected state:
-//! - the plugin data dir. Anywhere: `$CLAUDE_PLUGIN_DATA` (its path, or the variable itself) and
-//!   `…/plugins/data/` followed by a component whose literal prefix does not rule safe-ai-skill out
-//!   (`safe-ai-skill-stbr`, `*-stbr`, `plugins/d*/[s]afe…`). An absolute path also matches by the
+//! - the plugin data dir. Anywhere: `$CLAUDE_PLUGIN_DATA` (its path, or the variable itself).
+//!   Under a config dir: `<config>/plugins/data/` followed by a component whose literal prefix
+//!   does not rule safe-ai-skill out (`safe-ai-skill-stbr`, `*-stbr`, `plugins/d*/[s]afe…`),
+//!   where `<config>` is any `.claude` dir, `$CLAUDE_CONFIG_DIR`, the live data dir's
+//!   `<config>`, or a prefix that cannot be resolved (`~user`, an unexpanded `$VAR`), so a
+//!   project's own `src/plugins/data` is not protected. An absolute path also matches by the
 //!   live data dir's basename (`/tmp/link/safe-ai-skill-stbr`). A relative path matches by any
 //!   data dir name (`safe-ai-skill-<marketplace>`, the live basename, or a glob spelling one) only
 //!   when the command also `cd`s into a `plugins` or `plugins/data` dir or the live data dir's
-//!   parent, and after a `cd` into `plugins/data` (or that parent) any glob or brace word is
+//!   parent, and after a `cd` into a config dir's `plugins/data` (or that parent) any glob or brace word is
 //!   denied (`rm -rf sa*`, `safe-ai-skill-{stbr,x}`). A relative path is also resolved against
 //!   the directory the command runs in: the session's working directory, then each
 //!   `cd`/`pushd` and `env|git|tar|make -C <dir>` (`--directory=`, `--chdir=`), so `rm -rf
 //!   data/*` after `cd ~/.claude/plugins`, or `echo x > grants.json` from inside the data dir,
-//!   counts. Brace groups expand (`plugins/{data,x}/…`), up to 64 alternatives, past which a group
-//!   reads as `*`;
+//!   counts. Brace groups expand (`plugins/{data,x}/…`); past 8 groups, 64 alternatives or a
+//!   4096-byte word, each group reads as `*`;
 //! - the `~/.safe-ai-skill` fallback data dir (also `~user/`, `$HOME/` and globs such as `~/.s*`);
 //! - the installed plugin, `…/plugins/cache/<marketplace>/safe-ai-skill/…`;
 //! - the live plugin's `hooks/hooks.json` (`$CLAUDE_PLUGIN_ROOT`);
@@ -35,6 +38,11 @@
 //! bare `mode`) is never blocked, even through the plugin's cache path. Matching is deliberately
 //! loose (case-insensitive, blind to quotes and escapes, `$IFS` read as a space, `~`/`$HOME`
 //! expanded, globs honoured) so that it errs towards a false deny. The Bash path reads no files.
+//!
+//! The Bash scan is linear in the command and spends from a work [`Budget`] shared with the
+//! secrets scan (units plus a 2 s deadline). A command that exhausts it is asked about ("too
+//! complex to inspect"), never given no opinion, so an input built to be slow cannot push the
+//! hook past its timeout and fail open.
 //!
 //! This is a tripwire against a careless or prompt-injected model, **not a sandbox**: any
 //! same-UID process can rewrite user-space state, the Claude Code sandbox is the hard boundary,
@@ -61,10 +69,87 @@
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::io::Decision;
+
+/// Work units one Bash command may cost the tripwire and the secrets scan together. A unit is
+/// roughly the cost of looking at one token; checking a word against the path rules costs
+/// [`PATH_CHECK`] plus its length.
+const WORK_UNITS: u64 = 24_000_000;
+
+/// Wall-clock backstop for the same work, well inside the 10 s hook timeout.
+const WORK_TIME: Duration = Duration::from_secs(2);
+
+/// Units for checking one word or directory against the path rules, on top of its length.
+const PATH_CHECK: usize = 32;
+
+/// Longest word either scan inspects; a longer one that could matter is too complex. This keeps
+/// every step between two [`Budget::spend`] calls small, so the deadline holds.
+pub(crate) const MAX_WORD: usize = 64 * 1024;
+
+/// The reason given when a command exhausts its [`Budget`].
+const TOO_COMPLEX: &str = "safe-ai-skill: command too complex to inspect; review manually.";
+
+/// The work one Bash command may cost the tripwire and the secrets scan. When it runs out the
+/// command gets [`too_complex`], never no opinion: an input built to be slow to scan must not
+/// fail open.
+#[derive(Debug)]
+pub struct Budget {
+    left: u64,
+    deadline: Instant,
+}
+
+/// A [`Budget`] ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooComplex;
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget::new(WORK_UNITS, WORK_TIME)
+    }
+}
+
+impl Budget {
+    /// `units` of work, all to be spent within `time`.
+    pub fn new(units: u64, time: Duration) -> Self {
+        let now = Instant::now();
+        Budget {
+            left: units,
+            deadline: now.checked_add(time).unwrap_or(now),
+        }
+    }
+
+    /// Spend `units`; `Err` once the units or the time have run out (and from then on).
+    pub fn spend(&mut self, units: usize) -> Result<(), TooComplex> {
+        let units = u64::try_from(units).unwrap_or(u64::MAX);
+        match self.left.checked_sub(units) {
+            Some(left) if Instant::now() <= self.deadline => {
+                self.left = left;
+                Ok(())
+            }
+            _ => {
+                self.left = 0;
+                self.deadline = Instant::now();
+                Err(TooComplex)
+            }
+        }
+    }
+}
+
+/// The verdict for a command that exhausted its [`Budget`]: ask (the gate is a hard guard).
+pub fn too_complex() -> Decision {
+    Decision::Ask {
+        reason: TOO_COMPLEX.to_string(),
+    }
+}
+
+/// Units for checking a word of `len` bytes against the path rules.
+fn path_check(len: usize) -> usize {
+    PATH_CHECK.saturating_add(len)
+}
 
 /// The engine binary name; per-platform builds are `safe-ai-skill-<os>-<arch>[.exe]`.
 const BINARY: &str = "safe-ai-skill";
@@ -169,6 +254,8 @@ pub struct Protected {
     data: Option<PathBuf>,
     /// `$CLAUDE_PLUGIN_ROOT` as given (only its `hooks/hooks.json` is protected).
     root: Option<PathBuf>,
+    /// `$CLAUDE_CONFIG_DIR` as given: its `plugins/data` holds plugin data dirs.
+    config: Option<PathBuf>,
     /// Project roots as given (`$CLAUDE_PROJECT_DIR`, the hook's working directory).
     projects: Vec<PathBuf>,
     /// Normalised spellings of `projects`: their components never count as data dir names.
@@ -187,18 +274,24 @@ pub struct Protected {
     data_names: Vec<String>,
     /// `hooks/hooks.json` under each spelling of `root` and of `$CLAUDE_PLUGIN_ROOT`.
     hooks_files: Vec<String>,
+    /// Normalised config dirs whose `plugins/data` holds plugin data dirs: each spelling of
+    /// `config`, and `<x>` when the live data dir is `<x>/plugins/data/<name>`.
+    config_roots: Vec<String>,
 }
 
 impl Protected {
-    /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PROJECT_DIR` (a
-    /// project root). No file is read.
+    /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CONFIG_DIR` and
+    /// `CLAUDE_PROJECT_DIR` (a project root). No file is read.
     pub fn from_env() -> Self {
         let var = |key: &str| std::env::var(key).ok();
-        let protected = Protected::new(
+        let mut protected = Protected::new(
             var("HOME").as_deref(),
             var("CLAUDE_PLUGIN_DATA").as_deref(),
             var("CLAUDE_PLUGIN_ROOT").as_deref(),
         );
+        if let Some(dir) = var("CLAUDE_CONFIG_DIR") {
+            protected = protected.with_config_dir(Path::new(&dir));
+        }
         match var("CLAUDE_PROJECT_DIR") {
             Some(dir) => protected.with_project_root(Path::new(&dir)),
             None => protected,
@@ -212,6 +305,18 @@ impl Protected {
             self.start_dir = Some(normalize_path(&cwd.to_string_lossy()));
         }
         self.with_project_root(cwd)
+    }
+
+    /// `$CLAUDE_CONFIG_DIR`: its `plugins/data` is where plugin data dirs live.
+    fn with_config_dir(mut self, dir: &Path) -> Self {
+        if dir.is_absolute() && dir.parent().is_some() {
+            push_new(
+                &mut self.config_roots,
+                normalize_path(&dir.to_string_lossy()),
+            );
+            self.config = Some(dir.to_path_buf());
+        }
+        self
     }
 
     /// Add a project root: its components never count as a data dir name.
@@ -241,6 +346,7 @@ impl Protected {
             home,
             data,
             root,
+            config: None,
             projects: Vec::new(),
             project_roots: Vec::new(),
             start_dir: None,
@@ -251,6 +357,7 @@ impl Protected {
             hooks_files: ["$claude_plugin_root", "${claude_plugin_root}"]
                 .map(|r| format!("{r}/hooks/hooks.json"))
                 .to_vec(),
+            config_roots: Vec::new(),
         };
         protected.add_spellings(|p| Some(p.to_string_lossy().into_owned()));
         protected
@@ -277,7 +384,16 @@ impl Protected {
             if let Some(name) = data.rsplit('/').next().filter(|n| !n.is_empty()) {
                 push_new(&mut self.data_names, name.to_string());
             }
+            if let Some(config) = data
+                .rsplit_once('/')
+                .and_then(|(parent, _)| parent.strip_suffix("/plugins/data"))
+            {
+                push_new(&mut self.config_roots, config.to_string());
+            }
             push_new(&mut self.data_dirs, data);
+        }
+        if let Some(config) = self.config.as_deref().and_then(norm) {
+            push_new(&mut self.config_roots, config);
         }
         if let Some(root) = self.root.as_deref().and_then(norm) {
             push_new(&mut self.hooks_files, format!("{root}/hooks/hooks.json"));
@@ -302,8 +418,26 @@ fn push_new(list: &mut Vec<String>, item: String) {
 }
 
 /// Decide a Bash command: deny a mutating `safe-ai-skill` invocation or any reference to
-/// protected state, otherwise no opinion. Pure string work, no I/O.
+/// protected state, ask when it is too complex to inspect, otherwise no opinion. Pure string
+/// work, no I/O.
 pub fn decide_bash(command: &str, protected: &Protected) -> Decision {
+    decide_bash_within(command, protected, &mut Budget::default())
+}
+
+/// [`decide_bash`] spending from `budget`, which the caller's later checks share.
+pub fn decide_bash_within(command: &str, protected: &Protected, budget: &mut Budget) -> Decision {
+    match scan_bash(command, protected, budget) {
+        Ok(Some(reason)) => Decision::Deny { reason },
+        Ok(None) => Decision::Defer,
+        Err(TooComplex) => too_complex(),
+    }
+}
+
+fn scan_bash(
+    command: &str,
+    protected: &Protected,
+    budget: &mut Budget,
+) -> Result<Option<String>, TooComplex> {
     let mut lower = command.to_lowercase();
     if lower.contains("$ifs") || lower.contains("${ifs") {
         lower = ifs_as_space(&lower);
@@ -318,11 +452,12 @@ pub fn decide_bash(command: &str, protected: &Protected) -> Decision {
     let windows = lower
         .contains('\\')
         .then(|| lower.replace(['\'', '"'], "").replace('\\', "/"));
-    match check_text(&posix, protected)
-        .or_else(|| windows.as_deref().and_then(|w| check_text(w, protected)))
-    {
-        Some(reason) => Decision::Deny { reason },
-        None => Decision::Defer,
+    if let Some(reason) = check_text(&posix, protected, budget)? {
+        return Ok(Some(reason));
+    }
+    match windows {
+        Some(w) => check_text(&w, protected, budget),
+        None => Ok(None),
     }
 }
 
@@ -354,14 +489,22 @@ pub fn decide_file(tool_input: Option<&Value>, cwd: &Path, protected: &Protected
     Decision::Defer
 }
 
-/// `safe-ai-skill${IFS}allow`: `$IFS` (and `${IFS…}`) splits words like a space.
+/// `safe-ai-skill${IFS}allow`: `$IFS` (and `${IFS…}`, closing within 64 characters) splits
+/// words like a space.
 fn ifs_as_space(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    let close = |after: &str| {
+        after
+            .char_indices()
+            .take(64)
+            .find(|&(_, c)| c == '}')
+            .map(|(j, _)| j)
+    };
     while let Some(i) = rest.find('$') {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        if let Some(end) = tail.strip_prefix("${ifs").and_then(|after| after.find('}')) {
+        if let Some(end) = tail.strip_prefix("${ifs").and_then(close) {
             out.push(' ');
             rest = &tail["${ifs".len() + end + 1..];
         } else if let Some(after) = tail
@@ -380,9 +523,17 @@ fn ifs_as_space(text: &str) -> String {
 }
 
 /// Scan one reading of a command. `Some(reason)` means deny.
-fn check_text(text: &str, protected: &Protected) -> Option<String> {
+fn check_text(
+    text: &str,
+    protected: &Protected,
+    budget: &mut Budget,
+) -> Result<Option<String>, TooComplex> {
     let toks = tokenize(text);
-    let cds = scan_cds(&toks, protected);
+    budget.spend(toks.len())?;
+    let cds = scan_cds(&toks, protected, budget)?;
+    let subst_ends = subst_ends(&toks);
+    // A word over MAX_WORD is not inspected: the command is too complex unless a deny turns up.
+    let mut too_long = false;
     let names_for = |word: &str| {
         if is_absolute(word) {
             Names::Live
@@ -399,22 +550,40 @@ fn check_text(text: &str, protected: &Protected) -> Option<String> {
         let here = &cds.dirs[cds.at[i]];
         // Inside `plugins/data`, any glob or brace word may expand to a data dir.
         if here.data_parent && raw.contains(EXPANSION) {
-            return Some(path_reason(raw, Kind::DataDir));
+            return Ok(Some(path_reason(raw, Kind::DataDir)));
         }
         // Inside a protected dir, a bare file name (`grants.json`) is a reference to it.
         if !(here.protected && looks_like_path(raw)) && !may_matter(raw, protected) {
             continue;
         }
-        for alternative in expand_braces(raw) {
+        if raw.len() > MAX_WORD {
+            too_long = true;
+            continue;
+        }
+        let alternatives = expand_braces(raw);
+        budget.spend(alternatives.len().saturating_mul(raw.len()))?;
+        let home_len = protected.homes.first().map_or(0, String::len);
+        for alternative in alternatives {
+            // Paid before the work: `~` and `$HOME` expansion can make the word much longer,
+            // and it is checked as given and joined to the current directory.
+            let expansions = alternative.matches(['$', '~']).count();
+            let checked = alternative
+                .len()
+                .saturating_add(expansions.saturating_mul(home_len));
+            if checked > MAX_WORD {
+                too_long = true;
+                continue;
+            }
+            budget.spend(path_check(checked).saturating_mul(2))?;
             let word = normalize_word(&alternative, protected);
             let mut run_by_name = false;
             if is_binary(&word) {
                 // Its own arguments, and for `$(which safe-ai-skill) allow` the words after the
                 // substitution that computed it.
-                let starts = [Some(i + 1), subst_end(&toks, i).map(|j| j + 1)];
+                let starts = [Some(i + 1), subst_ends[i].map(|j| j + 1)];
                 for start in starts.into_iter().flatten() {
                     if let Some(sub) = toks.get(start..).and_then(mutating_invocation) {
-                        return Some(subcommand_reason(&sub));
+                        return Ok(Some(subcommand_reason(&sub)));
                     }
                 }
                 run_by_name = args(&toks[i + 1..])
@@ -430,13 +599,17 @@ fn check_text(text: &str, protected: &Protected) -> Option<String> {
                 match protected_kind(candidate, protected, names_for(candidate)) {
                     // Running the plugin's own binary by its cache path is not a write to it.
                     Some(Kind::Plugin) if run_by_name => {}
-                    Some(kind) => return Some(path_reason(candidate, kind)),
+                    Some(kind) => return Ok(Some(path_reason(candidate, kind))),
                     None => {}
                 }
             }
         }
     }
-    None
+    if too_long {
+        Err(TooComplex)
+    } else {
+        Ok(None)
+    }
 }
 
 /// A word that can name a file in the current directory: not a flag, and dotted, with a path,
@@ -489,7 +662,11 @@ impl CdScan {
 
 /// Follow a command's directory changes: `cd`/`pushd` (until the next one) and
 /// `env|git|tar|make -C <dir>`, `--directory=<dir>`, `--chdir=<dir>` (until the command ends).
-fn scan_cds(toks: &[Tok], protected: &Protected) -> CdScan {
+fn scan_cds(
+    toks: &[Tok],
+    protected: &Protected,
+    budget: &mut Budget,
+) -> Result<CdScan, TooComplex> {
     // Longer than PATH_MAX (macOS) reads as unknown, which keeps a chain of relative `cd`s from
     // growing without bound.
     const MAX_DIR: usize = 1024;
@@ -498,6 +675,28 @@ fn scan_cds(toks: &[Tok], protected: &Protected) -> CdScan {
         dirs: Vec::new(),
         at: Vec::with_capacity(toks.len()),
     };
+    // Per token, scanning forward through words: the first one that is not a flag, and the
+    // last word before a boundary. One backward pass, so a run of flags is not rescanned by
+    // every `-C` in it.
+    let mut operand: Vec<Option<usize>> = vec![None; toks.len()];
+    let mut run_end: Vec<usize> = (0..toks.len()).collect();
+    for i in (0..toks.len()).rev() {
+        if let Tok::Word(word) = toks[i] {
+            let next_is_word = matches!(toks.get(i + 1), Some(Tok::Word(_)));
+            operand[i] = if word.starts_with('-') {
+                operand
+                    .get(i + 1)
+                    .copied()
+                    .flatten()
+                    .filter(|_| next_is_word)
+            } else {
+                Some(i)
+            };
+            if next_is_word {
+                run_end[i] = run_end[i + 1];
+            }
+        }
+    }
     let mut current = scan.add(protected.start_dir.clone(), protected);
     // A `-C <dir>` scope: the rest of this command runs there.
     let mut scoped: Option<usize> = None;
@@ -532,15 +731,14 @@ fn scan_cds(toks: &[Tok], protected: &Protected) -> CdScan {
             }
         };
         // The operand is the first word that is not a flag (`cd -P dir`); `cd -` stays unknown.
-        let mut end = i;
-        let mut operand = None;
-        while let Some(Tok::Word(next)) = toks.get(end + 1) {
-            end += 1;
-            if !next.starts_with('-') {
-                operand = Some(normalize_word(&first_alternative(next), protected));
-                break;
-            }
-        }
+        let (end, operand) = match operand.get(i + 1).copied().flatten() {
+            Some(j) => match toks[j] {
+                Tok::Word(next) => (j, Some(normalize_word(&first_alternative(next), protected))),
+                _ => (j, None),
+            },
+            None if matches!(toks.get(i + 1), Some(Tok::Word(_))) => (run_end[i + 1], None),
+            None => (i, None),
+        };
         let from = scan.dirs[scoped.unwrap_or(current)].path.clone();
         let next = operand
             .map(|w| match &from {
@@ -548,10 +746,12 @@ fn scan_cds(toks: &[Tok], protected: &Protected) -> CdScan {
                 _ => w,
             })
             .filter(|d| d.len() <= MAX_DIR);
+        // Three path checks on the new directory.
+        budget.spend(path_check(next.as_ref().map_or(0, String::len)).saturating_mul(3))?;
         let dir = scan.add(next, protected);
         pending = Some((end, dir, is_scoped));
     }
-    scan
+    Ok(scan)
 }
 
 /// Whether a normalised directory is protected state itself or a `.safe-ai-skill` dir.
@@ -583,15 +783,35 @@ fn is_plugins_dir(dir: &str) -> bool {
         .is_some_and(|c| !is_wildcard(c) && could_be(c, "plugins"))
 }
 
-/// Whether a normalised directory is a `…/plugins/data` dir or the live data dir's parent.
+/// Whether a normalised directory is a config dir's `plugins/data` (see [`is_config_dir`]) or
+/// the live data dir's parent.
 fn is_data_parent(dir: &str, protected: &Protected) -> bool {
-    let mut tail = dir.rsplit('/');
-    let (last, parent) = (tail.next(), tail.next());
-    matches!((parent, last), (Some(p), Some(l)) if is_pair(p, l, "plugins", "data"))
+    let comps: Vec<&str> = dir.split('/').collect();
+    let n = comps.len();
+    (n >= 2
+        && is_pair(comps[n - 2], comps[n - 1], "plugins", "data")
+        && is_config_dir(&comps[..n - 2], protected))
         || protected
             .data_dirs
             .iter()
             .any(|d| d.rsplit_once('/').is_some_and(|(parent, _)| parent == dir))
+}
+
+/// Whether `prefix`, the components before a `plugins/data` pair, is a dir where Claude Code
+/// keeps plugin data: any `.claude` dir (every home's, however spelled, and a relative
+/// `.claude/`), `$CLAUDE_CONFIG_DIR`, the live data dir's `<x>` in `<x>/plugins/data/<name>`, or
+/// a prefix that cannot be resolved (`~user`, an unexpanded `$VAR`). An ordinary project's
+/// `src/plugins/data` is none of these.
+fn is_config_dir(prefix: &[&str], protected: &Protected) -> bool {
+    let Some(first) = prefix.first() else {
+        return false;
+    };
+    first.trim_start_matches('@').starts_with(['~', '$'])
+        || prefix.last().is_some_and(|c| could_be(c, ".claude"))
+        || protected.config_roots.iter().any(|root| {
+            let root: Vec<&str> = root.split('/').collect();
+            root.len() == prefix.len() && prefix.iter().zip(&root).all(|(c, r)| could_be(c, r))
+        })
 }
 
 /// How many leading components of `word` belong to a project root (0 when none contains it).
@@ -644,13 +864,17 @@ fn tokenize(text: &str) -> Vec<Tok<'_>> {
     let mut parens: Vec<bool> = Vec::new();
     let mut in_backticks = false;
     let mut skip_to = 0;
+    let braces = brace_ends(text);
     for (i, c) in text.char_indices() {
         if i < skip_to {
             continue;
         }
         let group_end = match c {
             '[' => bracket_end(text, i, start.is_some()),
-            '{' => brace_end(text, i),
+            '{' => braces
+                .binary_search_by_key(&i, |&(open, _)| open)
+                .ok()
+                .map(|k| braces[k].1),
             _ => None,
         };
         if let Some(close) = group_end {
@@ -735,96 +959,132 @@ fn bracket_end(text: &str, open: usize, in_word: bool) -> Option<usize> {
     (in_word || continues).then_some(open + 1 + close)
 }
 
-/// The index of the `}` closing the brace group that opens at `open`, when it closes before any
-/// whitespace or command separator (so `{data,}` stays one word but `{'a': 1}` does not).
-fn brace_end(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, c) in text.get(open..)?.char_indices() {
+/// Every brace group in `text` that closes before any whitespace or command separator, as
+/// `(open, close)` sorted by `open` (so `{data,}` stays one word but `{'a': 1}` does not). One
+/// pass with a stack: an unclosed `{` costs nothing later.
+fn brace_ends(text: &str) -> Vec<(usize, usize)> {
+    let mut open: Vec<usize> = Vec::new();
+    let mut ends = Vec::new();
+    for (i, c) in text.char_indices() {
         match c {
-            '{' => depth += 1,
+            '{' => open.push(i),
             '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
+                if let Some(o) = open.pop() {
+                    ends.push((o, i));
                 }
             }
             c if c.is_whitespace()
                 || matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`') =>
             {
-                return None
+                open.clear()
             }
             _ => {}
         }
     }
-    None
+    ends.sort_unstable();
+    ends
 }
 
 /// Most alternatives a word's braces expand to before they read as a `*` glob.
 const MAX_EXPANSIONS: usize = 64;
 
-/// Bash brace expansion: `a{b,c}d` → `abd`, `acd` (nested groups too). A group without a comma
-/// stays literal and `${…}` is a parameter; a `{x..y}` range, or more than [`MAX_EXPANSIONS`]
-/// alternatives, reads as `*` (a glob that may match anything there).
-fn expand_braces(word: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if expand_into(word, &mut out) {
-        out
-    } else {
-        vec![braces_as_glob(word)]
-    }
+/// Most expanding brace groups a word may have before they read as `*` globs.
+const MAX_GROUPS: usize = 8;
+
+/// Longest word whose braces are expanded; a longer one reads them as `*` globs.
+const MAX_EXPAND_LEN: usize = 4096;
+
+/// An expanding brace group: `{a,b}` (alternatives) or `{x..y}` (a range, one `*`).
+#[derive(Debug, Clone, Copy)]
+struct Group {
+    open: usize,
+    close: usize,
+    /// Alternatives it expands to (1 for a range).
+    alternatives: usize,
 }
 
-/// Push the expansions of `word` onto `out`; `false` once there are too many.
-fn expand_into(word: &str, out: &mut Vec<String>) -> bool {
-    let Some((open, close, alternatives)) = brace_group(word) else {
-        out.push(word.to_string());
-        return out.len() <= MAX_EXPANSIONS;
-    };
-    alternatives.iter().all(|alt| {
-        expand_into(
-            &format!("{}{alt}{}", &word[..open], &word[close + 1..]),
-            out,
-        )
-    })
-}
-
-/// The first expanding brace group in `word`: `(open, close, alternatives)`.
-fn brace_group(word: &str) -> Option<(usize, usize, Vec<&str>)> {
-    let mut from = 0;
-    while let Some(offset) = word[from..].find('{') {
-        let open = from + offset;
-        let close = matching_brace(word, open)?;
-        if !word[..open].ends_with('$') {
-            let body = &word[open + 1..close];
-            let alternatives = split_top_level(body);
-            if alternatives.len() > 1 {
-                return Some((open, close, alternatives));
-            }
-            if body.contains("..") {
-                return Some((open, close, vec!["*"]));
-            }
-        }
-        from = close + 1;
-    }
-    None
-}
-
-/// The index of the `}` that closes the `{` at `open`.
-fn matching_brace(word: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, b) in word.bytes().enumerate().skip(open) {
+/// The expanding brace groups of `word`, nested ones included, sorted by `open`. A group without
+/// a comma or `..` is literal, and so is a `${…}` parameter. One pass with a stack.
+fn brace_groups(word: &str) -> Vec<Group> {
+    // Per open `{`: (position, top-level commas, top-level `..`, is a parameter).
+    let mut open: Vec<(usize, usize, bool, bool)> = Vec::new();
+    let mut groups = Vec::new();
+    let bytes = word.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
         match b {
-            b'{' => depth += 1,
+            b'{' => open.push((i, 0, false, i > 0 && bytes[i - 1] == b'$')),
             b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+                if let Some((o, commas, dots, param)) = open.pop() {
+                    if !param && (commas > 0 || dots) {
+                        groups.push(Group {
+                            open: o,
+                            close: i,
+                            alternatives: commas.saturating_add(1),
+                        });
+                    }
+                }
+            }
+            b',' => {
+                if let Some(top) = open.last_mut() {
+                    top.1 = top.1.saturating_add(1);
+                }
+            }
+            b'.' if bytes.get(i + 1) == Some(&b'.') => {
+                if let Some(top) = open.last_mut() {
+                    top.2 = true;
                 }
             }
             _ => {}
         }
     }
-    None
+    groups.sort_unstable_by_key(|g| g.open);
+    groups
+}
+
+/// Bash brace expansion: `a{b,c}d` → `abd`, `acd` (nested groups too). A group without a comma
+/// stays literal and `${…}` is a parameter; a `{x..y}` range reads as `*`. More than
+/// [`MAX_GROUPS`] groups, more than [`MAX_EXPANSIONS`] alternatives, or a word longer than
+/// [`MAX_EXPAND_LEN`] is not expanded: every outermost group reads as `*` (a glob that may match
+/// anything there). Work is bounded whatever the input.
+fn expand_braces(word: &str) -> Vec<String> {
+    let groups = brace_groups(word);
+    if groups.is_empty() {
+        return vec![word.to_string()];
+    }
+    let total = groups
+        .iter()
+        .fold(1usize, |n, g| n.saturating_mul(g.alternatives));
+    if groups.len() > MAX_GROUPS || total > MAX_EXPANSIONS || word.len() > MAX_EXPAND_LEN {
+        return vec![braces_as_glob(word, &groups)];
+    }
+    let mut out = Vec::new();
+    if expand_into(word, 0, &mut out) {
+        out
+    } else {
+        vec![braces_as_glob(word, &groups)]
+    }
+}
+
+/// Push the expansions of `word` onto `out`; `false` once they go past the limits. Each level
+/// resolves one group, so the depth is at most [`MAX_GROUPS`].
+fn expand_into(word: &str, depth: usize, out: &mut Vec<String>) -> bool {
+    let Some(group) = brace_groups(word).first().copied() else {
+        out.push(word.to_string());
+        return out.len() <= MAX_EXPANSIONS;
+    };
+    if depth >= MAX_GROUPS {
+        return false;
+    }
+    let body = &word[group.open + 1..group.close];
+    let alternatives = if group.alternatives > 1 {
+        split_top_level(body)
+    } else {
+        vec!["*"]
+    };
+    let (head, tail) = (&word[..group.open], &word[group.close + 1..]);
+    alternatives
+        .iter()
+        .all(|alt| expand_into(&format!("{head}{alt}{tail}"), depth + 1, out))
 }
 
 /// A brace body split at its top-level commas (`a,{b,c}` → `a`, `{b,c}`).
@@ -847,16 +1107,19 @@ fn split_top_level(body: &str) -> Vec<&str> {
     parts
 }
 
-/// `word` with each expanding brace group read as `*`.
-fn braces_as_glob(word: &str) -> String {
-    let mut out = String::new();
-    let mut rest = word;
-    while let Some((open, close, _)) = brace_group(rest) {
-        out.push_str(&rest[..open]);
+/// `word` with each outermost expanding brace group (from [`brace_groups`]) read as `*`.
+fn braces_as_glob(word: &str, groups: &[Group]) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut cursor = 0;
+    for group in groups {
+        if group.open < cursor {
+            continue;
+        }
+        out.push_str(&word[cursor..group.open]);
         out.push('*');
-        rest = &rest[close + 1..];
+        cursor = group.close + 1;
     }
-    out.push_str(rest);
+    out.push_str(&word[cursor..]);
     out
 }
 
@@ -877,33 +1140,31 @@ fn args<'a>(toks: &'a [Tok<'a>]) -> impl Iterator<Item = &'a str> + 'a {
         .filter(|w| *w != "--")
 }
 
-/// The index of the `SubstClose` that ends the innermost command substitution around token `i`.
-fn subst_end(toks: &[Tok], i: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut inside = false;
-    for tok in toks[..i].iter().rev() {
+/// Per token, the index of the `SubstClose` that ends the innermost command substitution around
+/// it. One pass with a stack.
+fn subst_ends(toks: &[Tok]) -> Vec<Option<usize>> {
+    let mut open: Vec<usize> = Vec::new();
+    let mut close_of: Vec<Option<usize>> = vec![None; toks.len()];
+    let mut enclosing: Vec<Option<usize>> = Vec::with_capacity(toks.len());
+    for (i, tok) in toks.iter().enumerate() {
         match tok {
-            Tok::SubstClose => depth += 1,
-            Tok::SubstOpen if depth == 0 => {
-                inside = true;
-                break;
+            Tok::SubstOpen => {
+                enclosing.push(open.last().copied());
+                open.push(i);
             }
-            Tok::SubstOpen => depth -= 1,
-            _ => {}
+            Tok::SubstClose => {
+                if let Some(o) = open.pop() {
+                    close_of[o] = Some(i);
+                }
+                enclosing.push(open.last().copied());
+            }
+            _ => enclosing.push(open.last().copied()),
         }
     }
-    if !inside {
-        return None;
-    }
-    for (j, tok) in toks.iter().enumerate().skip(i + 1) {
-        match tok {
-            Tok::SubstOpen => depth += 1,
-            Tok::SubstClose if depth == 0 => return Some(j),
-            Tok::SubstClose => depth -= 1,
-            _ => {}
-        }
-    }
-    None
+    enclosing
+        .into_iter()
+        .map(|o| o.and_then(|o| close_of[o]))
+        .collect()
 }
 
 /// The mutating subcommand (for the message) when the binary is run with one.
@@ -975,7 +1236,7 @@ fn protected_kind(word: &str, protected: &Protected, names: Names) -> Option<Kin
         || named
         || after_pair(&comps, "plugins", "data")
             .into_iter()
-            .any(|i| could_name(comps[i], BINARY))
+            .any(|i| could_name(comps[i], BINARY) && is_config_dir(&comps[..i - 2], protected))
         || protected.data_dirs.iter().any(|d| contains_path(word, d));
     if data_dir {
         return Some(Kind::DataDir);
@@ -1032,10 +1293,11 @@ fn names_home_data_dir(word: &str, comps: &[&str], protected: &Protected) -> boo
         comps.len() > 1 && comps[0].starts_with('~') && could_name(comps[1], ".safe-ai-skill");
     tilde
         || protected.home_prefixes.iter().any(|h| {
-            word.match_indices(h.as_str()).any(|(i, m)| {
-                let comp = word[i + m.len()..].split('/').next().unwrap_or("");
-                could_name(comp, ".safe-ai-skill")
-            })
+            h.len() < word.len()
+                && word.match_indices(h.as_str()).any(|(i, m)| {
+                    let comp = word[i + m.len()..].split('/').next().unwrap_or("");
+                    could_name(comp, ".safe-ai-skill")
+                })
         })
 }
 
@@ -1130,7 +1392,7 @@ fn skeleton(glob: &str) -> String {
 /// Whether `root` occurs in `word` as a whole path prefix (a full component boundary on both
 /// sides), e.g. `/d` in `cat@/d/x` but not in `/d2/x` or `/a/d/x`.
 fn contains_path(word: &str, root: &str) -> bool {
-    if root.is_empty() {
+    if root.is_empty() || root.len() > word.len() {
         return false;
     }
     word.match_indices(root).any(|(i, _)| {
@@ -1160,22 +1422,28 @@ fn normalize_word(word: &str, protected: &Protected) -> String {
     out
 }
 
+/// `${home}` and `$home` (not `$homer`) → `home`, then a leading `~`. One pass.
 fn expand_home(word: &str, home: &str) -> String {
-    let mut out = word.replace("${home}", home);
-    let mut from = 0;
-    while let Some(i) = out[from..].find("$home").map(|i| i + from) {
-        let end = i + "$home".len();
-        if out[end..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(after) = tail.strip_prefix("${home}") {
+            out.push_str(home);
+            rest = after;
+        } else if let Some(after) = tail
+            .strip_prefix("$home")
+            .filter(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
         {
-            from = end;
-            continue;
+            out.push_str(home);
+            rest = after;
+        } else {
+            out.push('$');
+            rest = &tail[1..];
         }
-        out.replace_range(i..end, home);
-        from = i + home.len();
     }
+    out.push_str(rest);
     if out == "~" {
         return home.to_string();
     }
@@ -1675,7 +1943,7 @@ mod tests {
 
     #[test]
     fn file_targets() {
-        let p = protected();
+        let p = protected().with_config_dir(Path::new("/opt/cfg"));
         let cwd = Path::new("/work/proj");
         let file =
             |path: &str| decide_file(Some(&serde_json::json!({ "file_path": path })), cwd, &p);
@@ -1697,6 +1965,8 @@ mod tests {
         for path in [
             "/work/proj/.safe-ai-skill/policy.yaml",
             "/work/proj/src/main.rs",
+            "/work/proj/src/plugins/data/safe-ai-skill-x/a.json",
+            "/opt/other/plugins/data/safe-ai-skill-stbr/mode.json",
             "/work/proj/docs/safe-ai-skill-notes.md",
             "/work/safe-ai-skill-fork/src/main.rs",
             "/work/safe-ai-skill-v2/Cargo.toml",
@@ -1842,15 +2112,20 @@ mod tests {
     fn relative_words_resolve_against_the_tracked_dir() {
         for cmd in [
             "cd ~/.claude/plugins && rm -rf data/*",
-            "cd plugins && rm -rf data/sa*",
             "cd ~/.claude && rm -rf plugins/data/safe-ai-skill-stbr",
             "cd ~ && rm -rf .safe-ai-skill",
+            "cd .claude/plugins/data && rm -rf sa*",
         ] {
             assert_deny(cmd);
         }
         assert_defer("cd ~/code && rm -rf data/*");
         // The session cwd seeds it.
         let at = |cwd: &str| protected().with_session_cwd(Path::new(cwd));
+        let d = decide_bash("cd plugins && rm -rf data/sa*", &at("/home/u/.claude"));
+        assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+        // Unknown session cwd: a relative `plugins/data` is only taken as Claude Code's when
+        // it is spelled from `.claude/`.
+        assert_defer("cd plugins && rm -rf data/sa*");
         let in_data = at("/home/u/.claude/plugins/data/safe-ai-skill-stbr");
         for cmd in ["echo x > grants.json", "cat mode.json", "rm -rf session"] {
             let d = decide_bash(cmd, &in_data);
@@ -1869,6 +2144,108 @@ mod tests {
             "git clone x safe-ai-skill-dev",
         ] {
             assert_eq!(decide_bash(cmd, &in_project), Decision::Defer, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn brace_expansion_is_bounded() {
+        // One `*` per group, without recursing per group.
+        assert_eq!(expand_braces(&"{a,b}".repeat(40_000)), ["*".repeat(40_000)]);
+        assert_eq!(
+            expand_braces(&"{a..b}".repeat(60_000)),
+            ["*".repeat(60_000)]
+        );
+        assert_eq!(expand_braces(&"{,}".repeat(60_000)), ["*".repeat(60_000)]);
+        // More than MAX_GROUPS groups, even of one alternative each.
+        assert_eq!(expand_braces(&"{1..2}".repeat(9)), ["*********"]);
+        // A word longer than MAX_EXPAND_LEN.
+        let long = "x".repeat(MAX_EXPAND_LEN);
+        assert_eq!(
+            expand_braces(&format!("{long}{{a,b}}")),
+            [format!("{long}*")]
+        );
+        // Nested groups read as one `*`; an unclosed `{` is literal.
+        let nested = format!("{}b{}", "{a,".repeat(1000), "}".repeat(1000));
+        assert_eq!(expand_braces(&nested), ["*"]);
+        assert_eq!(expand_braces("{{a,b}"), ["{a", "{b"]);
+        assert_eq!(expand_braces(&"{a,".repeat(1000)), ["{a,".repeat(1000)]);
+    }
+
+    #[test]
+    fn brace_ends_pairs_in_one_pass() {
+        assert_eq!(brace_ends("{a,{b,c}} {d"), [(0, 8), (3, 7)]);
+        assert_eq!(brace_ends("{a, b}"), []);
+        assert!(brace_ends(&"{a,".repeat(100_000)).is_empty());
+        let words = tokenize(&"{a,".repeat(1000)).len();
+        assert_eq!(words, 1000);
+    }
+
+    #[test]
+    fn work_budget_exhaustion_asks() {
+        let ask =
+            |d: &Decision| matches!(d, Decision::Ask { reason } if reason.contains("too complex"));
+        let p = protected();
+        let mut tiny = Budget::new(5, Duration::from_secs(60));
+        assert!(ask(&decide_bash_within("cat a b c d e f g", &p, &mut tiny)));
+        let mut late = Budget::new(u64::MAX, Duration::ZERO);
+        assert!(ask(&decide_bash_within("ls", &p, &mut late)));
+        let mut ample = Budget::new(1_000, Duration::from_secs(60));
+        assert_eq!(
+            decide_bash_within("ls -la", &p, &mut ample),
+            Decision::Defer
+        );
+        let mut budget = Budget::new(10, Duration::from_secs(60));
+        assert!(budget.spend(10).is_ok());
+        assert_eq!(budget.spend(1), Err(TooComplex));
+        // A word over MAX_WORD is not inspected: too complex, unless a deny turns up elsewhere.
+        let long = "{a,b}".repeat(40_000);
+        assert!(ask(&decide_bash(&format!("echo {long}"), &p)));
+        assert!(matches!(
+            decide_bash(
+                &format!("echo {long} > ~/.claude/plugins/data/safe-ai-skill-stbr/mode.json"),
+                &p
+            ),
+            Decision::Deny { .. }
+        ));
+        assert!(ask(&decide_bash(
+            &format!("echo {}*", "$HOME".repeat(20_000)),
+            &p
+        )));
+        // A chain of relative `cd`s costs more than its length: each directory is checked.
+        let chain = "cd x && ".repeat(4096);
+        let units = || Budget::new(1_000_000, Duration::from_secs(60));
+        assert!(ask(&decide_bash_within(&chain, &p, &mut units())));
+        // The directory scan runs first, so exhaustion asks even where a deny would follow.
+        let deny_then_chain = format!("safe-ai-skill allow; {chain}");
+        assert!(ask(&decide_bash_within(&deny_then_chain, &p, &mut units())));
+    }
+
+    #[test]
+    fn plugins_data_rule_is_anchored_to_config_dirs() {
+        let p = protected()
+            .with_session_cwd(Path::new("/work/proj"))
+            .with_config_dir(Path::new("/opt/cfg"));
+        for cmd in [
+            "rm -rf ~/.claude/plugins/data/*",
+            "rm -rf /users/other/.claude/plugins/data/*",
+            "rm -rf $X/plugins/data/*",
+            "rm -rf ~other/plugins/data/*",
+            "rm -rf /opt/cfg/plugins/data/*",
+            "cd /home/u/.claude/plugins/data && rm -f *.tmp",
+            "cd /opt/cfg/plugins/data && rm -f *.tmp",
+            "cd .claude/plugins/data && rm -f *.tmp",
+        ] {
+            let d = decide_bash(cmd, &p);
+            assert!(matches!(d, Decision::Deny { .. }), "{cmd}: {d:?}");
+        }
+        for cmd in [
+            "cd src/plugins/data && rm -f *.tmp",
+            "rm -rf src/plugins/data/*",
+            "rm -rf /work/proj/src/plugins/data/safe-ai-skill-x",
+            "cd /opt/x/plugins/data && ls *.json",
+            "rm -rf /opt/cfg/other/plugins/data/*",
+        ] {
+            assert_eq!(decide_bash(cmd, &p), Decision::Defer, "{cmd}");
         }
     }
 }

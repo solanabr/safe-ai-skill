@@ -49,19 +49,33 @@ const ALLOWLISTED_POST_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
 /// wraps the result in a hard-guard [`crate::gate::GateMeta`]. `cwd` is the session's working
 /// directory (the hook payload's), where the command's relative paths start.
 pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
-    // Self-grant / state-tamper tripwire first: its deny is final, whatever else matches.
+    // Self-grant / state-tamper tripwire first: its deny is final, whatever else matches. Both
+    // scans share one work budget; running out asks (this gate is a hard guard), so a command
+    // built to be slow to inspect never gets no opinion.
+    let mut budget = tamper::Budget::default();
     let protected = tamper::Protected::from_env().with_session_cwd(cwd);
-    let tripwire = tamper::decide_bash(command, &protected);
+    let tripwire = tamper::decide_bash_within(command, &protected, &mut budget);
     if matches!(tripwire, Decision::Deny { .. }) {
         return tripwire;
     }
+    let scanned = scan_segments(command, policy, &mut budget);
+    match tripwire {
+        // Too complex for the tripwire: a secret read found anyway still denies.
+        Decision::Ask { .. } if !matches!(scanned, Decision::Deny { .. }) => tripwire,
+        _ => scanned,
+    }
+}
 
+/// The secret-read / exfil and installer checks, spending from `budget`.
+fn scan_segments(command: &str, policy: &Policy, budget: &mut tamper::Budget) -> Decision {
     // Per-segment secret-read / exfil scan. A clear secret access or upload is a hard
     // `Deny` and must win over the (softer, configurable) install-script gate, so capture
     // the strongest segment decision and short-circuit on a `Deny`.
     let mut segment_decision = Decision::Defer;
     for segment in split_segments(command) {
-        let decision = decide_segment(segment, policy);
+        let Ok(decision) = decide_segment(segment, policy, budget) else {
+            return tamper::too_complex();
+        };
         match decision {
             Decision::Deny { .. } => return decision,
             Decision::Defer => {}
@@ -159,14 +173,27 @@ fn install_script_decision(policy: &Policy) -> Decision {
     }
 }
 
-/// Evaluate one command segment.
-fn decide_segment(segment: &str, policy: &Policy) -> Decision {
+/// Evaluate one command segment, spending from `budget`: a token each, and per glob match
+/// (each argument is matched against every secrets glob) a fixed cost plus its length.
+fn decide_segment(
+    segment: &str,
+    policy: &Policy,
+    budget: &mut tamper::Budget,
+) -> Result<Decision, tamper::TooComplex> {
     let tokens: Vec<String> = tokenize(segment);
+    budget.spend(tokens.len())?;
     if tokens.is_empty() {
-        return Decision::Defer;
+        return Ok(Decision::Defer);
     }
 
     let program = base_program(&tokens[0]);
+    let globs = policy.secrets.allow_read_globs.len() + policy.secrets.deny_read_globs.len();
+    let mut spend_matches = |arg: &str| {
+        if arg.len() > tamper::MAX_WORD {
+            return Err(tamper::TooComplex);
+        }
+        budget.spend(globs.saturating_mul(16 + arg.len()))
+    };
 
     // 1. Reader/copier hitting a denied secret path.
     if READER_COMMANDS.contains(&program.as_str()) {
@@ -174,23 +201,27 @@ fn decide_segment(segment: &str, policy: &Policy) -> Decision {
             if is_flag(arg) {
                 continue;
             }
+            spend_matches(arg)?;
             if matches_secret(arg, policy) {
-                return Decision::Deny {
+                return Ok(Decision::Deny {
                     reason: format!(
                         "Reading secret file `{arg}` via `{program}` is blocked (keypair/.env/config)"
                     ),
-                };
+                });
             }
         }
-        return Decision::Defer;
+        return Ok(Decision::Defer);
     }
 
     // 2. Exfil via curl / wget.
     if program == "curl" || program == "wget" {
-        return decide_http_exfil(&tokens, policy);
+        for tok in &tokens {
+            spend_matches(tok)?;
+        }
+        return Ok(decide_http_exfil(&tokens, policy));
     }
 
-    Decision::Defer
+    Ok(Decision::Defer)
 }
 
 /// Decide a `curl`/`wget` segment: deny if it uploads a secret file, ask if it POSTs to a
@@ -677,5 +708,27 @@ mod tests {
             &policy(),
         );
         assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn exhausted_budget_is_too_complex() {
+        let mut budget = tamper::Budget::new(10, std::time::Duration::from_secs(60));
+        let scanned = decide_segment("cat a b c d e f", &policy(), &mut budget);
+        assert_eq!(scanned, Err(tamper::TooComplex));
+    }
+
+    #[test]
+    fn too_complex_for_the_tripwire_still_denies_a_secret_read() {
+        let word = "{a,b}".repeat(40_000);
+        let d = decide(
+            &format!("echo {word}; cat ~/.config/solana/id.json"),
+            &policy(),
+        );
+        assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+        let d = decide(&format!("echo {word}"), &policy());
+        assert!(
+            matches!(&d, Decision::Ask { reason } if reason.contains("too complex")),
+            "{d:?}"
+        );
     }
 }

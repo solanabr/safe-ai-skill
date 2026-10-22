@@ -46,6 +46,7 @@ impl Drop for Scratch {
 }
 
 /// Isolated HOME, plugin data dir, plugin root and project dir for one test.
+/// `$CLAUDE_CONFIG_DIR` is `<home>/cfg`, a second config dir besides `<home>/.claude`.
 struct Sandbox {
     home: Scratch,
     /// `$CLAUDE_PLUGIN_DATA`, laid out as Claude Code does: `~/.claude/plugins/data/<plugin>-<mkt>`.
@@ -109,6 +110,7 @@ impl Sandbox {
             .plugin_data(&self.data)
             .home(self.home.path())
             .env("CLAUDE_PLUGIN_ROOT", &self.root())
+            .env("CLAUDE_CONFIG_DIR", &format!("{}/cfg", self.home()))
             .env("CLAUDE_PROJECT_DIR", project_dir)
             .stdin(body)
             .run()
@@ -731,4 +733,164 @@ fn hooks_json_wires_tamper_gate_for_file_tools() {
         hook.get("if").is_none(),
         "tripwire must be unconditional: {hook}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Adversarial inputs: the hook must answer, quickly, and never fail open
+// ---------------------------------------------------------------------------------------
+
+/// The Bash hook's verdict on `command` and how long the process took.
+fn timed_bash(sb: &Sandbox, command: &str) -> (Run, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let run = sb.bash(command);
+    (run, start.elapsed())
+}
+
+/// Well under the 10 s hook timeout, loose enough for a debug build on a busy CI runner: the
+/// work budget's 2 s deadline is what keeps the hook inside it.
+const HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `command` must be answered with one of `allowed` (`None` = no opinion), exit 0, in time.
+fn assert_answers(sb: &Sandbox, what: &str, command: &str, allowed: &[Option<&str>]) {
+    let (run, took) = timed_bash(sb, command);
+    assert_eq!(run.code, Some(0), "{what}: crashed\nstderr: {}", run.stderr);
+    let got = verdict(&run);
+    assert!(
+        allowed.contains(&got.as_deref()),
+        "{what}: got {got:?}, want one of {allowed:?}\nstderr: {}",
+        run.stderr
+    );
+    assert!(took < HOOK_DEADLINE, "{what}: took {took:?}");
+}
+
+const SECRET_READ: &str = "; cat ~/.config/solana/id.json";
+
+#[test]
+fn huge_brace_sequences_never_fail_open() {
+    // 40k+ brace groups in one word used to recurse once per group and abort on a stack
+    // overflow: empty stdout, so both the tripwire and the secret-read guard were skipped.
+    let sb = Sandbox::new("tw-braces");
+    for (what, word) in [
+        ("{a,b} x40k", "{a,b}".repeat(40_000)),
+        ("{a..b} x60k", "{a..b}".repeat(60_000)),
+        ("{,} x60k", "{,}".repeat(60_000)),
+    ] {
+        let deny_or_ask = [Some("deny"), Some("ask")];
+        assert_answers(
+            &sb,
+            what,
+            &format!("echo {word}{SECRET_READ}"),
+            &deny_or_ask,
+        );
+        assert_answers(
+            &sb,
+            what,
+            &format!("echo {word} > ~/.claude/plugins/data/safe-ai-skill-stbr/mode.json"),
+            &deny_or_ask,
+        );
+        assert_answers(&sb, what, &format!("echo {word}"), &[None, Some("ask")]);
+    }
+}
+
+#[test]
+fn unclosed_braces_are_linear() {
+    // Each unclosed `{` used to rescan the rest of the word: 120 KB took 13.5 s.
+    let sb = Sandbox::new("tw-unclosed");
+    let word = "{a,".repeat(40_000);
+    assert_answers(
+        &sb,
+        "unclosed {a,",
+        &format!("echo {word}{SECRET_READ}"),
+        &[Some("deny"), Some("ask")],
+    );
+    let nested = format!("{}b{}", "{a,".repeat(40_000), "}".repeat(40_000));
+    assert_answers(
+        &sb,
+        "nested {a,{a,…}}",
+        &format!("echo {nested}{SECRET_READ}"),
+        &[Some("deny"), Some("ask")],
+    );
+}
+
+#[test]
+fn work_budget_exhaustion_asks() {
+    // A 1 MiB chain of relative `cd`s is more than the tripwire will inspect: it must ask (a
+    // hard guard), never answer with no opinion.
+    let sb = Sandbox::new("tw-budget");
+    let chain = "cd x && ".repeat((1 << 20) / 8);
+    let (run, took) = timed_bash(&sb, &chain);
+    assert_eq!(verdict(&run).as_deref(), Some("ask"), "{}", run.stderr);
+    assert!(
+        reason(&run).contains("too complex to inspect"),
+        "{}",
+        reason(&run)
+    );
+    assert!(took < HOOK_DEADLINE, "took {took:?}");
+    assert_answers(
+        &sb,
+        "cd chain + secret read",
+        &format!("{chain}true{SECRET_READ}"),
+        &[Some("deny"), Some("ask")],
+    );
+}
+
+#[test]
+fn megabyte_of_ordinary_words_answers_in_time() {
+    let sb = Sandbox::new("tw-mib");
+    let mib = 1 << 20;
+    for (what, command) in [
+        ("{a,b} words", format!("echo {}", "{a,b} ".repeat(mib / 6))),
+        ("glob words", format!("ls {}", "src/*.rs ".repeat(mib / 9))),
+        ("glob chars", format!("echo {}", "*?[".repeat(mib / 3))),
+        ("$HOME words", format!("echo {}*", "$HOME".repeat(mib / 5))),
+        ("-C flags", format!("env {}", "-C ".repeat(mib / 3))),
+        ("${IFS runs", format!("echo {}", "${IFS".repeat(mib / 5))),
+    ] {
+        assert_answers(&sb, what, &command, &[None, Some("ask")]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The `plugins/data` rule is anchored to Claude Code's config dir
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn project_plugins_data_dir_has_no_opinion() {
+    let sb = Sandbox::new("tw-projdata");
+    std::fs::create_dir_all(sb.project.join("src/plugins/data")).unwrap();
+    for cmd in [
+        "cd src/plugins/data && rm -f *.tmp",
+        "rm -rf src/plugins/data/*",
+        "rm -rf ./src/plugins/data/safe-ai-skill-x",
+    ] {
+        assert_no_opinion(&sb.bash(cmd), cmd);
+    }
+    let home = sb.home();
+    for cmd in [
+        "cd ~/.claude/plugins/data && rm -f *.tmp".to_string(),
+        "rm -rf ~/.claude/plugins/data/*".to_string(),
+        format!("cd {home}/.claude && rm -rf plugins/data/*"),
+    ] {
+        assert_deny(&sb.bash(&cmd), &cmd);
+    }
+}
+
+#[test]
+fn custom_config_dir_plugins_data_is_protected() {
+    let sb = Sandbox::new("tw-cfgdir");
+    let home = sb.home();
+    let cfg = format!("{home}/cfg");
+    for cmd in [
+        format!("rm -rf {cfg}/plugins/data/*"),
+        format!("cd {cfg}/plugins/data && rm -rf sa*"),
+        format!("cp x {cfg}/plugins/data/safe-ai-skill-safe-ai-skill/lockfile.json"),
+    ] {
+        assert_deny(&sb.bash(&cmd), &cmd);
+    }
+    for cmd in [
+        format!("rm -rf {home}/other/plugins/data/*"),
+        format!("cd {home}/other/plugins/data && rm -rf *.tmp"),
+    ] {
+        assert_no_opinion(&sb.bash(&cmd), &cmd);
+    }
 }
