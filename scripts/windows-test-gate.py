@@ -23,7 +23,9 @@ DEFAULT_ALLOWLIST = os.path.join(ROOT, "crates", "engine", "tests", "windows-kno
 
 RUNNING = re.compile(r"^\s*Running .*[/\\]deps[/\\]([A-Za-z0-9_]+)-[0-9a-f]+(?:\.exe)?\)?\s*$")
 DOCTESTS = re.compile(r"^\s*Doc-tests (\S+)")
-RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)")
+# Doc-test names contain spaces (`src/lib.rs - item (line 12)`).
+RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)")
+SUMMARY = re.compile(r"^test result: ")
 
 
 def load_allowlist(path):
@@ -48,15 +50,18 @@ def main():
                             encoding="utf-8", errors="replace")
     binary = "?"
     failed, passed = set(), set()
+    # Test binaries that started but never printed a `test result:` line (crashed or aborted):
+    # their unreported tests are failures no allowlist entry can cover.
+    started, finished = [], set()
     for line in proc.stdout:
         sys.stdout.write(line)
-        m = RUNNING.match(line)
+        m = RUNNING.match(line) or DOCTESTS.match(line)
         if m:
-            binary = m.group(1)
+            binary = m.group(1) if RUNNING.match(line) else "doctest"
+            started.append(binary)
             continue
-        m = DOCTESTS.match(line)
-        if m:
-            binary = "doctest"
+        if SUMMARY.match(line):
+            finished.add(binary)
             continue
         m = RESULT.match(line)
         if m:
@@ -64,6 +69,7 @@ def main():
             (failed if m.group(2) == "FAILED" else passed).add(key)
     code = proc.wait()
 
+    aborted = sorted(set(started) - finished)
     new = sorted(failed - allowed)
     stale = sorted(allowed & passed)
     print(f"\nwindows-test-gate: {len(failed)} failed ({len(failed) - len(new)} allowlisted), "
@@ -72,7 +78,9 @@ def main():
         print(f"::warning::{key} passes now; delete it from the allowlist")
     for key in new:
         print(f"::error::{key} fails and is not in the allowlist")
-    if new:
+    for name in aborted:
+        print(f"::error::test binary {name} ended without a result (crashed or aborted)")
+    if new or aborted:
         return 1
     if code != 0 and not failed:
         print("::error::cargo test failed without a test failure (build error?)")
