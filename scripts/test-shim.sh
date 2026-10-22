@@ -425,6 +425,11 @@ matrix() {
     expect_rc 0
     expect_ask
     expect_err_lines 1
+    t "$sc: gate-skill answers ask"
+    run gate-skill
+    expect_rc 0
+    expect_ask
+    expect_err_lines 1
     t "$sc: SessionStart reports the firewall INACTIVE"
     run verify session
     expect_rc 0
@@ -466,6 +471,11 @@ matrix() {
     expect_err_has crashed
     t "crash $sc: gate-mcp blocks"
     run gate-mcp
+    expect_rc 2
+    expect_no_out
+    expect_err_has crashed
+    t "crash $sc: gate-skill blocks"
+    run gate-skill
     expect_rc 2
     expect_no_out
     expect_err_has crashed
@@ -676,8 +686,12 @@ matrix() {
   run gate-mcp
   expect_rc 2
   expect_no_out
+  t "tamper: gate-skill blocks"
+  run gate-skill
+  expect_rc 2
+  expect_no_out
   t "tamper: the other PreToolUse gates ask"
-  for args in gate-read gate-bash-secrets gate-skill; do
+  for args in gate-read gate-bash-secrets; do
     run "$args"
     expect_rc 0
     expect_tamper_ask
@@ -858,12 +872,12 @@ matrix() {
   while IFS= read -r args; do
     fresh
     u_s=SunOS
-    t "hooks.json '$args' fails open on an unsupported platform"
+    t "hooks.json '$args' takes its hook contract on an unsupported platform"
     # shellcheck disable=SC2086 # 'verify session' is two arguments
     run $args
     expect_rc 0
     case $args in
-      gate-bash) expect_ask ;;
+      gate-bash | gate-skill) expect_ask ;;
       'verify session') expect_notice INACTIVE ;;
       *) expect_no_out ;;
     esac

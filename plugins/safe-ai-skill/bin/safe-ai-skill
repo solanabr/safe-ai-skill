@@ -6,13 +6,13 @@
 # contract (spec D6.1):
 #   - Environment failure (no prebuilt for this platform, not an executable for this
 #     machine, no sha256 tool to verify it, exit 126/127): fail open with a notice.
-#     gate-bash keeps the Solana CLI surface at `ask`, SessionStart reports the firewall
+#     gate-bash keeps the Solana CLI surface at `ask` (gate-skill asks too), SessionStart reports the firewall
 #     INACTIVE, every other hook exits 0 with one stderr line.
 #   - Tamper (the prebuilt's sha256 differs from the constant stamped below at release):
-#     the prebuilt never runs. gate-bash and gate-mcp exit 2, the other PreToolUse gates
+#     the prebuilt never runs. gate-bash, gate-mcp and gate-skill exit 2, the other PreToolUse gates
 #     ask, SessionStart reports the firewall TAMPERED, the remaining hooks exit 0 with a
 #     stderr line, CLI subcommands exit 2.
-#   - Engine crash (signal, or exit not in {0,2,3}): gate-bash and gate-mcp exit 2
+#   - Engine crash (signal, or exit not in {0,2,3}): gate-bash, gate-mcp and gate-skill exit 2
 #     (block); every other hook exits 0 with a stderr line, SessionStart with a notice.
 #   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
@@ -45,6 +45,8 @@ sub=${1:-}
 case $sub in
   gate-bash) kind=solana ;;
   gate-mcp) kind=mcp ;;
+  # A fail-open Skill gate would let a blocked pack's `!cmd` run (spec D6.2 as amended).
+  gate-skill) kind=skill ;;
   # Hooks on events other than PreToolUse, where `ask` means nothing.
   gate-prompt-expansion | redact | prompt-guard | pending-notice) kind=other ;;
   gate-*) kind=broad ;;
@@ -127,6 +129,7 @@ env_failure() {
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
     solana) ask_json "safe-ai-skill inactive on $label: $1; review this command manually" ;;
+    skill) ask_json "safe-ai-skill inactive on $label: $1; review this skill call manually" ;;
     session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
     cli) exit 1 ;;
   esac
@@ -137,7 +140,7 @@ env_failure() {
 tampered() {
   printf 'safe-ai-skill: %s fails its sha256 check (tampered, or not the binary this release shipped); not running it\n' "${bin##*/}" >&2
   case $kind in
-    solana | mcp | cli) exit 2 ;;
+    solana | mcp | skill | cli) exit 2 ;;
   esac
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
@@ -183,7 +186,7 @@ sha256_ok() {
 crashed() {
   if [ "$1" -gt 128 ]; then how="signal $(($1 - 128))"; else how="exit $1"; fi
   case $kind in
-    solana | mcp)
+    solana | mcp | skill)
       printf 'safe-ai-skill: engine crashed (%s); %s blocked this call\n' "$how" "$sub" >&2
       exit 2
       ;;
