@@ -297,7 +297,9 @@ fn solana_commands_use_the_cli_default_and_anchor_its_own() {
     let policy = Policy::default();
     let (d, meta) = bash::decide("solana program deploy ./p.so", &ctx, &policy);
     assert!(is_ask(&d), "{d:?}");
-    assert!(meta.hard_guard);
+    // Class C (D8 v2 §2): a grantable ask on mainnet.
+    assert!(!meta.hard_guard);
+    assert_eq!(meta.scope, safe_ai_skill::gate::Scope::Deploy);
     let (d, _) = bash::decide("anchor deploy", &ctx, &policy);
     assert_eq!(d, Decision::Defer);
 }
