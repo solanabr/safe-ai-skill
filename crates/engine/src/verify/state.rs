@@ -27,6 +27,14 @@ pub const STATE_VERSION: u32 = 2;
 pub const MAX_STORED_FINDINGS: usize = 50;
 /// Domain separation of [`tree_hash`].
 const TREE_DOMAIN: &[u8] = b"safe-ai-skill/tree/v2\0";
+/// Domain separation of [`stat_fingerprint_until`].
+const STAT_DOMAIN: &[u8] = b"safe-ai-skill/stat/v1\0";
+/// Rule id of the HIGH finding for a pack that was not fully scanned (its name walk, hash or
+/// scan ran out of budget).
+pub const SCAN_BUDGET_RULE: &str = "scan_budget_exceeded";
+/// Rule id of the combo for a symlink that resolves outside its pack. Neither approval nor trust
+/// clears it (spec D2.8): its content lives outside what was reviewed.
+pub const SYMLINK_ESCAPE_RULE: &str = "symlink_escape";
 
 /// How a pack is laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +193,11 @@ pub struct PackEntry {
     /// The user approved or trusted the pinned content (prompt-nonce confirmed).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub approved: bool,
+    /// [`stat_fingerprint_until`] of the content [`Self::last_scanned_hash`] was computed from
+    /// (taken before hashing it). While it still matches, the gates trust the stored verdict
+    /// without re-hashing. Empty when the content was not fully hashed and scanned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
     /// Where `supply_chain.on_block: move` put the pack (its key stays the origin path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined_to: Option<String>,
@@ -195,6 +208,20 @@ pub struct PackEntry {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+impl PackEntry {
+    /// Unreviewed because it was not fully scanned (deferred past the sweep budget, or its hash,
+    /// name walk or scan overran): the gates deny its paths like a blocked pack's.
+    pub fn unscanned(&self) -> bool {
+        self.state == PackStatus::Unreviewed
+            && self.flagged_rules.iter().any(|r| r == SCAN_BUDGET_RULE)
+    }
+
+    /// Holds a symlink that resolves outside the pack (never cleared by approval or trust).
+    pub fn escapes(&self) -> bool {
+        !self.escaping.is_empty() || self.flagged_rules.iter().any(|r| r == SYMLINK_ESCAPE_RULE)
+    }
 }
 
 /// The `state.json` body.
@@ -281,6 +308,8 @@ pub struct Observation {
     pub trusted: bool,
     /// The project's `packs.lock` pins exactly this content.
     pub lock_matches: bool,
+    /// The content holds a symlink resolving outside the pack: blocked whatever is trusted.
+    pub escapes: bool,
 }
 
 /// The result of [`decide`].
@@ -299,12 +328,16 @@ pub struct Transition {
 /// `pin` is the entry's current pin (`None` on first sight). `floor` raises the state for a v1
 /// re-baseline (`Warned`) or a v1 pin recorded with a HIGH scan (`Unreviewed`).
 ///
-/// In order: trusted content is clean and becomes the pin; a combo blocks; content that
+/// In order: a symlink escaping the pack blocks (trust never clears it, spec D2.8); trusted
+/// content is clean and becomes the pin; a combo blocks; content that
 /// differs from its pin blocks (drift); content that differs from the committed `packs.lock`
 /// blocks; otherwise the grade decides (HIGH → unreviewed, unless `packs.lock` pins this
 /// exact content, which counts as reviewed → warned).
 pub fn decide(pin: Option<&str>, obs: &Observation, floor: Option<PackStatus>) -> Transition {
     let recorded = pin.unwrap_or(&obs.hash).to_string();
+    if obs.escapes {
+        return blocked(Reason::Combo, recorded);
+    }
     if obs.trusted {
         return Transition {
             state: PackStatus::Clean,
@@ -430,8 +463,16 @@ pub fn tree_hash(root: &Path) -> String {
     tree_hash_until(root, None).unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Content hashes computed on this thread (tests assert the gates skip them).
+    pub static TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [`tree_hash`], giving up (`None`) once `deadline` passes.
 pub fn tree_hash_until(root: &Path, deadline: Option<std::time::Instant>) -> Option<String> {
+    #[cfg(test)]
+    TREE_HASHES.with(|n| n.set(n.get() + 1));
     let Ok(meta) = root.symlink_metadata() else {
         return Some(String::new());
     };
@@ -478,6 +519,104 @@ pub fn tree_hash_until(root: &Path, deadline: Option<std::time::Instant>) -> Opt
         hasher.update(record);
     }
     Some(hex(&hasher.finalize()))
+}
+
+/// A cheap identity of a pack's entry set, from metadata only (no file is read), or `None` once
+/// `deadline` passes.
+///
+/// Every non-directory entry below `root` (the pack-root `.git` skipped, as in [`tree_hash`])
+/// counts, sorted by relative path, as `(path, type, size, mtime_ns, ctime_ns, inode, mode,
+/// link target)`. Content cannot change without changing it: a write moves mtime and ctime, and
+/// ctime cannot be set back by an unprivileged process (unlike mtime). Taken *before* a content
+/// hash, a later match means the content is still what was hashed.
+pub fn stat_fingerprint_until(root: &Path, deadline: Option<std::time::Instant>) -> Option<String> {
+    let meta = root.symlink_metadata().ok()?;
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    if meta.is_dir() {
+        let walker = WalkDir::new(root)
+            .follow_links(false)
+            .min_depth(1)
+            .into_iter()
+            .filter_entry(|e| !(e.depth() == 1 && e.file_name() == ".git"));
+        for entry in walker {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
+            match entry {
+                Ok(e) if e.file_type().is_dir() => {}
+                Ok(e) => {
+                    let rel = rel_bytes(e.path().strip_prefix(root).unwrap_or(e.path()));
+                    entries.push((rel, stat_record(e.path())));
+                }
+                Err(err) => {
+                    if let Some(path) = err.path() {
+                        let rel = rel_bytes(path.strip_prefix(root).unwrap_or(path));
+                        entries.push((rel, b"E".to_vec()));
+                    }
+                }
+            }
+        }
+    } else {
+        entries.push((Vec::new(), stat_record(root)));
+    }
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(STAT_DOMAIN);
+    for (rel, record) in &entries {
+        hasher.update((rel.len() as u64).to_le_bytes());
+        hasher.update(rel);
+        hasher.update((record.len() as u64).to_le_bytes());
+        hasher.update(record);
+    }
+    Some(hex(&hasher.finalize()))
+}
+
+/// The metadata record of one entry (see [`stat_fingerprint_until`]).
+fn stat_record(path: &Path) -> Vec<u8> {
+    let Ok(meta) = path.symlink_metadata() else {
+        return b"E".to_vec();
+    };
+    let ft = meta.file_type();
+    let mut r = vec![if ft.is_symlink() {
+        b'L'
+    } else if ft.is_file() {
+        b'F'
+    } else {
+        b'O'
+    }];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for n in [
+            meta.size(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+            meta.ino(),
+            u64::from(meta.mode()),
+        ] {
+            r.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        r.extend_from_slice(&meta.len().to_le_bytes());
+        r.extend_from_slice(&mtime.to_le_bytes());
+    }
+    if ft.is_symlink() {
+        match std::fs::read_link(path) {
+            Ok(target) => r.extend(rel_bytes(&target)),
+            Err(_) => r.push(b'E'),
+        }
+    }
+    r
 }
 
 /// The record of one non-directory entry (see [`tree_hash`]).
@@ -584,7 +723,17 @@ pub struct SkillNames {
 /// is no depth limit: the walk stops after [`MAX_NAME_WALK_ENTRIES`] work units (dirs read and
 /// `SKILL.md` files) or at `deadline`, setting [`SkillNames::over_budget`].
 pub fn skill_names_until(root: &Path, deadline: Option<std::time::Instant>) -> SkillNames {
-    skill_names_bounded(root, deadline, MAX_NAME_WALK_ENTRIES)
+    #[cfg(test)]
+    let cap = NAME_CAP.with(|c| c.get());
+    #[cfg(not(test))]
+    let cap = MAX_NAME_WALK_ENTRIES;
+    skill_names_bounded(root, deadline, cap)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The sweep's name-walk cap on this thread (tests shrink it to fake a huge pack).
+    pub static NAME_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_NAME_WALK_ENTRIES) };
 }
 
 /// [`skill_names_until`] with an explicit entry cap.
@@ -906,6 +1055,7 @@ mod tests {
             lock: None,
             trusted: false,
             lock_matches: false,
+            escapes: false,
         }
     }
 
@@ -1203,6 +1353,56 @@ mod tests {
     }
 
     #[test]
+    fn decide_never_lets_trust_clear_a_symlink_escape() {
+        let mut o = obs("h", Grade::Block);
+        o.trusted = true;
+        o.escapes = true;
+        let t = decide(Some("h"), &o, None);
+        assert_eq!(
+            (t.state, t.reason),
+            (PackStatus::Blocked, Some(Reason::Combo))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_fingerprint_moves_with_every_content_change_but_not_git() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("fingerprint");
+        fs::write(d.join("SKILL.md"), "# s").unwrap();
+        fs::write(d.join("run.sh"), "echo a").unwrap();
+        fs::create_dir_all(d.join(".git")).unwrap();
+        let fp = || stat_fingerprint_until(&d, None).unwrap();
+        let before = fp();
+        assert_eq!(before, fp(), "stable while nothing changes");
+        fs::write(d.join(".git/FETCH_HEAD"), "x").unwrap();
+        assert_eq!(before, fp(), "the pack-root .git is not content");
+        // Same size, mtime set back: ctime still moves.
+        let mtime = fs::metadata(d.join("run.sh")).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(d.join("run.sh"), "echo b").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(d.join("run.sh"))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let edited = fp();
+        assert_ne!(before, edited, "a same-size edit with mtime restored");
+        fs::set_permissions(d.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(edited, fp(), "chmod +x");
+        let moded = fp();
+        std::os::unix::fs::symlink("SKILL.md", d.join("l")).unwrap();
+        assert_ne!(moded, fp(), "a new link");
+        assert_eq!(
+            stat_fingerprint_until(&d, Some(std::time::Instant::now())),
+            None,
+            "gives up past its deadline"
+        );
+        assert_eq!(tree_hash_until(&d, Some(std::time::Instant::now())), None);
+    }
+
+    #[test]
     fn decide_floor_raises_but_never_lowers() {
         let t = decide(Some("h"), &obs("h", Grade::Clean), Some(PackStatus::Warned));
         assert_eq!(t.state, PackStatus::Warned);
@@ -1271,6 +1471,7 @@ mod tests {
                     names_incomplete: false,
                     escaping: vec![],
                     approved: false,
+                    fingerprint: String::new(),
                     quarantined_to: None,
                     note: None,
                 },

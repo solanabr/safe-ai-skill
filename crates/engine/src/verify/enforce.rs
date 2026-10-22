@@ -2,13 +2,16 @@
 //!
 //! - `Skill` (PreToolUse) and a typed `/name` (`UserPromptExpansion`, or a raw `/name` in
 //!   `UserPromptSubmit`): the name is mapped to every swept pack providing it (its directory
-//!   name or a `SKILL.md` name), each is re-hashed and re-graded on the spot (a mid-session
-//!   edit is drift), and the call is denied when any of them is blocked. A typed `/name`
-//!   never reaches the Skill tool, so both prompt-time events are needed.
+//!   name or a `SKILL.md` name); a pack whose stat fingerprint changed since it was verified is
+//!   re-hashed and re-graded on the spot (a mid-session edit is drift), and the call is denied
+//!   when any of them is blocked or was never fully scanned. A typed `/name` never reaches the
+//!   Skill tool, so both prompt-time events are needed.
 //! - Read: denied when the file resolves inside a blocked pack. Grep/Glob: denied when the
-//!   search root lies inside a blocked pack or contains one.
-//! - Verifying a skill's packs is bounded by [`SKILL_BUDGET`]; an overrun denies, and the
-//!   Skill hook is wired `onFailure: block`, so a crash or timeout never fails open.
+//!   search root lies inside a blocked pack or contains one. A pack the sweep could not fully
+//!   scan in its budget counts as blocked here.
+//! - Verifying a skill's packs is bounded by [`SKILL_BUDGET`]; an overrun denies the names the
+//!   unverified packs may provide, and the Skill hook is wired `onFailure: block`, so a crash
+//!   or timeout never fails open.
 //! - Bash (best effort): every word of every command segment is resolved against the hook
 //!   `cwd`, following each `cd`/`pushd` in order and expanding globs; denied when one lands
 //!   inside a blocked pack, or when a command runs with its working dir inside one.
@@ -45,18 +48,25 @@ struct BlockedPack {
     why: &'static str,
 }
 
-/// Every blocked pack in `st`.
+/// Every pack in `st` whose paths the gates deny: blocked packs, and packs left unreviewed
+/// because they were not fully scanned (a pack unreviewed only for a first-seen HIGH finding is
+/// a warning, not denied).
 fn blocked_packs(st: &State) -> Vec<BlockedPack> {
     st.packs
         .iter()
-        .filter(|(_, e)| e.state == PackStatus::Blocked)
+        .filter(|(_, e)| e.state == PackStatus::Blocked || e.unscanned())
         .map(|(key, e)| {
             let mut roots = vec![state::path_of(key)];
             roots.extend(e.quarantined_to.iter().map(PathBuf::from));
             BlockedPack {
                 roots,
                 shown: key.clone(),
-                why: why_label(e.reason),
+                why: if e.state == PackStatus::Blocked {
+                    why_label(e.reason)
+                } else {
+                    "it could not be fully scanned within the time budget; `safe-ai-skill verify \
+                     check <dir>` scans it"
+                },
             }
         })
         .collect()
@@ -126,6 +136,20 @@ pub fn skill_verdict(dir: &DataDir, cwd: &Path, policy: &Policy, skill: &str) ->
 }
 
 /// [`skill_verdict`] with an explicit user skills dir, scanner and time budget.
+///
+/// Per pack in scope, the stat fingerprint is taken first (cheap, bounded by the budget):
+/// - it matches the one recorded when the pack was last hashed and scanned (trusted data dir):
+///   the stored verdict and names stand, with no content hash, so a pack too large to hash in
+///   the budget costs only its stat walk;
+/// - otherwise (changed, never verified, or left unscanned) the pack's names are walked and,
+///   when it may provide the name, it is hashed and re-graded on the spot. Running out of
+///   budget then denies the names that pack may provide (drift until the next sweep).
+///
+/// A pack the stat walk itself cannot cover in time denies only the names it may provide (its
+/// directory name and recorded names), never every name. When no pack resolves the name and a
+/// pack in scope has names that may be incomplete (an escaping link, unparseable frontmatter,
+/// a name walk out of budget), the name is denied, unless it is plugin-namespaced
+/// (`plugin:skill`), which a project pack cannot provide.
 pub(super) fn skill_verdict_in(
     dir: &DataDir,
     cwd: &Path,
@@ -140,140 +164,163 @@ pub(super) fn skill_verdict_in(
         return Verdict::NoOpinion;
     }
     let is_wanted = |n: &str| wanted.iter().any(|w| w.eq_ignore_ascii_case(n));
+    let plugin = skill.contains(':');
     let deadline = Instant::now() + limits.budget;
     let mut st = state::load(dir).state;
     let mut seen: Vec<String> = Vec::new();
+    let mut evaluated = false;
     let mut blocked: Option<(String, &'static str)> = None;
-    // A pack whose names may be incomplete (escaping link, unparseable frontmatter).
+    // A pack whose names may be incomplete (escaping link, unparseable frontmatter, a walk out
+    // of budget): it may provide a name no pack resolves.
     let mut unsure: Option<String> = None;
-    // Packs whose name walk ran out of budget: one that may provide the name, and any.
-    let mut over_matching: Option<String> = None;
-    let mut over_any: Option<String> = None;
-    for project in project_dirs(cwd) {
-        let env = Env::new(dir, &project, user_skills, scanner);
-        for pack in swept_packs(&project, user_skills, policy, &env.v1) {
-            let key = state::key_of(&pack.canonical);
-            if seen.contains(&key) {
-                continue;
+    // A pack that may provide the name but could not be verified in time (or was left
+    // unscanned by the sweep).
+    let mut unverified: Option<String> = None;
+    let projects = project_dirs(cwd);
+    let envs: Vec<Env> = projects
+        .iter()
+        .map(|p| Env::new(dir, p, user_skills, scanner))
+        .collect();
+    let mut queue: Vec<(&Env, super::Pack)> = Vec::new();
+    for (project, env) in projects.iter().zip(&envs) {
+        for pack in swept_packs(project, user_skills, policy, &env.v1) {
+            queue.push((env, pack));
+        }
+    }
+    // Packs that may provide the name are verified first, so the budget goes to them.
+    queue.sort_by_key(|(_, pack)| {
+        !(is_wanted(&pack.name)
+            || st
+                .packs
+                .get(&state::key_of(&pack.canonical))
+                .is_some_and(|e| e.names.iter().any(|n| is_wanted(n))))
+    });
+    for (env, pack) in queue {
+        // A deny is settled: the packs that may provide the name came first.
+        if blocked.is_some() || unverified.is_some() {
+            break;
+        }
+        let key = state::key_of(&pack.canonical);
+        if seen.contains(&key) {
+            continue;
+        }
+        let stored = st.packs.get(&key);
+        let recorded =
+            is_wanted(&pack.name) || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
+        let fingerprint = if Instant::now() >= deadline {
+            None
+        } else {
+            state::stat_fingerprint_until(&pack.canonical, Some(deadline))
+        };
+        let Some(fingerprint) = fingerprint else {
+            if recorded {
+                unverified.get_or_insert_with(|| pack.display.clone());
             }
-            let stored = st.packs.get(&key);
-            // Out of time: an unverified pack may provide the name by its dir name or the
-            // names it was last recorded with.
-            if Instant::now() >= deadline {
-                let may = is_wanted(&pack.name)
-                    || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
-                let slot = if may {
-                    &mut over_matching
-                } else {
-                    &mut over_any
-                };
-                slot.get_or_insert_with(|| pack.display.clone());
-                continue;
+            continue;
+        };
+        let same = stored.filter(|e| !e.fingerprint.is_empty() && e.fingerprint == fingerprint);
+        // Unchanged since it was verified: the stored verdict stands (trusted data dir).
+        if let Some(e) = same.filter(|_| dir.trusted) {
+            if let Some(name) = e.escaping.iter().find(|n| is_wanted(n)) {
+                return escaping_denial(skill, name, &pack.display);
             }
-            // Clean content with complete names, or content the user approved as it is, is
-            // not re-walked (only re-hashed, below, for TOCTOU).
-            let reusable = stored
-                .filter(|e| e.state == PackStatus::Clean && (e.approved || !e.names_incomplete));
-            let mut hash: Option<String> = None;
-            let approved = match reusable {
-                Some(e) => match state::tree_hash_until(&pack.canonical, Some(deadline)) {
-                    Some(h) if h == e.tree_hash => {
-                        hash = Some(h);
-                        Some(state::SkillNames {
-                            names: e.names.clone(),
-                            ..state::SkillNames::default()
-                        })
-                    }
-                    Some(h) => {
-                        hash = Some(h);
-                        None
-                    }
-                    None => None,
-                },
-                None => None,
-            };
-            // Current names (a mid-session rename counts) united with the recorded ones.
-            let current = approved.unwrap_or_else(|| {
-                state::skill_names_bounded(&pack.canonical, Some(deadline), limits.name_cap)
-            });
-            // A skill dir (or its SKILL.md) linking outside the pack is never verified.
-            if let Some(name) = current.escaping.iter().find(|n| is_wanted(n)) {
-                return Verdict::Deny(format!(
-                    "safe-ai-skill: skill `{skill}` resolves through `{name}` in the skill pack \
-                     {}, which links outside the pack, so its content was never verified.",
-                    pack.display
-                ));
-            }
-            let provides = is_wanted(&pack.name)
-                || current.names.iter().any(|n| is_wanted(n))
-                || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
-            if current.over_budget {
-                let slot = if provides {
-                    &mut over_matching
-                } else {
-                    &mut over_any
-                };
-                slot.get_or_insert_with(|| pack.display.clone());
-                continue;
-            }
-            if !provides {
-                if current.unparseable || !current.escaping.is_empty() {
+            if !recorded {
+                if !e.approved && (e.names_incomplete || e.escapes()) {
                     unsure.get_or_insert_with(|| pack.display.clone());
                 }
                 continue;
             }
-            // Only a pack that may provide the name is hashed in full (TOCTOU).
-            let hash = match hash {
-                Some(h) => h,
-                None => match state::tree_hash_until(&pack.canonical, Some(deadline)) {
-                    Some(h) => h,
-                    None => {
-                        over_matching.get_or_insert_with(|| pack.display.clone());
-                        continue;
-                    }
-                },
-            };
             seen.push(key.clone());
-            let input = super::EvalInput {
-                deadline: Some(deadline),
-                names: Some(current),
-                hash: Some(hash),
-                soft_deadline: None,
+            if e.state == PackStatus::Blocked {
+                blocked.get_or_insert_with(|| (pack.display.clone(), why_label(e.reason)));
+            } else if e.unscanned() {
+                unverified.get_or_insert_with(|| pack.display.clone());
+            }
+            continue;
+        }
+        // In an untrusted data dir an unchanged pack's names are reused (approved, or
+        // complete and contained), but it is still hashed and re-graded below.
+        let current = match same.filter(|e| (e.approved || !e.names_incomplete) && !e.escapes()) {
+            Some(e) => state::SkillNames {
+                names: e.names.clone(),
+                ..state::SkillNames::default()
+            },
+            None => state::skill_names_bounded(&pack.canonical, Some(deadline), limits.name_cap),
+        };
+        // A skill dir (or its SKILL.md) linking outside the pack is never verified.
+        if let Some(name) = current.escaping.iter().find(|n| is_wanted(n)) {
+            return escaping_denial(skill, name, &pack.display);
+        }
+        let provides = recorded || current.names.iter().any(|n| is_wanted(n));
+        if current.over_budget {
+            let slot = if provides {
+                &mut unverified
+            } else {
+                &mut unsure
             };
-            let Some(ev) = super::evaluate(&mut st, &pack, &env, input) else {
-                over_matching.get_or_insert_with(|| pack.display.clone());
-                continue;
-            };
-            if let Some(e) = st.packs.get(&ev.key) {
-                if e.state == PackStatus::Blocked && blocked.is_none() {
-                    blocked = Some((pack.display.clone(), why_label(e.reason)));
-                }
+            slot.get_or_insert_with(|| pack.display.clone());
+            continue;
+        }
+        if !provides {
+            if current.unparseable || !current.escaping.is_empty() {
+                unsure.get_or_insert_with(|| pack.display.clone());
+            }
+            continue;
+        }
+        // Only a pack that may provide the name is hashed in full (TOCTOU).
+        let Some(hash) = state::tree_hash_until(&pack.canonical, Some(deadline)) else {
+            unverified.get_or_insert_with(|| pack.display.clone());
+            continue;
+        };
+        seen.push(key.clone());
+        let input = super::EvalInput {
+            deadline: Some(deadline),
+            names: Some(current),
+            hash: Some(hash),
+            fingerprint: Some(fingerprint),
+            soft_deadline: None,
+        };
+        let Some(ev) = super::evaluate(&mut st, &pack, env, input) else {
+            unverified.get_or_insert_with(|| pack.display.clone());
+            continue;
+        };
+        evaluated = true;
+        if let Some(e) = st.packs.get(&ev.key) {
+            if e.state == PackStatus::Blocked {
+                blocked.get_or_insert_with(|| (pack.display.clone(), why_label(e.reason)));
+            } else if e.unscanned() {
+                unverified.get_or_insert_with(|| pack.display.clone());
             }
         }
     }
-    if !seen.is_empty() {
+    if evaluated {
         let _ = state::store(dir, &st);
     }
     if let Some((shown, why)) = blocked {
         return denial(&format!("skill `{skill}` comes from"), &shown, why);
     }
-    if let Some(shown) = over_matching {
+    if let Some(shown) = unverified {
         return over_budget_pack(skill, &shown);
     }
-    if seen.is_empty() {
+    if seen.is_empty() && !plugin {
         if let Some(shown) = unsure {
             return denial(
                 &format!("skill `{skill}` matches no verified pack, and it may come from"),
                 &shown,
-                "a SKILL.md links outside the pack or its frontmatter does not parse, so its \
-                 skill names are unknown",
+                "a SKILL.md links outside the pack, its frontmatter does not parse, or it is \
+                 too large to list its skills, so its skill names are unknown",
             );
-        }
-        if let Some(shown) = over_any {
-            return over_budget_pack(skill, &shown);
         }
     }
     Verdict::NoOpinion
+}
+
+/// The denial for a skill reached through a link leaving its pack.
+fn escaping_denial(skill: &str, name: &str, shown: &str) -> Verdict {
+    Verdict::Deny(format!(
+        "safe-ai-skill: skill `{skill}` resolves through `{name}` in the skill pack {shown}, \
+         which links outside the pack, so its content was never verified."
+    ))
 }
 
 /// What the Skill and slash gates may spend.
