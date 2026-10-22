@@ -1,11 +1,11 @@
-# safe-ai-skill engine — architecture & round-2 contract
+# safe-ai-skill engine — architecture
 
 `safe-ai-skill` is the Rust security engine behind the **safe-ai-skill** Claude Code plugin. It is
 a single binary (hot path: gates fire on every Bash/Read/MCP call) plus a thin library so
 tests and the binary share one module tree.
 
-This document is the **contract** the round-2 parallel agents build against. The public
-type signatures below are FROZEN — consume them, do not change them.
+This document maps the modules, the hook contract and the state they share. Signatures below
+are the public surface as of 1.1.0.
 
 ---
 
@@ -21,71 +21,28 @@ cargo fmt --check
 All four must be green before a commit (`cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check` clean, `cargo test` passing).
 
-Dependencies (resolved, FROZEN in `Cargo.toml`): `serde 1`, `serde_json 1`, `serde_yaml
-0.9`, `sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`),
-`ureq 2` (`default-features = false, features = ["tls"]` → rustls). No tokio, no async.
+Dependencies (`Cargo.toml`): `serde 1`, `serde_json 1` (`float_roundtrip`), `serde_yaml 0.9`,
+`sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`), `rand_core
+0.6` (`getrandom`), `ureq 2` (`default-features = false, features = ["tls"]` → rustls), and
+`libc` on unix. No tokio, no async. A new dependency needs review (binary size, supply chain).
 
 ---
 
-## Round-2 rules for parallel agents
+## Module rules
 
-1. **Cargo.toml is FROZEN.** Every dependency the four agents need is already present. If an
-   agent believes it needs a new crate, it must **STOP and flag it for human review** — it
-   must NOT add a dependency itself (a silent dep add breaks the lean-binary guarantee and
-   can conflict with another agent's parallel work).
-2. **`main.rs` and `lib.rs` are COMPLETE and OFF-LIMITS.** All `mod` / `pub mod`
-   declarations and the subcommand dispatch are finished. No agent edits these two files.
-   New public items are exposed by filling existing stub bodies, not by re-declaring modules.
-3. **Each agent edits ONLY its assigned module file(s) + that module's `#[cfg(test)]`
-   tests.** No cross-module edits. The shared contracts below are FROZEN type signatures —
-   consume them, never change them:
-   - `io::{HookInput, Decision}` and the `render_*` / `emit_*` functions
-   - `policy::Policy` (and sub-structs, `ProfileOverlay`)
-   - `context::{Network, Context}`
-   - `gate::{Scope, GateMeta}`
-   - `audit::AuditEntry`
-   - `verify::{Report, Finding, Severity}`
-   - `grants::{Grant, Grants}`
-4. **Gate purity.** Gates return a decision (+ metadata); they do NOT read stdin, load
-   policy, audit, emit, or apply relaxation. `main.rs` owns all of that.
-
-### Ownership table
-
-| File(s) | Round-2 owner |
-|---|---|
-| `gates/bash.rs` | bash-gate agent |
-| `gates/secrets.rs`, `gates/read.rs`, `redact.rs`, `promptguard.rs` | secrets/read/redact agent |
-| `gates/mcp.rs`, `rugcheck.rs`, `spend.rs` | mcp/swap/spend agent |
-| `grants.rs`, `mode.rs`, `relax.rs` | **grants/mode/relax agent (the relaxation trio — ONE agent)** |
-| `verify/{heuristics,provenance,osv,lockfile}.rs`, `squads.rs`, `session.rs` | supply-chain/session agent |
-| `io.rs`, `policy.rs`, `context.rs`, `audit.rs`, `error.rs`, `gate.rs`, `main.rs`, `lib.rs`, `Cargo.toml` | **FROZEN — foundation, do not edit** |
-
-(The orchestrator may re-bucket agent→file groupings, but the FROZEN row is absolute and the
-relaxation trio must stay with one agent.)
-
-### Round-2 ownership table — solana-ai-kit compatibility milestone (P0)
-
-This milestone's foundation pass (THIS pass) froze the policy schema, the `install` subcommand,
-the `registry` module signatures, and the `verify::ext_submodules` extension point. The three
-round-2 agents fill the stubs below. **Each agent edits ONLY its assigned file(s) + that file's
-`#[cfg(test)]` tests.** No cross-module edits. Consume the FROZEN signatures, never change them.
-
-| Agent | Owns | Task |
-|---|---|---|
-| **A** | `src/registry.rs` | Full impl + tests: `parse` (tolerant JSON), `Registry::load`, `Registry::high_risk` (classify against `policy.catalog.high_risk_classes` by id + keyword over safety/description/tags). |
-| **B** | `src/verify/mod.rs` (`ext_submodules` + `run_session` integration), `src/verify/lockfile.rs` | Per-`ext`-submodule verify + git-SHA pin/drift; make `run_session` iterate `ext_submodules(...)` as individual units; `@latest` flagging downgraded to LOW (informational, not Warn). |
-| **C** | `src/gates/mcp.rs`, `src/gates/bash.rs` | Use the expanded `mcp.sensitive_name_pattern` verbs (already in policy); high-risk MCP/class gating (phantom/x402 → `ask`/`deny`); runtime `curl … | sh/bash` gate honoring `supply_chain.exec_install_scripts`. |
-
-**FROZEN this milestone (foundation-owned — round-2 does NOT touch):** `Cargo.toml` (flag a
-needed dep, don't add it), `src/main.rs`, `src/lib.rs`, `src/policy.rs`. The `RegistryEntry` /
-`Registry` / `CatalogPolicy` / `HighRiskClass` / `SupplyChainPolicy` shapes and the
-`ext_submodules` / `Registry::{parse,load,high_risk}` signatures are FROZEN — consume them.
+- **Gate purity.** Gates return a decision (+ metadata); they do NOT read stdin, load policy,
+  audit, emit, or apply relaxation. `main.rs` owns all of that.
+- **Subcommands** are registered in `main.rs`'s `SUBCOMMANDS` table; the PreToolUse gates run
+  under `DEADLINE_GATES` (8 s, `ask` past it) and `PANIC_ASK_GATES` (a panic writes a hard-guard
+  `ask` before the abort).
+- **State** goes through `statefile` (authenticated envelopes) in the data dir `datadir`
+  resolves; hooks resolve it with the payload `cwd` (`data_dir_with_cwd`).
 
 ---
 
 ## Request flow (owned by `main.rs`)
 
-For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp`):
+For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp` / `gate-skill`):
 
 ```
 stdin → io::read_payload                           # bytes (≤ 1 MiB + 1) + parse or Unreadable
@@ -122,15 +79,19 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 (never `cargo build`, never a binary outside its own directory) and maps failures onto the hook
 contract:
 
-- **Environment failure** (no prebuilt for the platform, not an executable here, exit 126/127):
-  fail open with a notice. `gate-bash` answers `ask` for the Solana surface, SessionStart reports
-  the firewall INACTIVE, every other hook exits 0 with one stderr line.
-- **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash` and `gate-mcp` exit 2 (block);
-  the rest exit 0 with a stderr line.
+- **Environment failure** (no prebuilt for the platform, not an executable here, no sha256 tool,
+  exit 126/127): fail open with a notice. `gate-bash` and `gate-skill` answer `ask`, SessionStart
+  reports the firewall INACTIVE, every other hook exits 0 with one stderr line.
+- **Tamper** (the prebuilt's sha256 differs from the constant `scripts/stamp-shim.sh` stamped at
+  release): the prebuilt never runs; `gate-bash`, `gate-mcp` and `gate-skill` exit 2, the other
+  PreToolUse gates ask, non-PreToolUse hooks exit 0 with a stderr line.
+- **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash`, `gate-mcp` and `gate-skill`
+  exit 2 (block); the rest exit 0 with a stderr line.
 - `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
   turns the hooks off, but is ignored in strict mode or when the committed project
   `.claude/settings.json` mentions it; SessionStart reports either way.
-- The Solana `gate-bash` entries set `onFailure: block`, the others `continue`. `onFailure`
+- The Solana `gate-bash` entries and the `Skill` matcher set `onFailure: block`, the others
+  `continue`. `onFailure`
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
 
@@ -143,9 +104,16 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
 - **PreToolUse**:
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny"[,"permissionDecisionReason":"…"]}}`
   (reason key omitted for `allow`); `Defer` → no output.
-- **PostToolUse redact** (intended shape; not active in 1.0.1, see `redact` above): no output (no change) or `{"updatedToolOutput":"…"}` /
-  `{"updatedMCPToolOutput":"…"}` (mcp tools).
-- **UserPromptSubmit**: no output (allow) or `{"decision":"block","reason":"…"}`.
+- **PostToolUse redact**: no output (no change) or
+  `{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":…}}` in the tool's own
+  response shape (Read, Bash, Grep, MCP).
+- **PostToolUse pending-notice** (Bash): no output, or `{"systemMessage":"…"}` with confirmation
+  codes (user only).
+- **PreToolUse Read/Grep rewrite**: `{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":…}}`
+  (no permission decision) for a directory Grep whose `glob` gets the env/key exclusions.
+- **UserPromptSubmit / UserPromptExpansion**: no output (allow), `{"decision":"block","reason":"…"}`
+  (a raw secret, a blocked pack's `/name`), or a confirmation outcome (`systemMessage` +
+  `additionalContext`, never a code).
 - **SessionStart** (`verify::SessionResult::hook_output`, report-only): no output when there is
   nothing to report, else `{["systemMessage":"…",]["hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"…"}]}`
   (each part only when non-empty).
@@ -170,7 +138,9 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | `grants.json` | `grants` | scoped grants (authenticated; created only by a confirmed prompt nonce) |
 | `mode.json` | `mode` | runtime active-profile override (authenticated; looser profiles need a confirmed nonce) |
 | `sessions.json` | `session` | session-key metadata and the active-session pointer (authenticated) |
-| `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
+| `lockfile.json` | `verify::lockfile` | v1 name-keyed pins; read for the state-v2 carry-over, still written by `add`/`install` |
+| `state.json` | `verify::state` | state v2: per-pack pin, grade, findings, names, fingerprint (authenticated) |
+| `trust.json` | `verify::trust` | user trust by content hash (authenticated) |
 | `quarantine/<name>` | 1.0.0 `verify` (legacy) | skill dirs 1.0.0 moved; 1.0.1+ never writes here. `verify approve <name>` restores one, `verify session` lists leftovers |
 | `session/<id>.json` | `session` | ephemeral session keypairs (0600, Solana CLI format, plain) |
 | `key` | `statefile` | 32-byte HMAC key for authenticated state (0600) |
@@ -181,7 +151,7 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 
 ---
 
-## Public API (FROZEN signatures)
+## Public API
 
 ### `error`
 ```rust
@@ -310,7 +280,7 @@ them: the `off` profile, `relax_transfer`, `relax_swap`, `disabled`, and the nev
 `gates`/`hard_guards` lists. Hard guards are set by the gates (`GateMeta::hard_guard`) and
 never relaxed.
 
-**On-disk ⇄ embedded equivalence (FROZEN invariant).** The on-disk
+**On-disk ⇄ embedded equivalence (invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
 `active_profile`, `profiles`, `catalog`, and the new `supply_chain` fields) and
 MUST parse to the same `Policy` as the embedded `DEFAULT_POLICY_YAML` const. The
@@ -323,7 +293,7 @@ both together.
   (adds the value-moving verbs `stake delegate mint bridge lend borrow`).
 - `catalog` (`CatalogPolicy`) — registry path + `high_risk_classes` (built-in classes:
   `wallet_signing`→`phantom-mcp`, `key_custody`→`x402-proxy-mcp`, `installer_script`→curl|bash).
-  Classification is consumed by the round-2 catalog gate and `registry verify`.
+  Classification is consumed by the catalog gate and `registry verify`.
 - `supply_chain.verify_ext_submodules` / `ext_dir` / `exec_install_scripts` — per-`ext/`
   submodule verification toggle + dir + the runtime `curl … | sh/bash` gate setting.
 - Every new field has a serde default so older/partial policy files still parse
@@ -350,7 +320,7 @@ pub mod shell;  // parse(): quote-aware split, prefix/wrapper strip, recursion (
 pub fn plugin_data_dir() -> PathBuf;                            // datadir::data_dir().path
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
-Fully implemented (not a stub). Never panics; `Unknown` on failure.
+Never panics; `Unknown` on failure.
 
 ### `gate`
 ```rust
@@ -381,12 +351,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String;
 pub fn append(entry: &AuditEntry, plugin_data: &Path) -> std::io::Result<()>;
 ```
 
-### `gates` (STUBS — return safe defaults)
+### `gates`
 ```rust
-pub fn gates::bash::decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta);   // (Defer, unknown)
-pub fn gates::secrets::decide(command: &str, cwd: &Path, policy: &Policy) -> Decision;                // Defer
-pub fn gates::read::decide(path: &str, policy: &Policy) -> Decision;                                  // Defer
-pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, ctx: &Context, policy: &Policy) -> (Decision, GateMeta); // (Defer, unknown)
+pub fn gates::bash::decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta);
+pub fn gates::bash::with_indirection_prefilter(decision, meta, command, cwd, policy) -> (Decision, GateMeta);
+pub fn gates::secrets::decide(command: &str, cwd: &Path, policy: &Policy) -> Decision;
+pub fn gates::read::decide_tool(tool: &str, input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdict; // Decide | Rewrite
+pub fn gates::read::decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> Decision;
+pub fn gates::skill::decide(tool_input: Option<&Value>, cwd: &Path, dir: &DataDir, policy: &Policy) -> Verdict;
+pub fn gates::tamper::decide_nested_claude(command: &str) -> Decision;                              // Deny | Ask | Defer
+pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, ctx: &Context, policy: &Policy) -> (Decision, GateMeta);
 pub fn gates::tamper::decide_bash(command: &str, protected: &Protected) -> Decision;                  // Deny | Ask | Defer
 pub fn gates::tamper::decide_bash_within(command: &str, protected: &Protected, budget: &mut Budget) -> Decision; // Deny | Ask | Defer
 pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &Path, protected: &Protected) -> Decision; // Deny | Defer
@@ -402,23 +376,24 @@ pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &
 
 ### `redact` / `promptguard`
 ```rust
-pub fn redact::scrub(text: &str) -> Option<String>;       // None
-pub fn promptguard::check(prompt: &str) -> Option<String>; // None
+pub fn redact::scrub(text: &str) -> Option<String>;
+pub fn redact::scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value>;
+pub fn promptguard::check(prompt: &str) -> Option<String>;
 ```
 
-`redact::scrub` is implemented, but the PostToolUse hook is inert in 1.0.1 (fixed in 1.1.0): `cmd_redact`
-reads `tool_output` while Claude Code sends `tool_response`, the emitted JSON lacks the
-`hookSpecificOutput.updatedToolOutput` envelope, and the `hooks.json` matcher (`Bash|Read|Grep`) excludes MCP
-tools. No output is redacted.
+`cmd_redact` reads `tool_response` (up to `redact::MAX_SCAN_BYTES`, larger passes unchanged),
+scrubs literal values from the project's env files (`env::values`) and the pattern classes, and
+answers in the tool's own shape. `redact::contains_key_material` (the `.env.schema` guard) and
+`is_secret_key_name` (value scrub) share one key-name table (`names_secret_value`).
 
 ### `spend` / `rugcheck`
 ```rust
 pub struct spend::SpendLedger { pub day: u64, pub total_sol: f64 }
-pub fn spend::record_and_check(plugin_data: &Path, sol_amount: f64, policy: &Policy) -> Decision;  // Defer
-pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;                              // Defer
+pub fn spend::record_and_check(plugin_data: &Path, sol_amount: f64, policy: &Policy) -> Decision;
+pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;
 ```
 
-`rugcheck::check_mint` (trusted mints, score threshold) is implemented but has no callers in 1.0.1: `gate-mcp`
+`rugcheck::check_mint` (trusted mints, score threshold) is implemented but has no callers yet: `gate-mcp`
 records the mint, and swap tool calls get `ask`. `swap.rugcheck*` and `swap.trusted_mints` have no effect yet.
 
 ### Relaxation (D4)
@@ -472,37 +447,47 @@ re-validated, stored, audited and echoed (no code). `verify trust|approve` kinds
 handled here (WS-D1). The tripwire (H5) denies Bash invocations of the hook subcommands and
 `confirm`.
 
-### `verify` (`Report`/`Finding`/`Severity` FROZEN; scan fns STUBS)
+### `verify`
 ```rust
-pub enum Severity { Low, Medium, High }            // Ord: High > Medium > Low
-pub struct Finding { pub severity: Severity, pub kind: String, pub detail: String }
-impl Finding { pub fn new(severity, kind, detail) -> Self; }
+pub enum Severity { Low, Medium, High }            // v1 report severities (add / install / verify check)
+pub struct Finding { pub severity, pub kind, pub detail, pub path, pub line }
 pub struct Report { pub findings: Vec<Finding> }
-impl Report { pub fn max_severity(&self) -> Option<Severity>; pub fn merge(&mut self, other: Report); }
 
-pub fn verify::heuristics::scan(path: &Path) -> Report;        // empty
-pub fn verify::provenance::resolve(source: &str) -> Report;    // empty
-pub fn verify::osv::query(pkg: &str, version: &str) -> Report; // empty
-pub fn verify::lockfile::hash_tree(path: &Path) -> String;     // ""
+pub mod verify::rules;      // rule engine: scan_pack, scan_pack_until(deadline), grade, PackReport, ScanBudget
+pub mod verify::grading;    // re-exports the rules types the state machine reads
+pub mod verify::heuristics; // v1 compatibility view of rules (Report) for add / install / verify check
+pub mod verify::state;      // state v2: PackEntry, PackStatus {Clean, Warned, Unreviewed, Blocked}, tree_hash, stat_fingerprint
+pub mod verify::trust;      // trust.json by content hash
+pub mod verify::enforce;    // gate-time checks: skill_verdict, read_verdict, bash_verdict
+pub type verify::Scanner = fn(&Path, Option<Instant>) -> grading::PackReport;
 
-// Per-ext-submodule discovery: each `ext/<name>` dir under `skills_dir` is its own verifiable
-// unit (git-SHA pin/drift), walked by `run_session`; empty when `verify_ext_submodules` is off.
-pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;
-pub fn verify::run_session(plugin_data: &Path, project_dir: &Path, policy: &Policy) -> SessionResult;
-pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, policy: &Policy) -> std::io::Result<Approval>;
+pub fn verify::run_session(dir: &DataDir, project_dir: &Path, policy: &Policy) -> SessionResult;
+pub fn verify::request_approve(dir, cwd, target, policy) -> Result<PendingRequest, EngineError>; // id only
+pub fn verify::request_trust(dir, path) -> Result<PendingRequest, EngineError>;
+pub fn verify::apply_confirmed(dir: &DataDir, c: &confirm::Confirmed) -> Result<String, EngineError>;
 ```
 
-**`verify session` is report-only.** `run_session` sweeps each root in `supply_chain.verify_skills_dirs`
-(project `.claude/skills`; `~/.claude/skills` only when a project overlay opts in to it, the one out-of-project dir
-`keep_scan_dirs` accepts, canonicalised by `confine_project_dirs`; except packs `install --from`
-put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
-own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
-if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, High findings
-at `path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is
-moved or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
-`quarantine/` (never over an existing directory).
+**`verify session` (state v2).** `run_session` sweeps each root in
+`supply_chain.verify_skills_dirs` (project `.claude/skills`; `~/.claude/skills` only when a
+project overlay opts in, plus packs `install --from` put there) and each `ext/<name>` submodule,
+and the project `.mcp.json`. Per pack, the content hash runs first, then the scan (bounded by the
+pack allowance, the sweep budget and the hook deadline); `state::decide` moves the entry:
+first-seen clean → `clean`; doc-only findings → `warned`; a code HIGH → `unreviewed` (warned, not
+denied); a combination rule, drift from the pin, or a `packs.lock` mismatch → `blocked`. A pack
+not fully scanned in time is recorded unscanned (`unreviewed` + `scan_budget_exceeded`) and
+denied like a blocked one until a sweep scans it. Gates never move packs; only
+`supply_chain.on_block: move` does, at the sweep. v1 lockfile pins are carried over on first
+sight. `verify approve|trust` create pending requests; `relax::confirm_prompt` performs them via
+`apply_confirmed`, which never clears a combination rule (a combo-blocked pack moved to
+quarantine is refused at request time).
 
-### `registry` (NEW — opt-in catalog; STUBS, round-2 Agent A)
+**Gate-time enforcement (`enforce`).** The Skill tool and a typed `/name` map the name to the
+packs providing it; a pack whose stat fingerprint changed since it was verified is re-hashed and
+re-graded on the spot within 5 s, and any blocked, unscanned or unverifiable provider denies. A
+pack whose stat walk is cut makes every unresolved non-plugin name deny. Read/Grep/Glob and Bash
+deny access inside blocked or unscanned packs from the stored state only (no hashing).
+
+### `registry` (opt-in catalog)
 ```rust
 pub struct RegistryEntry {
     pub id: String, pub title: String, pub source: String, pub category: String,
@@ -511,9 +496,9 @@ pub struct RegistryEntry {
     pub risk_class: Option<String>,   // DERIVED (not on disk); set by Registry::high_risk
 }
 pub struct Registry { pub entries: Vec<RegistryEntry> }
-pub fn registry::parse(json: &str) -> Result<Registry>;                          // Ok(empty)
-pub fn registry::Registry::load(path: &Path) -> Result<Registry>;               // Ok(empty)
-pub fn registry::Registry::high_risk(entry: &RegistryEntry, policy: &Policy) -> Option<String>; // None
+pub fn registry::parse(json: &str) -> Result<Registry>;
+pub fn registry::Registry::load(path: &Path) -> Result<Registry>;
+pub fn registry::Registry::high_risk(entry: &RegistryEntry, policy: &Policy) -> Option<String>;
 ```
 The on-disk catalog shape is `{ version, updated, entries: [ … ] }`; each entry carries
 `id`/`name`/`type`/`domain`/`description`/`source`/`install`/`license`/`maintainer`/`signal`/
@@ -521,28 +506,30 @@ The on-disk catalog shape is `{ version, updated, entries: [ … ] }`; each entr
 `name`→`title`, `type`→`category`); unknown fields are tolerated. `high_risk` classifies an
 entry against `policy.catalog.high_risk_classes` (id match or case-insensitive keyword match
 against safety/description/tags) and returns the matching class `kind`. `risk_class` is `None`
-until classified. Round-2 Agent A fills the three stub bodies + tests.
+until classified.
 
 ### `squads` / `session`
 ```rust
-pub fn squads::upgrade_authority_advisory(program: &str, ctx: &Context) -> Option<String>;  // None
+pub fn squads::upgrade_authority_advisory(program: &str, ctx: &Context) -> Option<String>;
 pub fn session::init(cap_sol: f64, dir: &DataDir) -> error::Result<String>;
 pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ```
 
-`squads::upgrade_authority_advisory` has no callers in 1.0.1; no Squads routing happens.
+`squads::upgrade_authority_advisory` has no callers yet; no Squads routing happens. `session init
+--cap` records metadata only: no gate reads it, so it relaxes nothing.
 
 ---
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `redact` · `prompt-guard` ·
-`pending-notice` ·
-`verify session|check|approve` · `add skill|mcp|repo <source>` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `gate-skill` ·
+`gate-prompt-expansion` · `redact` · `prompt-guard` · `pending-notice` ·
+`verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`mode [<profile>]` · `revoke` · `status` · `--version`. `allow` and `mode autopilot` only park
-a pending request (prompt-nonce confirmation); an argument error exits 1.
+`mode [<profile>]` · `revoke` · `status` · `--version`. `allow`, `mode autopilot` and
+`verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
+an argument error exits 1.
 
 Gate subcommands emit the authoritative PreToolUse decision (nothing for no opinion); the rest
 print a JSON result line. Unknown or missing subcommand → empty stdout, stderr message, exit 3.
@@ -558,5 +545,4 @@ widens `settings.json`; a High finding holds the skill unless `--yes`.
 
 **`registry verify|list`.** Loads the project `skill-registry.json` (path from
 `policy.catalog.registry_path`) via `registry::Registry::load` and lists/audits entries with
-`high_risk` classification. STUB now (the parser is a round-2 Agent A stub) → reports an empty
-catalog until filled in.
+`high_risk` classification.
