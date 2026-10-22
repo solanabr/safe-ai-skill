@@ -63,7 +63,11 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
     }
     if bits & (T_EVAL | T_SPAWN | T_SHELL) != 0 {
         let shell_like = lang != Lang::Js && lang != Lang::Python && lang != Lang::Rust;
-        if shell_like && bits & T_SHELL != 0 {
+        // Shell-level execution needs a pipe, a `-c` style flag or a shell `eval`.
+        let shell_shape = lower.contains('|')
+            || lower.contains(" -")
+            || (lang == Lang::Shell && bits & T_EVAL != 0);
+        if shell_like && bits & T_SHELL != 0 && shell_shape {
             if let Some(off) = shell_exec(lower, lang == Lang::Shell) {
                 out.emit("shell_eval", Severity::Info, line(off), ctx);
                 sink.get_or_insert((off, quoted(off)));
@@ -258,8 +262,17 @@ fn shell_exec(s: &str, shell: bool) -> Option<usize> {
 /// `Function('return this')` global-object idiom.
 fn eval_call(cmd: &Cmd<'_>) -> Option<usize> {
     let lower = cmd.lower();
-    let direct = find_call(lower, "eval", false)
-        .or_else(|| find_any(lower, &["window.eval(", "globalthis.eval(", "global.eval("]));
+    // In prose and data (`Lang::Other`), "eval (the …)" is a word, so the call needs `eval(`.
+    let call = if cmd.lang() == Lang::Other {
+        lower.match_indices("eval(").map(|(p, _)| p).find(|&p| {
+            p == 0
+                || !(context::is_ident(lower.as_bytes()[p - 1]) || lower.as_bytes()[p - 1] == b'.')
+        })
+    } else {
+        find_call(lower, "eval", false)
+    };
+    let direct =
+        call.or_else(|| find_any(lower, &["window.eval(", "globalthis.eval(", "global.eval("]));
     if direct.is_some() {
         return direct;
     }
@@ -563,6 +576,16 @@ mod tests {
         let r = scan_one("b.js", "const ok = 1;\nconst v = eval(code);\n");
         let f = hits(&r, "eval");
         assert_eq!((f[0].sev, f[0].line), (Severity::High, Some(2)), "{r:?}");
+    }
+
+    #[test]
+    fn prose_eval_word_is_not_a_call() {
+        let yml = "on:\n  workflow_dispatch:\n    inputs:\n      skill:\n        description: \"Skill to eval (blank = all skills)\"\n# Nothing runs when there are no skills to eval (the seeder skips)\n";
+        assert!(!has(&scan_one("qa-eval.yml", yml), "eval"));
+        assert!(has(
+            &scan_one("notes.yml", "run: node -e 'eval(x)'\n"),
+            "eval"
+        ));
     }
 
     #[test]

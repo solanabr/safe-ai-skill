@@ -199,15 +199,12 @@ const TELEMETRY_WORDS: &[&str] = &[
 ];
 /// Local data a request should not carry off the machine.
 const LOCAL_DATA: &[&str] = &[
-    "process.env",
-    "os.environ",
     "$(env",
     "printenv",
     "$(whoami",
     "$(hostname",
     "$(uname",
     "$(id)",
-    "$user",
     "${user}",
     "os.hostname(",
     "os.userinfo(",
@@ -220,15 +217,31 @@ const LOCAL_DATA: &[&str] = &[
     "$(cat ",
     "git remote",
     "git config user",
-    "=@",
-    " @",
 ];
 
 /// The request reports usage or carries local data (environment, secrets, files, identity).
+/// A single env var (an API key header) is ordinary client code; serialising the environment,
+/// uploading a local file or naming a secret path is not.
 fn carries_telemetry(s: &str) -> bool {
     TELEMETRY_WORDS.iter().any(|w| find_word(s, w).is_some())
         || LOCAL_DATA.iter().any(|m| s.contains(m))
+        || find_word(s, "$user").is_some()
+        || uploads_local_file(s)
+        || super::secrets_ctx::serializes_env(s)
         || super::secrets_ctx::has_secret_path(s)
+}
+
+/// `curl -d @file`, `-F x=@file`, `--data-binary @file`, `-T file` (but not `@-`, stdin).
+fn uploads_local_file(s: &str) -> bool {
+    let b = s.as_bytes();
+    let at_file = s.match_indices('@').any(|(p, _)| {
+        let after = b.get(p + 1).copied().unwrap_or(b'-');
+        let before = if p == 0 { b' ' } else { b[p - 1] };
+        (before == b'=' || before.is_ascii_whitespace())
+            && after != b'-'
+            && (after.is_ascii_alphanumeric() || matches!(after, b'/' | b'~' | b'.' | b'$'))
+    });
+    at_file || s.contains(" -t ") || s.contains("--upload-file")
 }
 
 /// First network call in the command (a sink for the padding combo).
@@ -642,6 +655,33 @@ mod tests {
             assert_eq!(f.len(), 1, "{line}: {r:?}");
             assert_eq!((f[0].sev, f[0].ctx), (Severity::High, Ctx::Code), "{line}");
         }
+    }
+
+    #[test]
+    fn api_key_headers_and_stdin_uploads_are_not_telemetry() {
+        let ts = "await fetch(`${LULO_API_URL}/v1/deposit`, {\n  method: 'POST',\n  headers: { 'x-api-key': process.env.LULO_API_KEY! },\n  body: JSON.stringify({ owner }),\n});\n";
+        let r = scan_one(
+            "deposit.ts",
+            &format!("const LULO_API_URL = 'https://api.example.invalid';\n{ts}"),
+        );
+        assert!(
+            !has(&r, "telemetry_post") && has(&r, "network_post"),
+            "{r:?}"
+        );
+        let sh = "printf '%s' \"$SECRET\" | curl -s --data-binary @- https://verify.example.invalid/v0/siteverify\n";
+        let r = scan_one("validate.sh", sh);
+        assert!(
+            !has(&r, "telemetry_post") && has(&r, "network_post"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn user_agent_variable_is_not_the_username() {
+        let sh = "curl -s -X PUT -H \"User-Agent: $USER_AGENT\" -d \"$data\" \"https://db.example.invalid/t.json\"\n";
+        assert!(!has(&scan_one("probe.sh", sh), "telemetry_post"));
+        let who = "curl -s -X POST https://x.example.invalid/c -d \"u=$USER\"\n";
+        assert!(has(&scan_one("who.sh", who), "telemetry_post"));
     }
 
     #[test]

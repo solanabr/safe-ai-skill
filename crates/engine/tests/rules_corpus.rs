@@ -269,7 +269,7 @@ fn aikit_corpus_acceptance() {
     let m = manifest();
     assert_eq!(m.rows.len(), 46, "manifest rows");
     let root = corpus_root(&m);
-    // SAFE_AI_SKILL_CORPUS_VERBOSE=1 lists every combo and HIGH finding (calibration aid).
+    // SAFE_AI_SKILL_CORPUS_VERBOSE=1 lists every combo, HIGH and WARN finding (calibration aid).
     let verbose = std::env::var("SAFE_AI_SKILL_CORPUS_VERBOSE").as_deref() == Ok("1");
 
     let mut mismatches = Vec::new();
@@ -299,9 +299,19 @@ fn aikit_corpus_acceptance() {
             for f in report
                 .findings
                 .iter()
-                .filter(|f| f.effective_sev() == rules::Severity::High)
+                .filter(|f| f.effective_sev() >= rules::Severity::Warn)
             {
-                eprintln!("    high  {} at {}:{:?}", f.rule, f.path.display(), f.line);
+                let sev = if f.effective_sev() == rules::Severity::High {
+                    "high"
+                } else {
+                    "warn"
+                };
+                eprintln!(
+                    "    {sev:5} {} at {}:{:?}",
+                    f.rule,
+                    f.path.display(),
+                    f.line
+                );
             }
         }
         match rules::grade(&report) {

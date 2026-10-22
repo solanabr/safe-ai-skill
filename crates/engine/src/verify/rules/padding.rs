@@ -2,7 +2,7 @@
 //! that push a payload out of view, plus long-line inventory with the printable-ratio split
 //! between base64 data (INFO) and encoded text (WARN).
 
-use super::context::{self, Document};
+use super::context::{self, Document, FileClass, Role};
 use super::{line_no, Ctx, FileOut, Severity, Signal};
 
 /// Whitespace run that pushes the rest of a line out of view (spec D2.4).
@@ -18,6 +18,11 @@ const LONG_B64_RUN: usize = 256;
 const TEXT_RATIO: f64 = 0.75;
 
 pub(super) fn scan(doc: &Document<'_>, out: &mut FileOut) {
+    // Data files (JSON, YAML, terminal captures …) pad for alignment and are never run or read
+    // as instructions: padding is checked in code, Markdown and metadata only.
+    if doc.class == FileClass::Doc {
+        return;
+    }
     let mut blank_start: Option<usize> = None;
     for i in 0..doc.len() {
         let line = doc.line(i);
@@ -43,7 +48,9 @@ pub(super) fn scan(doc: &Document<'_>, out: &mut FileOut) {
             }
         }
         let ctx = doc.ctx(i);
-        if line.len() > HORIZONTAL_RUN && longest_blank_run(line) >= HORIZONTAL_RUN {
+        // A Markdown table pads cells for alignment, and renders them anyway.
+        let table_row = doc.role(i) == Role::Prose && line.trim_start().starts_with('|');
+        if !table_row && line.len() > HORIZONTAL_RUN && longest_blank_run(line) >= HORIZONTAL_RUN {
             out.emit("padding_horizontal", Severity::High, Some(line_no(i)), ctx);
             out.signal(Signal::PadH(line_no(i)), ctx);
         }
@@ -172,6 +179,16 @@ mod tests {
         assert_eq!(f.len(), 1, "{r:?}");
         assert_eq!(f[0].sev, Severity::Warn);
         assert_eq!(grade(&r), Grade::Warn);
+    }
+
+    #[test]
+    fn table_rows_and_data_files_are_not_padding() {
+        let row = format!("| Category        | Description{}|\n", " ".repeat(120));
+        let r = scan_one("README.md", &format!("# T\n\n{row}"));
+        assert!(!has(&r, "padding_horizontal"), "{r:?}");
+        let cast = format!("[8.0, \"o\", \"x{}y\"]\n", " ".repeat(200));
+        assert!(!has(&scan_one("demo.cast", &cast), "padding_horizontal"));
+        assert!(!has(&scan_one("data.json", &cast), "padding_horizontal"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::context::{
     self, find_any, find_word, find_word_from, shell_tokens, Cmd, Document, FileClass, Lang, Stmt,
-    T_NPX, T_REG,
+    T_NPX, T_REG, T_URL,
 };
 use super::network_ctx::VarCache;
 use super::{line_no, Ctx, FileOut, Severity, Signal};
@@ -85,7 +85,8 @@ pub(super) fn scan_registry_hosts(doc: &Document<'_>, out: &mut FileOut) {
         return;
     }
     for i in 0..doc.len() {
-        if doc.bits(i) & T_REG == 0 {
+        // `CORP_REGISTRY="https://…"` is one word, so a URL line is checked by substring too.
+        if doc.bits(i) & (T_REG | T_URL) == 0 {
             continue;
         }
         let line = doc.lower_line(i);

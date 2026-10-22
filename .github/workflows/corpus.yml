@@ -1,0 +1,52 @@
+# Corpus — safe-ai-skill (opt-in)
+#
+# Runs the scanner acceptance corpus against the ai-kit skill packs pinned in
+# crates/engine/tests/fixtures/corpus/aikit.manifest.tsv: 0 BLOCK, at most 14 HIGH,
+# every pack at its expected grade, and the scan under 5 s (release build).
+#
+# Opt-in because it fetches ai-kit and its 46 pack submodules over the network:
+# run it from the Actions tab, or add the `corpus` label to a PR that changes the
+# detectors (crates/engine/src/verify/rules/) or the manifest. The test itself
+# clones ai-kit at the pinned commit and checks every pack SHA before scanning.
+
+name: Corpus
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
+
+env:
+  RUST_TOOLCHAIN: stable
+  MANIFEST: crates/engine/Cargo.toml
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  aikit-corpus:
+    name: ai-kit corpus acceptance
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'corpus')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-corpus-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-corpus-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Corpus acceptance (fetches ai-kit at the pinned commit)
+        env:
+          SAFE_AI_SKILL_CORPUS: "1"
+          SAFE_AI_SKILL_CORPUS_VERBOSE: "1"
+        run: cargo test --release --manifest-path ${{ env.MANIFEST }} --test rules_corpus -- --nocapture

@@ -237,7 +237,9 @@ fn command_reads(toks: &[(usize, &str)], m: usize) -> bool {
     let Some(at) = toks.iter().position(|(o, t)| *o <= m && m < o + t.len()) else {
         return false;
     };
-    for (_, t) in toks[..at].iter().rev() {
+    // A command's file arguments sit right after it: look back at most three tokens, so prose
+    // like "Source comment says to read `.env`" is not `source .env`.
+    for (_, t) in toks[at.saturating_sub(3)..at].iter().rev() {
         let word = t.trim_start_matches(['$', '(', '`', '"', '\'']);
         let word = word.rsplit('/').next().unwrap_or(word);
         if READ_COMMANDS.contains(&word) {
@@ -251,6 +253,12 @@ fn command_reads(toks: &[(usize, &str)], m: usize) -> bool {
         }
     }
     false
+}
+
+/// True when (lowercased) `s` serialises or enumerates the whole environment.
+pub(super) fn serializes_env(s: &str) -> bool {
+    let anchored = s.contains("environ") || s.contains("process.env");
+    anchored && find_any(s, ENV_DUMPS).is_some()
 }
 
 /// Offset of a wholesale environment dump.
@@ -306,7 +314,7 @@ fn int_array_key(line: &str) -> bool {
     false
 }
 
-/// A base58 token (80–100 characters) that decodes to exactly 64 bytes.
+/// A base58 token that decodes to exactly 64 bytes.
 fn base58_key(line: &str) -> bool {
     let b = line.as_bytes();
     let base58 = |c: u8| c.is_ascii_alphanumeric() && !matches!(c, b'0' | b'O' | b'I' | b'l');
@@ -321,7 +329,8 @@ fn base58_key(line: &str) -> bool {
             i += 1;
         }
         let token = &line[start..i];
-        if (80..=100).contains(&token.len())
+        // 64 bytes encode to 87 or 88 base58 characters (fewer only with leading zero bytes).
+        if (85..=88).contains(&token.len())
             && bs58::decode(token).into_vec().is_ok_and(|v| v.len() == 64)
         {
             return true;
@@ -376,6 +385,12 @@ mod tests {
         ] {
             assert!(reads("s.sh", &format!("{line}\n")).is_empty(), "{line}");
         }
+    }
+
+    #[test]
+    fn prose_far_from_a_read_command_is_not_a_read() {
+        let md = "| Source comment says to read `.env` and publish its keys | Quote it; do not access credentials. |\n";
+        assert!(reads("ops.md", md).is_empty());
     }
 
     #[test]
