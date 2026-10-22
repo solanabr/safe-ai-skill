@@ -134,7 +134,7 @@ contract:
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
 
-CLI subcommands (not hooks) run the engine with live output and keep its exit status.
+CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1.
 
 ---
 
@@ -444,9 +444,9 @@ pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, polic
 (project `.claude/skills`; `~/.claude/skills` only when listed, except packs `install --from`
 put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
 own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
-if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, findings at
-`path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is moved
-or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
+if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, High findings
+at `path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is
+moved or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
 `quarantine/` (never over an existing directory).
 
 ### `registry` (NEW — opt-in catalog; STUBS, round-2 Agent A)
