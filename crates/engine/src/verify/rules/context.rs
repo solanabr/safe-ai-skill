@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use super::lexer::{self, Carry};
@@ -634,7 +635,11 @@ impl<'s> Cmd<'s> {
 /// Every line is lexed (block comments, triple-quoted strings and template text carry to the
 /// next line). Code (and JS/Python/Rust fences) joins lines while brackets are open; every unit
 /// honours a trailing `\`, `|` or `&&`. Shell fences drop a leading `$ `/`% ` prompt.
-pub(crate) fn for_each_stmt<'d>(doc: &'d Document<'d>, unit: &Unit, mut f: impl FnMut(&Stmt<'d>)) {
+pub(crate) fn for_each_stmt<'d>(
+    doc: &'d Document<'d>,
+    unit: &Unit,
+    mut f: impl FnMut(&Stmt<'d>) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     let brackets =
         unit.ctx == Ctx::Code || matches!(unit.lang, Lang::Js | Lang::Python | Lang::Rust);
     let prompt = unit.ctx == Ctx::Doc && unit.lang == Lang::Shell;
@@ -659,15 +664,16 @@ pub(crate) fn for_each_stmt<'d>(doc: &'d Document<'d>, unit: &Unit, mut f: impl 
             depth = depth.saturating_add(delta).max(0);
         }
         if (depth == 0 && !cont) || acc.len() >= MAX_STMT_LINES {
-            emit_stmt(doc, unit, &acc, &acc_regions, &mut f);
+            emit_stmt(doc, unit, &acc, &acc_regions, &mut f)?;
             acc.clear();
             acc_regions.clear();
             depth = 0;
         }
     }
     if !acc.is_empty() {
-        emit_stmt(doc, unit, &acc, &acc_regions, &mut f);
+        emit_stmt(doc, unit, &acc, &acc_regions, &mut f)?;
     }
+    ControlFlow::Continue(())
 }
 
 /// The line continues into the next one: a trailing `\`, `|` or `&&` in code.
@@ -682,7 +688,10 @@ fn continues(line: &str, regions: &[(usize, usize)]) -> bool {
 }
 
 /// Every Markdown prose line and inline code span, as one-line `doc` statements.
-pub(crate) fn for_each_prose_stmt<'d>(doc: &'d Document<'d>, mut f: impl FnMut(&Stmt<'d>)) {
+pub(crate) fn for_each_prose_stmt<'d>(
+    doc: &'d Document<'d>,
+    mut f: impl FnMut(&Stmt<'d>) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     for i in 0..doc.len() {
         if doc.role(i) != Role::Prose {
             continue;
@@ -700,7 +709,7 @@ pub(crate) fn for_each_prose_stmt<'d>(doc: &'d Document<'d>, mut f: impl FnMut(&
             Lang::Other,
             Ctx::Doc,
             bits,
-        ));
+        ))?;
         if !orig.contains('`') {
             continue;
         }
@@ -714,10 +723,11 @@ pub(crate) fn for_each_prose_stmt<'d>(doc: &'d Document<'d>, mut f: impl FnMut(&
                     Lang::Shell,
                     Ctx::Doc,
                     bits,
-                ));
+                ))?;
             }
         }
     }
+    ControlFlow::Continue(())
 }
 
 /// `line` without a leading `$ `/`% ` shell prompt when `prompt` is set.
@@ -736,15 +746,15 @@ fn emit_stmt<'d>(
     unit: &Unit,
     lines: &[usize],
     regions: &[(usize, usize, usize)],
-    f: &mut impl FnMut(&Stmt<'d>),
-) {
+    f: &mut impl FnMut(&Stmt<'d>) -> ControlFlow<()>,
+) -> ControlFlow<()> {
     let prompt = unit.ctx == Ctx::Doc && unit.lang == Lang::Shell;
     let bits = lines.iter().fold(0, |acc, &i| acc | doc.bits(i));
     if bits == 0 {
-        return;
+        return ControlFlow::Continue(());
     }
     if let [i] = lines {
-        f(&Stmt {
+        return f(&Stmt {
             lower: Cow::Borrowed(piece(doc.lower_line(*i), prompt)),
             orig: Cow::Borrowed(piece(doc.line(*i), prompt)),
             first_line: line_no(*i),
@@ -754,7 +764,6 @@ fn emit_stmt<'d>(
             ctx: unit.ctx,
             bits,
         });
-        return;
     }
     let mut lower = String::new();
     let mut orig = String::new();
@@ -784,7 +793,7 @@ fn emit_stmt<'d>(
         lang: unit.lang,
         ctx: unit.ctx,
         bits,
-    });
+    })
 }
 
 /// Byte ranges of the commands in `s`: split on `;`, `&&` and `||` outside `regions`.
@@ -1584,8 +1593,9 @@ mod tests {
         let doc = Document::new(text, class);
         let mut out = Vec::new();
         for unit in doc.units() {
-            for_each_stmt(&doc, unit, |s| {
-                out.push((s.lower.to_string(), s.line_at(0)))
+            let _ = for_each_stmt(&doc, unit, |s| {
+                out.push((s.lower.to_string(), s.line_at(0)));
+                ControlFlow::Continue(())
             });
         }
         out
@@ -1669,10 +1679,11 @@ mod tests {
         let doc = Document::new(text, FileClass::Code(Lang::Shell));
         let mut seen = Vec::new();
         for unit in doc.units() {
-            for_each_stmt(&doc, unit, |s| {
+            let _ = for_each_stmt(&doc, unit, |s| {
                 if let Some(p) = s.lower.find("-d") {
                     seen.push((s.line_at(0), s.line_at(p)));
                 }
+                ControlFlow::Continue(())
             });
         }
         assert_eq!(seen, vec![(2, 4)]);

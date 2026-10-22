@@ -470,6 +470,8 @@ pub fn run_session_with_policy(
     let mut lock = lockfile::load(plugin_data);
     let mut result = SessionResult::default();
     let mut warnings: Vec<String> = Vec::new();
+    // One scan budget for the whole sweep: a crafted pack cannot stall SessionStart.
+    let budget = rules::ScanBudget::session();
 
     // The ext dir name (e.g. `ext`) is skipped as a top-level skill child: its submodules are
     // verified individually below, so the `ext/` blob is never pinned as one unit.
@@ -502,7 +504,7 @@ pub fn run_session_with_policy(
 
             let hash = lockfile::hash_tree(&dir);
             let drift = lock.skill_drift(&name, &hash);
-            let report = heuristics::scan(&dir);
+            let report = heuristics::scan_within(&dir, &budget);
             let eval = eval_skill(&name, hash.clone(), drift, &report);
 
             if eval.quarantine {
@@ -543,7 +545,14 @@ pub fn run_session_with_policy(
 
         // Verify each `ext/<name>` submodule under this root as its own unit.
         for sub in ext_submodules(&root_path, policy) {
-            process_ext_submodule(plugin_data, &sub, &mut lock, &mut result, &mut warnings);
+            process_ext_submodule(
+                plugin_data,
+                &sub,
+                &budget,
+                &mut lock,
+                &mut result,
+                &mut warnings,
+            );
         }
     }
 
@@ -568,6 +577,7 @@ pub fn run_session_with_policy(
 fn process_ext_submodule(
     plugin_data: &Path,
     dir: &Path,
+    budget: &rules::ScanBudget,
     lock: &mut lockfile::Lockfile,
     result: &mut SessionResult,
     warnings: &mut Vec<String>,
@@ -579,7 +589,7 @@ fn process_ext_submodule(
 
     let identity = lockfile::resolve_ext_identity(dir);
     let drift = lock.ext_drift(&name, &identity.sha);
-    let report = heuristics::scan(dir);
+    let report = heuristics::scan_within(dir, budget);
     let eval = eval_skill(&name, identity.sha.clone(), drift, &report);
 
     if eval.quarantine {

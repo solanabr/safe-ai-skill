@@ -55,7 +55,8 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
     let quoted = |off: usize| cmd.quoted(off);
     let mut sink: Option<(usize, bool)> = None;
 
-    if bits & T_NET != 0 {
+    // A rule that already hit MAX_HITS_PER_RULE times in this file is not evaluated again.
+    if bits & T_NET != 0 && !out.saturated("download_and_run") {
         if let Some(off) = download_and_run(lower) {
             out.emit("download_and_run", Severity::High, line(off), ctx);
             sink.get_or_insert((off, false));
@@ -67,7 +68,7 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
         let shell_shape = lower.contains('|')
             || lower.contains(" -")
             || (lang == Lang::Shell && bits & T_EVAL != 0);
-        if shell_like && bits & T_SHELL != 0 && shell_shape {
+        if shell_like && bits & T_SHELL != 0 && shell_shape && !out.saturated("shell_eval") {
             if let Some(off) = shell_exec(lower, lang == Lang::Shell) {
                 out.emit("shell_eval", Severity::Info, line(off), ctx);
                 sink.get_or_insert((off, quoted(off)));
@@ -75,33 +76,39 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
         }
         let evals = lang != Lang::Shell && bits & T_EVAL != 0;
         if evals {
-            if let Some(off) = eval_call(cmd) {
-                let q = quoted(off);
-                out.emit("eval", grade_sink(q), line(off), ctx);
-                if !q {
-                    out.signal(Signal::Eval(cmd.line_at(off)), ctx);
+            if !out.saturated("eval") {
+                if let Some(off) = eval_call(cmd) {
+                    let q = quoted(off);
+                    out.emit("eval", grade_sink(q), line(off), ctx);
+                    if !q {
+                        out.signal(Signal::Eval(cmd.line_at(off)), ctx);
+                    }
+                    sink.get_or_insert((off, q));
                 }
-                sink.get_or_insert((off, q));
             }
-            if let Some(off) = obfuscated(lower, lang) {
-                let q = quoted(off);
-                out.emit("obfuscated_sink", grade_sink(q), line(off), ctx);
-                sink.get_or_insert((off, q));
+            if !out.saturated("obfuscated_sink") {
+                if let Some(off) = obfuscated(lower, lang) {
+                    let q = quoted(off);
+                    out.emit("obfuscated_sink", grade_sink(q), line(off), ctx);
+                    sink.get_or_insert((off, q));
+                }
             }
-            if let Some(off) = find_call(lower, "createrequire", true) {
-                out.emit("create_require", Severity::Info, line(off), ctx);
+            if !out.saturated("create_require") {
+                if let Some(off) = find_call(lower, "createrequire", true) {
+                    out.emit("create_require", Severity::Info, line(off), ctx);
+                }
             }
         }
         // JS `exec(` is child_process exec, so eval-family words also wake the spawn check.
         let spawns = bits & T_SPAWN != 0 || (lang == Lang::Js && bits & T_EVAL != 0);
-        if lang != Lang::Shell && spawns {
+        if lang != Lang::Shell && spawns && !out.saturated("child_process") {
             if let Some(off) = spawn(lower, lang) {
                 out.emit("child_process", Severity::Info, line(off), ctx);
                 sink.get_or_insert((off, quoted(off)));
             }
         }
     }
-    let decoder = if bits & T_DECODE != 0 {
+    let decoder = if bits & T_DECODE != 0 && !out.saturated("decoder") {
         decoder(lower)
     } else {
         None

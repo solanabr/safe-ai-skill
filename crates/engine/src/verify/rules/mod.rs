@@ -17,6 +17,12 @@
 //!   - BLOCK only on a combination rule ([`ComboHit`]). Drift and lock mismatches are decided by
 //!     the caller, not here.
 //! * [`describe`] gives a one-line summary for any rule or combo id.
+//! * [`scan_pack_within`] is [`scan_pack`] under a wall-clock [`ScanBudget`] (SessionStart).
+//!   A pack that runs out gets `scan_budget_exceeded` (HIGH): never clean, and the caller moves
+//!   on to the next pack. One budget can span a sweep: each pack gets [`PACK_BUDGET`], and no
+//!   pack scans past [`SWEEP_BUDGET`] from the budget's creation.
+//! * Per file, a rule stops being evaluated after [`MAX_HITS_PER_RULE`] hits;
+//!   [`PackReport::capped`] records each rule that did.
 //!
 //! Every finding carries a pack-relative `path` and, when it is line-addressable, a 1-based
 //! `line`.
@@ -38,7 +44,9 @@ mod unicode;
 
 use std::collections::HashSet;
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -56,6 +64,14 @@ const MAX_PER_RULE_FILE: u16 = 5;
 const MAX_SIGNALS_PER_FILE: usize = 4096;
 /// Bytes of each `SKILL.md` kept for the "referenced by SKILL.md" combo.
 const MAX_SKILL_MD_BYTES: usize = 1024 * 1024;
+/// Hits of one rule in one file after which that rule stops being evaluated there.
+pub const MAX_HITS_PER_RULE: u32 = 50;
+/// Time one pack may take at SessionStart.
+pub const PACK_BUDGET: Duration = Duration::from_secs(2);
+/// Time one SessionStart sweep may spend scanning, across all its packs.
+pub const SWEEP_BUDGET: Duration = Duration::from_secs(4);
+/// Loop iterations between clock reads while a deadline is set.
+const CLOCK_EVERY: u32 = 256;
 
 /// Severity of one finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -127,6 +143,50 @@ pub struct PackReport {
     pub findings: Vec<Finding>,
     /// Pack-level combination hits.
     pub combos: Vec<ComboHit>,
+    /// Rules that reached [`MAX_HITS_PER_RULE`] in a file and stopped being evaluated there.
+    pub capped: Vec<RuleCount>,
+}
+
+/// How many times a rule hit in one file (see [`PackReport::capped`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleCount {
+    pub rule: &'static str,
+    /// Path relative to the pack root.
+    pub path: PathBuf,
+    /// Hits counted; at least [`MAX_HITS_PER_RULE`].
+    pub hits: u32,
+}
+
+/// Wall-clock budget for [`scan_pack_within`], so a crafted pack cannot stall SessionStart.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanBudget {
+    per_pack: Duration,
+    /// No pack scanned with this budget runs past this instant.
+    sweep_deadline: Option<Instant>,
+}
+
+impl ScanBudget {
+    /// SessionStart: [`PACK_BUDGET`] per pack within [`SWEEP_BUDGET`] for the whole sweep.
+    pub fn session() -> Self {
+        Self::new(PACK_BUDGET, SWEEP_BUDGET)
+    }
+
+    /// `per_pack` for each pack, and `total` from now for every pack scanned with this budget.
+    pub fn new(per_pack: Duration, total: Duration) -> Self {
+        ScanBudget {
+            per_pack,
+            sweep_deadline: Instant::now().checked_add(total),
+        }
+    }
+
+    /// The deadline of a pack that starts now.
+    fn pack_deadline(&self) -> Option<Instant> {
+        let pack = Instant::now().checked_add(self.per_pack);
+        match (pack, self.sweep_deadline) {
+            (Some(p), Some(s)) => Some(p.min(s)),
+            (p, s) => p.or(s),
+        }
+    }
 }
 
 /// Pack-level verdict (spec D2.4).
@@ -216,6 +276,7 @@ const RULES: &[RuleInfo] = &[
     RuleInfo { id: "bytecode", code: Severity::High, summary: "compiled Python bytecode (.pyc) shipped in the pack" },
     RuleInfo { id: "archive", code: Severity::Info, summary: "archive shipped in the pack (contents not scanned)" },
     RuleInfo { id: "executable", code: Severity::Info, summary: "file with the executable bit set" },
+    RuleInfo { id: "scan_budget_exceeded", code: Severity::High, summary: "scan stopped at its time budget: the rest of the pack is unscanned" },
     RuleInfo { id: "nul_bytes", code: Severity::Warn, summary: "NUL bytes in a text or code file (read with the NULs stripped)" },
     // lifecycle
     RuleInfo { id: "lifecycle_script", code: Severity::High, summary: "package.json install lifecycle script (runs on install)" },
@@ -330,6 +391,12 @@ pub(crate) struct FileOut {
     /// Bundler or minifier output (decided only when the file has an eval or decoder signal).
     pub(crate) generated: bool,
     counts: Vec<(&'static str, Severity, u16)>,
+    /// Hits per rule, every severity (for [`MAX_HITS_PER_RULE`]).
+    hits: Vec<(&'static str, u32)>,
+    deadline: Option<Instant>,
+    ticks: u32,
+    /// The scan of this file stopped at the deadline.
+    pub(crate) expired: bool,
 }
 
 impl FileOut {
@@ -340,7 +407,32 @@ impl FileOut {
             signals: Vec::new(),
             generated: false,
             counts: Vec::new(),
+            hits: Vec::new(),
+            deadline: None,
+            ticks: 0,
+            expired: false,
         }
+    }
+
+    /// True once `rule` hit [`MAX_HITS_PER_RULE`] times in this file: detectors skip it.
+    pub(crate) fn saturated(&self, rule: &str) -> bool {
+        self.hits
+            .iter()
+            .any(|&(r, n)| r == rule && n >= MAX_HITS_PER_RULE)
+    }
+
+    /// True once the deadline has passed (the clock is read every [`CLOCK_EVERY`] calls).
+    pub(crate) fn out_of_time(&mut self) -> bool {
+        let Some(deadline) = self.deadline else {
+            return false;
+        };
+        if !self.expired {
+            self.ticks = self.ticks.wrapping_add(1);
+            if self.ticks.is_multiple_of(CLOCK_EVERY) && Instant::now() >= deadline {
+                self.expired = true;
+            }
+        }
+        self.expired
     }
 
     /// Record a finding: docs are capped at WARN, INFO is kept once per file and WARN/HIGH up
@@ -351,6 +443,10 @@ impl FileOut {
         } else {
             sev
         };
+        match self.hits.iter_mut().find(|(r, _)| *r == rule) {
+            Some((_, n)) => *n = n.saturating_add(1),
+            None => self.hits.push((rule, 1)),
+        }
         let cap = if sev == Severity::Info {
             1
         } else {
@@ -407,8 +503,18 @@ pub fn scan_pack(root: &Path) -> PackReport {
     scan_pack_capped(root, MAX_SCAN_BYTES)
 }
 
+/// [`scan_pack`] under `budget`: a pack that runs out of time is cut short and graded HIGH by
+/// `scan_budget_exceeded`, with the findings and combos gathered so far.
+pub fn scan_pack_within(root: &Path, budget: &ScanBudget) -> PackReport {
+    scan_pack_inner(root, MAX_SCAN_BYTES, budget.pack_deadline())
+}
+
 /// [`scan_pack`] with an explicit per-file byte cap (tests shrink it).
 pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
+    scan_pack_inner(root, cap, None)
+}
+
+fn scan_pack_inner(root: &Path, cap: u64, deadline: Option<Instant>) -> PackReport {
     let mut facts = PackFacts::default();
     let mut outs: Vec<FileOut> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
@@ -424,6 +530,8 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| e.depth() != 1 || e.file_name() != ".git");
+    // Where the scan stopped when it ran out of time.
+    let mut exceeded: Option<PathBuf> = None;
     for entry in walker.flatten() {
         let rel = match entry.path().strip_prefix(root) {
             Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
@@ -433,6 +541,10 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
                 None => continue,
             },
         };
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            exceeded = Some(rel);
+            break;
+        }
         let file_type = entry.file_type();
         if file_type.is_symlink() {
             outs.push(symlink::scan(base, entry.path(), &rel));
@@ -445,15 +557,28 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
         } else if file_type.is_file() {
             let meta = entry.metadata().ok();
             facts.files.insert(rel.clone());
-            outs.push(scan_file(
+            let out = scan_file(
                 entry.path(),
                 &rel,
                 meta.as_ref(),
                 cap,
+                deadline,
                 &mut buf,
                 &mut facts,
-            ));
+            );
+            let expired = out.expired;
+            outs.push(out);
+            if expired {
+                exceeded = Some(rel);
+                break;
+            }
         }
+    }
+    if let Some(path) = exceeded {
+        let mut out = FileOut::new(&path);
+        out.emit("scan_budget_exceeded", Severity::High, None, Ctx::Meta);
+        outs.push(out);
+        facts.bang_runs.clear();
     }
 
     // A load-time command that runs a pack script inherits the script's network/secret access.
@@ -470,8 +595,25 @@ pub(crate) fn scan_pack_capped(root: &Path, cap: u64) -> PackReport {
         }
     }
     let combos = combo::evaluate(&outs, &facts);
+    let capped = outs
+        .iter()
+        .flat_map(|o| {
+            o.hits
+                .iter()
+                .filter(|&&(_, n)| n >= MAX_HITS_PER_RULE)
+                .map(|&(rule, hits)| RuleCount {
+                    rule,
+                    path: o.path.clone(),
+                    hits,
+                })
+        })
+        .collect();
     let findings = outs.into_iter().flat_map(|o| o.findings).collect();
-    PackReport { findings, combos }
+    PackReport {
+        findings,
+        combos,
+        capped,
+    }
 }
 
 /// True when any execute bit is set (always false off unix).
@@ -494,10 +636,12 @@ fn scan_file(
     rel: &Path,
     meta: Option<&std::fs::Metadata>,
     cap: u64,
+    deadline: Option<Instant>,
     buf: &mut Vec<u8>,
     facts: &mut PackFacts,
 ) -> FileOut {
     let mut out = FileOut::new(rel);
+    out.deadline = deadline;
     let executable = meta.map(is_executable).unwrap_or(false);
     let size = meta.map(|m| m.len()).unwrap_or(0);
     if executable {
@@ -650,6 +794,9 @@ fn scan_text(
 
     padding::scan(doc, out);
     for i in 0..doc.len() {
+        if out.out_of_time() {
+            return;
+        }
         unicode::scan_line(doc, i, out);
         description::scan_injection_line(doc, i, out);
         secrets_ctx::scan_line(doc, i, out);
@@ -660,13 +807,24 @@ fn scan_text(
     }
 
     let mut vars = network_ctx::VarCache::default();
+    let mut each = |stmt: &context::Stmt<'_>| {
+        if out.out_of_time() {
+            return ControlFlow::Break(());
+        }
+        scan_stmt(stmt, doc, &mut vars, out);
+        ControlFlow::Continue(())
+    };
     if !package_json {
         for unit in doc.units() {
-            context::for_each_stmt(doc, unit, |stmt| scan_stmt(stmt, doc, &mut vars, out));
+            if context::for_each_stmt(doc, unit, &mut each).is_break() {
+                return;
+            }
         }
     }
+    if markdown && context::for_each_prose_stmt(doc, &mut each).is_break() {
+        return;
+    }
     if markdown {
-        context::for_each_prose_stmt(doc, |stmt| scan_stmt(stmt, doc, &mut vars, out));
         bang_cmd::scan(doc, rel, out, facts);
         if name == "skill.md" {
             description::scan_frontmatter(doc, out);
@@ -749,11 +907,23 @@ pub(crate) fn scan_stmt(
     vars: &mut network_ctx::VarCache,
     out: &mut FileOut,
 ) {
+    // A detector family whose every rule hit MAX_HITS_PER_RULE times in this file is skipped.
+    let all = |out: &FileOut, rules: &[&str]| rules.iter().all(|r| out.saturated(r));
     for cmd in stmt.commands() {
+        // One statement can hold millions of commands (a minified line).
+        if out.out_of_time() {
+            return;
+        }
         exec_sinks::scan_cmd(&cmd, out);
-        network_ctx::scan_cmd(&cmd, doc, vars, out);
-        secrets_ctx::scan_cmd(&cmd, out);
-        lifecycle::scan_cmd(&cmd, out);
+        if !all(out, &["telemetry_post", "network_post", "ip_literal"]) {
+            network_ctx::scan_cmd(&cmd, doc, vars, out);
+        }
+        if !all(out, &["secret_read", "env_dump"]) {
+            secrets_ctx::scan_cmd(&cmd, out);
+        }
+        if !all(out, &["registry_write", "git_hooks_write", "unpinned_npx"]) {
+            lifecycle::scan_cmd(&cmd, out);
+        }
     }
 }
 
@@ -915,10 +1085,72 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_stops_at_its_hit_cap_and_the_count_is_recorded() {
+        let r = scan_one("w.js", &"eval(x);\n".repeat(200));
+        let stored = r.findings.iter().filter(|f| f.rule == "eval").count();
+        assert_eq!(stored, usize::from(MAX_PER_RULE_FILE), "{r:?}");
+        assert_eq!(
+            r.capped,
+            vec![RuleCount {
+                rule: "eval",
+                path: PathBuf::from("w.js"),
+                hits: MAX_HITS_PER_RULE,
+            }]
+        );
+        assert_eq!(grade(&r), Grade::High);
+        assert!(scan_one("w.js", &"eval(x);\n".repeat(49)).capped.is_empty());
+    }
+
+    #[test]
+    fn a_pack_out_of_time_is_high_never_clean() {
+        let pack = TempPack::new("budget");
+        pack.file("README.md", "# plain\n");
+        pack.file("src/a.js", "export const a = 1;\n");
+        assert_eq!(grade(&pack.scan()), Grade::Clean);
+        let none = ScanBudget::new(Duration::ZERO, Duration::from_secs(60));
+        let r = scan_pack_within(&pack.root, &none);
+        let f = hits(&r, "scan_budget_exceeded");
+        assert_eq!(
+            (f.len(), f[0].sev, f[0].ctx),
+            (1, Severity::High, Ctx::Meta),
+            "{r:?}"
+        );
+        assert_eq!(grade(&r), Grade::High);
+        // A generous budget changes nothing.
+        let ample = ScanBudget::new(Duration::from_secs(60), Duration::from_secs(60));
+        assert_eq!(scan_pack_within(&pack.root, &ample), pack.scan());
+    }
+
+    #[test]
+    fn a_sweep_budget_spans_packs() {
+        let pack = TempPack::new("sweep");
+        pack.file("README.md", "# plain\n");
+        // The sweep's time is spent: every later pack is cut, whatever its own allowance.
+        let spent = ScanBudget::new(Duration::from_secs(60), Duration::ZERO);
+        for _ in 0..3 {
+            let r = scan_pack_within(&pack.root, &spent);
+            assert!(has(&r, "scan_budget_exceeded"), "{r:?}");
+            assert_eq!(grade(&r), Grade::High);
+        }
+    }
+
+    #[test]
+    fn a_long_file_is_cut_inside_one_statement() {
+        let pack = TempPack::new("budget-line");
+        pack.file("a.js", &"eval(x);".repeat(400_000));
+        let short = ScanBudget::new(Duration::from_millis(1), Duration::from_secs(60));
+        let started = Instant::now();
+        let r = scan_pack_within(&pack.root, &short);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(has(&r, "scan_budget_exceeded"), "{r:?}");
+        assert_eq!(grade(&r), Grade::High);
+    }
+
+    #[test]
     fn grade_caps_a_hand_built_doc_high_at_warn() {
         let r = PackReport {
             findings: vec![finding("eval", Severity::High, Ctx::Doc)],
-            combos: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(grade(&r), Grade::Warn);
     }

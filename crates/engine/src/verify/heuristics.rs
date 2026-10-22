@@ -9,7 +9,9 @@
 //! * a `High` finding → `High`; a documentation finding capped from a code-`High` rule also →
 //!   `High` (v1 never told docs from code — the grader is where the doc cap bites);
 //! * any other `Warn` → `Medium`; `Info` → `Low`, except `unpinned_npx`, which v1 graded
-//!   `Medium` and keeps.
+//!   `Medium` and keeps;
+//! * `scan_budget_exceeded` → `Medium`: the pack is unscanned, so it is surfaced, but v1
+//!   quarantines on `High` and a slow machine must not quarantine packs.
 //!
 //! Detectors ported from v1 keep their v1 kind (`install_hook`, `eval`, `base64_exec`,
 //! `unicode_obfuscation`, `broad_permissions`, and `telemetry_post` for any outbound POST); new
@@ -24,7 +26,15 @@ use super::{Finding, Report, Severity};
 ///
 /// Pure and hermetic: no network, no command execution, no panics.
 pub fn scan(path: &Path) -> Report {
-    let pack = rules::scan_pack(path);
+    legacy_report(&rules::scan_pack(path))
+}
+
+/// [`scan`] under a wall-clock budget shared across a sweep (SessionStart).
+pub fn scan_within(path: &Path, budget: &rules::ScanBudget) -> Report {
+    legacy_report(&rules::scan_pack_within(path, budget))
+}
+
+fn legacy_report(pack: &rules::PackReport) -> Report {
     let mut report = Report::default();
     for f in &pack.findings {
         report.findings.push(legacy(
@@ -58,6 +68,9 @@ fn legacy(sev: Severity, kind: &str, summary: &str, path: &Path, line: Option<u3
 
 /// v1 severity of a rule finding (see the module docs).
 fn legacy_severity(f: &rules::Finding) -> Severity {
+    if f.rule == "scan_budget_exceeded" {
+        return Severity::Medium;
+    }
     match f.sev {
         rules::Severity::High => Severity::High,
         rules::Severity::Warn
@@ -88,6 +101,7 @@ fn legacy_kind(rule: &'static str) -> &'static str {
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::Duration;
 
     fn tempdir(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -209,6 +223,22 @@ mod tests {
             .expect("description_url");
         assert_eq!(url.severity, Severity::Medium);
         assert_eq!(super::super::verdict(&report), super::super::Verdict::Block);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_budget_overrun_is_medium_in_v1() {
+        let dir = tempdir("budget");
+        fs::write(dir.join("README.md"), "# plain\n").unwrap();
+        let none = rules::ScanBudget::new(Duration::ZERO, Duration::ZERO);
+        let report = scan_within(&dir, &none);
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.kind == "scan_budget_exceeded")
+            .expect("scan_budget_exceeded");
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(report.findings.iter().all(|f| f.severity < Severity::High));
         fs::remove_dir_all(&dir).ok();
     }
 
