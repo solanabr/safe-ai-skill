@@ -49,9 +49,7 @@ pub struct HookInput {
     pub tool_name: Option<String>,
     /// Tool input arguments.
     pub tool_input: Option<Value>,
-    /// Tool output (legacy field name; Claude Code sends `tool_response`).
-    pub tool_output: Option<Value>,
-    /// Tool output (PostToolUse), shaped per tool.
+    /// Tool output (PostToolUse), shaped per tool. Claude Code never sends `tool_output`.
     pub tool_response: Option<Value>,
     /// User prompt text (UserPromptSubmit).
     pub prompt: Option<String>,
@@ -78,14 +76,14 @@ impl HookInput {
         self.tool_input.as_ref()?.get("command")?.as_str()
     }
 
-    /// The read target: `tool_input["file_path"]`, then `["path"]`, then glob `["pattern"]`.
+    /// The read target: `tool_input["file_path"]`, then `["path"]`. Never Grep's `pattern`,
+    /// which is a regex, not a path.
     pub fn read_path(&self) -> Option<&str> {
         let input = self.tool_input.as_ref()?;
         input
             .get("file_path")
             .and_then(Value::as_str)
             .or_else(|| input.get("path").and_then(Value::as_str))
-            .or_else(|| input.get("pattern").and_then(Value::as_str))
     }
 
     /// The raw MCP payload (`tool_input`), if present.
@@ -290,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn read_path_prefers_file_path_then_path_then_pattern() {
+    fn read_path_prefers_file_path_then_path_never_pattern() {
         assert_eq!(
             HookInput::parse(READ_PAYLOAD).read_path(),
             Some("/home/u/.config/solana/id.json")
@@ -298,7 +296,7 @@ mod tests {
         let by_path = HookInput::parse(r#"{"tool_input":{"path":"/a/b"}}"#);
         assert_eq!(by_path.read_path(), Some("/a/b"));
         let by_pattern = HookInput::parse(r#"{"tool_input":{"pattern":"**/*.env"}}"#);
-        assert_eq!(by_pattern.read_path(), Some("**/*.env"));
+        assert_eq!(by_pattern.read_path(), None);
     }
 
     #[test]

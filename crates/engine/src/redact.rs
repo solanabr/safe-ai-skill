@@ -262,6 +262,10 @@ pub(crate) fn contains_key_material(text: &str) -> bool {
 /// Whether `text` holds a high-confidence API credential: a vendor-prefixed token long enough
 /// to be real (`sk_live_…`, `sk-…`, `ghp_…`, `xoxb-…`, `AKIA…`, `AIza…`) or a JWT. Key names
 /// alone (`*_API_KEY=`) never count.
+///
+/// Interim: H9 (1.0.1) extends [`contains_key_material`] with API-key/credential detectors.
+/// When H9 is merged, fold this into that helper and drop the second call in
+/// `gates::read::guard_env_schema`.
 pub(crate) fn contains_high_confidence_token(text: &str) -> bool {
     const PREFIXES: &[(&str, usize)] = &[
         ("sk_live_", 20),
