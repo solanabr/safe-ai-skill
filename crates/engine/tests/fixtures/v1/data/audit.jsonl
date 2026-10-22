@@ -1,0 +1,4 @@
+{"ts":1792632862,"session_id":"","tool":"safe-ai-skill","classification":"install","decision":"verify_in_place","reason":"verified=3 held=0","input_sha256":"bb046e27db6cb6992be5861255476ebfb90175eb7d5f05714bf6178a5d1eb8fc"}
+{"ts":1792632862,"session_id":"","tool":"safe-ai-skill","classification":"install","decision":"install","reason":"installed=1 held=0","input_sha256":"08d80ac2ec899d2de134e176901d146b7fbfb0572949247407f4e238ab486a74"}
+{"ts":1792632862,"session_id":"","tool":"safe-ai-skill","classification":"install","decision":"verify_in_place","reason":"verified=3 held=0","input_sha256":"bb046e27db6cb6992be5861255476ebfb90175eb7d5f05714bf6178a5d1eb8fc"}
+{"ts":1792632862,"session_id":"","tool":"safe-ai-skill","classification":"grant_create","decision":"allow","reason":"scope=swap max_tx=0 budget=0 expires_at=1792634662 danger=false","input_sha256":"9748fc9f4b4d31864bd8285a047888c2aacdfb51b5420692281a0a99cf797bd6"}
