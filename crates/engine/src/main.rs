@@ -1894,7 +1894,7 @@ fn print_tier(cwd: &Path, dir: &DataDir, command: &str) -> ExitCode {
         "line": notice::tier_line(&resolution, &effective.runtime),
         "notes": resolution.notes,
         "policy_notes": effective.ignored_overrides,
-        "tier_state": state_label(&tierstate::load(dir)),
+        "tier_state": tier_state_label(dir),
         "data_dir_trusted": dir.trusted,
     }));
     ExitCode::SUCCESS
@@ -1932,6 +1932,15 @@ fn state_label<T>(loaded: &Loaded<T>) -> &'static str {
         Loaded::Valid(_) => "valid",
         Loaded::Missing => "missing",
         Loaded::Tampered => "failed authentication",
+    }
+}
+
+/// [`state_label`] for `tier.json`, or `deleted` when it was stored before.
+fn tier_state_label(dir: &DataDir) -> &'static str {
+    if tierstate::deleted(dir) {
+        "deleted"
+    } else {
+        state_label(&tierstate::load(dir))
     }
 }
 
@@ -1990,7 +1999,7 @@ fn cmd_status() -> ExitCode {
         "sandbox": effective.runtime.sandbox.label(),
         "data_dir_trusted": dir.trusted,
         "grants_state": grants_state,
-        "tier_state": state_label(&tierstate::load(&dir)),
+        "tier_state": tier_state_label(&dir),
         "grants": grants_view,
         "spend": spend_view,
         "recent_audit": recent_audit_lines(&plugin_data, 5),

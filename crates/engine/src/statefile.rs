@@ -115,6 +115,21 @@ pub fn load<T: DeserializeOwned + Default>(dir: &DataDir, name: &str) -> Loaded<
     }
 }
 
+/// Whether `${dir}/{name}` was stored before, as far as the data dir can tell: the
+/// authenticated index lists it, or the index exists but does not authenticate, or there is
+/// no index although the state key exists (nothing proves the file never existed). A file
+/// missing while this holds was deleted.
+pub fn was_stored(dir: &DataDir, name: &str) -> bool {
+    if dir.is_unresolved() || !valid_name(name) {
+        return false;
+    }
+    match read_envelope(&dir.path, GEN_INDEX) {
+        Envelope::Good { body, .. } => body.get(name).and_then(Value::as_u64).unwrap_or(0) > 0,
+        Envelope::Bad => true,
+        Envelope::Missing => std::fs::symlink_metadata(dir.path.join(KEY_FILE)).is_ok(),
+    }
+}
+
 /// What [`read_envelope`] found.
 enum Envelope {
     Missing,

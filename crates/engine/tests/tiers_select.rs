@@ -687,3 +687,64 @@ fn a_replayed_tier_json_is_ignored() {
     assert_eq!(r.tier, Tier::Relaxed);
     assert!(noted(&r, "MAC"), "{:?}", r.notes);
 }
+
+/// Deleting tier.json after a tier was set is not a silent lowering: tier High applies, with a
+/// note, until the user sets a tier again.
+#[test]
+fn a_deleted_tier_json_fails_closed_to_high_with_a_note() {
+    let w = World::new("tiers-deleted");
+    let dir = w.dir();
+    let set = |tier| tierstate::Change {
+        project: None,
+        tier: Some(tier),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&dir, &set(Tier::Off), 0).unwrap();
+    std::fs::remove_file(w.data.join("tier.json")).unwrap();
+    let r = w.resolve(&[]);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::StateDeleted));
+    assert!(noted(&r, "tier.json was deleted"), "{:?}", r.notes);
+
+    if common::TEST_HOOKS {
+        let trusted = |args: &[&str]| {
+            Invocation::new(args)
+                .plugin_data(w.data.path())
+                .home(w.home.path())
+                .cwd(w.proj.path())
+                .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
+                .run()
+        };
+        let status = trusted(&["status"]).json();
+        assert_eq!(status["tier"], "high", "{status}");
+        assert_eq!(status["tier_state"], "deleted", "{status}");
+        let session = Invocation::new(&["verify", "session"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
+            .stdin(
+                json!({"hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
+                    .to_string(),
+            )
+            .run();
+        assert!(
+            session.stdout.contains("tier.json was deleted"),
+            "{}",
+            session.stdout
+        );
+        // `tier relaxed` lowers from High: a pending request, nothing applied.
+        let run = trusted(&["tier", "relaxed"]);
+        assert_ne!(run.json()["status"], "set", "{}", run.stdout);
+        assert_eq!(trusted(&["status"]).json()["tier"], "high");
+        // `tier high` re-creates the file at once.
+        let run = trusted(&["tier", "high"]);
+        assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+        let status = trusted(&["status"]).json();
+        assert_eq!(
+            (status["tier"].as_str(), status["tier_state"].as_str()),
+            (Some("high"), Some("valid")),
+            "{status}"
+        );
+    }
+}

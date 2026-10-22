@@ -121,6 +121,8 @@ pub enum TierSource {
     RepoPolicy,
     /// `SAFE_AI_SKILL_TIER` / `SAFE_AI_SKILL_PROFILE` (raise-only).
     Env,
+    /// `tier.json` was deleted after a tier was set: High until the user sets one again.
+    StateDeleted,
 }
 
 impl TierSource {
@@ -133,6 +135,7 @@ impl TierSource {
             TierSource::KitSecurityJson => "kit .claude/security.json",
             TierSource::RepoPolicy => "repo .safe-ai-skill/policy.yaml",
             TierSource::Env => "env",
+            TierSource::StateDeleted => "tier.json deleted",
         }
     }
 }
@@ -291,6 +294,11 @@ pub fn resolve_from(inputs: Inputs) -> Resolution {
         UserStatus::Untrusted => notes.push(
             "user tier ignored: data dir untrusted (tier.json is not under \
              ~/.claude/plugins/data, or that dir is inside the project)"
+                .to_string(),
+        ),
+        UserStatus::Deleted => notes.push(
+            "tier.json was deleted after a tier was set; tier high applies until you choose a \
+             tier again with `safe-ai-skill tier <off|relaxed|medium|high>`"
                 .to_string(),
         ),
         UserStatus::Valid | UserStatus::Missing => {}

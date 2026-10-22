@@ -85,6 +85,9 @@ pub enum UserStatus {
     Tampered,
     /// It exists, but the data dir is not trusted.
     Untrusted,
+    /// It is missing although it was stored before ([`statefile::was_stored`]): deleted.
+    /// Tier High applies until the user sets a tier again.
+    Deleted,
 }
 
 /// The user-scope choice for one project.
@@ -115,13 +118,29 @@ fn usable(dir: &DataDir) -> (Option<TierFile>, UserStatus) {
         Loaded::Valid(_) => (None, UserStatus::Untrusted),
         Loaded::Tampered if !dir.trusted => (None, UserStatus::Untrusted),
         Loaded::Tampered => (None, UserStatus::Tampered),
+        Loaded::Missing if deleted(dir) => (None, UserStatus::Deleted),
         Loaded::Missing => (None, UserStatus::Missing),
     }
 }
 
+/// Whether `tier.json` is missing from a trusted data dir although it was stored before.
+pub fn deleted(dir: &DataDir) -> bool {
+    dir.trusted && matches!(load(dir), Loaded::Missing) && statefile::was_stored(dir, TIER_FILE)
+}
+
+/// The tier a deleted `tier.json` fails closed to.
+const DELETED_TIER: Tier = Tier::High;
+
 /// The user-scope choice for the project at `root`: `projects[root]`, else `global`.
 pub fn user_choice(dir: &DataDir, root: &Path) -> UserChoice {
     let (file, status) = usable(dir);
+    if status == UserStatus::Deleted {
+        return UserChoice {
+            tier: Some((DELETED_TIER.max(BASE), TierSource::StateDeleted)),
+            env_read: None,
+            status,
+        };
+    }
     let Some(file) = file else {
         return UserChoice {
             status,
@@ -179,7 +198,13 @@ fn before_after(dir: &DataDir, change: &Change) -> ((Tier, EnvRead), (Tier, EnvR
         _ => TierFile::default(),
     };
     let global = file.global.as_ref();
-    let global_tier = global.map_or(BASE, |e| e.tier);
+    // A deleted file counts as tier High: lowering from it needs a confirmation.
+    let floor = if deleted(dir) {
+        DELETED_TIER.max(BASE)
+    } else {
+        BASE
+    };
+    let global_tier = global.map_or(floor, |e| e.tier);
     let global_env = global.and_then(|e| e.env_read).unwrap_or_default();
     let (current, fallback) = match &change.project {
         Some(key) => {
@@ -209,7 +234,7 @@ pub fn plan(dir: &DataDir, change: &Change) -> Plan {
     let (before, after) = before_after(dir, change);
     if (change.clear && clears_a_raise(dir, change)) || after.0 < before.0 || after.1 > before.1 {
         Plan::NeedsConfirm
-    } else if after == before && !change.clear {
+    } else if after == before && !change.clear && !deleted(dir) {
         Plan::NoChange
     } else {
         Plan::Immediate
@@ -357,6 +382,55 @@ mod tests {
 
     fn root() -> String {
         "/work/proj".to_string()
+    }
+
+    #[test]
+    fn a_deleted_tier_file_fails_closed_to_high_until_a_tier_is_set() {
+        let dir = tmp_data("tierstate_deleted");
+        apply(&dir, &global(Some(Tier::Off), None), 1).unwrap();
+        std::fs::remove_file(dir.path.join(TIER_FILE)).unwrap();
+        let c = user_choice(&dir, Path::new("/x"));
+        assert_eq!(c.status, UserStatus::Deleted);
+        assert_eq!(c.tier, Some((Tier::High, TierSource::StateDeleted)));
+        // Setting a tier again: High re-creates the file at once, lowering needs a confirm.
+        assert_eq!(
+            plan(&dir, &global(Some(Tier::Relaxed), None)),
+            Plan::NeedsConfirm
+        );
+        assert_eq!(plan(&dir, &global(Some(Tier::High), None)), Plan::Immediate);
+        apply(&dir, &global(Some(Tier::High), None), 2).unwrap();
+        let c = user_choice(&dir, Path::new("/x"));
+        assert_eq!(
+            (c.status, c.tier),
+            (
+                UserStatus::Valid,
+                Some((Tier::High, TierSource::UserGlobal))
+            )
+        );
+        // No index although the key exists: deleted as well.
+        std::fs::remove_file(dir.path.join(TIER_FILE)).unwrap();
+        std::fs::remove_file(dir.path.join(statefile::GEN_INDEX)).unwrap();
+        assert_eq!(
+            user_choice(&dir, Path::new("/x")).status,
+            UserStatus::Deleted
+        );
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_tier_file_never_stored_is_missing_not_deleted() {
+        let dir = tmp_data("tierstate_never");
+        assert_eq!(
+            user_choice(&dir, Path::new("/x")).status,
+            UserStatus::Missing
+        );
+        // Other state (a grant file) exists: tier.json was still never stored.
+        crate::grants::save(&dir, &crate::grants::Grants::default()).unwrap();
+        assert_eq!(
+            user_choice(&dir, Path::new("/x")).status,
+            UserStatus::Missing
+        );
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
