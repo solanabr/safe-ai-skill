@@ -487,6 +487,24 @@ fn now_secs() -> u64 {
 /// The user-scope skills dir: `install --from` installs there, and 1.0.0 swept (and moved) it.
 const USER_SKILLS_DIR: &str = "~/.claude/skills";
 
+/// What [`evaluate`] is given beyond the pack.
+#[derive(Default)]
+struct EvalInput {
+    /// Hard deadline: past it the evaluation is abandoned (`None`), state untouched.
+    deadline: Option<std::time::Instant>,
+    /// The pack's skill names, when the caller already walked for them.
+    names: Option<state::SkillNames>,
+    /// The pack's current tree hash, when the caller already computed it.
+    hash: Option<String>,
+    /// The sweep's overall budget: past it a pack is recorded unscanned (HIGH
+    /// `scan_budget_exceeded`) so the state is always stored in time.
+    soft_deadline: Option<std::time::Instant>,
+}
+
+/// Total time a sweep spends walking and scanning before the remaining packs are recorded
+/// unscanned.
+const SWEEP_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Time one pack's skill-name walk may take during a sweep before the pack is graded HIGH.
 const NAME_WALK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// Rule id of the HIGH finding for a pack whose name walk ran out of budget.
@@ -870,16 +888,19 @@ struct Evaluated {
 /// `names` are the pack's skill names when the caller already walked for them (each pack is
 /// walked once per invocation). A name walk that runs out of budget grades the pack HIGH
 /// (`scan_budget_exceeded`).
-fn evaluate(
-    st: &mut State,
-    pack: &Pack,
-    env: &Env,
-    deadline: Option<std::time::Instant>,
-    names: Option<state::SkillNames>,
-) -> Option<Evaluated> {
+fn evaluate(st: &mut State, pack: &Pack, env: &Env, input: EvalInput) -> Option<Evaluated> {
+    let EvalInput {
+        deadline,
+        names,
+        hash,
+        soft_deadline,
+    } = input;
     let over = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let key = state::key_of(&pack.canonical);
-    let hash = state::tree_hash_until(&pack.canonical, deadline)?;
+    let hash = match hash {
+        Some(h) => h,
+        None => state::tree_hash_until(&pack.canonical, deadline)?,
+    };
     let head = match pack.kind {
         PackKind::Ext => lockfile::resolve_git_sha(&pack.dir),
         PackKind::Skill => None,
@@ -888,22 +909,35 @@ fn evaluate(
     let cached = prev
         .as_ref()
         .filter(|p| env.dir.trusted && p.last_scanned_hash == hash);
-    let (grade, findings, more_findings, flagged_rules, names) = match cached {
+    // Past the sweep's overall budget a pack is recorded unscanned (and rescanned next time).
+    let skipped = cached.is_none() && soft_deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    let (grade, findings, more_findings, flagged_rules, walked) = match cached {
         Some(p) => (
             p.grade,
             p.findings.clone(),
             p.more_findings,
             p.flagged_rules.clone(),
-            p.names.clone(),
+            state::SkillNames {
+                names: p.names.clone(),
+                unparseable: p.names_incomplete,
+                escaping: p.escaping.clone(),
+                over_budget: false,
+            },
         ),
         None => {
             let walked = names.unwrap_or_else(|| {
-                let budget = std::time::Instant::now() + NAME_WALK_BUDGET;
-                let until = deadline.map_or(budget, |d| d.min(budget));
+                let mut until = std::time::Instant::now() + NAME_WALK_BUDGET;
+                for d in [deadline, soft_deadline].into_iter().flatten() {
+                    until = until.min(d);
+                }
                 state::skill_names_until(&pack.canonical, Some(until))
             });
-            let mut report = (env.scanner)(&pack.canonical);
-            if walked.over_budget {
+            let mut report = if skipped {
+                grading::PackReport::default()
+            } else {
+                (env.scanner)(&pack.canonical)
+            };
+            if walked.over_budget || skipped {
                 report.findings.push(grading::Finding {
                     rule: SCAN_BUDGET_RULE,
                     sev: grading::Severity::High,
@@ -912,13 +946,23 @@ fn evaluate(
                     ctx: grading::Ctx::Meta,
                 });
             }
+            // A SKILL.md or skill dir that resolves outside the pack (the walk follows links
+            // the way Claude Code loads them, so chains the lexical check misses count too).
+            for name in &walked.escaping {
+                report.combos.push(grading::ComboHit {
+                    rule: "symlink_escape",
+                    path: PathBuf::from(name),
+                    line: None,
+                    parts: vec!["symlink"],
+                });
+            }
             let (findings, more) = state::stored_findings(&report);
             (
                 grading::grade(&report),
                 findings,
                 more,
                 state::flagged_rules(&report),
-                walked.names,
+                walked,
             )
         }
     };
@@ -943,14 +987,20 @@ fn evaluate(
         tree_hash: t.pin,
         head,
         first_seen: prev.as_ref().map(|p| p.first_seen).unwrap_or(env.now),
-        last_scanned_hash: hash,
+        last_scanned_hash: if skipped { String::new() } else { hash },
         grade,
         state: t.state,
         findings,
         more_findings,
         flagged_rules,
         reason: t.reason,
-        names,
+        names: walked.names,
+        names_incomplete: walked.unparseable,
+        escaping: walked.escaping,
+        // An approval holds for the content it pinned.
+        approved: prev
+            .as_ref()
+            .is_some_and(|p| p.approved && t.state == PackStatus::Clean),
         quarantined_to: prev.as_ref().and_then(|p| p.quarantined_to.clone()),
         note,
     };
@@ -1206,8 +1256,13 @@ fn sweep(
     let mut swept_keys: Vec<String> = Vec::new();
 
     let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
+    let scan_until = std::time::Instant::now() + SWEEP_SCAN_BUDGET;
     for pack in targets.packs {
-        let Some(ev) = evaluate(&mut st, &pack, &env, None, None) else {
+        let input = EvalInput {
+            soft_deadline: Some(scan_until),
+            ..EvalInput::default()
+        };
+        let Some(ev) = evaluate(&mut st, &pack, &env, input) else {
             continue;
         };
         swept_keys.push(ev.key.clone());
@@ -1810,6 +1865,7 @@ fn apply_trust(dir: &DataDir, payload: &serde_json::Value) -> Result<String, Eng
 /// Mark `e` approved at content `hash`.
 fn accept(e: &mut PackEntry, hash: &str) {
     e.tree_hash = hash.to_string();
+    e.approved = true;
     e.state = PackStatus::Clean;
     e.reason = None;
     e.note = None;
@@ -1910,6 +1966,7 @@ fn approve_entry(
 ) {
     let key = state::key_of(path);
     let now = now_secs();
+    let walked = state::skill_names_until(path, Some(std::time::Instant::now() + NAME_WALK_BUDGET));
     let entry = st.packs.entry(key.clone()).or_insert_with(|| {
         let report = grading::scan_pack(path);
         let (findings, more_findings) = state::stored_findings(&report);
@@ -1925,12 +1982,20 @@ fn approve_entry(
             more_findings,
             flagged_rules: state::flagged_rules(&report),
             reason: None,
-            names: state::skill_names(path),
+            names: Vec::new(),
+            names_incomplete: false,
+            escaping: Vec::new(),
+            approved: false,
             quarantined_to: None,
             note: None,
         }
     });
     accept(entry, hash);
+    // The approved content's names (partial when the walk ran out of budget: the user
+    // accepted the pack as it is).
+    entry.names = walked.names;
+    entry.names_incomplete = walked.unparseable;
+    entry.escaping = walked.escaping;
     if dir.trusted {
         let _ = trust::add(dir, hash, rules, &key, now);
     }
@@ -2974,7 +3039,7 @@ mod enforce_tests {
         blocked_with(tag, "---\nname: evil-tool\n---\n# evil")
     }
 
-    fn skill_budget(d: &DataDir, cwd: &Path, name: &str, budget: Duration) -> GateVerdict {
+    fn skill_limits(d: &DataDir, cwd: &Path, name: &str, limits: enforce::Limits) -> GateVerdict {
         enforce::skill_verdict_in(
             d,
             cwd,
@@ -2982,7 +3047,19 @@ mod enforce_tests {
             &policy(),
             name,
             grading::scan_pack,
-            budget,
+            limits,
+        )
+    }
+
+    fn skill_budget(d: &DataDir, cwd: &Path, name: &str, budget: Duration) -> GateVerdict {
+        skill_limits(
+            d,
+            cwd,
+            name,
+            enforce::Limits {
+                budget,
+                ..enforce::Limits::default()
+            },
         )
     }
 
@@ -3165,10 +3242,51 @@ mod enforce_tests {
             escaping: vec![],
             over_budget: true,
         };
-        let ev = evaluate(&mut st, &pack, &env, None, Some(names)).unwrap();
+        let input = EvalInput {
+            names: Some(names),
+            ..EvalInput::default()
+        };
+        let ev = evaluate(&mut st, &pack, &env, input).unwrap();
         let e = &st.packs[&ev.key];
         assert_eq!(e.state, PackStatus::Unreviewed);
         assert!(e
+            .flagged_rules
+            .contains(&"scan_budget_exceeded".to_string()));
+    }
+
+    #[test]
+    fn packs_past_the_sweep_budget_are_recorded_unscanned_and_rescanned_later() {
+        let project = tempdir("soft-budget");
+        let d = DataDir {
+            path: project.join("data"),
+            trusted: true,
+        };
+        let dir = project.join(".claude/skills/late");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "# late").unwrap();
+        let pack = Pack {
+            kind: PackKind::Skill,
+            name: "late".into(),
+            dir: dir.clone(),
+            canonical: dir.canonicalize().unwrap(),
+            display: ".claude/skills/late".into(),
+        };
+        let env = Env::new(&d, &project, &no_user_skills(), grading::scan_pack);
+        let mut st = State::default();
+        let input = EvalInput {
+            soft_deadline: Some(std::time::Instant::now()),
+            ..EvalInput::default()
+        };
+        let ev = evaluate(&mut st, &pack, &env, input).unwrap();
+        let e = &st.packs[&ev.key];
+        assert_eq!(e.state, PackStatus::Unreviewed);
+        assert!(e
+            .flagged_rules
+            .contains(&"scan_budget_exceeded".to_string()));
+        assert_eq!(e.last_scanned_hash, "", "not cached as scanned");
+        // The next evaluation within budget scans it properly.
+        let ev = evaluate(&mut st, &pack, &env, EvalInput::default()).unwrap();
+        assert!(!st.packs[&ev.key]
             .flagged_rules
             .contains(&"scan_budget_exceeded".to_string()));
     }
@@ -3402,6 +3520,259 @@ mod enforce_tests {
         ] {
             assert_eq!(bash(cmd), GateVerdict::NoOpinion, "{cmd}");
         }
+    }
+
+    // ---- Review fixtures (rr5 p1–p9, pa, pb), recreated ----
+
+    /// An empty project with its data dir.
+    fn fresh(tag: &str) -> (DataDir, PathBuf) {
+        let project = tempdir(tag);
+        let d = DataDir {
+            path: project.join("../").join(format!("{tag}-data")),
+            trusted: false,
+        };
+        let _ = fs::remove_dir_all(&d.path);
+        fs::create_dir_all(project.join(".claude/skills")).unwrap();
+        (d, project)
+    }
+
+    fn skills_of(project: &Path) -> PathBuf {
+        project.join(".claude/skills")
+    }
+
+    fn md(dir: &Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\n---\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn link(target: impl AsRef<Path>, at: impl AsRef<Path>) {
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    /// Run `f` and assert it took less than `secs`.
+    fn within<T>(secs: u64, what: &str, f: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let out = f();
+        assert!(
+            started.elapsed() < Duration::from_secs(secs),
+            "{what} took {:?}",
+            started.elapsed()
+        );
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rr5_p1_p2_symlink_fan_outs_stay_bounded_and_named() {
+        for (tag, levels, fan) in [("p1", 7, 8), ("p2", 14, 10)] {
+            let (d, project) = fresh(tag);
+            let pack = skills_of(&project).join("pack");
+            for l in 1..=levels {
+                fs::create_dir_all(pack.join(format!("d{l}"))).unwrap();
+            }
+            for i in 1..=fan {
+                link("d1", pack.join(format!("l{i}")));
+                for l in 1..levels {
+                    link(format!("../d{}", l + 1), pack.join(format!("d{l}/l{i}")));
+                }
+            }
+            md(&pack.join(format!("d{levels}")), "deep");
+            within(5, tag, || {
+                for name in ["deep", &format!("d{levels}"), "l1", "pack"] {
+                    assert_eq!(
+                        skill(&d, &project, name),
+                        GateVerdict::NoOpinion,
+                        "{tag} {name}"
+                    );
+                }
+                assert_eq!(skill(&d, &project, "absent"), GateVerdict::NoOpinion);
+                assert!(sweep_it(&d, &project).blocked.is_empty());
+            });
+            assert!(
+                !state::load(&d).state.packs.is_empty(),
+                "{tag}: state stored"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rr5_p3_p8_p9_outside_links_deny_before_any_sweep() {
+        let outside = tempdir("rr5-out");
+        md(&outside.join("o3"), "faraway");
+        md(&outside.join("o8"), "hidden");
+        md(&outside.join("o9/real"), "hidden9");
+
+        // p3: a skill dir's SKILL.md links outside.
+        let (d, project) = fresh("p3");
+        let pack = skills_of(&project).join("pack");
+        fs::create_dir_all(pack.join("tool")).unwrap();
+        link(outside.join("o3/SKILL.md"), pack.join("tool/SKILL.md"));
+        for name in ["tool", "pack", "faraway", "absent"] {
+            assert!(is_deny(&skill(&d, &project, name)), "p3 {name}");
+        }
+        // p8: the pack's own SKILL.md links outside.
+        let (d, project) = fresh("p8");
+        let pack = skills_of(&project).join("pack");
+        fs::create_dir_all(&pack).unwrap();
+        link(outside.join("o8/SKILL.md"), pack.join("SKILL.md"));
+        for name in ["hidden", "pack"] {
+            assert!(is_deny(&skill(&d, &project, name)), "p8 {name}");
+        }
+        // p9: a skill dir links outside.
+        let (d, project) = fresh("p9");
+        let pack = skills_of(&project).join("pack");
+        md(&pack, "pack2");
+        link(outside.join("o9/real"), pack.join("sub"));
+        for name in ["hidden9", "sub", "pack2", "pack"] {
+            assert!(is_deny(&skill(&d, &project, name)), "p9 {name}");
+        }
+        // After a sweep it is blocked outright.
+        let r = sweep_it(&d, &project);
+        assert_eq!(r.blocked, vec![".claude/skills/pack".to_string()]);
+    }
+
+    #[test]
+    fn rr5_p4_an_over_budget_pack_denies_only_names_nothing_else_resolves() {
+        let (d, project) = fresh("p4");
+        let many = skills_of(&project).join("many");
+        for i in 0..300 {
+            md(&many.join(format!("s{i}")), &format!("n{i}"));
+        }
+        md(&skills_of(&project).join("benign"), "benign");
+        let small = enforce::Limits {
+            name_cap: 50,
+            ..enforce::Limits::default()
+        };
+        let gate = |name: &str| skill_limits(&d, &project, name, small);
+        assert_eq!(gate("benign"), GateVerdict::NoOpinion);
+        for name in ["many", "n299", "s3", "absent"] {
+            assert!(is_deny(&gate(name)), "p4 {name}");
+        }
+        // With the default cap (300 dirs is little) nothing is denied.
+        assert_eq!(skill(&d, &project, "n299"), GateVerdict::NoOpinion);
+    }
+
+    #[test]
+    fn rr5_p5_a_deep_chain_has_no_depth_blind_spot() {
+        let (d, project) = fresh("p5");
+        let root = skills_of(&project).join("deepchain");
+        let mut dir = root.clone();
+        for i in 0..200 {
+            dir = dir.join("a");
+            md(&dir, &format!("c{i}"));
+        }
+        within(5, "p5", || {
+            assert!(state::skill_names(&root).contains(&"c150".to_string()));
+            assert_eq!(skill(&d, &project, "c150"), GateVerdict::NoOpinion);
+        });
+        // An edit 150 levels down is drift.
+        sweep_it(&d, &project);
+        let mut deep = root.clone();
+        for _ in 0..=150 {
+            deep = deep.join("a");
+        }
+        fs::write(deep.join("extra.sh"), "id").unwrap();
+        assert!(is_deny(&skill(&d, &project, "c150")));
+    }
+
+    #[test]
+    fn rr5_p6_a_large_flat_pack_costs_no_budget_and_approval_clears_an_overrun() {
+        let (d, project) = fresh("p6");
+        let large = skills_of(&project).join("large");
+        md(&large, "large");
+        for dd in 0..10 {
+            let sub = large.join(format!("d{dd}"));
+            fs::create_dir_all(&sub).unwrap();
+            for f in 0..200 {
+                fs::write(sub.join(format!("f{f}.txt")), "x").unwrap();
+            }
+        }
+        md(&skills_of(&project).join("benign"), "benign");
+        // Plain files cost no units: the default cap walks it completely.
+        within(5, "p6", || {
+            assert_eq!(skill(&d, &project, "benign"), GateVerdict::NoOpinion);
+            assert_eq!(skill(&d, &project, "large"), GateVerdict::NoOpinion);
+        });
+        // A pack that does overrun is denied for its own names until approved; others pass.
+        let d = DataDir {
+            path: project.join("../p6-data-tiny"),
+            trusted: false,
+        };
+        let _ = fs::remove_dir_all(&d.path);
+        let tiny = enforce::Limits {
+            name_cap: 3,
+            ..enforce::Limits::default()
+        };
+        assert_eq!(
+            skill_limits(&d, &project, "benign", tiny),
+            GateVerdict::NoOpinion
+        );
+        assert!(is_deny(&skill_limits(&d, &project, "large", tiny)));
+        let req = request_approve_in(&d, &project, &no_user_skills(), "large", &policy()).unwrap();
+        let c = confirm::confirm_from_prompt(
+            &d,
+            &format!("safe-ai-skill confirm {}", req.nonce),
+            now_secs(),
+        )
+        .unwrap();
+        apply_confirmed(&d, &c).unwrap();
+        // Approved content: stored names, no re-walk; the re-hash still guards edits.
+        assert_eq!(
+            skill_limits(&d, &project, "large", tiny),
+            GateVerdict::NoOpinion
+        );
+        fs::write(large.join("d0/f0.txt"), "changed").unwrap();
+        assert!(is_deny(&skill_limits(&d, &project, "large", tiny)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rr5_p7_many_links_to_one_big_dir_are_listed_once() {
+        let (d, project) = fresh("p7");
+        let amp = skills_of(&project).join("amp");
+        md(&amp, "amp");
+        fs::create_dir_all(amp.join("T")).unwrap();
+        for f in 0..2000 {
+            fs::write(amp.join(format!("T/f{f}")), "x").unwrap();
+        }
+        for l in 0..1500 {
+            link("T", amp.join(format!("L{l}")));
+        }
+        // Listing T once per link (no cache) takes seconds here; once in total is quick.
+        within(2, "p7", || {
+            assert_eq!(skill(&d, &project, "amp"), GateVerdict::NoOpinion);
+            assert_eq!(skill(&d, &project, "absent"), GateVerdict::NoOpinion);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rr5_pb_an_in_pack_link_chain_that_lands_outside_blocks() {
+        let (d, project) = fresh("pb");
+        let chain = skills_of(&project).join("chain");
+        md(&chain, "chain");
+        let a6 = chain.join("a1/a2/a3/a4/a5/a6");
+        fs::create_dir_all(&a6).unwrap();
+        // `d` lands on the pack root; `s` goes through it and six levels further up.
+        link("../../../../../..", a6.join("d"));
+        link("d/../../../../../..", a6.join("s"));
+        assert_eq!(
+            a6.join("d").canonicalize().unwrap(),
+            chain.canonicalize().unwrap()
+        );
+        assert!(is_deny(&skill(&d, &project, "chain")), "before any sweep");
+        let r = sweep_it(&d, &project);
+        assert_eq!(r.blocked, vec![".claude/skills/chain".to_string()]);
+        assert!(
+            r.system_message.contains("symlink_escape"),
+            "{}",
+            r.system_message
+        );
+        // The adapter alone (no walk) also sees it.
+        let report = grading::scan_pack(&chain.canonicalize().unwrap());
+        assert!(report.combos.iter().any(|c| c.rule == "symlink_escape"));
     }
 
     #[test]

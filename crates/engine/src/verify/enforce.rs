@@ -121,7 +121,7 @@ pub fn skill_verdict(dir: &DataDir, cwd: &Path, policy: &Policy, skill: &str) ->
         policy,
         skill,
         grading::scan_pack,
-        SKILL_BUDGET,
+        Limits::default(),
     )
 }
 
@@ -133,34 +133,69 @@ pub(super) fn skill_verdict_in(
     policy: &Policy,
     skill: &str,
     scanner: Scanner,
-    budget: Duration,
+    limits: Limits,
 ) -> Verdict {
     let wanted = skill_candidates(skill);
     if wanted.is_empty() {
         return Verdict::NoOpinion;
     }
     let is_wanted = |n: &str| wanted.iter().any(|w| w.eq_ignore_ascii_case(n));
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now() + limits.budget;
     let mut st = state::load(dir).state;
     let mut seen: Vec<String> = Vec::new();
     let mut blocked: Option<(String, &'static str)> = None;
-    // Blocked packs whose names may be incomplete (unparseable frontmatter).
-    let mut unsure_blocked: Option<String> = None;
+    // A pack whose names may be incomplete (escaping link, unparseable frontmatter).
+    let mut unsure: Option<String> = None;
+    // Packs whose name walk ran out of budget: one that may provide the name, and any.
+    let mut over_matching: Option<String> = None;
+    let mut over_any: Option<String> = None;
     for project in project_dirs(cwd) {
         let env = Env::new(dir, &project, user_skills, scanner);
         for pack in swept_packs(&project, user_skills, policy, &env.v1) {
-            if Instant::now() >= deadline {
-                return over_budget(skill);
-            }
             let key = state::key_of(&pack.canonical);
             if seen.contains(&key) {
                 continue;
             }
-            // Current names (a mid-session rename counts) united with the recorded ones.
-            let current = state::skill_names_until(&pack.canonical, Some(deadline));
-            if current.over_budget {
-                return over_budget(skill);
+            let stored = st.packs.get(&key);
+            // Out of time: an unverified pack may provide the name by its dir name or the
+            // names it was last recorded with.
+            if Instant::now() >= deadline {
+                let may = is_wanted(&pack.name)
+                    || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
+                let slot = if may {
+                    &mut over_matching
+                } else {
+                    &mut over_any
+                };
+                slot.get_or_insert_with(|| pack.display.clone());
+                continue;
             }
+            // Clean content with complete names, or content the user approved as it is, is
+            // not re-walked (only re-hashed, below, for TOCTOU).
+            let reusable = stored
+                .filter(|e| e.state == PackStatus::Clean && (e.approved || !e.names_incomplete));
+            let mut hash: Option<String> = None;
+            let approved = match reusable {
+                Some(e) => match state::tree_hash_until(&pack.canonical, Some(deadline)) {
+                    Some(h) if h == e.tree_hash => {
+                        hash = Some(h);
+                        Some(state::SkillNames {
+                            names: e.names.clone(),
+                            ..state::SkillNames::default()
+                        })
+                    }
+                    Some(h) => {
+                        hash = Some(h);
+                        None
+                    }
+                    None => None,
+                },
+                None => None,
+            };
+            // Current names (a mid-session rename counts) united with the recorded ones.
+            let current = approved.unwrap_or_else(|| {
+                state::skill_names_bounded(&pack.canonical, Some(deadline), limits.name_cap)
+            });
             // A skill dir (or its SKILL.md) linking outside the pack is never verified.
             if let Some(name) = current.escaping.iter().find(|n| is_wanted(n)) {
                 return Verdict::Deny(format!(
@@ -169,23 +204,45 @@ pub(super) fn skill_verdict_in(
                     pack.display
                 ));
             }
-            let stored = st.packs.get(&key);
             let provides = is_wanted(&pack.name)
                 || current.names.iter().any(|n| is_wanted(n))
                 || stored.is_some_and(|e| e.names.iter().any(|n| is_wanted(n)));
+            if current.over_budget {
+                let slot = if provides {
+                    &mut over_matching
+                } else {
+                    &mut over_any
+                };
+                slot.get_or_insert_with(|| pack.display.clone());
+                continue;
+            }
             if !provides {
-                if current.unparseable
-                    && stored.is_some_and(|e| e.state == PackStatus::Blocked)
-                    && unsure_blocked.is_none()
-                {
-                    unsure_blocked = Some(pack.display.clone());
+                if current.unparseable || !current.escaping.is_empty() {
+                    unsure.get_or_insert_with(|| pack.display.clone());
                 }
                 continue;
             }
+            // Only a pack that may provide the name is hashed in full (TOCTOU).
+            let hash = match hash {
+                Some(h) => h,
+                None => match state::tree_hash_until(&pack.canonical, Some(deadline)) {
+                    Some(h) => h,
+                    None => {
+                        over_matching.get_or_insert_with(|| pack.display.clone());
+                        continue;
+                    }
+                },
+            };
             seen.push(key.clone());
-            let Some(ev) = super::evaluate(&mut st, &pack, &env, Some(deadline), Some(current))
-            else {
-                return over_budget(skill);
+            let input = super::EvalInput {
+                deadline: Some(deadline),
+                names: Some(current),
+                hash: Some(hash),
+                soft_deadline: None,
+            };
+            let Some(ev) = super::evaluate(&mut st, &pack, &env, input) else {
+                over_matching.get_or_insert_with(|| pack.display.clone());
+                continue;
             };
             if let Some(e) = st.packs.get(&ev.key) {
                 if e.state == PackStatus::Blocked && blocked.is_none() {
@@ -197,22 +254,52 @@ pub(super) fn skill_verdict_in(
     if !seen.is_empty() {
         let _ = state::store(dir, &st);
     }
-    match (blocked, unsure_blocked) {
-        (Some((shown, why)), _) => denial(&format!("skill `{skill}` comes from"), &shown, why),
-        (None, Some(shown)) if seen.is_empty() => denial(
-            &format!("skill `{skill}` matches no verified pack, and it may come from"),
-            &shown,
-            "its SKILL.md frontmatter does not parse, so its skill names are unknown",
-        ),
-        _ => Verdict::NoOpinion,
+    if let Some((shown, why)) = blocked {
+        return denial(&format!("skill `{skill}` comes from"), &shown, why);
+    }
+    if let Some(shown) = over_matching {
+        return over_budget_pack(skill, &shown);
+    }
+    if seen.is_empty() {
+        if let Some(shown) = unsure {
+            return denial(
+                &format!("skill `{skill}` matches no verified pack, and it may come from"),
+                &shown,
+                "a SKILL.md links outside the pack or its frontmatter does not parse, so its \
+                 skill names are unknown",
+            );
+        }
+        if let Some(shown) = over_any {
+            return over_budget_pack(skill, &shown);
+        }
+    }
+    Verdict::NoOpinion
+}
+
+/// What the Skill and slash gates may spend.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Limits {
+    /// Time for re-hashing and walking every pack in scope.
+    pub budget: Duration,
+    /// Name-walk work units per pack.
+    pub name_cap: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            budget: SKILL_BUDGET,
+            name_cap: state::MAX_NAME_WALK_ENTRIES,
+        }
     }
 }
 
-/// The denial when verifying a skill's packs overran [`SKILL_BUDGET`].
-fn over_budget(skill: &str) -> Verdict {
+/// The denial for a skill an over-budget pack may provide.
+fn over_budget_pack(skill: &str, shown: &str) -> Verdict {
     Verdict::Deny(format!(
-        "safe-ai-skill: the packs providing skill `{skill}` could not be verified within {} s; \
-         the call is denied. Run `safe-ai-skill verify session` to inspect them.",
+        "safe-ai-skill: skill `{skill}` may come from the skill pack {shown}, which could not be \
+         verified within {} s (too large or too slow to list its skills); review it and run \
+         `safe-ai-skill verify approve {shown}`.",
         SKILL_BUDGET.as_secs()
     ))
 }

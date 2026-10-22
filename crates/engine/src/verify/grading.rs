@@ -143,11 +143,15 @@ pub fn scan_pack(root: &Path) -> PackReport {
     }
 }
 
-/// A `symlink_escape` combo for every symlink in the pack whose target, resolved lexically
-/// against the link's dir, leaves the pack (as WS-D2's `symlink_escape` rule does). Links are
-/// never followed.
+/// A `symlink_escape` combo for every symlink in the pack whose target leaves the pack: the
+/// link is resolved through the filesystem (so an in-pack chain such as `d -> ../..`,
+/// `s -> d/../..` is judged by where it really lands); a dangling link is judged lexically
+/// against its real parent dir. Links are never walked through.
 fn symlink_escapes(root: &Path) -> Vec<ComboHit> {
     let mut hits = Vec::new();
+    let Ok(real_root) = root.canonicalize() else {
+        return hits;
+    };
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .min_depth(1)
@@ -157,12 +161,21 @@ fn symlink_escapes(root: &Path) -> Vec<ComboHit> {
         if !entry.path_is_symlink() {
             continue;
         }
-        let Ok(target) = std::fs::read_link(entry.path()) else {
-            continue;
+        let landed = match entry.path().canonicalize() {
+            Ok(real) => real,
+            Err(_) => {
+                let Ok(target) = std::fs::read_link(entry.path()) else {
+                    continue;
+                };
+                let parent = entry
+                    .path()
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .unwrap_or_else(|| real_root.clone());
+                lexical(&parent.join(target))
+            }
         };
-        let base = entry.path().parent().unwrap_or(root);
-        let resolved = lexical(&base.join(&target));
-        if !resolved.starts_with(lexical(root)) {
+        if !landed.starts_with(&real_root) {
             hits.push(ComboHit {
                 rule: "symlink_escape",
                 path: entry

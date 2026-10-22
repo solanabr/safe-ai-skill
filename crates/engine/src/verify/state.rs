@@ -175,6 +175,16 @@ pub struct PackEntry {
     /// Skill names the pack provides (its directory name and each `SKILL.md` name).
     #[serde(default)]
     pub names: Vec<String>,
+    /// [`Self::names`] may be incomplete (unparseable frontmatter, an escaping link, or a
+    /// name walk that ran out of budget).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub names_incomplete: bool,
+    /// Skill dirs whose `SKILL.md`, or which themselves, link outside the pack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub escaping: Vec<String>,
+    /// The user approved or trusted the pinned content (prompt-nonce confirmed).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
     /// Where `supply_chain.on_block: move` put the pack (its key stays the origin path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined_to: Option<String>,
@@ -545,10 +555,8 @@ pub fn skill_names(root: &Path) -> Vec<String> {
     skill_names_until(root, None).names
 }
 
-/// Entries the name walk visits per pack before giving up.
+/// Work units (dirs read and SKILL.md files) the name walk spends per pack before giving up.
 pub const MAX_NAME_WALK_ENTRIES: usize = 20_000;
-/// Directory depth the name walk descends to.
-const MAX_NAME_WALK_DEPTH: usize = 8;
 
 /// What [`skill_names_until`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -561,7 +569,7 @@ pub struct SkillNames {
     /// Names of the skill dirs whose `SKILL.md`, or which themselves, link outside the pack:
     /// their content is never verified, so invoking them is denied.
     pub escaping: Vec<String>,
-    /// The walk hit [`MAX_NAME_WALK_ENTRIES`] or the deadline before finishing.
+    /// The walk spent [`MAX_NAME_WALK_ENTRIES`] work units or hit the deadline before finishing.
     pub over_budget: bool,
 }
 
@@ -572,9 +580,9 @@ pub struct SkillNames {
 /// Symlinks are never walked through blindly: a `SKILL.md` link or a dir link is resolved once
 /// (the kernel bounds the chain) and followed only when it stays inside the pack; each real dir
 /// is visited once however many links lead to it. A link leaving the pack (or dangling) marks
-/// the result [`SkillNames::unparseable`] and lists the name in [`SkillNames::escaping`]. The
-/// walk stops at [`MAX_NAME_WALK_ENTRIES`] entries or at `deadline`, setting
-/// [`SkillNames::over_budget`].
+/// the result [`SkillNames::unparseable`] and lists the name in [`SkillNames::escaping`]. There
+/// is no depth limit: the walk stops after [`MAX_NAME_WALK_ENTRIES`] work units (dirs read and
+/// `SKILL.md` files) or at `deadline`, setting [`SkillNames::over_budget`].
 pub fn skill_names_until(root: &Path, deadline: Option<std::time::Instant>) -> SkillNames {
     skill_names_bounded(root, deadline, MAX_NAME_WALK_ENTRIES)
 }
@@ -601,14 +609,29 @@ pub(crate) fn skill_names_bounded(
     visited.insert(canonical_root.clone());
     // (canonical dir, the name it was reached by, depth)
     let mut stack: Vec<(PathBuf, String, usize)> = vec![(canonical_root.clone(), root_name, 0)];
-    let mut seen = 0usize;
+    // Work units: dirs read (including a link target checked for a SKILL.md) and SKILL.md
+    // files. Plain files cost no unit, so a large but flat pack stays within budget; the
+    // deadline still bounds the time spent listing them.
+    let mut units = 0usize;
+    let mut skill_md_in: std::collections::HashMap<PathBuf, bool> =
+        std::collections::HashMap::new();
+    let charge = |out: &mut SkillNames, units: &mut usize| -> bool {
+        *units += 1;
+        if *units > max_entries {
+            out.over_budget = true;
+            out.unparseable = true;
+        }
+        out.over_budget
+    };
     while let Some((dir, reached_as, depth)) = stack.pop() {
+        if charge(&mut out, &mut units) {
+            return finish(out);
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            seen += 1;
-            if seen > max_entries || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 out.over_budget = true;
                 out.unparseable = true;
                 return finish(out);
@@ -623,6 +646,9 @@ pub(crate) fn skill_names_bounded(
             let Ok(ft) = entry.file_type() else { continue };
             let path = dir.join(&name);
             if name.eq_ignore_ascii_case("SKILL.md") {
+                if charge(&mut out, &mut units) {
+                    return finish(out);
+                }
                 // The dir it sits in is a skill name whatever the file resolves to.
                 out.names.push(reached_as.clone());
                 let target = if ft.is_symlink() {
@@ -645,9 +671,6 @@ pub(crate) fn skill_names_bounded(
                 }
                 continue;
             }
-            if depth + 1 > MAX_NAME_WALK_DEPTH {
-                continue;
-            }
             if ft.is_dir() {
                 if visited.insert(path.clone()) {
                     stack.push((path, name, depth + 1));
@@ -655,8 +678,20 @@ pub(crate) fn skill_names_bounded(
             } else if ft.is_symlink() {
                 match path.canonicalize() {
                     Ok(t) if t.is_dir() && t.starts_with(&canonical_root) => {
-                        // A linked skill dir is invoked by the link's name.
-                        if has_skill_md(&t) {
+                        // A linked skill dir is invoked by the link's name. Each target is
+                        // listed once, however many links lead to it.
+                        let has = match skill_md_in.get(&t) {
+                            Some(h) => *h,
+                            None => {
+                                if charge(&mut out, &mut units) {
+                                    return finish(out);
+                                }
+                                let h = has_skill_md(&t);
+                                skill_md_in.insert(t.clone(), h);
+                                h
+                            }
+                        };
+                        if has {
                             out.names.push(name.clone());
                         }
                         if visited.insert(t.clone()) {
@@ -994,8 +1029,16 @@ mod tests {
         let d = tmp("cap").join("pack");
         fs::create_dir_all(&d).unwrap();
         for i in 0..50 {
+            fs::create_dir_all(d.join(format!("d{i}"))).unwrap();
             fs::write(d.join(format!("f{i}")), "x").unwrap();
         }
+        // Plain files cost nothing: 50 files fit a cap of 10 units, 50 dirs do not.
+        let files_only = tmp("cap-files").join("pack");
+        fs::create_dir_all(&files_only).unwrap();
+        for i in 0..50 {
+            fs::write(files_only.join(format!("f{i}")), "x").unwrap();
+        }
+        assert!(!skill_names_bounded(&files_only, None, 10).over_budget);
         let capped = skill_names_bounded(&d, None, 10);
         assert!(capped.over_budget && capped.unparseable, "{capped:?}");
         let late = skill_names_until(&d, Some(std::time::Instant::now()));
@@ -1039,6 +1082,25 @@ mod tests {
         assert!(parsed && n.contains(&"bar".to_string()), "{n:?}");
         let (n, _) = names("---\nname: \"\u{feff}bar\"\n---\n");
         assert!(n.iter().all(|x| x == "bar"), "{n:?}");
+    }
+
+    #[test]
+    fn rr5_pa_tag_and_bom_spellings_of_name_are_read() {
+        let d = tmp("pa");
+        for (body, want) in [
+            ("---\nname: !custom bar\n---\n", "bar"),
+            ("---\nname: !!str bar2\n---\n", "bar2"),
+            ("---\nname: !custom \"bar3\"\n---\n", "bar3"),
+            ("---\n\u{feff}name: bar4\n---\n", "bar4"),
+            ("---\nname: \u{feff}bar5\n---\n", "bar5"),
+            ("---\nname: \"\u{feff}bar6\"\n---\n", "bar6"),
+            ("---\nname: ! bar7\n---\n", "bar7"),
+            ("---\nname: !t\tbar8\n---\n", "bar8"),
+        ] {
+            fs::write(d.join("SKILL.md"), body).unwrap();
+            let (names, _) = frontmatter_names(&d.join("SKILL.md"));
+            assert!(names.contains(&want.to_string()), "{body:?}: {names:?}");
+        }
     }
 
     #[test]
@@ -1206,6 +1268,9 @@ mod tests {
                     flagged_rules: vec![],
                     reason: None,
                     names: vec!["foo".into()],
+                    names_incomplete: false,
+                    escaping: vec![],
+                    approved: false,
                     quarantined_to: None,
                     note: None,
                 },
