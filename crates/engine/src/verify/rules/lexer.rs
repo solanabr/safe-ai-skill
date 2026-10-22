@@ -1,66 +1,61 @@
 //! Statement lexer: which bytes of a line or statement are code, and which are string literals,
 //! regex literals or comments.
 //!
-//! Interpolations are code: JS template `${…}`, Python f-string `{…}` and shell `"$(…)"`.
-//! Block comments, Python triple-quoted strings and JS template text carry from one line to the
-//! next. Comment syntax per language: `//` and `/* */` for JS and Rust, `#` anywhere for Python,
-//! `#` at a word start for shell and other text.
+//! Interpolations are code: JS template `${…}`, Python f-string `{…}` and shell `"$(…)"`. The
+//! whole state carries from one line to the next ([`Carry`]): block comments, Python
+//! triple-quoted strings (f-string flag included), JS template text, strings continued by a
+//! trailing backslash, and the stack of open interpolations with their bracket depth. Comment
+//! syntax per language: `//` and `/* */` for JS and Rust, `#` anywhere for Python, `#` at a word
+//! start for shell and other text.
 
 use super::context::Lang;
 
-/// State carried from one line to the next within a unit.
+/// What the lexer is inside of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Carry {
-    /// Plain code.
+enum Kind {
     #[default]
-    Code,
-    /// Inside `/* … */`.
-    BlockComment,
-    /// Inside a Python triple-quoted string (its quote byte).
-    Triple(u8),
-    /// Inside JS template literal text.
-    Template,
-}
-
-/// One lexed line or statement.
-pub(crate) struct Lexed {
-    /// State after the last byte.
-    pub(crate) carry: Carry,
-    /// Net bracket depth change in code.
-    pub(crate) delta: i32,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Mode {
     Code,
     Str {
         quote: u8,
-        start: usize,
         triple: bool,
         fstring: bool,
         raw: bool,
         shell_dq: bool,
     },
-    Template {
-        start: usize,
-    },
-    Line {
-        start: usize,
-    },
-    Block {
-        start: usize,
-    },
+    Template,
+    Line,
+    Block,
     Regex {
-        start: usize,
         class: bool,
     },
 }
 
-/// An open interpolation: the string mode to resume once `close` brings the depth back.
+/// An open interpolation: the string to resume once `close` brings the depth back to `depth`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Frame {
-    resume: Mode,
+    resume: Kind,
     depth: i32,
     close: u8,
+}
+
+/// Interpolations tracked at once; deeper nesting is lexed as code (the safe side).
+const MAX_FRAMES: usize = 64;
+
+/// Lexer state carried from one line to the next within a unit: what the line ended inside
+/// (a block comment, a multi-line string, template text), the open interpolations and the
+/// bracket depth they are measured against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Carry {
+    kind: Kind,
+    frames: Vec<Frame>,
+    depth: i32,
+}
+
+impl Carry {
+    /// Plain code: nothing open from earlier lines.
+    pub(crate) fn is_plain(&self) -> bool {
+        self.kind == Kind::Code && self.frames.is_empty()
+    }
 }
 
 /// Bytes that can change the lexer state in code, per language (everything else is skipped).
@@ -126,29 +121,6 @@ fn push(regions: &mut Vec<(usize, usize)>, base: usize, from: usize, to: usize) 
     }
 }
 
-/// The same string mode, restarted at `start` (after an interpolation closes).
-fn restart(mode: Mode, start: usize) -> Mode {
-    match mode {
-        Mode::Str {
-            quote,
-            triple,
-            fstring,
-            raw,
-            shell_dq,
-            ..
-        } => Mode::Str {
-            quote,
-            start,
-            triple,
-            fstring,
-            raw,
-            shell_dq,
-        },
-        Mode::Template { .. } => Mode::Template { start },
-        other => other,
-    }
-}
-
 /// `(f-string, raw)` from the Python prefix letters right before the quote at `q`.
 fn python_prefix(b: &[u8], q: usize) -> (bool, bool) {
     let mut k = q;
@@ -189,38 +161,44 @@ fn rust_char_end(b: &[u8], q: usize) -> Option<usize> {
     (b.get(j) == Some(&b'\'')).then_some(j)
 }
 
-/// Lex `s` (one line, or lines joined with `\n`) starting in `carry`, appending the byte ranges
-/// of literals and comments, offset by `base`, to `regions` in order.
+/// Enter an interpolation from string kind `resume`: code until `close` brings the depth back.
+fn open_frame(frames: &mut Vec<Frame>, depth: &mut i32, resume: Kind, close: u8) {
+    if frames.len() < MAX_FRAMES {
+        frames.push(Frame {
+            resume,
+            depth: *depth,
+            close,
+        });
+    }
+    *depth += 1;
+}
+
+/// Lex `s` (one line, or lines joined with `\n`) starting from `carry`, which is updated to the
+/// state after the last byte. Appends the byte ranges of literals and comments, offset by `base`,
+/// to `regions` in order, and returns the net bracket depth change in code.
 pub(crate) fn lex(
     s: &str,
     lang: Lang,
-    carry: Carry,
+    carry: &mut Carry,
     base: usize,
     regions: &mut Vec<(usize, usize)>,
-) -> Lexed {
+) -> i32 {
     let b = s.as_bytes();
     let n = b.len();
     let slash_comments = matches!(lang, Lang::Js | Lang::Rust);
-    let mut mode = match carry {
-        Carry::Code => Mode::Code,
-        Carry::BlockComment => Mode::Block { start: 0 },
-        Carry::Triple(quote) => Mode::Str {
-            quote,
-            start: 0,
-            triple: true,
-            fstring: false,
-            raw: false,
-            shell_dq: false,
-        },
-        Carry::Template => Mode::Template { start: 0 },
-    };
-    let mut frames: Vec<Frame> = Vec::new();
-    let mut depth = 0i32;
     let special = match lang {
         Lang::Js | Lang::Rust => &SPECIAL_SLASH,
         Lang::Python => &SPECIAL_PYTHON,
         Lang::Shell | Lang::Other => &SPECIAL_HASH,
     };
+    let start_depth = carry.depth;
+    let mut depth = carry.depth;
+    let frames = &mut carry.frames;
+    let mut kind = carry.kind;
+    // Where the current literal or comment began in `s`.
+    let mut start = 0;
+    // A string whose last byte is an escaping backslash continues on the next line.
+    let mut continued = false;
     // Cleared after an unterminated regex: that `/` was a division, and re-lexing from every
     // later `/` could go quadratic on one long line.
     let mut regex_ok = lang == Lang::Js;
@@ -228,8 +206,8 @@ pub(crate) fn lex(
     loop {
         while i < n {
             let c = b[i];
-            match mode {
-                Mode::Code => {
+            match kind {
+                Kind::Code => {
                     if !special[usize::from(c)] {
                         i += 1;
                         while i < n && !special[usize::from(b[i])] {
@@ -240,7 +218,8 @@ pub(crate) fn lex(
                     if let Some(top) = frames.last() {
                         if c == top.close && depth == top.depth + 1 {
                             depth = top.depth;
-                            mode = restart(top.resume, i + 1);
+                            kind = top.resume;
+                            start = i + 1;
                             frames.pop();
                             i += 1;
                             continue;
@@ -270,60 +249,66 @@ pub(crate) fn lex(
                             } else {
                                 (false, false)
                             };
-                            mode = Mode::Str {
+                            kind = Kind::Str {
                                 quote: c,
-                                start: i,
                                 triple,
                                 fstring,
                                 raw: raw || (lang == Lang::Shell && c == b'\''),
                                 shell_dq: lang == Lang::Shell && c == b'"',
                             };
+                            start = i;
                             if triple {
                                 i += 3;
                                 continue;
                             }
                         }
                         b'`' => match lang {
-                            Lang::Js => mode = Mode::Template { start: i },
+                            Lang::Js => {
+                                kind = Kind::Template;
+                                start = i;
+                            }
                             // Shell backticks are command substitution: code.
                             Lang::Shell => {}
                             _ => {
-                                mode = Mode::Str {
+                                kind = Kind::Str {
                                     quote: c,
-                                    start: i,
                                     triple: false,
                                     fstring: false,
                                     raw: false,
                                     shell_dq: false,
-                                }
+                                };
+                                start = i;
                             }
                         },
                         b'/' if slash_comments && b.get(i + 1) == Some(&b'/') => {
-                            mode = Mode::Line { start: i }
+                            kind = Kind::Line;
+                            start = i;
                         }
                         b'/' if slash_comments && b.get(i + 1) == Some(&b'*') => {
-                            mode = Mode::Block { start: i };
+                            kind = Kind::Block;
+                            start = i;
                             i += 2;
                             continue;
                         }
                         b'/' if regex_ok && regex_starts(b, s, i) => {
-                            mode = Mode::Regex {
-                                start: i,
-                                class: false,
-                            }
+                            kind = Kind::Regex { class: false };
+                            start = i;
                         }
-                        b'#' if lang == Lang::Python => mode = Mode::Line { start: i },
+                        b'#' if lang == Lang::Python => {
+                            kind = Kind::Line;
+                            start = i;
+                        }
                         b'#' if matches!(lang, Lang::Shell | Lang::Other)
                             && (i == 0 || b[i - 1].is_ascii_whitespace()) =>
                         {
-                            mode = Mode::Line { start: i }
+                            kind = Kind::Line;
+                            start = i;
                         }
                         _ => {}
                     }
                 }
-                Mode::Str {
+                Kind::Str {
                     quote,
-                    start,
                     triple,
                     fstring,
                     raw,
@@ -344,6 +329,7 @@ pub(crate) fn lex(
                         continue;
                     }
                     if c == b'\\' {
+                        continued = i + 1 == n;
                         i += 2;
                         continue;
                     }
@@ -353,46 +339,36 @@ pub(crate) fn lex(
                             continue;
                         }
                         push(regions, base, start, i);
-                        frames.push(Frame {
-                            resume: mode,
-                            depth,
-                            close: b'}',
-                        });
-                        depth += 1;
-                        mode = Mode::Code;
+                        open_frame(frames, &mut depth, kind, b'}');
+                        kind = Kind::Code;
                         i += 1;
                         continue;
                     }
                     if shell_dq && c == b'$' {
                         if b.get(i + 1) == Some(&b'(') {
                             push(regions, base, start, i);
-                            frames.push(Frame {
-                                resume: mode,
-                                depth,
-                                close: b')',
-                            });
-                            depth += 1;
-                            mode = Mode::Code;
+                            open_frame(frames, &mut depth, kind, b')');
+                            kind = Kind::Code;
                             i += 2;
                             continue;
                         }
                     } else if c == quote {
                         if !triple {
                             push(regions, base, start, i + 1);
-                            mode = Mode::Code;
+                            kind = Kind::Code;
                         } else if b.get(i + 1) == Some(&quote) && b.get(i + 2) == Some(&quote) {
                             push(regions, base, start, i + 3);
-                            mode = Mode::Code;
+                            kind = Kind::Code;
                             i += 3;
                             continue;
                         }
                     } else if c == b'\n' && !triple && lang != Lang::Shell {
                         // A single-line string ends at the line end.
                         push(regions, base, start, i);
-                        mode = Mode::Code;
+                        kind = Kind::Code;
                     }
                 }
-                Mode::Template { start } => {
+                Kind::Template => {
                     if !matches!(c, b'\\' | b'`' | b'$') {
                         i += 1;
                         while i < n && !matches!(b[i], b'\\' | b'`' | b'$') {
@@ -406,24 +382,19 @@ pub(crate) fn lex(
                     }
                     if c == b'`' {
                         push(regions, base, start, i + 1);
-                        mode = Mode::Code;
+                        kind = Kind::Code;
                     } else if b.get(i + 1) == Some(&b'{') {
                         push(regions, base, start, i);
-                        frames.push(Frame {
-                            resume: mode,
-                            depth,
-                            close: b'}',
-                        });
-                        depth += 1;
-                        mode = Mode::Code;
+                        open_frame(frames, &mut depth, Kind::Template, b'}');
+                        kind = Kind::Code;
                         i += 2;
                         continue;
                     }
                 }
-                Mode::Line { start } => match b[i..].iter().position(|&c| c == b'\n') {
+                Kind::Line => match b[i..].iter().position(|&c| c == b'\n') {
                     Some(k) => {
                         push(regions, base, start, i + k);
-                        mode = Mode::Code;
+                        kind = Kind::Code;
                         i += k + 1;
                         continue;
                     }
@@ -432,10 +403,10 @@ pub(crate) fn lex(
                         continue;
                     }
                 },
-                Mode::Block { start } => match b[i..].windows(2).position(|w| w == b"*/") {
+                Kind::Block => match b[i..].windows(2).position(|w| w == b"*/") {
                     Some(k) => {
                         push(regions, base, start, i + k + 2);
-                        mode = Mode::Code;
+                        kind = Kind::Code;
                         i += k + 2;
                         continue;
                     }
@@ -444,25 +415,22 @@ pub(crate) fn lex(
                         continue;
                     }
                 },
-                Mode::Regex { start, class } => {
+                Kind::Regex { class } => {
                     if c == b'\\' {
                         i += 2;
                         continue;
                     }
                     if c == b'[' {
-                        mode = Mode::Regex { start, class: true };
+                        kind = Kind::Regex { class: true };
                     } else if c == b']' {
-                        mode = Mode::Regex {
-                            start,
-                            class: false,
-                        };
+                        kind = Kind::Regex { class: false };
                     } else if c == b'/' && !class {
                         let mut j = i + 1;
                         while j < n && b[j].is_ascii_alphabetic() {
                             j += 1;
                         }
                         push(regions, base, start, j);
-                        mode = Mode::Code;
+                        kind = Kind::Code;
                         i = j;
                         continue;
                     } else if c == b'\n' {
@@ -473,50 +441,24 @@ pub(crate) fn lex(
             i += 1;
         }
         // An unterminated regex was a division: resume as code after its `/`.
-        if let Mode::Regex { start, .. } = mode {
-            mode = Mode::Code;
+        if let Kind::Regex { .. } = kind {
+            kind = Kind::Code;
             regex_ok = false;
             i = start + 1;
             continue;
         }
         break;
     }
-    let carry = match mode {
-        Mode::Code | Mode::Regex { .. } => Carry::Code,
-        Mode::Str {
-            quote,
-            start,
-            triple,
-            ..
-        } => {
-            push(regions, base, start, n);
-            if triple {
-                Carry::Triple(quote)
-            } else {
-                Carry::Code
-            }
-        }
-        Mode::Template { start } => {
-            push(regions, base, start, n);
-            Carry::Template
-        }
-        Mode::Line { start } => {
-            push(regions, base, start, n);
-            Carry::Code
-        }
-        Mode::Block { start } => {
-            push(regions, base, start, n);
-            Carry::BlockComment
-        }
-    };
-    Lexed {
-        carry: if frames.is_empty() {
-            carry
-        } else {
-            Carry::Code
-        },
-        delta: depth,
+    if kind != Kind::Code {
+        push(regions, base, start, n);
     }
+    carry.kind = match kind {
+        Kind::Str { triple, .. } if triple || continued => kind,
+        Kind::Template | Kind::Block => kind,
+        _ => Kind::Code,
+    };
+    carry.depth = depth;
+    depth - start_depth
 }
 
 /// True when byte `off` lies in one of the sorted `regions`.
@@ -531,8 +473,22 @@ mod tests {
 
     fn quoted(s: &str, lang: Lang, needle: &str) -> bool {
         let mut regions = Vec::new();
-        lex(s, lang, Carry::Code, 0, &mut regions);
+        lex(s, lang, &mut Carry::default(), 0, &mut regions);
         in_regions(&regions, s.find(needle).unwrap())
+    }
+
+    /// Lex `text` line by line with a carried state; true when `needle` (first occurrence, in
+    /// the line holding it) is inside a literal or comment.
+    fn quoted_lines(text: &str, lang: Lang, needle: &str) -> bool {
+        let mut carry = Carry::default();
+        for line in text.split('\n') {
+            let mut regions = Vec::new();
+            lex(line, lang, &mut carry, 0, &mut regions);
+            if let Some(p) = line.find(needle) {
+                return in_regions(&regions, p);
+            }
+        }
+        panic!("{needle} not in {text}");
     }
 
     #[test]
@@ -570,26 +526,79 @@ mod tests {
 
     #[test]
     fn block_comments_and_triple_quotes_carry_across_lines() {
-        let mut regions = Vec::new();
-        let first = lex("/* start", Lang::Js, Carry::Code, 0, &mut regions);
-        assert_eq!(first.carry, Carry::BlockComment);
-        regions.clear();
-        let second = lex(
-            "* eval(x) */ eval(y)",
+        assert!(quoted_lines("/* start\n* eval(x) */", Lang::Js, "eval"));
+        assert!(!quoted_lines("/* start\n*/ eval(y)", Lang::Js, "eval"));
+        // A `*`-led line outside a block comment is code.
+        assert!(!quoted_lines("x = 1\n*eval(atob(p))", Lang::Js, "eval"));
+        assert!(quoted_lines(
+            "x = '''start\neval(x)\n'''",
+            Lang::Python,
+            "eval"
+        ));
+    }
+
+    #[test]
+    fn interpolation_frames_carry_across_lines() {
+        // A line ending inside `${` keeps the frame: the next line closes it, the template ends.
+        assert!(!quoted_lines(
+            "const r = `${\n0}`;\neval(atob(s));",
             Lang::Js,
-            first.carry,
+            "eval"
+        ));
+        assert!(!quoted_lines(
+            "const r = `${\n0}`; eval(atob(s));",
+            Lang::Js,
+            "eval"
+        ));
+        assert!(quoted_lines(
+            "const r = `${\n0} eval(x)`;",
+            Lang::Js,
+            "eval"
+        ));
+        // Triple-quoted f-strings keep their f flag across lines.
+        assert!(!quoted_lines(
+            "r = f\"\"\"\n{exec(x)}\n\"\"\"",
+            Lang::Python,
+            "exec"
+        ));
+        assert!(quoted_lines(
+            "r = \"\"\"\n{exec(x)}\n\"\"\"",
+            Lang::Python,
+            "exec"
+        ));
+        assert!(!quoted_lines(
+            "r = f\"\"\"{\n0}\"\"\"\nexec(base64.b64decode(s))",
+            Lang::Python,
+            "exec"
+        ));
+        assert!(!quoted_lines(
+            "r = f'{\n0}'\nexec(base64.b64decode(s))",
+            Lang::Python,
+            "exec"
+        ));
+        assert!(!quoted_lines(
+            "x=\"$(\necho hi)\"; curl -s x | sh",
+            Lang::Shell,
+            "curl"
+        ));
+        // A backslash-continued string continues; the code after its end is code.
+        assert!(!quoted_lines("s = \"abc\\\n\"; eval(x)", Lang::Js, "eval"));
+    }
+
+    #[test]
+    fn deep_nesting_is_bounded_and_lexed_as_code() {
+        let deep = format!("{}eval(x){}", "`${".repeat(200), "}`".repeat(200));
+        assert!(!quoted(&deep, Lang::Js, "eval"));
+        let mut carry = Carry::default();
+        let mut regions = Vec::new();
+        lex(
+            &"`${".repeat(100_000),
+            Lang::Js,
+            &mut carry,
             0,
             &mut regions,
         );
-        assert_eq!(second.carry, Carry::Code);
-        assert!(in_regions(&regions, 2));
-        assert!(!in_regions(&regions, 13));
-        regions.clear();
-        // A `*`-led line outside a block comment is code.
-        lex("*eval(atob(p))", Lang::Js, Carry::Code, 0, &mut regions);
-        assert!(regions.is_empty());
-        let doc = lex("x = '''start", Lang::Python, Carry::Code, 0, &mut regions);
-        assert_eq!(doc.carry, Carry::Triple(b'\''));
+        assert!(carry.frames.len() <= MAX_FRAMES);
     }
 
     #[test]
@@ -601,7 +610,7 @@ mod tests {
         let line = "(/[".repeat(100_000);
         let mut regions = Vec::new();
         let started = std::time::Instant::now();
-        lex(&line, Lang::Js, Carry::Code, 0, &mut regions);
+        lex(&line, Lang::Js, &mut Carry::default(), 0, &mut regions);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
@@ -618,13 +627,12 @@ mod tests {
     #[test]
     fn bracket_delta_counts_code_only() {
         let mut regions = Vec::new();
+        let mut carry = Carry::default();
         assert_eq!(
-            lex("foo(a, '(', {", Lang::Js, Carry::Code, 0, &mut regions).delta,
+            lex("foo(a, '(', {", Lang::Js, &mut carry, 0, &mut regions),
             2
         );
-        assert_eq!(
-            lex("}) // (", Lang::Js, Carry::Code, 0, &mut regions).delta,
-            -2
-        );
+        assert_eq!(lex("}) // (", Lang::Js, &mut carry, 0, &mut regions), -2);
+        assert!(carry.is_plain());
     }
 }

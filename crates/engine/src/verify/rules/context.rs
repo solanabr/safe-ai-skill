@@ -551,7 +551,13 @@ impl<'d> Stmt<'d> {
     fn regions(&self) -> &[(usize, usize)] {
         self.regions.get_or_init(|| {
             let mut regions = Vec::new();
-            lexer::lex(&self.lower, self.lang, Carry::Code, 0, &mut regions);
+            lexer::lex(
+                &self.lower,
+                self.lang,
+                &mut Carry::default(),
+                0,
+                &mut regions,
+            );
             regions
         })
     }
@@ -637,21 +643,20 @@ pub(crate) fn for_each_stmt<'d>(doc: &'d Document<'d>, unit: &Unit, mut f: impl 
     let mut acc_regions: Vec<(usize, usize, usize)> = Vec::new();
     let mut line_regions: Vec<(usize, usize)> = Vec::new();
     let mut depth: i32 = 0;
-    let mut carry = Carry::Code;
+    let mut carry = Carry::default();
     for i in unit.start..unit.end {
         let line = piece(doc.lower_line(i), prompt);
-        if acc.is_empty() && carry == Carry::Code && line.trim().is_empty() {
+        if acc.is_empty() && carry.is_plain() && line.trim().is_empty() {
             continue;
         }
         line_regions.clear();
-        let lexed = lexer::lex(line, unit.lang, carry, 0, &mut line_regions);
-        carry = lexed.carry;
+        let delta = lexer::lex(line, unit.lang, &mut carry, 0, &mut line_regions);
         let cont = continues(line, &line_regions);
         let k = acc.len();
         acc.push(i);
         acc_regions.extend(line_regions.iter().map(|&(a, z)| (k, a, z)));
         if brackets {
-            depth = depth.saturating_add(lexed.delta).max(0);
+            depth = depth.saturating_add(delta).max(0);
         }
         if (depth == 0 && !cont) || acc.len() >= MAX_STMT_LINES {
             emit_stmt(doc, unit, &acc, &acc_regions, &mut f);
@@ -1678,7 +1683,7 @@ mod tests {
     fn split_commands_respects_quotes() {
         let s = "echo \"a;b && c\" ; curl x && wget y || z";
         let mut regions = Vec::new();
-        lexer::lex(s, Lang::Shell, Carry::Code, 0, &mut regions);
+        lexer::lex(s, Lang::Shell, &mut Carry::default(), 0, &mut regions);
         let parts: Vec<&str> = split_commands(s, &regions).map(|(a, b)| &s[a..b]).collect();
         assert_eq!(parts, vec!["echo \"a;b && c\"", "curl x", "wget y", "z"]);
     }
