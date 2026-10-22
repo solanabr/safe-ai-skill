@@ -84,9 +84,9 @@ const MAX_GLOB_MATCHES: usize = 256;
 /// Most alternatives a brace group expands to.
 const MAX_BRACE: usize = 64;
 
-/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Tier-independent.
+/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Credential reads and
+/// project env reads are tier-independent; an env-file write follows the env-write tier rule.
 pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
-    let _ = tier;
     let parsed = shell::parse(command);
     if let Some(what) = parsed.commands.iter().find_map(reader) {
         return Some(Verdict::Deny(reason(what)));
@@ -108,13 +108,139 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     {
         return Some(Verdict::Deny(path_reason(&what)));
     }
-    let file = env_check(&parsed.commands, cwd, policy)?;
-    let hint = read::varlock_hint(cwd, &cwd.join(&file));
-    match read::env_verdict(&file, policy, hint) {
-        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
-        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
-        _ => None,
+    match env_check(&parsed.commands, cwd, policy)? {
+        EnvUse::Read(file) => {
+            let hint = read::varlock_hint(cwd, &cwd.join(&file));
+            match read::env_verdict(&file, policy, hint) {
+                Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+                Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+                _ => None,
+            }
+        }
+        EnvUse::Write(file) => crate::gates::envwrite::bash_write(&file, tier),
     }
+}
+
+/// How a command uses a project env file it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvUse {
+    /// Its contents can reach the output: the env-read verdict.
+    Read(String),
+    /// It is moved, removed or overwritten: the env-write tier rule.
+    Write(String),
+}
+
+/// Programs that write (remove or move) every env file they name.
+const ENV_WRITERS: &[&str] = &["rm", "unlink", "shred", "mv"];
+
+/// Words that print the environment or a file when they run a container's or a wrapper's
+/// command.
+const PRINTERS: &[&str] = &[
+    "env", "printenv", "cat", "echo", "printf", "set", "export", "declare", "sh", "bash", "zsh",
+    "dash", "ksh", "fish", "head", "tail", "less", "more", "od", "xxd", "strings",
+];
+
+/// Indices of the words naming an env file a program only loads into a process's environment
+/// (`node|bun --env-file`, `deno run --env-file`, `docker run|create|compose --env-file`,
+/// `podman run --env-file`, `dotenv -e <f> --`, `dotenvx run -f <f> --`): not a read, unless
+/// the same command can print what it loaded (`node -e|-p|--eval|--print`, `bun -e|--print`,
+/// or a container/wrapped command that is a printer, [`PRINTERS`]).
+fn env_file_loads(program: &str, words: &[&str]) -> Vec<usize> {
+    let sub = words.iter().skip(1).find(|w| !w.starts_with('-')).copied();
+    let (flags, prints): (&[&str], bool) = match program {
+        "node" | "bun" => {
+            let eval = words.iter().skip(1).any(|w| {
+                matches!(*w, "-e" | "-p" | "-pe" | "--eval" | "--print")
+                    || w.starts_with("--eval=")
+                    || w.starts_with("--print=")
+            });
+            (&["--env-file"], eval)
+        }
+        "deno" if sub == Some("run") => (&["--env-file", "--env"], false),
+        "docker" | "podman"
+            if matches!(sub, Some("run" | "create" | "compose"))
+                && (program == "docker" || sub == Some("run")) =>
+        {
+            (&["--env-file"], printer_after(words, 2))
+        }
+        "dotenv" => (&["-e"], printer_after_dashes(words)),
+        "dotenvx" if sub == Some("run") => (&["-f", "--env-file"], printer_after_dashes(words)),
+        _ => return Vec::new(),
+    };
+    if prints {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, w) in words.iter().enumerate().skip(1) {
+        if *w == "--" && matches!(program, "dotenv" | "dotenvx") {
+            break;
+        }
+        if flags.contains(w) {
+            out.push(i + 1);
+        } else if flags
+            .iter()
+            .any(|f| f.starts_with("--") && w.starts_with(&format!("{f}=")))
+        {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// Whether any word from index `from` on is a printer (a container's command).
+fn printer_after(words: &[&str], from: usize) -> bool {
+    words.iter().skip(from).any(|w| is_printer(w))
+}
+
+/// Whether the command after `--` prints: a printer, or `node`/`bun` with an eval/print flag.
+fn printer_after_dashes(words: &[&str]) -> bool {
+    let Some(i) = words.iter().position(|w| *w == "--") else {
+        return false;
+    };
+    let rest = &words[i + 1..];
+    match rest.first() {
+        None => false,
+        Some(first) if is_printer(first) => true,
+        Some(first) => {
+            let name = first.rsplit('/').next().unwrap_or(first);
+            matches!(name, "node" | "bun")
+                && rest
+                    .iter()
+                    .any(|w| matches!(*w, "-e" | "-p" | "-pe" | "--eval" | "--print"))
+        }
+    }
+}
+
+fn is_printer(word: &str) -> bool {
+    PRINTERS.contains(&word.rsplit('/').next().unwrap_or(word))
+}
+
+/// Indices of the env-file words of `cp` that are its destination (the last positional, or
+/// the `-t`/`--target-directory` value): an overwrite, not a read.
+fn cp_destinations(words: &[&str]) -> Vec<usize> {
+    let mut positional = Vec::new();
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < words.len() {
+        let w = words[i];
+        if w == "-t" || w == "--target-directory" {
+            out.push(i + 1);
+            i += 2;
+            continue;
+        }
+        if !w.starts_with('-') {
+            positional.push(i);
+        }
+        i += 1;
+    }
+    if out.is_empty() {
+        if let Some(last) = positional.last() {
+            if positional.len() >= 2 {
+                out.push(*last);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------------------
@@ -141,10 +267,11 @@ const ENV_PROBES: &[&str] = &[
 /// (pieces after `=`/`:`, braces, `~`, every cwd), a wildcard expanded against the filesystem
 /// (dotfiles only by a literal leading dot, as the shell does) and matched lexically against
 /// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
-fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Option<String> {
+fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Option<EnvUse> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
     let mut budget = MAX_WORDS;
+    let mut write: Option<String> = None;
     for cmd in commands {
         let program = cmd.program();
         if matches!(program.as_str(), "cd" | "pushd") {
@@ -170,7 +297,14 @@ fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Op
         let mut skip_pattern = pattern_first;
         let mut skip_value = false;
         let program_path = words.first().is_some_and(|w| w.contains(['/', '\\']));
-        for word in words.iter().skip(usize::from(!program_path)) {
+        let loads = env_file_loads(&program, &words);
+        let writes_all = ENV_WRITERS.contains(&program.as_str());
+        let cp_dest = if program == "cp" {
+            cp_destinations(&words)
+        } else {
+            Vec::new()
+        };
+        for (i, word) in words.iter().enumerate().skip(usize::from(!program_path)) {
             budget = budget.checked_sub(1)?;
             if std::mem::take(&mut skip_value) {
                 continue;
@@ -182,12 +316,19 @@ fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Op
             if std::mem::take(&mut skip_pattern) {
                 continue;
             }
+            if loads.contains(&i) {
+                continue;
+            }
             if let Some(hit) = env_word_hit(word, &cwds, &homes, policy) {
-                return Some(hit);
+                if writes_all || cp_dest.contains(&i) {
+                    write.get_or_insert(hit);
+                } else {
+                    return Some(EnvUse::Read(hit));
+                }
             }
         }
     }
-    None
+    write.map(EnvUse::Write)
 }
 
 /// Whether `word` names a project env file; the file as written.

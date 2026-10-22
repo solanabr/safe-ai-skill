@@ -1081,6 +1081,7 @@ fn any_command_naming_a_project_env_file_denies_at_every_tier() {
         "vim -c \":%p\" -c \":q\" .env",
         "python3 -c 'print(1)' apps/web/.env.local",
         "node --env-file=.env -e 'console.log(process.env)'",
+        "node app.js .env",
     ] {
         check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
     }
@@ -1095,6 +1096,63 @@ fn any_command_naming_a_project_env_file_denies_at_every_tier() {
         "echo .env >> .gitignore",
     ] {
         check(cmd, w.x4("Bash", &bash(cmd)), NO4);
+    }
+}
+
+#[test]
+fn loading_an_env_file_into_a_process_is_not_a_read_unless_it_prints() {
+    let w = env_world("env-load");
+    for cmd in [
+        "node --env-file=.env app.js",
+        "node --env-file .env server.js",
+        "bun --env-file=.env run dev",
+        "deno run --env-file=.env main.ts",
+        "docker run --env-file .env -p 3000:3000 myapp",
+        "docker create --env-file=.env myapp",
+        "docker compose --env-file .env up -d",
+        "podman run --env-file .env myapp",
+        "dotenv -e .env -- npm run dev",
+        "dotenvx run -f .env -- node app.js",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), NO4);
+    }
+    for cmd in [
+        "node --env-file=.env -e 'console.log(process.env)'",
+        "node --env-file=.env -p process.env",
+        "node --env-file=.env --print process.env",
+        "bun --env-file=.env -e 'console.log(Bun.env)'",
+        "bun --env-file=.env --print process.env",
+        "deno eval --env-file=.env 'console.log(Deno.env.toObject())'",
+        "docker run --env-file .env alpine env",
+        "docker run --env-file .env alpine printenv",
+        "docker run --env-file .env alpine sh -c 'echo $KEY'",
+        "podman run --env-file .env alpine cat /proc/self/environ",
+        "dotenv -e .env -- printenv",
+        "dotenvx run -f .env -- node -e 'console.log(process.env)'",
+        "source .env",
+        ". .env",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn moving_removing_or_overwriting_an_env_file_is_a_write() {
+    let w = env_world("env-write-bash");
+    w.put(".env.example", "HELIUS_KEY=\n");
+    const WRITE: [&str; 4] = ["", "", "deny", "deny"];
+    for cmd in [
+        "rm .env",
+        "rm -f apps/web/.env.local",
+        "mv .env .env.bak",
+        "cp .env.example .env",
+        "cp -f .env.example apps/web/.env.local",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), WRITE);
+    }
+    // Copying an env file somewhere else reads it.
+    for cmd in ["cp .env /tmp/x", "cp .env .env.copy"] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
     }
 }
 

@@ -72,6 +72,19 @@ pub fn decide_cli(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Opt
     )))
 }
 
+/// The verdict for a Bash command that moves, removes or overwrites the project env file
+/// `label` (`rm`, `mv`, the destination of `cp`): a write, by the tier (no opinion at Off and
+/// Relaxed, deny at Medium and High).
+pub fn bash_write(label: &str, tier: Tier) -> Option<Verdict> {
+    if tier < Tier::Medium {
+        return None;
+    }
+    Some(Verdict::Deny(format!(
+        "safe-ai-skill: tier {} denies agent writes to project env files ({label} would be moved, removed or overwritten). Ask the user to do it in their own terminal. `safe-ai-skill env keys {label}` lists the keys.",
+        tier.label()
+    )))
+}
+
 /// Whether the new text of a Write (`content`), Edit (`new_string`), MultiEdit
 /// (`edits[].new_string`) or NotebookEdit (`new_source`) holds a redaction marker.
 fn writes_redaction_marker(input: &serde_json::Map<String, Value>) -> bool {
