@@ -51,14 +51,21 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
     let lang = cmd.lang();
     let line = |off: usize| Some(cmd.line_at(off));
     // A language-level sink inside a string or comment is code-as-data (a help text, a rule
-    // table, a command built for a remote host): it warns and never feeds a combo.
+    // table, a command built for a remote host): it warns, never feeds a combo, and never
+    // counts toward the per-rule hit cap.
     let quoted = |off: usize| cmd.quoted(off);
+    let hit = |out: &mut FileOut, rule: &'static str, sev: Severity, off: usize| {
+        if quoted(off) {
+            out.emit_data(rule, sev, line(off), ctx);
+        } else {
+            out.emit(rule, sev, line(off), ctx);
+        }
+    };
     let mut sink: Option<(usize, bool)> = None;
 
-    // A rule that already hit MAX_HITS_PER_RULE times in this file is not evaluated again.
-    if bits & T_NET != 0 && !out.saturated("download_and_run") {
+    if bits & T_NET != 0 {
         if let Some(off) = download_and_run(lower) {
-            out.emit("download_and_run", Severity::High, line(off), ctx);
+            hit(out, "download_and_run", Severity::High, off);
             sink.get_or_insert((off, false));
         }
     }
@@ -68,53 +75,46 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
         let shell_shape = lower.contains('|')
             || lower.contains(" -")
             || (lang == Lang::Shell && bits & T_EVAL != 0);
-        if shell_like && bits & T_SHELL != 0 && shell_shape && !out.saturated("shell_eval") {
+        if shell_like && bits & T_SHELL != 0 && shell_shape {
             if let Some(off) = shell_exec(lower, lang == Lang::Shell) {
-                out.emit("shell_eval", Severity::Info, line(off), ctx);
+                hit(out, "shell_eval", Severity::Info, off);
                 sink.get_or_insert((off, quoted(off)));
             }
         }
         let evals = lang != Lang::Shell && bits & T_EVAL != 0;
         if evals {
-            if !out.saturated("eval") {
-                if let Some(off) = eval_call(cmd) {
-                    let q = quoted(off);
-                    out.emit("eval", grade_sink(q), line(off), ctx);
-                    if !q {
-                        out.signal(Signal::Eval(cmd.line_at(off)), ctx);
-                    }
-                    sink.get_or_insert((off, q));
+            if let Some(off) = eval_call(cmd) {
+                let q = quoted(off);
+                hit(out, "eval", grade_sink(q), off);
+                if !q {
+                    out.signal(Signal::Eval(cmd.line_at(off)), ctx);
                 }
+                sink.get_or_insert((off, q));
             }
-            if !out.saturated("obfuscated_sink") {
-                if let Some(off) = obfuscated(lower, lang) {
-                    let q = quoted(off);
-                    out.emit("obfuscated_sink", grade_sink(q), line(off), ctx);
-                    sink.get_or_insert((off, q));
-                }
+            if let Some(off) = obfuscated(lower, lang) {
+                hit(out, "obfuscated_sink", grade_sink(quoted(off)), off);
+                sink.get_or_insert((off, quoted(off)));
             }
-            if !out.saturated("create_require") {
-                if let Some(off) = find_call(lower, "createrequire", true) {
-                    out.emit("create_require", Severity::Info, line(off), ctx);
-                }
+            if let Some(off) = find_call(lower, "createrequire", true) {
+                hit(out, "create_require", Severity::Info, off);
             }
         }
         // JS `exec(` is child_process exec, so eval-family words also wake the spawn check.
         let spawns = bits & T_SPAWN != 0 || (lang == Lang::Js && bits & T_EVAL != 0);
-        if lang != Lang::Shell && spawns && !out.saturated("child_process") {
+        if lang != Lang::Shell && spawns {
             if let Some(off) = spawn(lower, lang) {
-                out.emit("child_process", Severity::Info, line(off), ctx);
+                hit(out, "child_process", Severity::Info, off);
                 sink.get_or_insert((off, quoted(off)));
             }
         }
     }
-    let decoder = if bits & T_DECODE != 0 && !out.saturated("decoder") {
+    let decoder = if bits & T_DECODE != 0 {
         decoder(lower)
     } else {
         None
     };
     if let Some(off) = decoder {
-        out.emit("decoder", Severity::Info, line(off), ctx);
+        hit(out, "decoder", Severity::Info, off);
         if !quoted(off) {
             out.signal(Signal::Decoder(cmd.line_at(off)), ctx);
         }
@@ -124,7 +124,7 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
             out.signal(Signal::Sink(cmd.line_at(off)), ctx);
         }
         if decoder.is_some() {
-            out.emit("exec_decode", grade_sink(q), line(off), ctx);
+            hit(out, "exec_decode", grade_sink(q), off);
         }
         // A real base64 payload next to a sink is the payload itself, quoted sink or not
         // (Google's `'{encoded_script}'` placeholder is no literal and stays a warning).

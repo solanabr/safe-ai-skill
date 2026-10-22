@@ -21,8 +21,9 @@
 //!   A pack that runs out gets `scan_budget_exceeded` (HIGH): never clean, and the caller moves
 //!   on to the next pack. One budget can span a sweep: each pack gets [`PACK_BUDGET`], and no
 //!   pack scans past [`SWEEP_BUDGET`] from the budget's creation.
-//! * Per file, a rule stops being evaluated after [`MAX_HITS_PER_RULE`] hits;
-//!   [`PackReport::capped`] records each rule that did.
+//! * Per file, a rule stops creating findings after [`MAX_HITS_PER_RULE`] live hits (code, not
+//!   inside a string or comment); detection and combo signals carry on, [`PackReport::capped`]
+//!   records each such rule with its true count, and [`grade`] treats any entry as HIGH.
 //!
 //! Every finding carries a pack-relative `path` and, when it is line-addressable, a 1-based
 //! `line`.
@@ -64,7 +65,8 @@ const MAX_PER_RULE_FILE: u16 = 5;
 const MAX_SIGNALS_PER_FILE: usize = 4096;
 /// Bytes of each `SKILL.md` kept for the "referenced by SKILL.md" combo.
 const MAX_SKILL_MD_BYTES: usize = 1024 * 1024;
-/// Hits of one rule in one file after which that rule stops being evaluated there.
+/// Live code hits of one rule in one file after which that rule stops creating findings there
+/// (its combo signals carry on).
 pub const MAX_HITS_PER_RULE: u32 = 50;
 /// Time one pack may take at SessionStart.
 pub const PACK_BUDGET: Duration = Duration::from_secs(2);
@@ -143,7 +145,8 @@ pub struct PackReport {
     pub findings: Vec<Finding>,
     /// Pack-level combination hits.
     pub combos: Vec<ComboHit>,
-    /// Rules that reached [`MAX_HITS_PER_RULE`] in a file and stopped being evaluated there.
+    /// Rules that went past [`MAX_HITS_PER_RULE`] live hits in a file and stopped creating
+    /// findings there (combo signals carry on). Any entry makes the pack at least HIGH.
     pub capped: Vec<RuleCount>,
 }
 
@@ -153,7 +156,7 @@ pub struct RuleCount {
     pub rule: &'static str,
     /// Path relative to the pack root.
     pub path: PathBuf,
-    /// Hits counted; at least [`MAX_HITS_PER_RULE`].
+    /// Live code hits counted in the whole file (more than [`MAX_HITS_PER_RULE`]).
     pub hits: u32,
 }
 
@@ -207,6 +210,10 @@ pub enum Grade {
 pub fn grade(report: &PackReport) -> Grade {
     if !report.combos.is_empty() {
         return Grade::Block;
+    }
+    // A rule past its hit cap stopped creating findings: never grade below HIGH on that.
+    if !report.capped.is_empty() {
+        return Grade::High;
     }
     match report.findings.iter().map(Finding::effective_sev).max() {
         Some(Severity::High) => Grade::High,
@@ -391,7 +398,7 @@ pub(crate) struct FileOut {
     /// Bundler or minifier output (decided only when the file has an eval or decoder signal).
     pub(crate) generated: bool,
     counts: Vec<(&'static str, Severity, u16)>,
-    /// Hits per rule, every severity (for [`MAX_HITS_PER_RULE`]).
+    /// Live code hits per rule (for [`MAX_HITS_PER_RULE`]); counting goes on past the cap.
     hits: Vec<(&'static str, u32)>,
     deadline: Option<Instant>,
     ticks: u32,
@@ -414,11 +421,11 @@ impl FileOut {
         }
     }
 
-    /// True once `rule` hit [`MAX_HITS_PER_RULE`] times in this file: detectors skip it.
-    pub(crate) fn saturated(&self, rule: &str) -> bool {
+    /// True once `rule` has more than [`MAX_HITS_PER_RULE`] live hits: no more findings for it.
+    fn past_cap(&self, rule: &str) -> bool {
         self.hits
             .iter()
-            .any(|&(r, n)| r == rule && n >= MAX_HITS_PER_RULE)
+            .any(|&(r, n)| r == rule && n > MAX_HITS_PER_RULE)
     }
 
     /// True once the deadline has passed (the clock is read every [`CLOCK_EVERY`] calls).
@@ -435,18 +442,44 @@ impl FileOut {
         self.expired
     }
 
-    /// Record a finding: docs are capped at WARN, INFO is kept once per file and WARN/HIGH up
-    /// to [`MAX_PER_RULE_FILE`] times per rule.
+    /// Record a finding. A live code hit counts toward [`MAX_HITS_PER_RULE`]; past it the rule
+    /// creates no more findings in this file (callers keep emitting its combo signals).
     pub(crate) fn emit(&mut self, rule: &'static str, sev: Severity, line: Option<u32>, ctx: Ctx) {
+        if ctx == Ctx::Code {
+            match self.hits.iter_mut().find(|(r, _)| *r == rule) {
+                Some((_, n)) => *n = n.saturating_add(1),
+                None => self.hits.push((rule, 1)),
+            }
+        }
+        if self.past_cap(rule) {
+            return;
+        }
+        self.store(rule, sev, line, ctx);
+    }
+
+    /// Record a hit written as data (inside a string or comment): it never counts toward
+    /// [`MAX_HITS_PER_RULE`], so padding the cap with quoted hits hides nothing.
+    pub(crate) fn emit_data(
+        &mut self,
+        rule: &'static str,
+        sev: Severity,
+        line: Option<u32>,
+        ctx: Ctx,
+    ) {
+        if self.past_cap(rule) {
+            return;
+        }
+        self.store(rule, sev, line, ctx);
+    }
+
+    /// Keep a finding: docs are capped at WARN, INFO is kept once per file and WARN/HIGH up to
+    /// [`MAX_PER_RULE_FILE`] times per rule.
+    fn store(&mut self, rule: &'static str, sev: Severity, line: Option<u32>, ctx: Ctx) {
         let sev = if ctx == Ctx::Doc {
             sev.min(Severity::Warn)
         } else {
             sev
         };
-        match self.hits.iter_mut().find(|(r, _)| *r == rule) {
-            Some((_, n)) => *n = n.saturating_add(1),
-            None => self.hits.push((rule, 1)),
-        }
         let cap = if sev == Severity::Info {
             1
         } else {
@@ -600,7 +633,7 @@ fn scan_pack_inner(root: &Path, cap: u64, deadline: Option<Instant>) -> PackRepo
         .flat_map(|o| {
             o.hits
                 .iter()
-                .filter(|&&(_, n)| n >= MAX_HITS_PER_RULE)
+                .filter(|&&(_, n)| n > MAX_HITS_PER_RULE)
                 .map(|&(rule, hits)| RuleCount {
                     rule,
                     path: o.path.clone(),
@@ -907,23 +940,15 @@ pub(crate) fn scan_stmt(
     vars: &mut network_ctx::VarCache,
     out: &mut FileOut,
 ) {
-    // A detector family whose every rule hit MAX_HITS_PER_RULE times in this file is skipped.
-    let all = |out: &FileOut, rules: &[&str]| rules.iter().all(|r| out.saturated(r));
     for cmd in stmt.commands() {
         // One statement can hold millions of commands (a minified line).
         if out.out_of_time() {
             return;
         }
         exec_sinks::scan_cmd(&cmd, out);
-        if !all(out, &["telemetry_post", "network_post", "ip_literal"]) {
-            network_ctx::scan_cmd(&cmd, doc, vars, out);
-        }
-        if !all(out, &["secret_read", "env_dump"]) {
-            secrets_ctx::scan_cmd(&cmd, out);
-        }
-        if !all(out, &["registry_write", "git_hooks_write", "unpinned_npx"]) {
-            lifecycle::scan_cmd(&cmd, out);
-        }
+        network_ctx::scan_cmd(&cmd, doc, vars, out);
+        secrets_ctx::scan_cmd(&cmd, out);
+        lifecycle::scan_cmd(&cmd, out);
     }
 }
 
@@ -1085,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_stops_at_its_hit_cap_and_the_count_is_recorded() {
+    fn a_rule_stops_at_its_hit_cap_and_the_true_count_is_recorded() {
         let r = scan_one("w.js", &"eval(x);\n".repeat(200));
         let stored = r.findings.iter().filter(|f| f.rule == "eval").count();
         assert_eq!(stored, usize::from(MAX_PER_RULE_FILE), "{r:?}");
@@ -1094,11 +1119,42 @@ mod tests {
             vec![RuleCount {
                 rule: "eval",
                 path: PathBuf::from("w.js"),
-                hits: MAX_HITS_PER_RULE,
+                hits: 200,
             }]
         );
         assert_eq!(grade(&r), Grade::High);
-        assert!(scan_one("w.js", &"eval(x);\n".repeat(49)).capped.is_empty());
+        assert!(scan_one("w.js", &"eval(x);\n".repeat(50)).capped.is_empty());
+    }
+
+    #[test]
+    fn quoted_and_comment_hits_never_count_toward_the_cap() {
+        for line in ["// eval(x)\n", "s = 'eval(x)';\n", "/* atob(x) */\n"] {
+            let r = scan_one("w.js", &line.repeat(200));
+            assert!(r.capped.is_empty(), "{line}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_capped_rule_still_feeds_combos_and_grades_high() {
+        // 60 live `eval`s cap the rule; the padded payload after them still blocks.
+        let body = format!(
+            "{}x();{}eval(atob(s));\n",
+            "eval(x);\n".repeat(60),
+            " ".repeat(200)
+        );
+        let r = scan_one("w.js", &body);
+        assert!(combo(&r, "padding_sink").is_some(), "{r:?}");
+        assert_eq!(r.capped[0].hits, 61);
+        // A hand-built report with only a capped INFO rule is still HIGH.
+        let capped_only = PackReport {
+            capped: vec![RuleCount {
+                rule: "decoder",
+                path: PathBuf::from("w.js"),
+                hits: 60,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(grade(&capped_only), Grade::High);
     }
 
     #[test]
