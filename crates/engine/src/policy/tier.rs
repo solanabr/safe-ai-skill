@@ -289,8 +289,8 @@ pub fn resolve_from(inputs: Inputs) -> Resolution {
                 .to_string(),
         ),
         UserStatus::Untrusted => notes.push(
-            "tier.json is in an untrusted plugin data dir; ignored, so your tier setting does \
-             not apply"
+            "user tier ignored: data dir untrusted (tier.json is not under \
+             ~/.claude/plugins/data, or that dir is inside the project)"
                 .to_string(),
         ),
         UserStatus::Valid | UserStatus::Missing => {}
@@ -389,11 +389,23 @@ pub fn kit_hints(root: &Path) -> Result<Vec<RawHint>, String> {
             TierSource::KitSecurityJson.label()
         )
     };
-    if !meta.is_file() || meta.len() > MAX_KIT_SECURITY_BYTES {
+    if !meta.is_file() {
         return Err(unusable());
     }
-    let text = std::fs::read_to_string(&path).map_err(|_| unusable())?;
+    let text = read_bounded(&path, MAX_KIT_SECURITY_BYTES).ok_or_else(unusable)?;
     kit_hints_from(&text).ok_or_else(unusable)
+}
+
+/// The UTF-8 text of `path` when it is at most `max` bytes, read with a bound (the file may
+/// grow after a size check); `None` otherwise.
+pub(crate) fn read_bounded(path: &Path, max: u64) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(max.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (u64::try_from(text.len()).ok()? <= max).then_some(text)
 }
 
 /// The hints in a kit `security.json` body; `None` when it is not a JSON object.

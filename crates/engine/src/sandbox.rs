@@ -100,17 +100,26 @@ pub fn declared_in(files: &[PathBuf]) -> Declared {
 
 /// The settings files, highest precedence first.
 pub fn settings_files(root: &Path) -> Vec<PathBuf> {
+    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    settings_files_with(root, config_dir, crate::datadir::passwd_home())
+}
+
+/// [`settings_files`] with the user scope given: `config_dir` (`$CLAUDE_CONFIG_DIR`) replaces
+/// `<passwd_home>/.claude`. Env `HOME` is never an input.
+pub fn settings_files_with(
+    root: &Path,
+    config_dir: Option<PathBuf>,
+    passwd_home: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut files = vec![
         PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json"),
         PathBuf::from("/etc/claude-code/managed-settings.json"),
         root.join(".claude").join("settings.local.json"),
         root.join(".claude").join("settings.json"),
     ];
-    let user_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| crate::datadir::passwd_home().map(|h| h.join(".claude")));
-    if let Some(dir) = user_dir {
+    if let Some(dir) = config_dir.or_else(|| passwd_home.map(|h| h.join(".claude"))) {
         files.push(dir.join("settings.json"));
     }
     files
@@ -129,11 +138,10 @@ pub fn platform_supported() -> bool {
 
 /// `sandbox.enabled` from one settings file, when it is a regular file that sets it.
 fn setting(path: &Path) -> Option<bool> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_SETTINGS_BYTES {
+    if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = crate::policy::tier::read_bounded(path, MAX_SETTINGS_BYTES)?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("sandbox")?.get("enabled")?.as_bool()
 }
@@ -184,14 +192,15 @@ mod tests {
 
     #[test]
     fn env_home_never_names_the_user_settings_file() {
-        let files = settings_files(Path::new("/proj"));
-        if let Some(home) = std::env::var_os("HOME") {
-            let planted = PathBuf::from(home).join(".claude/settings.json");
-            let from_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").is_some();
-            let passwd = crate::datadir::passwd_home().map(|h| h.join(".claude/settings.json"));
-            if !from_config_dir && passwd.as_ref() != Some(&planted) {
-                assert!(!files.contains(&planted));
-            }
-        }
+        let root = Path::new("/proj");
+        let passwd = PathBuf::from("/home/real");
+        let files = settings_files_with(root, None, Some(passwd.clone()));
+        assert_eq!(files.last(), Some(&passwd.join(".claude/settings.json")));
+        // A repo-set HOME is not an input at all; CLAUDE_CONFIG_DIR replaces the passwd home.
+        let cfg = PathBuf::from("/cfg");
+        let files = settings_files_with(root, Some(cfg.clone()), Some(passwd.clone()));
+        assert_eq!(files.last(), Some(&cfg.join("settings.json")));
+        assert!(!files.contains(&passwd.join(".claude/settings.json")));
+        assert_eq!(settings_files_with(root, None, None).len(), 4);
     }
 }

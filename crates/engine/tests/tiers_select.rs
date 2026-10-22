@@ -197,7 +197,7 @@ fn lowering_from_a_stored_high_needs_confirmation_too() {
         env_read: None,
         clear: false,
     };
-    tierstate::apply(&dir, Tier::Relaxed, &high, 0).unwrap();
+    tierstate::apply(&dir, &high, 0).unwrap();
     for (tier, clear) in [(Some(Tier::Medium), false), (None, true)] {
         let change = tierstate::Change {
             project: None,
@@ -206,7 +206,7 @@ fn lowering_from_a_stored_high_needs_confirmation_too() {
             clear,
         };
         assert_eq!(
-            tierstate::plan(&dir, Tier::Relaxed, &change),
+            tierstate::plan(&dir, &change),
             tierstate::Plan::NeedsConfirm
         );
     }
@@ -309,7 +309,7 @@ fn a_floor_beats_the_users_project_choice_and_siblings_get_the_base() {
         env_read: None,
         clear: false,
     };
-    tierstate::apply(&dir, Tier::Relaxed, &off, 0).unwrap();
+    tierstate::apply(&dir, &off, 0).unwrap();
     assert_eq!(w.resolve(&[]).tier, Tier::Off);
     w.write(".claude/security.json", r#"{"tier":"high"}"#);
     let r = w.resolve(&[]);
@@ -349,7 +349,7 @@ fn a_forged_or_edited_tier_json_is_ignored_with_a_mac_note() {
         env_read: None,
         clear: false,
     };
-    tierstate::apply(&dir, Tier::Relaxed, &high, 0).unwrap();
+    tierstate::apply(&dir, &high, 0).unwrap();
     let text = std::fs::read_to_string(w.data.join("tier.json")).unwrap();
     std::fs::write(
         w.data.join("tier.json"),
@@ -370,7 +370,7 @@ fn an_untrusted_data_dir_selects_nothing() {
         env_read: Some(EnvRead::Tier),
         clear: false,
     };
-    tierstate::apply(&w.dir(), Tier::Relaxed, &off, 0).unwrap();
+    tierstate::apply(&w.dir(), &off, 0).unwrap();
     let untrusted = DataDir {
         trusted: false,
         ..w.dir()
@@ -416,11 +416,8 @@ fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
         env_read: Some(EnvRead::Deny),
         clear: false,
     };
-    assert_eq!(
-        tierstate::plan(&w.dir(), Tier::Relaxed, &deny),
-        tierstate::Plan::Immediate
-    );
-    tierstate::apply(&w.dir(), Tier::Relaxed, &deny, 0).unwrap();
+    assert_eq!(tierstate::plan(&w.dir(), &deny), tierstate::Plan::Immediate);
+    tierstate::apply(&w.dir(), &deny, 0).unwrap();
     assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
 }
 
@@ -557,4 +554,136 @@ fn agents_may_request_a_tier_but_not_write_tier_json() {
                "tool_input":{"command": format!("echo '{{}}' > {}", target.display())}}),
     );
     assert_eq!(common::decision_label(&echo), "deny");
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1: base spoofing, base floor, untrusted note, replay
+// ---------------------------------------------------------------------------------------
+
+/// A `CLAUDE_PLUGIN_ROOT` whose default policy says `tier` / `env_read` as given.
+fn evil_root(tier_line: &str, env_read: &str) -> TempDir {
+    let root = TempDir::new("tiers-evil-root");
+    std::fs::create_dir_all(root.join("policy")).unwrap();
+    let text = DEFAULT_POLICY_YAML
+        .replace("tier: relaxed", tier_line)
+        .replace("env_read: deny", &format!("env_read: {env_read}"));
+    std::fs::write(root.join("policy/default.policy.yaml"), text).unwrap();
+    root
+}
+
+/// `tier --clear` (global and `--project`) stays pending even when the agent points
+/// `CLAUDE_PLUGIN_ROOT` at a default policy whose base equals the stored tier (review #1).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_spoofed_plugin_root_cannot_make_clear_immediate() {
+    let evil = evil_root("tier: high", "deny");
+    for project in [false, true] {
+        let w = World::new("tiers-spoof");
+        let cli = |args: &[&str], spoof: bool| {
+            let mut inv = Invocation::new(args)
+                .plugin_data(w.data.path())
+                .home(w.home.path())
+                .cwd(w.proj.path())
+                .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1");
+            if spoof {
+                inv = inv.env("CLAUDE_PLUGIN_ROOT", evil.path().to_str().unwrap());
+            }
+            inv.run().json()
+        };
+        let mut set = vec!["tier", "high"];
+        let mut clear = vec!["tier", "--clear"];
+        if project {
+            set.push("--project");
+            clear.push("--project");
+        }
+        assert_eq!(cli(&set, false)["status"], "set");
+        assert_eq!(cli(&clear, true)["status"], "pending", "project={project}");
+        assert_eq!(w.resolve(&[]).tier, Tier::High, "project={project}");
+        assert_eq!(cli(&["tier"], false)["tier"], "high");
+    }
+}
+
+/// The plugin default policy is floored at relaxed and its env_read pinned to deny (review #2).
+#[test]
+fn the_plugin_default_policy_cannot_lower_or_open_env_reads() {
+    let w = World::new("tiers-base-floor");
+    let evil = evil_root("tier: off", "tier");
+    let v = Invocation::new(&["tier"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .env("CLAUDE_PLUGIN_ROOT", evil.path().to_str().unwrap())
+        .run()
+        .json();
+    assert_eq!(
+        (v["tier"].as_str(), v["env_read"].as_str()),
+        (Some("relaxed"), Some("deny")),
+        "{v}"
+    );
+    let notes = v["policy_notes"].to_string();
+    assert!(
+        notes.contains("tier:") && notes.contains("secrets.env_read"),
+        "{v}"
+    );
+    // A higher base still applies.
+    let high = evil_root("tier: high", "deny");
+    let v = Invocation::new(&["tier"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .env("CLAUDE_PLUGIN_ROOT", high.path().to_str().unwrap())
+        .run()
+        .json();
+    assert_eq!(v["tier"], "high", "{v}");
+}
+
+/// An untrusted data dir falls back to relaxed and says so at SessionStart and in status.
+#[test]
+fn an_untrusted_data_dir_is_named_at_session_start_and_in_status() {
+    let w = World::new("tiers-untrusted-note");
+    let high = tierstate::Change {
+        project: None,
+        tier: Some(Tier::High),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&w.dir(), &high, 0).unwrap();
+    let session = w.session();
+    assert!(
+        session.starts_with("safe-ai-skill tier: relaxed"),
+        "{session}"
+    );
+    assert!(
+        session.contains("user tier ignored: data dir untrusted"),
+        "{session}"
+    );
+    let status = w.cli(&["status"]).json();
+    assert_eq!(status["tier"], "relaxed");
+    assert!(
+        status["tier_notes"]
+            .to_string()
+            .contains("user tier ignored: data dir untrusted"),
+        "{status}"
+    );
+}
+
+/// Restoring an older, genuine tier.json (a lower tier) does not verify.
+#[test]
+fn a_replayed_tier_json_is_ignored() {
+    let w = World::new("tiers-replay");
+    let dir = w.dir();
+    let set = |tier| tierstate::Change {
+        project: None,
+        tier: Some(tier),
+        env_read: None,
+        clear: false,
+    };
+    tierstate::apply(&dir, &set(Tier::Off), 0).unwrap();
+    let old = std::fs::read(w.data.join("tier.json")).unwrap();
+    tierstate::apply(&dir, &set(Tier::High), 1).unwrap();
+    assert_eq!(w.resolve(&[]).tier, Tier::High);
+    std::fs::write(w.data.join("tier.json"), old).unwrap();
+    let r = w.resolve(&[]);
+    assert_eq!(r.tier, Tier::Relaxed);
+    assert!(noted(&r, "MAC"), "{:?}", r.notes);
 }

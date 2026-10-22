@@ -209,8 +209,7 @@ impl<'a> Invocation<'a> {
                 env_read: self.env_read,
                 clear: false,
             };
-            safe_ai_skill::tierstate::apply(&dir, Tier::Relaxed, &change, 0)
-                .expect("write tier.json");
+            safe_ai_skill::tierstate::apply(&dir, &change, 0).expect("write tier.json");
             env.push((
                 safe_ai_skill::datadir::TEST_TRUST_ENV.to_string(),
                 "1".to_string(),

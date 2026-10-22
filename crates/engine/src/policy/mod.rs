@@ -584,6 +584,7 @@ impl Policy {
 
         policy.ignored_overrides.extend(removed_settings(&base));
         policy.base_tier = base_tier(&base, &mut policy.ignored_overrides);
+        pin_base_env_read(&mut policy);
 
         if let Some(text) = project_src {
             apply_project_overlay(&mut policy, &base, text);
@@ -655,6 +656,13 @@ fn base_tier(base: &Yaml, notes: &mut Vec<String>) -> Tier {
     for key in ["tier", "active_profile"] {
         if let Some(value) = base.get(key) {
             return match value.as_str().and_then(Tier::parse) {
+                Some(t) if t < Tier::Relaxed => {
+                    notes.push(format!(
+                        "{key}: the plugin default policy may not go below relaxed (lowering is \
+                         `safe-ai-skill tier`, confirmed by you); relaxed applies"
+                    ));
+                    Tier::Relaxed
+                }
                 Some(t) => t,
                 None => {
                     notes.push(format!(
@@ -666,6 +674,20 @@ fn base_tier(base: &Yaml, notes: &mut Vec<String>) -> Tier {
         }
     }
     Tier::Relaxed
+}
+
+/// The plugin default policy's `secrets.env_read` is pinned to `deny`: raw env reads loosen only
+/// through the user's confirmed `tier.json` (`safe-ai-skill tier --env-read`). Anything else
+/// is ignored with a note.
+fn pin_base_env_read(policy: &mut Policy) {
+    if EnvRead::parse(&policy.secrets.env_read) != Some(EnvRead::Deny) {
+        policy.ignored_overrides.push(
+            "secrets.env_read: the plugin default policy may only say deny (loosen it with \
+             `safe-ai-skill tier --env-read`, confirmed by you); deny applies"
+                .to_string(),
+        );
+        policy.secrets.env_read = "deny".to_string();
+    }
 }
 
 /// Removed settings still present in the base policy `base`, one note each. They are
@@ -959,6 +981,18 @@ mod tests {
         assert_eq!(with("tier: high").base_tier, Tier::High);
         assert_eq!(with("active_profile: paranoid").base_tier, Tier::High);
         assert_eq!(with("active_profile: strict").base_tier, Tier::Relaxed);
+        let off = with("tier: off");
+        assert_eq!(off.base_tier, Tier::Relaxed);
+        assert!(off.ignored_overrides.iter().any(|n| n.starts_with("tier:")));
+        let env = Policy::from_sources(
+            &DEFAULT_POLICY_YAML.replace("env_read: deny", "env_read: tier"),
+            None,
+        );
+        assert_eq!(env.secrets.env_read, "deny");
+        assert!(env
+            .ignored_overrides
+            .iter()
+            .any(|n| n.starts_with("secrets.env_read")));
         let bad = with("tier: turbo");
         assert_eq!(bad.base_tier, Tier::Relaxed);
         assert!(bad.ignored_overrides.iter().any(|n| n.starts_with("tier:")));

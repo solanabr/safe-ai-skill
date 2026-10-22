@@ -329,14 +329,14 @@ fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
     )
 }
 
-/// The strictest of several verdicts (`deny` > `ask` > `allow` > no opinion); `None` when
-/// none has an opinion.
+/// The strictest of the tier gates' verdicts (`deny` > `ask`); `None` when none asks or
+/// denies. Tier gates only tighten: an `allow` from one is ignored.
 fn strictest(verdicts: impl IntoIterator<Item = Option<Verdict>>) -> Option<Verdict> {
     verdicts
         .into_iter()
         .flatten()
+        .filter(|v| matches!(v, Verdict::Ask(_) | Verdict::Deny(_)))
         .max_by_key(verdict_rank)
-        .filter(|v| !matches!(v, Verdict::NoOpinion))
 }
 
 fn verdict_rank(v: &Verdict) -> u8 {
@@ -357,15 +357,19 @@ fn decision_rank(d: &Decision) -> u8 {
     }
 }
 
-/// Join a tier gate's verdict with a gate's decision: the tier verdict wins when it is
-/// stricter, under a hard-guard meta (no grant relaxes it).
+/// Join a tier gate's verdict with a gate's decision: an `ask` or `deny` from a tier gate wins
+/// when it is at least as strict, under a hard-guard meta, so no grant can relax it (on an ask
+/// tie the gate's grantable meta is dropped). A tier gate's `allow` is ignored: tier gates only
+/// tighten, and an allow outside a grant or the spend caps never comes from them.
 fn join_tier(
     tier_verdict: Option<Verdict>,
     decision: Decision,
     meta: GateMeta,
 ) -> (Decision, GateMeta) {
     match tier_verdict {
-        Some(v) if verdict_rank(&v) > decision_rank(&decision) => {
+        Some(v @ (Verdict::Ask(_) | Verdict::Deny(_)))
+            if verdict_rank(&v) >= decision_rank(&decision) =>
+        {
             (v.into(), GateMeta::new(Scope::SecretRead, true))
         }
         _ => (decision, meta),
@@ -1799,8 +1803,7 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         clear,
     };
     let summary = tierstate::summary(&change);
-    let base = policy::base().base_tier;
-    match tierstate::plan(&dir, base, &change) {
+    match tierstate::plan(&dir, &change) {
         Plan::NeedsConfirm => park_pending(
             "tier",
             &dir,
@@ -1816,7 +1819,7 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
             }));
             ExitCode::SUCCESS
         }
-        Plan::Immediate => match tierstate::apply(&dir, base, &change, now_secs()) {
+        Plan::Immediate => match tierstate::apply(&dir, &change, now_secs()) {
             Ok(()) => {
                 audit_event(&dir.path, "tier_set", "tier", &summary);
                 let (effective, resolution) = load_runtime(&cwd, &dir);
@@ -1850,6 +1853,7 @@ fn print_tier(cwd: &Path, dir: &DataDir, command: &str) -> ExitCode {
         "headless": effective.runtime.headless,
         "line": notice::tier_line(&resolution, &effective.runtime),
         "notes": resolution.notes,
+        "policy_notes": effective.ignored_overrides,
         "tier_state": state_label(&tierstate::load(dir)),
         "data_dir_trusted": dir.trusted,
     }));
@@ -2034,6 +2038,75 @@ mod tests {
         assert_eq!(deadline_from(Some("250")), Duration::from_millis(250));
         assert_eq!(deadline_from(Some("999999999")), GATE_DEADLINE);
         assert_eq!(deadline_from(Some("soon")), GATE_DEADLINE);
+    }
+
+    fn trusted_dir_with_transfer_grant(tag: &str) -> DataDir {
+        let path = std::env::temp_dir().join(format!("main_join_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let dir = DataDir {
+            path,
+            trusted: true,
+        };
+        let grant = grants::Grant {
+            id: "g1".into(),
+            scope: Scope::Transfer,
+            programs: Vec::new(),
+            to: Vec::new(),
+            max_tx_sol: 10.0,
+            budget_sol: 10.0,
+            spent_sol: 0.0,
+            expires_at: u64::MAX,
+            danger: false,
+        };
+        let all = grants::Grants {
+            grants: vec![grant],
+        };
+        grants::save(&dir, &all).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_tier_gate_ask_is_never_relaxed_by_a_grant() {
+        let dir = trusted_dir_with_transfer_grant("tie");
+        let policy = Policy::from_sources(policy::DEFAULT_POLICY_YAML, None);
+        let mut grantable = GateMeta::new(Scope::Transfer, false);
+        grantable.amount_sol = Some(0.5);
+        let gate_ask = || Decision::Ask {
+            reason: "transfer over cap".into(),
+        };
+        // Without a tier verdict the grant relaxes the gate's own ask.
+        let (d, m) = join_tier(None, gate_ask(), grantable.clone());
+        assert_eq!(relax::apply(d, &m, &policy, &dir), Decision::Allow);
+        // A tier-gate ask on a tie keeps the ask (and denies headless).
+        let stub = Some(Verdict::Ask("exfil host".into()));
+        for headless in [false, true] {
+            let (d, m) = join_tier(stub.clone(), gate_ask(), grantable.clone());
+            assert!(m.hard_guard);
+            let out = headless::apply(relax::apply(d, &m, &policy, &dir), headless);
+            let want = if headless { "deny" } else { "ask" };
+            assert_eq!(out.label(), want, "headless={headless}");
+            assert!(out.reason().starts_with("exfil host"), "{out:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_tier_gate_allow_is_ignored() {
+        let dir = trusted_dir_with_transfer_grant("allow");
+        let allow = || {
+            relax::apply_verdict(
+                Verdict::Ask("x".into()),
+                &GateMeta::new(Scope::Transfer, false),
+                &Policy::default(),
+                &dir,
+            )
+        };
+        assert!(matches!(allow(), Verdict::Allow(_)));
+        assert_eq!(strictest([Some(Verdict::NoOpinion), None]), None);
+        assert_eq!(strictest([Some(allow())]), None);
+        let (d, _) = join_tier(Some(allow()), Decision::Defer, GateMeta::unknown());
+        assert_eq!(d, Decision::Defer);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]

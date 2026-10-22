@@ -327,9 +327,11 @@ fn a_lower_tier_needs_confirmation_and_a_higher_one_does_not() {
     let run = sb.cli(&["tier", "high"]);
     assert_eq!(run.json()["status"], "set", "{}", run.stdout);
     assert!(sb.state("tier.json").unwrap().contains("\"mac\""));
-    // This data dir is untrusted, so tier.json is ignored and changes compare against the
-    // default (lowering from a stored `high` is covered in tiers_select.rs).
-    assert_eq!(sb.cli(&["tier", "relaxed"]).json()["status"], "unchanged");
+    // Changes compare against the stored file (trusted or not): back down from high is a
+    // lowering again, and restating it changes nothing.
+    assert_pending_without_code(&sb.cli(&["tier", "relaxed"]));
+    assert_pending_without_code(&sb.cli(&["tier", "--clear"]));
+    assert_eq!(sb.cli(&["tier", "high"]).json()["status"], "unchanged");
 
     for bad in [
         &["tier", "disabled"][..],

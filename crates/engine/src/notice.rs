@@ -183,7 +183,7 @@ mod tests {
             env_read,
             clear: false,
         };
-        tierstate::apply(dir, Tier::Relaxed, &change, 0).unwrap();
+        tierstate::apply(dir, &change, 0).unwrap();
     }
 
     #[test]

@@ -19,6 +19,8 @@ struct Sandbox {
     root: Option<TempDir>,
     /// An empty dir used as `PATH`, so `varlock` is never found unless a test installs it.
     path: TempDir,
+    /// The user's confirmed `env_read` (`tier.json`), when a test needs one.
+    user_env_read: Option<common::EnvRead>,
 }
 
 impl Sandbox {
@@ -29,7 +31,15 @@ impl Sandbox {
             data: TempDir::new("d3-data"),
             root: None,
             path: TempDir::new("d3-path"),
+            user_env_read: None,
         }
+    }
+
+    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`).
+    #[cfg(feature = "test-hooks")]
+    fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
+        self.user_env_read = Some(env_read);
+        self
     }
 
     /// Use the shipped default policy with `edit` applied to its text.
@@ -62,6 +72,9 @@ impl Sandbox {
             .stdin(payload.to_string());
         if let Some(root) = &self.root {
             inv = inv.env("CLAUDE_PLUGIN_ROOT", root.path().to_str().unwrap());
+        }
+        if let Some(env_read) = self.user_env_read {
+            inv = inv.env_read(env_read);
         }
         inv.run()
     }
@@ -304,8 +317,17 @@ fn read_deny_message_mentions_varlock_only_with_a_schema() {
 }
 
 #[test]
-fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
+fn the_plugin_policy_cannot_loosen_env_read() {
+    // Pinned to deny: only the user's confirmed tier.json loosens it.
     let sb = Sandbox::new().with_policy(|p| p.replace("env_read: deny", "env_read: ask"));
+    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
+    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
     assert_eq!(sb.read(".env"), "ask");
     assert_eq!(sb.read("~/.config/solana/id.json"), "deny");
     sb.write("k.json", &keypair_json());
@@ -562,9 +584,10 @@ fn bash_varlock_safe_commands_have_no_opinion_or_ask() {
     }
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn bash_env_read_ask_applies_to_readers_and_varlock() {
-    let sb = Sandbox::new().with_policy(|p| p.replace("env_read: deny", "env_read: ask"));
+    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
     assert_eq!(decision_label(&sb.bash("cat .env")), "ask");
     assert_eq!(decision_label(&sb.bash("varlock printenv K")), "ask");
     assert_eq!(decision_label(&sb.bash("cat wallet-keypair.json")), "deny");

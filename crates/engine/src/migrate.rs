@@ -226,7 +226,7 @@ fn carry_profile(dir: &DataDir, profile: &str, tier: Tier, now: u64, lines: &mut
                 env_read: None,
                 clear: false,
             };
-            if tierstate::apply(dir, Tier::Relaxed, &change, now).is_ok() {
+            if tierstate::apply(dir, &change, now).is_ok() {
                 lines.push("profile paranoid is now tier high (applied)".to_string());
             }
         }

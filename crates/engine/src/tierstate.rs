@@ -25,6 +25,10 @@ use crate::statefile::{self, FileLock, Loaded};
 /// State file holding the user's tier choices.
 pub const TIER_FILE: &str = "tier.json";
 
+/// The base tier changes are planned against: fixed at compile time (spec §1.2 `base =
+/// relaxed`), never read from a policy file an environment variable can point elsewhere.
+pub const BASE: Tier = Tier::Relaxed;
+
 /// Lock guarding the read-modify-write of [`TIER_FILE`].
 pub const LOCK_FILE: &str = "tier.lock";
 
@@ -166,12 +170,16 @@ pub enum Plan {
     NeedsConfirm,
 }
 
-/// The `(tier, env_read)` in force for the change's scope before and after it, comparing
-/// against the file as gates would read it (an unusable file counts as absent).
-fn before_after(dir: &DataDir, base: Tier, change: &Change) -> ((Tier, EnvRead), (Tier, EnvRead)) {
-    let file = usable(dir).0.unwrap_or_default();
+/// The `(tier, env_read)` in force for the change's scope before and after it, against
+/// [`BASE`] and the stored file whenever it authenticates, trusted or not (so a lowering from a
+/// stored value always needs a confirmation; a file that fails authentication counts as absent).
+fn before_after(dir: &DataDir, change: &Change) -> ((Tier, EnvRead), (Tier, EnvRead)) {
+    let file = match load(dir) {
+        Loaded::Valid(f) => f,
+        _ => TierFile::default(),
+    };
     let global = file.global.as_ref();
-    let global_tier = global.map_or(base, |e| e.tier);
+    let global_tier = global.map_or(BASE, |e| e.tier);
     let global_env = global.and_then(|e| e.env_read).unwrap_or_default();
     let (current, fallback) = match &change.project {
         Some(key) => {
@@ -182,7 +190,7 @@ fn before_after(dir: &DataDir, base: Tier, change: &Change) -> ((Tier, EnvRead),
             );
             (current, (global_tier, global_env))
         }
-        None => ((global_tier, global_env), (base, EnvRead::Deny)),
+        None => ((global_tier, global_env), (BASE, EnvRead::Deny)),
     };
     let after = if change.clear {
         fallback
@@ -195,11 +203,11 @@ fn before_after(dir: &DataDir, base: Tier, change: &Change) -> ((Tier, EnvRead),
     (current, after)
 }
 
-/// Whether `change` applies at once, needs a confirmation, or changes nothing. `base` is the
-/// plugin default tier.
-pub fn plan(dir: &DataDir, base: Tier, change: &Change) -> Plan {
-    let (before, after) = before_after(dir, base, change);
-    if after.0 < before.0 || after.1 > before.1 {
+/// Whether `change` applies at once, needs a confirmation, or changes nothing. Clearing an
+/// entry above [`BASE`] or with a loosened `env_read` always needs a confirmation.
+pub fn plan(dir: &DataDir, change: &Change) -> Plan {
+    let (before, after) = before_after(dir, change);
+    if (change.clear && clears_a_raise(dir, change)) || after.0 < before.0 || after.1 > before.1 {
         Plan::NeedsConfirm
     } else if after == before && !change.clear {
         Plan::NoChange
@@ -208,12 +216,25 @@ pub fn plan(dir: &DataDir, base: Tier, change: &Change) -> Plan {
     }
 }
 
+/// Whether the entry `change` clears holds a tier above [`BASE`] or an `env_read` other than
+/// `deny`.
+fn clears_a_raise(dir: &DataDir, change: &Change) -> bool {
+    let Loaded::Valid(file) = load(dir) else {
+        return false;
+    };
+    let entry = match &change.project {
+        Some(key) => file.projects.get(key),
+        None => file.global.as_ref(),
+    };
+    entry.is_some_and(|e| e.tier > BASE || e.env_read.is_some_and(|r| r != EnvRead::Deny))
+}
+
 /// Write `change` into `tier.json`. The caller decided it may apply ([`plan`], or a confirmed
 /// pending entry). A file that fails authentication is replaced.
-pub fn apply(dir: &DataDir, base: Tier, change: &Change, now: u64) -> Result<(), EngineError> {
+pub fn apply(dir: &DataDir, change: &Change, now: u64) -> Result<(), EngineError> {
     statefile::create_dir_private(&dir.path)?;
     let _lock = FileLock::acquire(&dir.path, LOCK_FILE)?;
-    let (_, after) = before_after(dir, base, change);
+    let (_, after) = before_after(dir, change);
     let mut file = match load(dir) {
         Loaded::Valid(f) => f,
         _ => TierFile::default(),
@@ -341,51 +362,47 @@ mod tests {
     #[test]
     fn raising_is_immediate_and_lowering_needs_confirmation() {
         let dir = tmp_data("tierstate_plan");
-        let base = Tier::Relaxed;
+        assert_eq!(plan(&dir, &global(Some(Tier::High), None)), Plan::Immediate);
         assert_eq!(
-            plan(&dir, base, &global(Some(Tier::High), None)),
-            Plan::Immediate
-        );
-        assert_eq!(
-            plan(&dir, base, &global(Some(Tier::Off), None)),
+            plan(&dir, &global(Some(Tier::Off), None)),
             Plan::NeedsConfirm
         );
         assert_eq!(
-            plan(&dir, base, &global(Some(Tier::Relaxed), None)),
+            plan(&dir, &global(Some(Tier::Relaxed), None)),
             Plan::NoChange
         );
         assert_eq!(
-            plan(&dir, base, &global(None, Some(EnvRead::Ask))),
+            plan(&dir, &global(None, Some(EnvRead::Ask))),
             Plan::NeedsConfirm
         );
         assert_eq!(
-            plan(&dir, base, &global(None, Some(EnvRead::Deny))),
+            plan(&dir, &global(None, Some(EnvRead::Deny))),
             Plan::NoChange
         );
-        apply(&dir, base, &global(Some(Tier::High), None), 1).unwrap();
+        apply(&dir, &global(Some(Tier::High), None), 1).unwrap();
         assert_eq!(
-            plan(&dir, base, &global(Some(Tier::Medium), None)),
+            plan(&dir, &global(Some(Tier::Medium), None)),
             Plan::NeedsConfirm
         );
         let clear = Change {
             clear: true,
             ..global(None, None)
         };
-        assert_eq!(plan(&dir, base, &clear), Plan::NeedsConfirm);
+        assert_eq!(plan(&dir, &clear), Plan::NeedsConfirm);
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
     fn project_entries_beat_global_and_siblings_get_global() {
         let dir = tmp_data("tierstate_project");
-        apply(&dir, Tier::Relaxed, &global(Some(Tier::Medium), None), 1).unwrap();
+        apply(&dir, &global(Some(Tier::Medium), None), 1).unwrap();
         let project = Change {
             project: Some(root()),
             tier: Some(Tier::High),
             env_read: Some(EnvRead::Deny),
             clear: false,
         };
-        apply(&dir, Tier::Relaxed, &project, 2).unwrap();
+        apply(&dir, &project, 2).unwrap();
         let c = user_choice(&dir, Path::new("/work/proj"));
         assert_eq!(c.tier, Some((Tier::High, TierSource::UserProject)));
         assert_eq!(c.env_read, Some(EnvRead::Deny));
@@ -398,8 +415,8 @@ mod tests {
     #[test]
     fn env_read_only_change_keeps_the_scope_tier() {
         let dir = tmp_data("tierstate_envonly");
-        apply(&dir, Tier::Relaxed, &global(Some(Tier::Medium), None), 1).unwrap();
-        apply(&dir, Tier::Relaxed, &global(None, Some(EnvRead::Ask)), 2).unwrap();
+        apply(&dir, &global(Some(Tier::Medium), None), 1).unwrap();
+        apply(&dir, &global(None, Some(EnvRead::Ask)), 2).unwrap();
         let c = user_choice(&dir, Path::new("/x"));
         assert_eq!(c.tier, Some((Tier::Medium, TierSource::UserGlobal)));
         assert_eq!(c.env_read, Some(EnvRead::Ask));
@@ -418,7 +435,7 @@ mod tests {
         let c = user_choice(&dir, Path::new("/x"));
         assert_eq!((c.tier, c.status), (None, UserStatus::Tampered));
         let _ = std::fs::remove_file(dir.path.join(TIER_FILE));
-        apply(&dir, Tier::Relaxed, &global(Some(Tier::Off), None), 1).unwrap();
+        apply(&dir, &global(Some(Tier::Off), None), 1).unwrap();
         dir.trusted = false;
         let c = user_choice(&dir, Path::new("/x"));
         assert_eq!((c.tier, c.status), (None, UserStatus::Untrusted));

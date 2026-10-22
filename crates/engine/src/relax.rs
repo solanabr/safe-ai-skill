@@ -227,8 +227,7 @@ fn activate_tier(dir: &DataDir, payload: &Value, now: u64) -> Result<String, Str
 }
 
 fn store_tier(dir: &DataDir, change: &tierstate::Change, now: u64) -> Result<String, String> {
-    tierstate::apply(dir, crate::policy::base().base_tier, change, now)
-        .map_err(|e| format!("could not store it: {e}"))?;
+    tierstate::apply(dir, change, now).map_err(|e| format!("could not store it: {e}"))?;
     Ok(tierstate::summary(change))
 }
 
