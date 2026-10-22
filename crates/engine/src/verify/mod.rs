@@ -1227,12 +1227,10 @@ fn not_moved_reason(pack: &Pack) -> Option<String> {
     if is_link {
         return Some("the pack directory is a symlink or cannot be inspected".to_string());
     }
-    [&pack.dir, &pack.canonical]
-        .into_iter()
-        .find_map(|p| match gittracked::tracking(p) {
-            gittracked::Tracking::Tracked(why) => Some(format!("tracked by git ({why})")),
-            gittracked::Tracking::Untracked => None,
-        })
+    match gittracked::tracking_any(&[&pack.dir, &pack.canonical]) {
+        gittracked::Tracking::Tracked(why) => Some(format!("tracked by git ({why})")),
+        gittracked::Tracking::Untracked => None,
+    }
 }
 
 /// Move a blocked pack into `${DATA}/quarantine/` (`supply_chain.on_block: move`), never

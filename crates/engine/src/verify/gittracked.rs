@@ -38,6 +38,23 @@ impl Tracking {
     }
 }
 
+/// [`tracking`] for several spellings of one pack (the path it was found under and its canonical
+/// one): the first that is tracked. Spellings that resolve to the same path are examined once.
+pub fn tracking_any(paths: &[&Path]) -> Tracking {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let resolved = absolute(path).unwrap_or_else(|| path.to_path_buf());
+        if seen.contains(&resolved) {
+            continue;
+        }
+        seen.push(resolved);
+        if let Tracking::Tracked(why) = tracking(path) {
+            return Tracking::Tracked(why);
+        }
+    }
+    Tracking::Untracked
+}
+
 /// Whether the pack directory `pack` is tracked by any enclosing git repository, or is a
 /// repository (a clone) itself.
 pub fn tracking(pack: &Path) -> Tracking {
@@ -173,10 +190,12 @@ fn index_path(git: &Path, root: &Path) -> Option<PathBuf> {
     dir.is_dir().then(|| dir.join("index"))
 }
 
-/// Lowercased, so a case-insensitive filesystem cannot slip a differently-cased spelling past
-/// the comparison (a false match only keeps a pack in place).
+/// ASCII-lowercased, so a case-insensitive filesystem cannot slip a differently-cased ASCII
+/// spelling past the comparison (a false match only keeps a pack in place). Non-ASCII bytes are
+/// compared exactly: folding them costs an allocation per entry and a Unicode-aware filesystem
+/// spelling the same name differently is not covered.
 fn fold(path: &str) -> String {
-    path.trim_matches('/').to_lowercase()
+    path.trim_matches('/').to_ascii_lowercase()
 }
 
 /// `target` is, contains or lies inside a path `.gitmodules` declares.
@@ -235,17 +254,9 @@ enum Rel {
     Apart,
 }
 
-/// `path` against `target` (already [`fold`]ed), ASCII-case-insensitively and without
-/// allocating; a path with non-ASCII bytes is lower-cased as text first.
+/// `path` against `target` (already [`fold`]ed): ASCII case folded, other bytes exact, and no
+/// allocation.
 fn relation(path: &[u8], target: &[u8]) -> Rel {
-    if !path.is_ascii() {
-        let lowered = String::from_utf8_lossy(path).to_lowercase();
-        return relation_ascii(lowered.as_bytes(), target);
-    }
-    relation_ascii(path, target)
-}
-
-fn relation_ascii(path: &[u8], target: &[u8]) -> Rel {
     let mut end = path.len();
     while end > 0 && path[end - 1] == b'/' {
         end -= 1;
@@ -267,14 +278,26 @@ fn at(base: usize, add: usize) -> Result<usize, ()> {
     base.checked_add(add).ok_or(())
 }
 
+/// Most work (bytes copied and compared, plus a fixed charge per entry) one index parse may do.
+/// Beyond it the parse gives up and the pack counts as tracked. A genuine index stays far below
+/// it (a 64 MiB index of ordinary paths costs about 100 million units), and a hostile one costs
+/// at most this many cheap byte operations, well under a second.
+const MAX_WORK: usize = 256 * 1024 * 1024;
+/// Work charged per entry on top of the bytes it copies and compares.
+const ENTRY_WORK: usize = 64;
+
 /// `Ok(true)` when an index entry is, lies inside or (for a submodule or a sparse directory)
 /// contains `target`; `Err` for anything this parser does not fully understand (an unknown
-/// version, a truncated or split index, a path over [`MAX_NAME`]).
+/// version, a truncated or split index, a path over [`MAX_NAME`], more than [`MAX_WORK`]).
 ///
 /// Work is linear in the index size: a version-4 path is rebuilt in one reused buffer (the
-/// previous path truncated, the new suffix appended), and the comparison allocates nothing for
-/// ASCII paths.
+/// previous path truncated, the new suffix appended), and the comparison allocates nothing.
 fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
+    scan_index(bytes, target).map(|(hit, _)| hit)
+}
+
+/// [`index_covers`], with the work it did.
+fn scan_index(bytes: &[u8], target: &str) -> Result<(bool, usize), ()> {
     if bytes.get(..4) != Some(b"DIRC") {
         return Err(());
     }
@@ -291,6 +314,7 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
     let target = target.as_bytes();
     let mut cursor = 12usize;
     let mut name: Vec<u8> = Vec::new();
+    let mut work = 0usize;
     for _ in 0..count {
         let start = cursor;
         let mode = be32(bytes, at(start, 24)?).ok_or(())?;
@@ -332,6 +356,15 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
         if cursor > bytes.len() {
             return Err(());
         }
+        // The entry's bytes read, the name copied (at most what was read) and the prefix
+        // compared.
+        work = work
+            .saturating_add(cursor.saturating_sub(start))
+            .saturating_add(name.len().min(target.len()))
+            .saturating_add(ENTRY_WORK);
+        if work > MAX_WORK {
+            return Err(());
+        }
         let kind = mode & MODE_TYPE;
         let container = kind == MODE_GITLINK || kind == MODE_DIR || name.ends_with(b"/");
         let hit = match relation(&name, target) {
@@ -340,7 +373,7 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
             Rel::Apart => false,
         };
         if hit {
-            return Ok(true);
+            return Ok((true, work));
         }
     }
     // Extensions follow the entries. A split index keeps its entries in another file.
@@ -353,7 +386,7 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
         let size = be32(bytes, at(ext, 4)?).ok_or(())? as usize;
         ext = at(at(ext, 8)?, size)?;
     }
-    Ok(false)
+    Ok((false, work))
 }
 
 #[cfg(test)]
@@ -700,5 +733,63 @@ mod tests {
         let p = pack(&root, ".claude/skills/evil");
         std::os::unix::fs::symlink("/dev/zero", root.join(".claude/skills/.gitmodules")).unwrap();
         assert!(tracking_within(&p).is_tracked());
+    }
+
+    /// A version-4 index of `entries` entries whose names stay at `len` bytes (each strips one
+    /// byte and adds one), made of `unit` repeated.
+    fn steady_v4(unit: &[u8], len: usize, entries: usize) -> Vec<u8> {
+        let first: Vec<u8> = unit.iter().cycle().take(len).copied().collect();
+        let mut rows = vec![(0, first, 0o100644)];
+        rows.extend((1..entries).map(|_| (1, unit[..1].to_vec(), 0o100644)));
+        v4_index(&rows)
+    }
+
+    #[test]
+    fn long_non_ascii_names_cost_bounded_work_and_no_allocation_per_entry() {
+        use std::time::Instant;
+        let e_acute = "é".as_bytes();
+        // 600k entries of 4000-byte non-ASCII names: an ASCII target stops at the first byte.
+        let idx = steady_v4(e_acute, 4000, 600_000);
+        let started = Instant::now();
+        let (hit, work) = scan_index(&idx, "x/y").unwrap();
+        assert!(!hit);
+        assert!(work < MAX_WORK, "{work}");
+        // The worst case for the comparison: a 3999-byte target equal to every name but its
+        // last byte. The work cap ends the parse, and the pack counts as tracked.
+        let long_target = format!("{}x", "é".repeat(1999));
+        assert_eq!(scan_index(&idx, &long_target), Err(()));
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "both scans took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn non_ascii_bytes_compare_exactly_and_only_ascii_folds() {
+        let idx = v4_index(&[(0, "Dir/é.txt".as_bytes().to_vec(), 0o100644)]);
+        assert_eq!(index_covers(&idx, "dir/é.txt"), Ok(true));
+        assert_eq!(index_covers(&idx, "DIR/é.TXT"), Ok(true));
+        assert_eq!(index_covers(&idx, "dir/É.txt"), Ok(false));
+    }
+
+    #[test]
+    fn work_is_counted_and_a_genuine_index_stays_far_below_the_cap() {
+        let idx = steady_v4(b"abc", 60, 100_000);
+        let (_, work) = scan_index(&idx, "some/pack/dir").unwrap();
+        assert!(work > 100_000 && work < MAX_WORK / 10, "{work}");
+    }
+
+    #[test]
+    fn two_spellings_of_one_pack_are_examined_once() {
+        let root = temp("any");
+        git(&root, &["init", "-q"]);
+        let p = pack(&root, "s/p");
+        // The marker proves the second look never happens: removing the index between the
+        // spellings cannot change the answer of a deduplicated call.
+        assert_eq!(tracking_any(&[&p, &p]), Tracking::Untracked);
+        let tracked = pack(&root, "s/t");
+        git(&root, &["add", "s/t"]);
+        assert!(tracking_any(&[&tracked, &tracked.canonicalize().unwrap()]).is_tracked());
     }
 }
