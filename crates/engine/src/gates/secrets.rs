@@ -208,11 +208,51 @@ fn decide_segment(
 ) -> Result<Decision, tamper::TooComplex> {
     let all: Vec<String> = tokenize(segment);
     budget.spend(all.len())?;
-    // `< .env` / `$(<.env)` / `dd if=.env` feed a secret to any command.
-    if let Some(decision) = decide_redirects(&all, policy, cwd) {
-        return Ok(decision);
+    // `< .env` / `$(<.env)` / `dd if=.env` feed a secret to any command. A redirect the
+    // user's env opt-in leaves open (no opinion) must not end the scan: the command's own
+    // arguments are still checked, and the stricter verdict wins.
+    let redirect = decide_redirects(&all, policy, cwd);
+    if matches!(redirect, Some(Decision::Deny { .. })) {
+        return Ok(redirect.unwrap_or(Decision::Defer));
     }
-    let (assignments, tokens) = strip_wrappers(&all);
+    let command = decide_command(&all, policy, cwd, budget)?;
+    Ok(match redirect {
+        Some(held) => stricter(held, command),
+        None => command,
+    })
+}
+
+/// The stricter of two decisions (`Deny` > `Ask` > `Allow` > `Defer`); `a` on a tie.
+fn stricter(a: Decision, b: Decision) -> Decision {
+    let rank = |d: &Decision| match d {
+        Decision::Defer => 0,
+        Decision::Allow => 1,
+        Decision::Ask { .. } => 2,
+        Decision::Deny { .. } => 3,
+    };
+    if rank(&b) > rank(&a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Fold `next` into `held`; `true` when the scan can stop (a `Deny`). A no-opinion verdict
+/// (an env file the user's opt-in leaves open) never stops the scan.
+fn hold(held: &mut Decision, next: Decision) -> bool {
+    let taken = std::mem::replace(held, Decision::Defer);
+    *held = stricter(taken, next);
+    matches!(held, Decision::Deny { .. })
+}
+
+/// The command part of a segment (after its redirects), spending from `budget`.
+fn decide_command(
+    all: &[String],
+    policy: &Policy,
+    cwd: Option<&Path>,
+    budget: &mut tamper::Budget,
+) -> Result<Decision, tamper::TooComplex> {
+    let (assignments, tokens) = strip_wrappers(all);
     if tokens.is_empty() {
         return Ok(Decision::Defer);
     }
@@ -246,6 +286,7 @@ fn decide_segment(
                     || t.starts_with("--regexp=")
                     || t.starts_with("--file=")
             });
+        let mut held = Decision::Defer;
         for arg in tokens.iter().skip(1) {
             if is_flag(arg) {
                 continue;
@@ -255,10 +296,12 @@ fn decide_segment(
             }
             spend_matches(arg)?;
             if let Some(decision) = secret_arg_decision(arg, &program, policy, cwd) {
-                return Ok(decision);
+                if hold(&mut held, decision) {
+                    break;
+                }
             }
         }
-        return Ok(Decision::Defer);
+        return Ok(held);
     }
 
     // `git show REV:.env`, `git cat-file -p REV:.env`.
@@ -278,6 +321,7 @@ fn decide_segment(
             }
         }
         let sub = tokens.get(i).map(String::as_str);
+        let mut held = Decision::Defer;
         if matches!(sub, Some("show" | "cat-file")) {
             for arg in tokens.iter().skip(i + 1).filter(|t| !is_flag(t)) {
                 spend_matches(arg)?;
@@ -285,11 +329,13 @@ fn decide_segment(
                     continue;
                 };
                 if let Some(decision) = secret_arg_decision(path, "git show", policy, cwd) {
-                    return Ok(decision);
+                    if hold(&mut held, decision) {
+                        break;
+                    }
                 }
             }
         }
-        return Ok(Decision::Defer);
+        return Ok(held);
     }
 
     // 2. Exfil via curl / wget.
@@ -351,13 +397,27 @@ fn is_assignment(tok: &str) -> bool {
 /// The verdict for reading a secret through a redirection-like form, if any: `< file`,
 /// `$(<file)` (anywhere, assignments included) and `dd if=file`.
 fn decide_redirects(tokens: &[String], policy: &Policy, cwd: Option<&Path>) -> Option<Decision> {
+    // The strictest verdict over every redirect; a `Deny` ends the scan, a no-opinion (opted-in
+    // env file) does not.
+    let mut held: Option<Decision> = None;
+    let mut fold = |decision: Decision| -> bool {
+        let next = match held.take() {
+            Some(prev) => stricter(prev, decision),
+            None => decision,
+        };
+        let stop = matches!(next, Decision::Deny { .. });
+        held = Some(next);
+        stop
+    };
     for tok in tokens {
         let mut rest = tok.as_str();
         while let Some(i) = rest.find("$(<") {
             let inner = &rest[i + 3..];
             let path = inner.split(')').next().unwrap_or("").trim();
             if let Some(decision) = secret_arg_decision(path, "$(<…)", policy, cwd) {
-                return Some(decision);
+                if fold(decision) {
+                    return held;
+                }
             }
             rest = inner;
         }
@@ -366,7 +426,9 @@ fn decide_redirects(tokens: &[String], policy: &Policy, cwd: Option<&Path>) -> O
         for tok in tokens {
             if let Some(path) = tok.strip_prefix("if=") {
                 if let Some(decision) = secret_arg_decision(path, "dd", policy, cwd) {
-                    return Some(decision);
+                    if fold(decision) {
+                        return held;
+                    }
                 }
             }
         }
@@ -382,11 +444,13 @@ fn decide_redirects(tokens: &[String], policy: &Policy, cwd: Option<&Path>) -> O
         };
         if let Some(path) = target {
             if let Some(decision) = secret_arg_decision(path, "<", policy, cwd) {
-                return Some(decision);
+                if fold(decision) {
+                    return held;
+                }
             }
         }
     }
-    None
+    held
 }
 
 /// The verdict for `program` reading `arg`, when `arg` names a secret.

@@ -449,12 +449,23 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
         return ReadVerdict::Decide(verdict.into());
     }
+    // An env glob the user's opt-in leaves open (no opinion) still gets the key-material
+    // exclusion, minus the env-file globs it opted into.
+    let mut keep_env = false;
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
-        return ReadVerdict::Decide(env_verdict(first, policy, varlock_hint(cwd, &real)));
+        let verdict = env_verdict(first, policy, varlock_hint(cwd, &real));
+        if !matches!(verdict, Decision::Defer) {
+            return ReadVerdict::Decide(verdict);
+        }
+        keep_env = true;
     }
 
-    let exclusion = grep_exclusion(&real);
+    let exclusion = if keep_env {
+        grep_exclusion_keeping_env(&real)
+    } else {
+        grep_exclusion(&real)
+    };
     let new_glob = if glob.trim().is_empty() {
         exclusion
     } else {
@@ -470,6 +481,19 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
 pub fn grep_exclusion(dir: &Path) -> String {
     let alts: Vec<String> = credpaths::grep_exclusions(dir)
         .iter()
+        .map(|g| case_insensitive(g))
+        .collect();
+    format!("!{{{}}}", alts.join(","))
+}
+
+/// [`grep_exclusion`] without the env-file globs, for an opted-in env Grep.
+fn grep_exclusion_keeping_env(dir: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions(dir)
+        .iter()
+        .filter(|g| {
+            let last = g.rsplit('/').next().unwrap_or(g);
+            secretpath::classify(last) != Class::Env
+        })
         .map(|g| case_insensitive(g))
         .collect();
     format!("!{{{}}}", alts.join(","))

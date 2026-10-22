@@ -622,8 +622,14 @@ fn env_keys_and_mentions_have_no_opinion_at_every_tier() {
 
 #[test]
 fn bash_in_place_edits_are_not_claimed_by_the_write_gate() {
-    // No Bash write coverage (spec §8): only the sandbox's denyWrite closes these. With the
-    // default `env_read: deny` the raw-read rule still denies `sed … .env` (sed reads it).
+    // No Bash write coverage (spec §8): only the sandbox's denyWrite closes these. The brief's
+    // `sed -i s/a/b/ .env` n/o ×4 row is deny ×4 by ruling: with the default `env_read: deny`
+    // the raw-read rule denies it (sed reads the file), which is the safer verdict.
+    let p = Proj::new();
+    for tier in tiers() {
+        let run = p.bash(Setup::at(tier), "sed -i s/a/b/ .env");
+        assert_eq!(decision_label(&run), "deny", "at {}", tier.label());
+    }
     let policy = safe_ai_skill::policy::Policy::default();
     let cwd = Path::new("/p");
     for tier in TIERS {
@@ -699,37 +705,69 @@ fn read_response(file: &Path, content: &str) -> Value {
     })
 }
 
-#[test]
-fn a_raw_env_read_response_is_never_rewritten() {
-    // Only an opted-in read gets this far (otherwise the read gate denied it), and a rewritten
-    // response would be written back by the next Edit or Write.
-    let p = Proj::new();
-    let env = p.project.join(".env");
-    let content = std::fs::read_to_string(&env).unwrap();
-    let run = p.redact(
-        Setup::at(Tier::Relaxed),
-        "Read",
-        json!({ "file_path": env }),
-        read_response(&env, &content),
-    );
-    assert!(run.stdout.trim().is_empty(), "{}", run.stdout);
-    // The same text from any other file is still scrubbed.
-    let notes = p.project.join("notes.txt");
-    let run = p.redact(
-        Setup::at(Tier::Relaxed),
-        "Read",
-        json!({ "file_path": notes }),
-        read_response(&notes, &content),
-    );
-    let out = updated(&run);
+fn assert_scrubbed(run: &Run, what: &str) {
+    let out = updated(run);
     assert!(
         out["file"]["content"]
             .as_str()
-            .unwrap()
+            .unwrap_or_default()
             .contains("«redacted:HELIUS_KEY»"),
-        "{out}"
+        "{what}: {out}"
     );
-    // And a Bash dump of the env file is scrubbed too.
+}
+
+fn env_read_post(p: &Proj, setup: Setup, file: &Path) -> Run {
+    let content = std::fs::read_to_string(p.project.join(".env")).unwrap();
+    p.redact(
+        setup,
+        "Read",
+        json!({ "file_path": file }),
+        read_response(file, &content),
+    )
+}
+
+#[test]
+fn an_env_read_the_read_gate_would_deny_is_still_scrubbed() {
+    // The read gate crashed or was bypassed (`onFailure: continue`): the redact hook re-checks
+    // the read against the policy and scrubs a read the gate would have denied.
+    let p = Proj::new();
+    let env = p.project.join(".env");
+    for tier in tiers() {
+        assert_scrubbed(&env_read_post(&p, Setup::at(tier), &env), tier.label());
+    }
+    // A repo cannot widen the exemption.
+    p.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: tier\n");
+    assert_scrubbed(
+        &env_read_post(&p, Setup::at(Tier::Relaxed).sandbox(SandboxMode::On), &env),
+        "repo env_read: tier",
+    );
+}
+
+#[test]
+fn other_reads_and_bash_dumps_of_env_values_are_scrubbed() {
+    let p = Proj::new();
+    let content = std::fs::read_to_string(p.project.join(".env")).unwrap();
+    let notes = p.project.join("notes.txt");
+    assert_scrubbed(
+        &p.redact(
+            Setup::at(Tier::Relaxed),
+            "Read",
+            json!({ "file_path": notes }),
+            read_response(&notes, &content),
+        ),
+        "notes.txt",
+    );
+    // A response claiming to be `.env` for a request of another file is scrubbed.
+    let env = p.project.join(".env");
+    assert_scrubbed(
+        &p.redact(
+            Setup::at(Tier::Relaxed),
+            "Read",
+            json!({ "file_path": notes }),
+            read_response(&env, &content),
+        ),
+        "mismatched filePath",
+    );
     let run = p.redact(
         Setup::at(Tier::Relaxed),
         "Bash",
@@ -742,19 +780,46 @@ fn a_raw_env_read_response_is_never_rewritten() {
         .contains("«redacted:HELIUS_KEY»"));
 }
 
-#[cfg(unix)]
+#[cfg(feature = "test-hooks")]
 #[test]
-fn a_read_through_a_symlink_to_an_env_file_is_never_rewritten() {
+fn an_opted_in_env_read_response_is_never_rewritten() {
+    let p = Proj::new();
+    let env = p.project.join(".env");
+    for env_read in [EnvRead::Tier, EnvRead::Ask] {
+        let opted = Setup::at(Tier::Relaxed)
+            .env_read(env_read)
+            .sandbox(SandboxMode::On);
+        let run = env_read_post(&p, opted, &env);
+        assert!(run.stdout.trim().is_empty(), "{env_read:?}: {}", run.stdout);
+        // The same opt-in with the sandbox off, or at a tier that denies it, scrubs.
+        assert_scrubbed(
+            &env_read_post(&p, opted.sandbox(SandboxMode::Off), &env),
+            "sandbox off",
+        );
+        assert_scrubbed(
+            &env_read_post(
+                &p,
+                Setup {
+                    tier: Tier::High,
+                    ..opted
+                },
+                &env,
+            ),
+            "high",
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "test-hooks"))]
+#[test]
+fn an_opted_in_read_through_a_symlink_to_an_env_file_is_never_rewritten() {
     let p = Proj::new();
     let link = p.project.join("settings.txt");
     std::os::unix::fs::symlink(p.project.join(".env"), &link).unwrap();
-    let content = std::fs::read_to_string(p.project.join(".env")).unwrap();
-    let run = p.redact(
-        Setup::at(Tier::Relaxed),
-        "Read",
-        json!({ "file_path": link }),
-        read_response(&link, &content),
-    );
+    let opted = Setup::at(Tier::Relaxed)
+        .env_read(EnvRead::Tier)
+        .sandbox(SandboxMode::On);
+    let run = env_read_post(&p, opted, &link);
     assert!(run.stdout.trim().is_empty(), "{}", run.stdout);
 }
 
@@ -832,14 +897,10 @@ fn a_scrubbed_read_would_have_clobbered_the_file() {
     assert!(scrubbed.contains("«redacted:HELIUS_KEY»"), "{scrubbed}");
 }
 
-/// An opted-in env argument must not end the scan of the rest of the command: key material
-/// after it still denies. Today `secrets.rs` (F4's file) returns the first env-class verdict,
-/// even no-opinion, so the reader and redirect rules stop at `.env`. Fix (in
-/// `secrets::decide_segment`, `decide_redirects` and the `git show` loop): return a
-/// `secret_arg_decision` only when it is not `Decision::Defer`.
+/// An opted-in env argument (no opinion) must not end the scan: key material after it, in
+/// arguments, redirects or `git show` paths, still denies.
 #[cfg(feature = "test-hooks")]
 #[test]
-#[ignore = "needs secrets.rs to keep scanning past an opted-in env argument (F4 / F8)"]
 fn an_opted_in_env_argument_does_not_hide_key_material_after_it() {
     let p = Proj::new();
     let opted = Setup::at(Tier::Relaxed)
@@ -850,20 +911,34 @@ fn an_opted_in_env_argument_does_not_hide_key_material_after_it() {
     for cmd in [
         "cat .env ~/.ssh/id_rsa",
         "cat .env deploy-keypair.json",
-        "cat < .env ~/.config/solana/id.json",
         "head .env -n 3 wallet-keypair.json",
+        // Redirects.
+        "cat < .env ~/.config/solana/id.json",
+        "wc -l < .env < deploy-keypair.json",
+        "echo $(<.env) $(<deploy-keypair.json)",
+        "dd if=.env of=/dev/null; dd if=deploy-keypair.json",
+        // `git show REV:path`.
+        "git show HEAD:.env HEAD:deploy-keypair.json",
+        "git cat-file -p HEAD:.env HEAD:.config/solana/id.json",
     ] {
         assert_eq!(decision_label(&p.bash(opted, cmd)), "deny", "{cmd}");
     }
+    // The env file alone stays open.
+    for cmd in [
+        "cat .env",
+        "cat < .env",
+        "git show HEAD:.env",
+        "wc -l < .env",
+    ] {
+        assert_eq!(decision_label(&p.bash(opted, cmd)), "", "{cmd}");
+    }
 }
 
-/// Same for a directory Grep whose glob names an env file and key material: with the opt-in
-/// the env verdict is no opinion and `read::decide_grep` (F0's file) returns it, skipping the
-/// key-material exclusion rewrite. Fix: when `env_verdict` is `Defer`, fall through to the
-/// exclusion rewrite instead of returning.
+/// Same for a directory Grep whose glob names an env file and key material: the opted-in env
+/// glob is no opinion, so the key-material exclusion rewrite still applies (without the
+/// env-file globs the user opted into).
 #[cfg(feature = "test-hooks")]
 #[test]
-#[ignore = "needs read::decide_grep to fall through to the exclusion rewrite (F0 / F8)"]
 fn an_opted_in_grep_glob_keeps_the_key_material_exclusion() {
     let p = Proj::new();
     let opted = Setup::at(Tier::Relaxed)
@@ -875,5 +950,19 @@ fn an_opted_in_grep_glob_keeps_the_key_material_exclusion() {
         "Grep",
         json!({ "pattern": "1", "path": p.project.path(), "glob": "{.env,*-keypair.json}" }),
     );
-    assert!(!run.stdout.trim().is_empty(), "no exclusion or decision");
+    let glob = run.json()["hookSpecificOutput"]["updatedInput"]["glob"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(glob.starts_with("{.env,*-keypair.json} !{"), "{glob}");
+    assert!(glob.contains("[kK][eE][yY][pP][aA][iI][rR]"), "{glob}");
+    assert!(!glob.contains("**/.[eE][nN][vV],"), "{glob}");
+    // Not opted in: the env glob is denied outright.
+    let run = p.pre(
+        Setup::at(Tier::Relaxed),
+        "gate-read",
+        "Grep",
+        json!({ "pattern": "1", "path": p.project.path(), "glob": "{.env,*-keypair.json}" }),
+    );
+    assert_eq!(decision_label(&run), "deny");
 }
