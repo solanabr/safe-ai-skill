@@ -89,26 +89,37 @@ const LAUNCHERS: &[&str] = &[
     "chpst",
 ];
 
-/// Value-moving or irreversible subcommand words. A family mention followed by one of these
-/// in text written to a file that a shell then runs is a solana command the gate cannot see.
-/// A word starting with `create-` counts too.
-pub const GATED_TOKENS: &[&str] = &[
+/// Value-moving or irreversible subcommand segments. A word is gated when one of its `.`- or
+/// `-`-separated parts is one of these (`transfer`, `close-mint`, `set-upgrade-authority`,
+/// `withdraw-from-vote-account`, `create-account`, `x.transfer`), or it holds `write-buffer`.
+pub const GATED_SEGMENTS: &[&str] = &[
     "transfer",
     "deploy",
     "upgrade",
     "close",
-    "close-mint",
-    "set-authority",
-    "set-upgrade-authority",
+    "authority",
     "authorize",
     "withdraw",
-    "withdraw-stake",
-    "delegate-stake",
+    "delegate",
+    "stake",
     "mint",
     "burn",
-    "erase-authority",
-    "write-buffer",
+    "approve",
+    "revoke",
+    "wrap",
+    "unwrap",
+    "erase",
+    "create",
 ];
+
+/// Whether `word` is a value-moving subcommand word (see [`GATED_SEGMENTS`]).
+pub fn is_gated_word(word: &str) -> bool {
+    let word = word.to_ascii_lowercase();
+    word.contains("write-buffer")
+        || word
+            .split(['.', '-'])
+            .any(|part| GATED_SEGMENTS.contains(&part))
+}
 
 /// Characters that continue a word for mention and gated-token matching.
 fn is_mention_char(c: char) -> bool {
@@ -245,11 +256,18 @@ pub struct Parsed {
     /// An opaque input (see [`Parsed::opaque`]) whose text names a solana-family program: a
     /// solana command runs that the parser cannot read.
     pub opaque_mention: bool,
-    /// Writes a file with text naming a solana-family program and a value-moving subcommand
-    /// (`echo 'solana transfer …' > x.sh`, `cat > x.sh <<EOF`).
-    pub writes_family_script: bool,
-    /// Runs a script file (`bash x.sh`, `source x`, `./x.sh`).
-    pub runs_script_file: bool,
+    /// Writes a file whose content names a solana-family program (`echo 'solana …' > x.sh`,
+    /// `cat > x.sh <<EOF`, `printf 'solana …' | tee x.sh`).
+    pub writes_family_text: bool,
+    /// After such a write, runs a file or standard input as code (`bash x.sh`, `cat x.sh |
+    /// bash`, `sh < x.sh`, `python3 x.py`, `source x`, `./x`).
+    pub write_then_run: bool,
+}
+
+/// Record that a command runs a file or stdin as code: after a family write, that is a
+/// solana command the gate cannot see.
+fn executes(out: &mut Parsed) {
+    out.write_then_run |= out.writes_family_text;
 }
 
 /// Mark `out` opaque because of code in `text` it cannot read.
@@ -265,19 +283,14 @@ pub fn parse(command: &str) -> Parsed {
     out
 }
 
-/// Whether `text` names a solana-family program on a word boundary, after removing quotes
+/// Whether `text` names a solana-family program as code would: a word, or the last segment of
+/// a path (`./solana`, `~/.local/…/bin/solana`, `/usr/bin/solana`), after removing quotes
 /// (and, in a second reading, backslashes: `s\olana`), or holds ANSI-C quoting
-/// (`$'\x73olana'`). `/usr/bin/solana`, `solana.exe` and `SOLANA` count; `solana-keygen`,
-/// `solana.so` and path segments that are not a program do not (`programs/anchor/x`,
-/// `@coral-xyz/anchor`, `~/.config/solana`).
+/// (`$'\x73olana'`). `solana.exe` and `SOLANA` count; `solana-keygen`, `solana.so` and inner
+/// path segments (`programs/anchor/x`) do not. Only text that runs is scanned: data
+/// arguments of ordinary commands never are.
 pub fn mentions_family(text: &str) -> bool {
-    text.contains("$'") || readings(text).iter().any(|r| scan(r, false))
-}
-
-/// Whether `text` names a solana-family program followed, somewhere later, by a value-moving
-/// subcommand word ([`GATED_TOKENS`]).
-pub fn gated_mention(text: &str) -> bool {
-    readings(text).iter().any(|r| scan(r, true))
+    text.contains("$'") || readings(text).iter().any(|r| scan(r))
 }
 
 /// `text` lowercased with quotes removed: backslashes kept as separators (`C:\bin\solana`),
@@ -292,8 +305,8 @@ fn readings(text: &str) -> [String; 2] {
     [unquoted, plain]
 }
 
-/// Scan one reading: any program mention, or (`gated`) one followed by a gated token.
-fn scan(text: &str, gated: bool) -> bool {
+/// Scan one reading for a program mention.
+fn scan(text: &str) -> bool {
     // (word, counts as a program mention)
     let mut words: Vec<(&str, bool)> = Vec::new();
     let is_path_sep = |c: char| matches!(c, '/' | '\\');
@@ -317,15 +330,14 @@ fn scan(text: &str, gated: bool) -> bool {
                     | '$'
             )
     }) {
+        // In a path, only the last segment can be the program (`./solana`, `~/…/bin/solana`,
+        // `$HOME/…/solana`, `C:\bin\solana.exe`); `programs/anchor/x` names none.
+        // An npm scope (`@coral-xyz/anchor`) names a package, never a program.
         let segments: Vec<&str> = token.split(is_path_sep).collect();
-        let pathy = segments.len() > 1;
-        // A program path: no npm scope, home, hidden or relative-dot segment.
-        let program_path = !segments
-            .iter()
-            .any(|s| s.starts_with('@') || s.starts_with('~') || s.starts_with('.'));
+        let package = segments.iter().any(|s| s.starts_with('@'));
         let last = segments.len().saturating_sub(1);
         for (i, segment) in segments.iter().enumerate() {
-            let program_position = !pathy || (i == last && program_path);
+            let program_position = i == last && !package;
             for word in segment.split(|c: char| !is_mention_char(c)) {
                 if !word.is_empty() {
                     words.push((word, program_position));
@@ -338,15 +350,9 @@ fn scan(text: &str, gated: bool) -> bool {
         let w = w.strip_suffix(".exe").unwrap_or(w);
         FAMILY.contains(&w)
     };
-    let is_gated = |w: &str| {
-        w.split('.')
-            .any(|part| GATED_TOKENS.contains(&part) || part.starts_with("create-"))
-    };
-    words.iter().enumerate().any(|(i, &(word, program))| {
-        program
-            && is_mention(word)
-            && (!gated || words.iter().skip(i + 1).any(|&(w, _)| is_gated(w)))
-    })
+    words
+        .iter()
+        .any(|&(word, program)| program && is_mention(word))
 }
 
 /// The base name of a program word, lowercased: path (`/` or `\`), a zsh `=` prefix and a
@@ -457,8 +463,8 @@ impl Lexer<'_> {
                             // Interpreter code the parser cannot read.
                             Reads::Interpreter => opaque(self.out, &body),
                             Reads::Data => {
-                                self.out.writes_family_script |=
-                                    self.line_writes && gated_mention(&body);
+                                self.out.writes_family_text |=
+                                    self.line_writes && mentions_family(&body);
                                 if doc.expands {
                                     self.scan_expansions(&body);
                                 }
@@ -1208,10 +1214,23 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
     let mut reads = Reads::Data;
     if writes_file {
         let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
-        out.writes_family_script |= gated_mention(&text.join(" "));
+        out.writes_family_text |= mentions_family(&text.join(" "));
     }
-    if first.text.starts_with("./") || first.text.starts_with("../") || program.ends_with(".sh") {
-        out.runs_script_file = true;
+    // `tee x.sh`, `dd of=x.sh`: they write what the pipe carries.
+    let writes_pipe = match program.as_str() {
+        "tee" => args
+            .iter()
+            .any(|w| !w.text.starts_with('-') && !is_harmless_target(&w.text)),
+        "dd" => args.iter().any(|w| w.text.starts_with("of=")),
+        _ => false,
+    };
+    if writes_pipe && piped_in {
+        out.writes_family_text |= mentions_family(&upstream);
+    }
+    let family_program = FAMILY.contains(&program.as_str());
+    if !family_program && (first.text.contains('/') || program.ends_with(".sh")) {
+        // `./x`, `../x.sh`, `/tmp/x`: a file run as a program.
+        executes(out);
     }
 
     match program.as_str() {
@@ -1221,7 +1240,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         }
         "source" | "." => {
             out.env_changed = true;
-            out.runs_script_file = true;
+            executes(out);
             for word in args.iter().filter(|w| w.dynamic) {
                 opaque(out, &word.text);
             }
@@ -1250,18 +1269,20 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 ShellInput::Script(script) => parse_into(&script.text, depth + 1, true, out),
                 ShellInput::File(file) if is_stdin_path(&file.text) => {
                     reads = Reads::Shell;
+                    executes(out);
                     if piped_in {
                         opaque(out, &upstream);
                     }
                 }
                 ShellInput::File(file) => {
-                    out.runs_script_file = true;
+                    executes(out);
                     if file.dynamic {
                         opaque(out, &file.text);
                     }
                 }
                 ShellInput::Stdin => {
                     reads = Reads::Shell;
+                    executes(out);
                     if piped_in {
                         opaque(out, &upstream);
                     }
@@ -1294,8 +1315,12 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             if runs_code {
                 opaque(out, &code.join(" "));
             }
-            if !args.iter().any(code_flag) && interpreter_reads_stdin(args) {
-                reads = Reads::Interpreter;
+            if !args.iter().any(code_flag) {
+                // A script file or stdin: either way it runs code.
+                executes(out);
+                if interpreter_reads_stdin(args) {
+                    reads = Reads::Interpreter;
+                }
             }
         }
         p if LAUNCHERS.contains(&p) => launch(args, p, depth, out),
@@ -1837,26 +1862,58 @@ mod tests {
     }
 
     #[test]
-    fn mentions_use_word_boundaries_and_skip_path_segments() {
-        assert!(mentions_family("x | /usr/bin/solana balance"));
-        assert!(mentions_family("SOLANA.EXE balance"));
-        assert!(mentions_family(r"C:\bin\solana.exe balance"));
+    fn mentions_use_word_boundaries_and_last_path_segments() {
+        for text in [
+            "x | /usr/bin/solana balance",
+            "SOLANA.EXE balance",
+            r"C:\bin\solana.exe balance",
+            "./solana $X",
+            "../bin/solana $A",
+            "~/.local/share/solana/install/active_release/bin/solana $X",
+            "$HOME/.local/share/solana/install/active_release/bin/solana $X",
+            "os.system('./solana ' + a)",
+        ] {
+            assert!(mentions_family(text), "{text}");
+        }
         for text in [
             "solana-keygen new",
             "cp target/deploy/solana_program.so x",
             "cargo add anchor-lang",
             "vim programs/anchor/tests/run.rs",
-            "yarn add @coral-xyz/anchor",
-            "ls ~/.config/solana",
             "cat $HOME/.config/solana/cli/config.yml",
+            "require('@coral-xyz/anchor')",
         ] {
             assert!(!mentions_family(text), "{text}");
         }
-        assert!(gated_mention("echo 'solana transfer X 1'"));
-        assert!(!gated_mention(
-            "solana config get; anchor test; anchor run x"
-        ));
-        assert!(!gated_mention("require('@coral-xyz/anchor'); x.transfer()"));
+    }
+
+    #[test]
+    fn gated_words_match_on_segments() {
+        for word in [
+            "transfer",
+            "withdraw-from-vote-account",
+            "set-buffer-authority",
+            "approve",
+            "revoke",
+            "wrap",
+            "unwrap",
+            "split-stake",
+            "merge-stake",
+            "deactivate-stake",
+            "redelegate-stake",
+            "close-vote-account",
+            "create-account",
+            "close-mint",
+            "write-buffer",
+            "x.transfer",
+        ] {
+            assert!(is_gated_word(word), "{word}");
+        }
+        for word in [
+            "balance", "config", "test", "run", "build", "program", "get",
+        ] {
+            assert!(!is_gated_word(word), "{word}");
+        }
     }
 
     #[test]
@@ -1882,11 +1939,20 @@ mod tests {
 
     #[test]
     fn scripts_written_then_run_are_noted() {
-        let p = parse("echo 'solana transfer -um X 1' > x.sh; bash x.sh");
-        assert!(p.writes_family_script && p.runs_script_file);
-        let p = parse("cat > x.sh <<EOF\nsolana transfer X 1\nEOF\nchmod +x x.sh && ./x.sh");
-        assert!(p.writes_family_script && p.runs_script_file);
-        assert!(!parse("echo 'solana balance' > notes.txt").writes_family_script);
+        for command in [
+            "echo 'solana transfer -um X 1' > x.sh; bash x.sh",
+            "cat > x.sh <<EOF\nsolana transfer X 1\nEOF\nchmod +x x.sh && ./x.sh",
+            "echo 'solana transfer -um X 1' > x.sh; cat x.sh | bash",
+            "echo 'solana transfer -um X 1' > x.sh; sh < x.sh",
+            "printf 'solana transfer X 1' | tee x.sh >/dev/null; bash x.sh",
+            "echo \"import os; os.system('solana transfer X 1')\" > x.py && python3 x.py",
+            "echo './solana transfer X 1' > x; source x",
+        ] {
+            assert!(parse(command).write_then_run, "{command}");
+        }
+        assert!(!parse("echo 'solana balance' > notes.txt").write_then_run);
+        // The run must come after the write.
+        assert!(!parse("bash x.sh; echo 'solana transfer' > x.sh").write_then_run);
     }
 
     #[test]

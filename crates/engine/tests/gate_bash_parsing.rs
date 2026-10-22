@@ -539,6 +539,54 @@ fn expansion_built_family_commands_ask_as_hard_guard() {
     assert!(unseen.reason().contains("cannot fully see"), "{unseen:?}");
 }
 
+/// Round-3 rows: path-qualified programs in opaque code, write-then-run variants, and
+/// dynamic programs with literal value-moving words. Each is a hard-guard ask from both hooks.
+fn round3_rows() -> Vec<String> {
+    let release = "~/.local/share/solana/install/active_release/bin/solana";
+    vec![
+        "bash -c \"./solana $X\"".to_string(),
+        "eval \"./solana $ARGS\"".to_string(),
+        "eval \"../bin/solana $A\"".to_string(),
+        format!("bash -c \"{release} $X\""),
+        "bash -c \"$HOME/.local/share/solana/install/active_release/bin/solana $X\"".to_string(),
+        "python3 -c \"import os; os.system('./solana ' + os.environ['A'])\"".to_string(),
+        format!("printf '{release} %s' \"$A\" | sh"),
+        "bash -c \"./solana transfer -um $D 1\"".to_string(),
+        format!("eval \"{release} transfer $A\""),
+        format!("echo 'solana transfer -um {DEST} 1' > x.sh; cat x.sh | bash"),
+        format!("echo 'solana transfer -um {DEST} 1' > x.sh; sh < x.sh"),
+        format!("printf 'solana transfer -um {DEST} 1' | tee x.sh >/dev/null; bash x.sh"),
+        format!(
+            "echo \"import os; os.system('solana transfer -um {DEST} 1')\" > x.py && python3 x.py"
+        ),
+        format!("$(echo sol)ana transfer -um {DEST} 1"),
+        format!("$(printf %s ./solana) transfer -um {DEST} 1"),
+    ]
+}
+
+#[test]
+fn round3_rows_ask_as_hard_guard_from_both_hooks() {
+    let policy = Policy::default();
+    for cmd in round3_rows() {
+        let (d, meta) = decide(&cmd, Network::Devnet);
+        assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
+        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+            Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn e2e_round3_rows_ask_in_the_secrets_hook() {
+    let bin = stub_solana(MAINNET_STUB);
+    let project = TempDir::new("round3-proj");
+    for cmd in round3_rows() {
+        let run = run_hook("gate-bash-secrets", &cmd, bin.path(), project.path(), &[]);
+        assert_eq!(label(&run).as_deref(), Some("ask"), "{cmd}: {}", run.stdout);
+    }
+}
+
 #[test]
 fn data_mentions_have_no_opinion() {
     let policy = Policy::default();

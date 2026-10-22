@@ -57,15 +57,11 @@ pub fn indirection_prefilter(
     cwd: &Path,
     policy: &Policy,
 ) -> Option<(Decision, GateMeta)> {
-    if !shell::mentions_family(command)
-        && !shell::parse(command).commands.iter().any(|c| c.is_family())
-    {
-        return None;
-    }
+    // The parse is pure and fast; a substring pre-check would miss `$(echo sol)ana`.
     let parsed = shell::parse(command);
     let routed = parsed.unparseable
         || parsed.opaque_mention
-        || (parsed.writes_family_script && parsed.runs_script_file)
+        || parsed.write_then_run
         || parsed.commands.iter().any(|c| {
             let dynamic_program = c.words.first().is_some_and(|w| w.dynamic);
             let dynamic_words = c.is_family() && c.words.iter().any(|w| w.dynamic);
@@ -141,8 +137,16 @@ fn decide_parsed(
                 decision
             };
             (mainnet_policy(decision, segment_ctx.network, policy), meta)
-        } else if named && cmd.words.first().is_some_and(|w| w.dynamic) {
-            // `X=solana; $X …`: the program is an expansion and could be any of them.
+        } else if cmd.words.first().is_some_and(|w| w.dynamic)
+            && (named
+                || cmd
+                    .words
+                    .iter()
+                    .skip(1)
+                    .any(|w| !w.dynamic && shell::is_gated_word(&w.text)))
+        {
+            // `X=solana; $X …`, `$(echo sol)ana transfer …`: the program is an expansion and
+            // could be any of them.
             ask_unaccounted()
         } else {
             unvetted = true;
@@ -158,8 +162,8 @@ fn decide_parsed(
         }
     }
 
-    // A value-moving solana command written to a file that a shell then runs.
-    if parsed.writes_family_script && parsed.runs_script_file {
+    // Solana text written to a file, then a file or stdin run as code.
+    if parsed.write_then_run {
         let unaccounted = ask_unaccounted();
         let keep = best
             .as_ref()
