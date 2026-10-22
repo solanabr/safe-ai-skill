@@ -5,6 +5,8 @@
 //! cluster`, then a cached `solana config get` (60s TTL). It never panics — any failure
 //! yields [`Network::Unknown`].
 
+pub mod shell;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
