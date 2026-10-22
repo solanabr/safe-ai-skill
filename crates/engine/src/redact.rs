@@ -229,14 +229,38 @@ fn has_literal_secret_assignment(line: &str) -> bool {
         || key.ends_with("_TOKEN")
         || key == "TOKEN"
         || key.contains("PASSWORD")
-        || key.ends_with("PRIVATE_KEY");
+        || key.contains("_SECRET_")
+        || key.ends_with("PRIVATE_KEY")
+        || (key.ends_with("_KEY")
+            && ["SECRET", "PRIVATE", "AUTH", "ACCESS"]
+                .iter()
+                .any(|w| key.contains(w)));
     if !secret_named {
         return false;
     }
-    let value = value
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
-    !is_non_literal_value(value)
+    !is_non_literal_value(strip_value(value))
+}
+
+/// The assignment value without surrounding quotes or a trailing ` # comment`: a quoted
+/// value ends at its closing quote, an unquoted one at the first `#` that starts a word.
+fn strip_value(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))
+    {
+        let inner = &value[1..];
+        return inner.split(quote).next().unwrap_or(inner);
+    }
+    let mut prev_ws = true;
+    for (i, c) in value.char_indices() {
+        if c == '#' && prev_ws {
+            return value[..i].trim_end();
+        }
+        prev_ws = c.is_whitespace();
+    }
+    value
 }
 
 /// Whether an assignment value is empty, a placeholder, a reference or a function call.
@@ -599,6 +623,14 @@ mod tests {
             "APP_SECRET='s3cr3t'",
             "SIGNER_PRIVATE_KEY=abc",
             "DB_PASSWORD=pass(word",
+            "STRIPE_SECRET_KEY=abc123",
+            "SECRET_KEY=abc123",
+            "AUTH_KEY=abc123",
+            "AWS_ACCESS_KEY=AKIA1234",
+            "DB_SECRET_URL=abc123",
+            "PRIVATE_SIGNING_KEY=abc123",
+            "API_KEY=abc123 # note",
+            "API_KEY=\"abc123\" # note",
         ] {
             assert!(contains_key_material(text), "{text}");
         }
@@ -619,6 +651,15 @@ mod tests {
             "# OPENAI_API_KEY=hunter2",
             "# a desk-lamp-with-a-long-description-here",
             "SOLANA_CLUSTER=devnet",
+            "API_KEY= # @sensitive",
+            "API_KEY=# @sensitive",
+            "API_KEY=exec('op read x') # note",
+            "API_KEY=varlock(\"local:x\")\t# note",
+            "API_KEY=\"\" # note",
+            "SECRET_KEY=",
+            "STRIPE_SECRET_KEY=$STRIPE",
+            "PUBLIC_KEY=abc123",
+            "AUTH_KEY=<paste>",
         ] {
             assert!(!contains_key_material(text), "{text}");
         }

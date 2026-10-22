@@ -173,6 +173,12 @@ fn schema_with_api_key_and_credential_values_denies() {
         "GH_TOKEN=ghp_abc123\n",
         "APP_SECRET=\"s3cr3t\"\n",
         "SIGNER_PRIVATE_KEY=abc\n",
+        "STRIPE_SECRET_KEY=abc123\n",
+        "SECRET_KEY=abc123\n",
+        "AUTH_KEY=abc123\n",
+        "AWS_ACCESS_KEY=AKIA1234\n",
+        "DB_SECRET_URL=abc123\n",
+        "API_KEY=abc123 # note\n",
     ] {
         let proj = project();
         write(&proj, ".env.schema", body);
@@ -192,6 +198,8 @@ fn schema_with_non_literal_values_has_no_opinion() {
             "# OPENAI_API_KEY=hunter2\nHELIUS_API_KEY=\nA_API_KEY=varlock(\"local:x\")\n",
             "B_API_KEY=exec(`op read x`)\nDB_PASSWORD=$DB_PASSWORD\nC_TOKEN=${C_TOKEN}\n",
             "D_SECRET=<paste here>\nE_TOKEN=xxx\nF_TOKEN=changeme\nG_TOKEN=your-token\n",
+            "API_KEY= # @sensitive\nH_API_KEY=exec('op read x') # note\nSECRET_KEY=\n",
+            "STRIPE_SECRET_KEY=$STRIPE\nPUBLIC_KEY=abc123\n",
         ),
     );
     assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "");
