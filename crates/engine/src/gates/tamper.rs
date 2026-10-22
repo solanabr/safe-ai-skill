@@ -4,7 +4,7 @@
 //!
 //! - **Bash** (checked first by [`crate::gates::secrets`], which runs on every Bash call): a
 //!   command that runs the `safe-ai-skill` binary with a mutating subcommand (`allow`, `grant`,
-//!   `revoke`, `confirm`, `mode <profile>`, `verify approve|trust`, `install`, and the hook-only
+//!   `revoke`, `confirm`, `mode <profile>`, `verify approve|trust`, `install`, `add`, and the hook-only
 //!   bare `verify` / `verify session`, which pin packs), including a binary computed
 //!   by `$(which safe-ai-skill)`, or that references protected state.
 //! - **Write|Edit|MultiEdit|NotebookEdit** (the `gate-tamper` hook): a write whose target is
@@ -1181,8 +1181,9 @@ fn mutating_invocation(rest: &[Tok]) -> Option<String> {
         return Some(sub);
     }
     match sub.as_str() {
-        // `install` pins packs (and re-pins drifted ones), with or without `--from`.
-        "install" => Some(sub),
+        // `install` pins packs (and re-pins drifted ones), with or without `--from`; `add`
+        // verifies and pins a skill, MCP or repo.
+        "install" | "add" => Some(sub),
         // A bare `mode` only prints the active profile.
         "mode" => args.next().map(|profile| {
             if computed(&profile) {
@@ -1654,7 +1655,6 @@ mod tests {
             "safe-ai-skill mode",
             "safe-ai-skill mode; echo done",
             "python3 -c \"import subprocess; subprocess.run(['safe-ai-skill', 'mode'])\"",
-            "npx @stbr/safe-ai-skill add skill foo",
             "safe-ai-skill status | grep allow",
             "safe-ai-skill registry list",
             "cargo build -p safe-ai-skill --release",

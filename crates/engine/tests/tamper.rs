@@ -236,6 +236,11 @@ fn bash_install_and_hook_only_verify_deny() {
         "echo hi && safe-ai-skill verify; ls",
         "$(which safe-ai-skill) verify session",
         "bash -c 'safe-ai-skill install'",
+        "safe-ai-skill add skill foo",
+        "safe-ai-skill add mcp @scope/pkg --offline",
+        "safe-ai-skill add repo https://github.com/x/y --yes",
+        "npx @stbr/safe-ai-skill add skill foo",
+        "safe-ai-skill add",
     ] {
         assert_deny(&sb.bash(cmd), cmd);
     }
