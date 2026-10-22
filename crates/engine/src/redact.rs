@@ -298,6 +298,8 @@ struct Span {
 /// - 64-byte base58 secret keys, plus `"secretKey"`/`"privateKey"` JSON field values.
 /// - BIP-39 seed phrases (a run of 12/24 lowercase words near a mnemonic/seed hint).
 /// - Common API-key shapes (`*_API_KEY=`, `PRIVATE_KEY=`, `sk-…`, `eyJ…` JWTs).
+/// - PEM / OpenSSH private-key blocks (`-----BEGIN … PRIVATE KEY-----` through its `END` line).
+/// - Vendor tokens ([`API_TOKEN_PREFIXES`]: GitHub, AWS, Slack, Google, Stripe, OpenAI).
 ///
 /// Ordinary 32-byte base58 public keys are deliberately NOT redacted to avoid mangling
 /// normal output (addresses appear constantly in legitimate Solana tool output).
@@ -309,6 +311,8 @@ pub fn scrub(text: &str) -> Option<String> {
     collect_base58_secret_keys(text, &mut spans);
     collect_json_secret_fields(text, &mut spans);
     collect_api_keys(text, &mut spans);
+    collect_pem_blocks(text, &mut spans);
+    collect_vendor_tokens(text, &mut spans);
 
     if spans.is_empty() {
         return None;
@@ -651,6 +655,86 @@ fn collect_api_keys(text: &str, spans: &mut Vec<Span>) {
     // `sk-...` OpenAI-style and `eyJ...` JWT bearer tokens.
     collect_prefixed_tokens(text, "sk-", 20, spans, "api_key");
     collect_jwts(text, spans);
+}
+
+/// Longest PEM block searched for its `END` line.
+const MAX_PEM_BYTES: usize = 64 * 1024;
+
+/// Collect `-----BEGIN … PRIVATE KEY-----` blocks through the matching `-----END …-----`. An
+/// unterminated block runs over the base64 body that follows (base64 characters, whitespace
+/// and `\n` escapes), so a truncated key is still covered.
+fn collect_pem_blocks(text: &str, spans: &mut Vec<Span>) {
+    const BEGIN: &str = "-----BEGIN ";
+    const DASHES: &str = "-----";
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(BEGIN) {
+        let start = from + rel;
+        let label_from = start + BEGIN.len();
+        let Some(label_len) = text[label_from..].find(DASHES) else {
+            break;
+        };
+        let label = &text[label_from..label_from + label_len];
+        let header_end = label_from + label_len + DASHES.len();
+        let is_private = label.ends_with("PRIVATE KEY")
+            && label.len() <= 40
+            && label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ');
+        if !is_private {
+            from = header_end;
+            continue;
+        }
+        let window_end = (header_end + MAX_PEM_BYTES).min(text.len());
+        let window = text.get(header_end..window_end).unwrap_or("");
+        let end = match window.find("-----END ") {
+            Some(rel_end) => {
+                let after = header_end + rel_end + "-----END ".len();
+                text[after..]
+                    .find(DASHES)
+                    .map_or(text.len(), |d| after + d + DASHES.len())
+            }
+            None => {
+                let mut end = header_end;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || matches!(bytes[end], b'+' | b'/' | b'=' | b'\\')
+                        || bytes[end].is_ascii_whitespace())
+                {
+                    end += 1;
+                }
+                end
+            }
+        };
+        spans.push(Span {
+            start,
+            end,
+            kind: "private_key",
+        });
+        from = end.max(start + 1);
+    }
+}
+
+/// Collect vendor-prefixed tokens ([`API_TOKEN_PREFIXES`]) that start a word and reach the
+/// prefix's minimum length.
+fn collect_vendor_tokens(text: &str, spans: &mut Vec<Span>) {
+    let bytes = text.as_bytes();
+    for (prefix, min) in API_TOKEN_PREFIXES {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel;
+            let mut end = start + prefix.len();
+            while end < bytes.len() && is_token_char(bytes[end]) {
+                end += 1;
+            }
+            if (start == 0 || !is_token_char(bytes[start - 1])) && end - start >= *min {
+                spans.push(Span {
+                    start,
+                    end,
+                    kind: "api_key",
+                });
+            }
+            from = end.max(start + 1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,6 +1191,44 @@ mod tests {
         // Real 32-byte mint address — must not be a false positive.
         let text = "mint So11111111111111111111111111111111111111112 balance 5";
         assert_eq!(scrub(text), None);
+    }
+
+    #[test]
+    fn pem_private_key_blocks_redacted() {
+        let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW";
+        let pem = format!(
+            "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n{body}\n-----END OPENSSH PRIVATE KEY-----\nafter"
+        );
+        let out = scrub(&pem).unwrap();
+        assert_eq!(out, "before\n***REDACTED:private_key***\nafter");
+        // Unterminated (truncated output): the body that follows is covered too.
+        let cut = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}");
+        let out = scrub(&cut).unwrap();
+        assert!(!out.contains(body), "{out}");
+        // A JSON-escaped block on one line.
+        let escaped =
+            format!("\"-----BEGIN PRIVATE KEY-----\\n{body}\\n-----END PRIVATE KEY-----\"");
+        assert!(!scrub(&escaped).unwrap().contains(body));
+        // A certificate or public key is not secret.
+        let cert = format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----");
+        assert_eq!(scrub(&cert), None);
+    }
+
+    #[test]
+    fn vendor_tokens_redacted() {
+        for token in [
+            "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "AKIAIOSFODNN7EXAMPLE",
+            "xox\x62-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+        ] {
+            let out = scrub(&format!("token: {token} end")).unwrap_or_default();
+            assert_eq!(out, "token: ***REDACTED:api_key*** end", "{token}");
+        }
+        for prose in ["xAKIAIOSFODNN7EXAMPLE", "ghp_short", "the AIza prefix"] {
+            assert_eq!(scrub(prose), None, "{prose}");
+        }
     }
 
     #[test]

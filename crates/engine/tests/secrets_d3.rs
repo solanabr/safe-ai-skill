@@ -761,6 +761,27 @@ fn redact_mcp_shapes_golden() {
 }
 
 #[test]
+fn redact_pem_and_vendor_token_golden() {
+    let sb = Sandbox::new();
+    let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW";
+    let stdout = format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n\
+         gh ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\naws AKIAIOSFODNN7EXAMPLE\n\
+         slack xox\x62-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx\n\
+         google AIzaSyA1234567890abcdefghijklmnopqrstuv\n"
+    );
+    assert_eq!(
+        updated(&sb.redact("Bash", json!({ "stdout": stdout, "stderr": "" }))),
+        json!({
+            "stdout": "***REDACTED:private_key***\ngh ***REDACTED:api_key***\n\
+                       aws ***REDACTED:api_key***\nslack ***REDACTED:api_key***\n\
+                       google ***REDACTED:api_key***\n",
+            "stderr": ""
+        })
+    );
+}
+
+#[test]
 fn redact_patterns_still_apply_and_clean_output_is_silent() {
     let sb = Sandbox::new();
     let run = sb.redact(
