@@ -143,24 +143,32 @@ safe-ai-skill session                # show active session state
 ```
 
 **Relaxations need your confirmation in the prompt.** `allow` and `mode autopilot` change
-nothing on their own: they print a summary and a line like `safe-ai-skill confirm 48213907`.
-The request takes effect only when your next prompt in Claude Code is exactly that line, on its
-own (within 10 minutes, once). Claude Code then shows you what you approved. The agent can't
-type your prompts, so it can't approve its own request; a confirm line inside pasted text is
-refused. A stricter `mode` and `revoke` apply at once. Grant scopes are `transfer`, `swap`,
-`deploy`, `authority` and `destructive`; anything else is an error.
+nothing on their own: they record a request (`request r3fa91c`) and print no code. Claude Code
+then shows **you** a confirmation code in a hook message (right after the command, or at your
+next prompt or session start) that is never put in the agent's context. The request takes
+effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
+(within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
+pasted text is refused, and three wrong codes cancel every pending request. The agent may run
+`allow` itself: it only creates a request it cannot confirm. In headless `claude -p`, where
+hook messages aren't shown, nothing can be confirmed. A stricter `mode` and `revoke` apply at
+once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
+else is an error.
 
 **Profiles.** `strict` is the default. `paranoid` asks for every Solana CLI command and
-disables every automatic allow, grants included. `autopilot` raises the per-transaction cap
+disables every automatic allow, grants included (it does not add prompts for MCP tools or file
+reads that otherwise have no opinion). `autopilot` raises the per-transaction cap
 to 2 SOL and applies only through a confirmed `safe-ai-skill mode autopilot`.
 `SAFE_AI_SKILL_PROFILE` can only pick a stricter profile. To turn the hooks off, set
 `SAFE_AI_SKILL_DISABLE=1`.
 
 **State is authenticated.** Grants, the mode, the daily spend ledger and session metadata are
-signed with a per-install key in the plugin data directory. A hand-edited grant or mode is
-ignored, and a deleted or edited spend ledger counts as today's budget spent. This is
-tamper-evident, not tamper-proof: anything running as you can read the key. Valid 1.0 grants
-and mode are migrated once, at the first 1.1.0 session, and listed then. Every session start
+signed with a per-install key in the plugin data directory, and each file carries a
+generation, so a hand-edited file or an older copy put back is ignored, and a deleted or edited
+spend ledger counts as today's budget spent. This is tamper-evident, not tamper-proof: code
+running as you outside the Claude Code sandbox can read the key, run the hook commands itself
+or restore a snapshot of the whole directory. The sandbox is the hard boundary. At the first
+1.1.0 session, unexpired 1.0 grants and an `autopilot` mode become pending requests you can
+confirm with the codes shown then; the 1.0 spend ledger becomes today's exhausted budget. Every session start
 lists what is currently loosened: a profile env var, a non-default mode, live grants, ignored
 repo policy, state that failed authentication, and a Claude Code sandbox that is off.
 

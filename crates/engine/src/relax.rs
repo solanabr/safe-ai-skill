@@ -17,11 +17,12 @@
 //!
 //! ## Confirmation (spec D4.1)
 //!
-//! `safe-ai-skill allow` and `mode <looser>` only park a pending entry
-//! ([`crate::confirm::create_pending`]). [`confirm_prompt`] runs in the `UserPromptSubmit`
-//! hook: when the user's whole prompt is `safe-ai-skill confirm <nonce>`, it consumes the
-//! entry, performs it, audits it, and returns the `systemMessage` that tells the user what
-//! they just approved.
+//! `safe-ai-skill allow` and `mode <looser>` only park a pending entry, with no code
+//! ([`crate::confirm::create_pending`]). [`announce`] makes the code and returns it for a
+//! hook `systemMessage` (user only). [`confirm_prompt`] runs in the `UserPromptSubmit` hook:
+//! when the user's whole prompt is `safe-ai-skill confirm <code>`, it consumes the entry,
+//! performs it, audits it, and returns the `systemMessage` that tells the user what they just
+//! approved; wrong codes lead to the lockout.
 
 use serde_json::{json, Value};
 

@@ -151,7 +151,10 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
 | `session/<id>.json` | `session` | ephemeral session keypairs (0600, Solana CLI format, plain) |
 | `key` | `statefile` | 32-byte HMAC key for authenticated state (0600) |
-| `pending.json` | `confirm` | prompt-nonce pending entries (authenticated, 600 s TTL) |
+| `generations.json` | `statefile` | authenticated `{file: generation}` index; an envelope below its generation is tampered |
+| `pending.json` | `confirm` | pending requests: id, payload, code **hash** once announced, failure count (authenticated) |
+| `migrated.json` | `migrate` | authenticated marker: 1.0 state was converted |
+| `*.lock` | `statefile::FileLock` | `state.lock` (stores), `pending.lock`, `grants.lock` |
 
 ---
 
@@ -409,13 +412,18 @@ and no grant is consulted; otherwise if `natural` is not `Ask`, or `meta.hard_gu
 true, return it unchanged; otherwise the first live grant matching within budget/`max_tx_sol`
 is debited (a failed debit keeps the ask) and the result is `Allow`.
 
-**Confirmation flow (D4.1).** `allow` and `mode <looser>` call `confirm::create_pending` and
-print the summary plus the exact `safe-ai-skill confirm <nonce>` line (JSON on stdout, text on
-stderr). `prompt-guard` (UserPromptSubmit) passes `confirm::user_prompt` to
-`relax::confirm_prompt`, which acts only when the whole trimmed prompt is that one line,
-consumes the entry, re-validates its payload, stores the grant/mode, audits it, and returns a
-`systemMessage` (+ `additionalContext`) echoing what was approved. `verify trust|approve`
-pending kinds are not handled here (WS-D1).
+**Confirmation flow (D4.1, fix round 1).** `allow` and `mode <looser>` call
+`confirm::create_pending`, which stores an entry with a public id and **no code**; the CLI
+prints the id and summary only. `confirm::announce_pending` (via `relax::announce`) runs in the
+PostToolUse `pending-notice` hook (Bash), in `prompt-guard` and in `verify session`: it draws
+an 8-digit code per unannounced entry, stores `sha256(code‖id‖HMAC(key,label))`, and the hook
+puts the code in `systemMessage` only. `prompt-guard` passes `confirm::user_prompt` to
+`relax::confirm_prompt` → `confirm::confirm_attempt`: only a whole-prompt single line
+(`confirm::classify`, one whitespace rule) can confirm; a wrong code counts, and the third
+cancels every entry (audited `state_tamper`/`confirm_lockout`). A confirmed entry's payload is
+re-validated, stored, audited and echoed (no code). `verify trust|approve` kinds are not
+handled here (WS-D1). The tripwire (H5) denies Bash invocations of the hook subcommands and
+`confirm`.
 
 ### `verify` (`Report`/`Finding`/`Severity` FROZEN; scan fns STUBS)
 ```rust
@@ -470,6 +478,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ## Subcommands (`main.rs`, complete)
 
 `gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `redact` · `prompt-guard` ·
+`pending-notice` ·
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
