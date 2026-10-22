@@ -34,7 +34,7 @@
 //!
 //! A checkout named like the plugin (`safe-ai-skill-fork`) is not protected state: a component
 //! of the project root (`$CLAUDE_PROJECT_DIR` or the session's working directory) never counts as
-//! a data dir name. Read-only use of the binary (`status`, `verify check`, `env …`, `--version`,
+//! a data dir name. Read-only use of the binary (`status`, `verify check`, `--version`,
 //! bare `mode`) is never blocked, even through the plugin's cache path. Matching is deliberately
 //! loose (case-insensitive, blind to quotes and escapes, `$IFS` read as a space, `~`/`$HOME`
 //! expanded, globs honoured) so that it errs towards a false deny. The Bash path reads no files.

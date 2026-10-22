@@ -26,7 +26,7 @@ Security hotfix for #5–#13. Several defaults change; each change is listed bel
 ### Known limitations in 1.0.1 (fixed in 1.1.0)
 
 - A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
-- A Solana CLI command wrapped in another command, or prefixed with environment assignments, may not reach the Solana gate, because Claude Code's `if: Bash(solana *)` filter matches only the plain form. Keep the sandbox on.
+- A Solana command wrapped in another command or prefixed with environment assignments may not be gated. Keep the sandbox on.
 - There is no SessionStart notice yet for Claude Code older than 2.1.295.
 
 ### Documentation

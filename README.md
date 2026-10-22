@@ -106,14 +106,14 @@ The npm and standalone paths download the binary matching their release tag and 
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute
 - MCP version tracking: flags `@latest` entries as informational — does not silently rewrite them
-- CVE lookup: `add mcp` queries osv.dev for the resolved `pkg@version` (no API key required). The session sweep makes no network calls
+- CVE lookup: `add` queries osv.dev for an exact, non-local npm source such as `add mcp`'s resolved `pkg@version` (no API key required). The session sweep makes no network calls
 - Heuristic scan: outbound POST in preambles, keypair/`.env` references, base58-encoded secrets, prompt injection, `eval`/download-and-exec
 
 **Hard guards (never relaxable)**
 
 `mainnet_deploy` · `set_authority` · `account_close` · `secret_read`
 
-No profile, grant, flag or repo policy relaxes them. Mainnet deploys, authority changes and account closes always ask you (a mainnet `--final` deploy is denied), and secret reads are denied. Deploys to other clusters are not hard guards, so a grant or profile can relax them.
+No profile, grant, flag or repo policy relaxes them. Mainnet deploys, authority changes and account closes always ask you (a mainnet `--final` deploy is denied), and secret reads are denied. Non-final deploys to other clusters are not hard guards, so a grant or profile can relax them.
 
 ## Threat model
 
@@ -124,7 +124,7 @@ If the engine can't run on a platform (no prebuilt binary, wrong executable form
 ## Known limitations in 1.0.1 (fixed in 1.1.0)
 
 - A directory-wide Grep can still return `.env*` contents. Until 1.1.0, rely on Read-level protection and the Claude Code sandbox `denyRead`.
-- A Solana CLI command wrapped in another command, or prefixed with environment assignments, may not reach the Solana gate, because Claude Code's `if: Bash(solana *)` filter matches only the plain form. Keep the sandbox on.
+- A Solana command wrapped in another command or prefixed with environment assignments may not be gated. Keep the sandbox on.
 - There is no SessionStart notice yet for Claude Code older than 2.1.295.
 
 **Runtime threats** — agentic workflows drive CLI commands and value-moving MCP calls with no gating. Interactive `read -r` prompts silently fail in hook context (no TTY). safe-ai-skill intercepts every such action before execution.
@@ -177,7 +177,7 @@ Trust is based on the artifact itself, not a hash allowlist to maintain:
 2. **Per-submodule pinning** — each `ext/` submodule is walked independently. The first-seen git commit SHA is recorded as the TOFU pin. On subsequent sessions, drift from that SHA is reported in every session (High findings listed at `path:line`) until you run `verify approve <name>`. Nothing is moved, so the working tree stays clean.
 3. **Catalog gating** — entries are classified by risk class. High-risk classes require explicit policy approval; safe-ai-skill blocks installation of denied classes without prompting.
 4. **Provenance pinning** — GitHub URLs resolve to immutable commit SHAs (moving refs are rejected). npm packages pin to `pkg@x.y.z` plus `dist.shasum`. `@latest` entries are flagged informational.
-5. **CVE lookup** — `add mcp` queries osv.dev for the resolved `pkg@version`. No API key required. This is the only network step; the session sweep and gates make no network calls.
+5. **CVE lookup** — `add` queries osv.dev for an exact, non-local npm source (for example `add mcp`'s resolved `pkg@version`). No API key required. This is the only network step; the session sweep and gates make no network calls.
 6. **Local TOFU lockfile** — pin the content hash on first install; any later change is reported as drift until you approve it.
 
 Block on high-severity heuristic match or known CVE. Warn and `ask` on medium. Pass and pin on clean.

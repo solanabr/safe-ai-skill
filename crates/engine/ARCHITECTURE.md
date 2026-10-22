@@ -134,7 +134,7 @@ contract:
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
 
-CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1.
+CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
 
 ---
 

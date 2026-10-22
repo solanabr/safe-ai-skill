@@ -76,7 +76,7 @@ Users occasionally paste private key material, seed phrases, or other sensitive 
 
 ### MCP CVEs
 
-MCP package vulnerabilities are a concrete, documented risk. safe-ai-skill addresses this at install time: `safe-ai-skill add mcp` queries osv.dev for the resolved `pkg@version` before installation (skip with `--offline`). The session sweep and `verify` make no network calls. The osv.dev API requires no authentication.
+MCP package vulnerabilities are a concrete, documented risk. safe-ai-skill addresses this at install time: `safe-ai-skill add` queries osv.dev for an exact, non-local npm source (for example `add mcp`'s resolved `pkg@version`) before installation (skip with `--offline`). The session sweep and `verify` make no network calls. The osv.dev API requires no authentication.
 
 ### Tool poisoning and prompt injection
 
@@ -84,7 +84,7 @@ Malicious skills can embed instructions targeting the language model in SKILL.md
 
 ## Design guarantees
 
-**Hard guards are unconditional while the firewall runs.** The four hard guards — `mainnet_deploy`, `set_authority`, `account_close`, `secret_read` — are enforced by the engine binary regardless of the active profile, any time-boxed grant, or any project policy override; no engine flag or configuration relaxes them. In practice: mainnet deploys, authority changes and account closes always ask (a mainnet `--final` deploy is denied), secret reads are denied, and deploys to other clusters are not hard guards. They stop applying only when the firewall itself is off: when the user sets `SAFE_AI_SKILL_DISABLE=1`, or when the engine cannot run on the platform (below; Solana CLI commands still ask). SessionStart reports both.
+**Hard guards are unconditional while the firewall runs.** The four hard guards — `mainnet_deploy`, `set_authority`, `account_close`, `secret_read` — are enforced by the engine binary regardless of the active profile, any time-boxed grant, or any project policy override; no engine flag or configuration relaxes them. In practice: mainnet deploys, authority changes and account closes always ask (a mainnet `--final` deploy is denied), secret reads are denied, and non-final deploys to other clusters are not hard guards. They stop applying only when the firewall itself is off: when the user sets `SAFE_AI_SKILL_DISABLE=1`, or when the engine cannot run on the platform (below; Solana CLI commands still ask). SessionStart reports both.
 
 **Fails open only when the engine cannot run, never past a broken gate.** If no engine runs on this platform (no matching prebuilt, not an executable for this OS, exec failure 126/127), the `bin/safe-ai-skill` shim keeps the Solana CLI hooks at `ask`, reports the firewall INACTIVE at SessionStart, and lets the other hooks continue with a one-line notice. An engine crash blocks `gate-bash` and `gate-mcp` (exit 2) and is reported at SessionStart. `SAFE_AI_SKILL_STRICT=1` turns every one of these cases into exit 2 (block). `SAFE_AI_SKILL_DISABLE=1` turns the hooks off unless strict mode is set or the committed `.claude/settings.json` mentions it or can't be read (a repo can't disable the firewall); SessionStart reports it either way. The shim never builds from source and never runs a binary outside its own directory. The Solana hooks set `onFailure: block`, the others `onFailure: continue` (honoured from Claude Code 2.1.295).
 
