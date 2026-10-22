@@ -9,6 +9,7 @@
 //!   [`audit`], [`error`], [`gate`].
 //! - Runtime gates: [`gates`].
 //! - Output / prompt guards: [`redact`], [`promptguard`].
+//! - Secrets CLI: [`env`] (`safe-ai-skill env keys|set|unset`).
 //! - Spend & swap: [`spend`], [`rugcheck`].
 //! - Relaxation layer: [`grants`], [`mode`], [`relax`], plus [`migrate`] (1.0 state) and
 //!   [`notice`] (the SessionStart loosenings notice).
@@ -23,6 +24,8 @@ pub mod audit;
 pub mod confirm;
 pub mod context;
 pub mod datadir;
+pub mod doctor;
+pub mod env;
 pub mod error;
 pub mod gate;
 pub mod gates;

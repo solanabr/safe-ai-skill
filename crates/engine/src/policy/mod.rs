@@ -47,16 +47,15 @@ swap:
     - "So11111111111111111111111111111111111111112"
     - "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 secrets:
+  env_read: deny
   deny_read_globs:
     - "**/*-keypair.json"
-    - "**/id.json"
-    - "**/.env"
-    - "**/.env.*"
-    - "**/*.pem"
-    - "~/.config/solana/**"
     - "~/.superstack/config.json"
   allow_read_globs:
     - "**/.env.example"
+    - "**/.env.sample"
+    - "**/.env.template"
+    - "**/.env.dist"
     - "**/.env.schema"
 redact:
   enabled: true
@@ -207,9 +206,15 @@ pub struct SwapPolicy {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SecretsPolicy {
-    /// Globs whose reads are denied.
+    /// Raw reads of env-class files (`.env`, `.env.*`, `*.env`, `.envrc`, …): `deny` (default,
+    /// served by `safe-ai-skill env`) or `ask` (opt-in, prompts). Hard-deny classes (keypairs,
+    /// private keys, the Solana config tree) are never affected.
+    pub env_read: String,
+    /// Extra globs whose reads are denied, on top of the built-in classes
+    /// (`gates::secretpath`).
     pub deny_read_globs: Vec<String>,
-    /// Globs explicitly allowed even if they match a deny glob.
+    /// Globs readable even though they match a deny glob or the env class (never a hard-deny
+    /// class). Templates and `.env.schema` are readable only while listed here.
     pub allow_read_globs: Vec<String>,
 }
 
@@ -370,16 +375,18 @@ impl Default for SwapPolicy {
 impl Default for SecretsPolicy {
     fn default() -> Self {
         SecretsPolicy {
+            env_read: "deny".into(),
             deny_read_globs: vec![
                 "**/*-keypair.json".into(),
-                "**/id.json".into(),
-                "**/.env".into(),
-                "**/.env.*".into(),
-                "**/*.pem".into(),
-                "~/.config/solana/**".into(),
                 "~/.superstack/config.json".into(),
             ],
-            allow_read_globs: vec!["**/.env.example".into(), "**/.env.schema".into()],
+            allow_read_globs: vec![
+                "**/.env.example".into(),
+                "**/.env.sample".into(),
+                "**/.env.template".into(),
+                "**/.env.dist".into(),
+                "**/.env.schema".into(),
+            ],
         }
     }
 }
@@ -815,6 +822,7 @@ mod tests {
             disk.secrets.allow_read_globs,
             embedded.secrets.allow_read_globs
         );
+        assert_eq!(disk.secrets.env_read, embedded.secrets.env_read);
         assert_eq!(disk.redact.enabled, embedded.redact.enabled);
         assert_eq!(disk.audit.enabled, embedded.audit.enabled);
         // Catalog parity.

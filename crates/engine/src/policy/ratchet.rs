@@ -158,6 +158,12 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         n,
     );
 
+    keep_stricter(
+        "secrets.env_read",
+        &mut policy.secrets.env_read,
+        &asked.secrets.env_read,
+        n,
+    );
     keep_union(
         "secrets.deny_read_globs",
         &mut policy.secrets.deny_read_globs,

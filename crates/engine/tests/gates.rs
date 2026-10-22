@@ -239,7 +239,8 @@ fn redact_keypair_array_in_bash_output() {
     let body = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
-        "tool_output": output
+        "cwd": data.path(),
+        "tool_response": { "stdout": output, "stderr": "", "interrupted": false }
     })
     .to_string();
     let run = Invocation::new(&["redact"])
@@ -247,14 +248,14 @@ fn redact_keypair_array_in_bash_output() {
         .stdin(body)
         .run();
     let v = run.json();
-    let updated = v["updatedToolOutput"]
+    let updated = v["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
         .as_str()
-        .expect("expected updatedToolOutput");
+        .expect("expected hookSpecificOutput.updatedToolOutput.stdout");
     assert!(
         updated.contains("***REDACTED:keypair***"),
         "output not redacted: {updated}"
     );
-    assert!(v.get("updatedMCPToolOutput").is_none());
+    assert!(v.get("updatedToolOutput").is_none());
 }
 
 #[test]
@@ -263,7 +264,8 @@ fn redact_clean_output_is_noop() {
     let body = serde_json::json!({
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
-        "tool_output": "balance: 1.5 SOL"
+        "cwd": data.path(),
+        "tool_response": { "stdout": "balance: 1.5 SOL", "stderr": "" }
     })
     .to_string();
     let run = Invocation::new(&["redact"])
@@ -357,7 +359,7 @@ fn scanner_triggers() -> [(&'static str, String); 2] {
         (
             "redact",
             format!(
-                r#""tool_name":"Bash","tool_output":"keypair = [{}]""#,
+                r#""tool_name":"Bash","tool_response":{{"stdout":"keypair = [{}]","stderr":""}}"#,
                 keypair.join(",")
             ),
         ),
@@ -373,7 +375,9 @@ fn scanner_triggers() -> [(&'static str, String); 2] {
 fn assert_scanner_acted(run: &Run, sub: &str) {
     let v = run.json();
     if sub == "redact" {
-        let updated = v["updatedToolOutput"].as_str().unwrap_or("");
+        let updated = v["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap_or("");
         assert!(updated.contains("***REDACTED:keypair***"), "redact: {v}");
     } else {
         assert_eq!(v["decision"], "block", "{sub}: {v}");
@@ -593,10 +597,16 @@ fn oversized_stdin_asks_on_pretooluse_gates() {
 
 #[test]
 fn oversized_stdin_has_no_opinion_on_scanners() {
-    // Read, the keypair is redacted and the seed phrase blocked; past 1 MiB both stay silent.
+    // Read, the keypair is redacted and the seed phrase blocked; past their bounds (8 MiB for
+    // redact, which scans large tool output, 1 MiB for prompt-guard) both stay silent.
     for (sub, fields) in scanner_triggers() {
         assert_scanner_acted(&run_raw(&[sub], &format!("{{{fields}}}")), sub);
-        let padded = format!(r#"{{{fields},"pad":"{}"}}"#, "x".repeat(1024 * 1024));
+        let bound = if sub == "redact" {
+            safe_ai_skill::redact::MAX_SCAN_BYTES
+        } else {
+            1024 * 1024
+        };
+        let padded = format!(r#"{{{fields},"pad":"{}"}}"#, "x".repeat(bound));
         assert_no_opinion(&run_raw(&[sub], &padded), sub);
     }
 }

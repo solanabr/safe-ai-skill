@@ -88,9 +88,10 @@ fn read_schema_has_no_opinion() {
     assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "");
     assert_eq!(read(proj.path(), proj.join("sub/dir/.env.schema")).0, "");
     assert_eq!(read(proj.path(), ".env.schema").0, "");
-    // The glob match is case-sensitive, so the upper-case name never hit the deny list.
+    // The allow-list match is case-sensitive (an allow never widens by case folding), while
+    // the env class is not: an upper-case name is an env file (1.1.0, #7).
     write(&proj, ".ENV.SCHEMA", CLEAN_SCHEMA);
-    assert_eq!(read(proj.path(), proj.join(".ENV.SCHEMA")).0, "");
+    assert_eq!(read(proj.path(), proj.join(".ENV.SCHEMA")).0, "deny");
 }
 
 #[test]
@@ -309,5 +310,5 @@ fn deny_reason_for_env_local_is_unchanged() {
     let proj = project();
     let (label, reason) = read(proj.path(), proj.join(".env.local"));
     assert_eq!(label, "deny");
-    assert!(reason.contains("environment file"), "{reason}");
+    assert!(reason.contains("is an env file"), "{reason}");
 }

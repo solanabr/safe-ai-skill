@@ -27,15 +27,25 @@
 
 use std::path::Path;
 
+use crate::gates::read;
+use crate::gates::secretpath::{self, Class};
 use crate::gates::tamper;
 use crate::io::Decision;
 use crate::policy::Policy;
 
-/// Commands that read or copy file contents — the ones that can leak a secret file.
+/// Commands that read or copy file contents — the ones that can leak a secret file. A nudge,
+/// not the control (spec D3.6): the sandbox and the redact hook are the backstops.
 const READER_COMMANDS: &[&str] = &[
     "cat", "less", "more", "head", "tail", "xxd", "od", "base64", "strings", "cp", "mv", "scp",
-    "rsync",
+    "rsync", "source", ".", "grep", "egrep", "fgrep", "rg", "sed", "awk", "nl", "tac", "bat",
+    "sort", "cut", "diff", "jq",
 ];
+
+/// Readers whose first positional argument is a pattern or program, not a file.
+const PATTERN_FIRST: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk", "jq"];
+
+/// Wrappers that run the rest of the line as the command.
+const WRAPPERS: &[&str] = &["sudo", "env", "command", "exec", "time", "nohup", "nice"];
 
 /// Hosts to which an outbound POST of local data is considered benign. Keep minimal: the
 /// gate only *asks* (not denies) on an off-allowlist host, so a short list is safe.
@@ -47,7 +57,9 @@ const ALLOWLISTED_POST_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
 /// or upload of one, [`Decision::Ask`] for the telemetry-style `curl -X POST` to an unknown
 /// host, and [`Decision::Defer`] otherwise. Its scope is fixed (`secret_read`), so `main.rs`
 /// wraps the result in a hard-guard [`crate::gate::GateMeta`]. `cwd` is the session's working
-/// directory (the hook payload's), where the command's relative paths start.
+/// directory (the hook payload's), where the command's relative paths start; an env-class deny
+/// mentions varlock when the project has a `.env.schema` or `varlock` is on `PATH` (checked
+/// only on that deny path, so the common case stays free of filesystem access).
 pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
     // Self-grant / state-tamper tripwire first: its deny is final, whatever else matches. Both
     // scans share one work budget; running out asks (this gate is a hard guard), so a command
@@ -58,7 +70,7 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
     if matches!(tripwire, Decision::Deny { .. }) {
         return tripwire;
     }
-    let scanned = scan_segments(command, policy, &mut budget);
+    let scanned = scan_segments(command, policy, Some(cwd), &mut budget);
     match tripwire {
         // Too complex for the tripwire: a secret read found anyway still denies.
         Decision::Ask { .. } if !matches!(scanned, Decision::Deny { .. }) => tripwire,
@@ -67,13 +79,18 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
 }
 
 /// The secret-read / exfil and installer checks, spending from `budget`.
-fn scan_segments(command: &str, policy: &Policy, budget: &mut tamper::Budget) -> Decision {
+fn scan_segments(
+    command: &str,
+    policy: &Policy,
+    cwd: Option<&Path>,
+    budget: &mut tamper::Budget,
+) -> Decision {
     // Per-segment secret-read / exfil scan. A clear secret access or upload is a hard
     // `Deny` and must win over the (softer, configurable) install-script gate, so capture
     // the strongest segment decision and short-circuit on a `Deny`.
     let mut segment_decision = Decision::Defer;
     for segment in split_segments(command) {
-        let Ok(decision) = decide_segment(segment, policy, budget) else {
+        let Ok(decision) = decide_segment(segment, policy, cwd, budget) else {
             return tamper::too_complex();
         };
         match decision {
@@ -178,12 +195,30 @@ fn install_script_decision(policy: &Policy) -> Decision {
 fn decide_segment(
     segment: &str,
     policy: &Policy,
+    cwd: Option<&Path>,
     budget: &mut tamper::Budget,
 ) -> Result<Decision, tamper::TooComplex> {
-    let tokens: Vec<String> = tokenize(segment);
-    budget.spend(tokens.len())?;
+    let all: Vec<String> = tokenize(segment);
+    budget.spend(all.len())?;
+    // `< .env` / `$(<.env)` / `dd if=.env` feed a secret to any command.
+    if let Some(decision) = decide_redirects(&all, policy, cwd) {
+        return Ok(decision);
+    }
+    let (assignments, tokens) = strip_wrappers(&all);
     if tokens.is_empty() {
         return Ok(Decision::Defer);
+    }
+
+    // `npx -c 'varlock printenv K'` / `--call`: the script is a command line of its own.
+    if let Some(script) = runner_call_script(tokens) {
+        let inner = scan_segments(script, policy, cwd, budget);
+        if !matches!(inner, Decision::Defer) {
+            return Ok(inner);
+        }
+    }
+
+    if let Some(args) = varlock_args(tokens) {
+        return Ok(decide_varlock(args, &assignments, policy));
     }
 
     let program = base_program(&tokens[0]);
@@ -197,17 +232,53 @@ fn decide_segment(
 
     // 1. Reader/copier hitting a denied secret path.
     if READER_COMMANDS.contains(&program.as_str()) {
+        let mut skip_pattern = PATTERN_FIRST.contains(&program.as_str())
+            && !tokens.iter().any(|t| {
+                matches!(t.as_str(), "-e" | "-f" | "--regexp" | "--file")
+                    || t.starts_with("--regexp=")
+                    || t.starts_with("--file=")
+            });
         for arg in tokens.iter().skip(1) {
             if is_flag(arg) {
                 continue;
             }
+            if std::mem::take(&mut skip_pattern) {
+                continue;
+            }
             spend_matches(arg)?;
-            if matches_secret(arg, policy) {
-                return Ok(Decision::Deny {
-                    reason: format!(
-                        "Reading secret file `{arg}` via `{program}` is blocked (keypair/.env/config)"
-                    ),
-                });
+            if let Some(decision) = secret_arg_decision(arg, &program, policy, cwd) {
+                return Ok(decision);
+            }
+        }
+        return Ok(Decision::Defer);
+    }
+
+    // `git show REV:.env`, `git cat-file -p REV:.env`.
+    if program == "git" {
+        // Global options before the subcommand, skipping the values of those that take one.
+        let mut i = 1;
+        while let Some(t) = tokens.get(i) {
+            if matches!(
+                t.as_str(),
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+            ) {
+                i += 2;
+            } else if is_flag(t) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let sub = tokens.get(i).map(String::as_str);
+        if matches!(sub, Some("show" | "cat-file")) {
+            for arg in tokens.iter().skip(i + 1).filter(|t| !is_flag(t)) {
+                spend_matches(arg)?;
+                let Some((_, path)) = arg.split_once(':') else {
+                    continue;
+                };
+                if let Some(decision) = secret_arg_decision(path, "git show", policy, cwd) {
+                    return Ok(decision);
+                }
             }
         }
         return Ok(Decision::Defer);
@@ -215,13 +286,289 @@ fn decide_segment(
 
     // 2. Exfil via curl / wget.
     if program == "curl" || program == "wget" {
-        for tok in &tokens {
+        for tok in tokens {
             spend_matches(tok)?;
         }
-        return Ok(decide_http_exfil(&tokens, policy));
+        return Ok(decide_http_exfil(tokens, policy));
     }
 
     Ok(Decision::Defer)
+}
+
+/// Leading `NAME=VALUE` assignments and wrapper commands (`sudo`, `env -i`, `command`, …)
+/// split off the command they run. Assignments after `env` are collected too.
+fn strip_wrappers(tokens: &[String]) -> (Vec<&String>, &[String]) {
+    let mut i = 0;
+    let mut assignments = Vec::new();
+    while i < tokens.len() && is_assignment(&tokens[i]) {
+        assignments.push(&tokens[i]);
+        i += 1;
+    }
+    while let Some(tok) = tokens.get(i) {
+        let prog = base_program(tok);
+        if !WRAPPERS.contains(&prog.as_str()) {
+            break;
+        }
+        i += 1;
+        // Wrapper flags (and the values of the few that take one), then env's assignments.
+        while let Some(t) = tokens.get(i) {
+            if t.starts_with('-') {
+                let takes_value = matches!(
+                    (prog.as_str(), t.as_str()),
+                    ("sudo", "-u" | "-g" | "-C" | "-D" | "-h" | "-p" | "-U")
+                        | ("env", "-u" | "-C" | "-S")
+                        | ("nice", "-n")
+                );
+                i += if takes_value { 2 } else { 1 };
+            } else if is_assignment(t) {
+                assignments.push(t);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    (assignments, tokens.get(i..).unwrap_or(&[]))
+}
+
+/// `NAME=VALUE` with a shell-variable name.
+fn is_assignment(tok: &str) -> bool {
+    tok.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The verdict for reading a secret through a redirection-like form, if any: `< file`,
+/// `$(<file)` (anywhere, assignments included) and `dd if=file`.
+fn decide_redirects(tokens: &[String], policy: &Policy, cwd: Option<&Path>) -> Option<Decision> {
+    for tok in tokens {
+        let mut rest = tok.as_str();
+        while let Some(i) = rest.find("$(<") {
+            let inner = &rest[i + 3..];
+            let path = inner.split(')').next().unwrap_or("").trim();
+            if let Some(decision) = secret_arg_decision(path, "$(<…)", policy, cwd) {
+                return Some(decision);
+            }
+            rest = inner;
+        }
+    }
+    if tokens.iter().any(|t| base_program(t) == "dd") {
+        for tok in tokens {
+            if let Some(path) = tok.strip_prefix("if=") {
+                if let Some(decision) = secret_arg_decision(path, "dd", policy, cwd) {
+                    return Some(decision);
+                }
+            }
+        }
+    }
+    let mut iter = tokens.iter().peekable();
+    while let Some(tok) = iter.next() {
+        let target = if tok == "<" {
+            iter.peek().map(|t| t.as_str())
+        } else if let Some(rest) = tok.strip_prefix('<') {
+            (!rest.is_empty() && !rest.starts_with(['<', '(', '&'])).then_some(rest)
+        } else {
+            None
+        };
+        if let Some(path) = target {
+            if let Some(decision) = secret_arg_decision(path, "<", policy, cwd) {
+                return Some(decision);
+            }
+        }
+    }
+    None
+}
+
+/// The verdict for `program` reading `arg`, when `arg` names a secret.
+fn secret_arg_decision(
+    arg: &str,
+    program: &str,
+    policy: &Policy,
+    cwd: Option<&Path>,
+) -> Option<Decision> {
+    match classify_arg(arg, policy)? {
+        ArgClass::Env => {
+            let hint =
+                cwd.is_some_and(|dir| read::varlock_hint(dir, &dir.join(normalize_path(arg))));
+            Some(read::env_verdict(&normalize_path(arg), policy, hint))
+        }
+        ArgClass::Secret => Some(Decision::Deny {
+            reason: format!(
+                "Reading secret file `{arg}` via `{program}` is blocked (keypair/.env/config)"
+            ),
+        }),
+    }
+}
+
+/// A Bash argument naming a secret.
+enum ArgClass {
+    /// Env class: the `safe-ai-skill env` verdict.
+    Env,
+    /// Hard-deny class, deny glob, or a possible key file (the Bash gate cannot sniff content).
+    Secret,
+}
+
+/// Classify a path-like argument by name only (no filesystem access).
+fn classify_arg(arg: &str, policy: &Policy) -> Option<ArgClass> {
+    let path = normalize_path(arg);
+    if path.is_empty() {
+        return None;
+    }
+    let class = secretpath::classify(&path);
+    if class.is_hard() {
+        return Some(ArgClass::Secret);
+    }
+    if policy
+        .secrets
+        .allow_read_globs
+        .iter()
+        .any(|g| glob_match(g, &path, true))
+    {
+        return None;
+    }
+    if class.is_env_family() {
+        return Some(ArgClass::Env);
+    }
+    let denied = policy
+        .secrets
+        .deny_read_globs
+        .iter()
+        .any(|g| glob_match(g, &path, false));
+    (denied || matches!(class, Class::Suspect(_))).then_some(ArgClass::Secret)
+}
+
+/// The arguments after `varlock` when `tokens` runs it, directly or through a package runner
+/// (`npx`, `pnpx`, `pnpm`, `yarn`, `bunx`, `bun`, `npm`, in any of their run/exec/dlx forms).
+/// After a runner, the first `varlock` token that is not the value of a flag (`--package`,
+/// `--filter`, …) is the binary: `npx -p varlock varlock printenv` → `printenv`.
+fn varlock_args(tokens: &[String]) -> Option<&[String]> {
+    let prog = base_program(tokens.first()?);
+    if prog == "varlock" {
+        return Some(&tokens[1..]);
+    }
+    if !matches!(
+        prog.as_str(),
+        "npx" | "pnpx" | "pnpm" | "yarn" | "bunx" | "bun" | "npm"
+    ) {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(tok) = tokens.get(i) {
+        if tok == "--" {
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') {
+            let takes_value = !tok.contains('=')
+                && matches!(
+                    tok.as_str(),
+                    "-p" | "--package"
+                        | "--filter"
+                        | "-F"
+                        | "-C"
+                        | "--dir"
+                        | "--cwd"
+                        | "--prefix"
+                        | "-w"
+                        | "--workspace"
+                        | "--registry"
+                        | "-c"
+                        | "--call"
+                );
+            i += if takes_value { 2 } else { 1 };
+            continue;
+        }
+        let name = tok.split('@').find(|s| !s.is_empty()).unwrap_or("");
+        if base_program(name) == "varlock" {
+            return Some(&tokens[i + 1..]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The `-c` / `--call` script of an `npx` / `npm exec` invocation, if any.
+fn runner_call_script(tokens: &[String]) -> Option<&str> {
+    let prog = base_program(tokens.first()?);
+    if !matches!(prog.as_str(), "npx" | "npm" | "pnpx") {
+        return None;
+    }
+    tokens.iter().enumerate().skip(1).find_map(|(i, t)| {
+        if t == "-c" || t == "--call" {
+            tokens.get(i + 1).map(String::as_str)
+        } else {
+            t.strip_prefix("--call=")
+        }
+    })
+}
+
+/// varlock subcommands that print resolved values are treated like `cat .env`; turning off
+/// `varlock run` output redaction asks (spec D3.8.5). safe-ai-skill never runs varlock itself.
+fn decide_varlock(args: &[String], assignments: &[&String], policy: &Policy) -> Decision {
+    let positional: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let sub = positional.first().copied().unwrap_or("");
+    let prints = match sub {
+        "load" => {
+            let format = flag_value(args, &["--format", "-f"]);
+            let plaintext = matches!(format, Some("json" | "env" | "shell" | "json-full"));
+            plaintext && !has("--agent")
+        }
+        "printenv" | "reveal" => true,
+        "freeze" => has("--allow-plaintext") || flag_value(args, &["--out", "-o"]) == Some("-"),
+        "proxy" => positional.get(1) == Some(&"token"),
+        "flatten" => has("--include-local"),
+        _ => false,
+    };
+    if prints {
+        let reason = format!(
+            "safe-ai-skill: `varlock {sub}` prints resolved secret values into the transcript. {}",
+            "Use `varlock load --agent` (redacted) to see the config, or `varlock run -- <cmd>` to run a tool with the values injected; `safe-ai-skill env keys <file>` lists keys with values masked."
+        );
+        return if policy.secrets.env_read == "ask" {
+            Decision::Ask { reason }
+        } else {
+            Decision::Deny { reason }
+        };
+    }
+    let unredacted = has("--no-redact-stdout")
+        || assignments.iter().any(|a| {
+            a.split_once('=').is_some_and(|(k, v)| {
+                k == "_VARLOCK_REDACT_STDOUT" && matches!(v, "0" | "false" | "")
+            })
+        });
+    if sub == "run" && unredacted {
+        return Decision::Ask {
+            reason: "`varlock run` with output redaction off: secret values the tool prints reach the transcript — approve to proceed".into(),
+        };
+    }
+    Decision::Defer
+}
+
+/// The value of the first of `names` (`--format json`, `--format=json`, `-fjson`).
+fn flag_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
+    for (i, arg) in args.iter().enumerate() {
+        for name in names {
+            if arg == name {
+                return args.get(i + 1).map(String::as_str);
+            }
+            if let Some(v) = arg.strip_prefix(&format!("{name}=")) {
+                return Some(v);
+            }
+            if name.len() == 2 && !name.starts_with("--") {
+                if let Some(v) = arg.strip_prefix(name).filter(|v| !v.is_empty()) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Decide a `curl`/`wget` segment: deny if it uploads a secret file, ask if it POSTs to a
@@ -358,40 +705,34 @@ fn host_allowlisted(host: &str) -> bool {
         .any(|h| host == *h || host.ends_with(&format!(".{h}")))
 }
 
-/// Whether `arg` matches a deny glob and is not exempted by an allow glob.
+/// Whether `arg` names a secret (any class); used for HTTP upload payloads.
 fn matches_secret(arg: &str, policy: &Policy) -> bool {
-    let path = normalize_path(arg);
-    if path.is_empty() {
-        return false;
-    }
-    if policy
-        .secrets
-        .allow_read_globs
-        .iter()
-        .any(|g| glob_match(g, &path))
-    {
-        return false;
-    }
-    policy
-        .secrets
-        .deny_read_globs
-        .iter()
-        .any(|g| glob_match(g, &path))
+    classify_arg(arg, policy).is_some()
 }
 
 /// Match `path` against a shell-style glob `pattern`, expanding a leading `~`.
 ///
-/// Patterns are matched both as-given and with a `**/` prefix so a bare filename like
-/// `id.json` matches a `**/id.json` deny glob. `~` in either the pattern or the path is
-/// expanded to `$HOME` when available so `~/.config/solana/**` and an absolute
-/// `/home/u/.config/solana/id.json` compare correctly.
-fn glob_match(pattern: &str, path: &str) -> bool {
+/// Patterns are matched against the path and its final component, so a bare filename like
+/// `wallet-keypair.json` matches a `**/*-keypair.json` deny glob. `~` in either the pattern or
+/// the path is expanded to `$HOME` when available so `~/.superstack/config.json` and an
+/// absolute `/home/u/.superstack/config.json` compare correctly. Deny globs match
+/// case-insensitively (`case_sensitive: false`); allow globs never widen by case.
+fn glob_match(pattern: &str, path: &str, case_sensitive: bool) -> bool {
     let expanded_pattern = expand_tilde(pattern);
     let expanded_path = expand_tilde(path);
-    match glob::Pattern::new(&expanded_pattern) {
-        Ok(p) => p.matches(&expanded_path),
-        Err(_) => false,
-    }
+    let Ok(p) = glob::Pattern::new(&expanded_pattern) else {
+        return false;
+    };
+    let options = glob::MatchOptions {
+        case_sensitive,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    p.matches_with(&expanded_path, options)
+        || expanded_path
+            .rsplit('/')
+            .next()
+            .is_some_and(|base| base != expanded_path && p.matches_with(base, options))
 }
 
 /// Expand a leading `~/` (or bare `~`) to `$HOME` when the env var is present.
@@ -713,7 +1054,7 @@ mod tests {
     #[test]
     fn exhausted_budget_is_too_complex() {
         let mut budget = tamper::Budget::new(10, std::time::Duration::from_secs(60));
-        let scanned = decide_segment("cat a b c d e f", &policy(), &mut budget);
+        let scanned = decide_segment("cat a b c d e f", &policy(), None, &mut budget);
         assert_eq!(scanned, Err(tamper::TooComplex));
     }
 
