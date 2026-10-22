@@ -296,7 +296,10 @@ fn cmd_gate_read() -> ExitCode {
     let plugin_data = context::plugin_data_dir();
     let effective = load_effective_policy(&cwd, &plugin_data);
     let path = input.read_path().unwrap_or("");
-    let decision = safe_ai_skill::gates::read::decide(path, &effective);
+    let decision = match safe_ai_skill::gates::read::decide(path, &effective) {
+        Decision::Defer => safe_ai_skill::gates::read::guard_env_schema(path, &cwd),
+        decided => decided,
+    };
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
 }

@@ -165,6 +165,22 @@ pub(crate) fn find_seed_phrase(text: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Whether `text` holds key material: a keypair-style byte array, a base58-encoded 64-byte
+/// secret key, or a PEM/OpenSSH private-key block. Narrower than [`scrub`] on purpose (no
+/// `*_API_KEY=` or JWT shapes), so a schema line such as `HELIUS_API_KEY=varlock("local:…")`
+/// is not a hit.
+pub(crate) fn contains_key_material(text: &str) -> bool {
+    if find_keypair_array(text).is_some() {
+        return true;
+    }
+    let mut spans = Vec::new();
+    collect_base58_secret_keys(text, &mut spans);
+    if !spans.is_empty() {
+        return true;
+    }
+    text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
+}
+
 // ---------------------------------------------------------------------------
 // Collectors (scrub-only)
 // ---------------------------------------------------------------------------

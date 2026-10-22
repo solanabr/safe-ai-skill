@@ -1,9 +1,16 @@
 //! Read/Grep/Glob secret-glob gate.
 
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
 use glob::Pattern;
 
 use crate::io::Decision;
 use crate::policy::Policy;
+use crate::redact;
+
+/// Largest `.env.schema` the content guard will read.
+const MAX_SCHEMA_BYTES: u64 = 64 * 1024;
 
 /// Decide whether a read of `path` is permitted.
 ///
@@ -39,6 +46,67 @@ pub fn decide(path: &str, policy: &Policy) -> Decision {
     }
 
     Decision::Defer
+}
+
+/// Content guard for a read that [`decide`] let through: a varlock `.env.schema` is allowed
+/// by default, but is denied when it holds key material, is larger than 64 KiB, is not a
+/// regular file, or resolves (symlink) to a file that is not itself a `.env.schema`.
+///
+/// Relative paths resolve against the hook `cwd`. Any other file name, and a schema that does
+/// not exist yet, return [`Decision::Defer`]. Never executes or parses the schema: it is a
+/// bounded byte scan with the shared [`redact`] detectors.
+pub fn guard_env_schema(path: &str, cwd: &Path) -> Decision {
+    if !is_env_schema(path) {
+        return Decision::Defer;
+    }
+    let mut full = PathBuf::from(expand_home(path));
+    if full.is_relative() {
+        full = cwd.join(full);
+    }
+    let real = match full.canonicalize() {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Decision::Defer,
+        Err(_) => return schema_denied("could not be resolved"),
+    };
+    if !real.to_str().map(is_env_schema).unwrap_or(false) {
+        return schema_denied("resolves to a different file");
+    }
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(&real).and_then(|f| {
+        if !f.metadata()?.is_file() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        f.take(MAX_SCHEMA_BYTES + 1).read_to_end(&mut buf)
+    });
+    if read.is_err() {
+        return schema_denied("could not be read as a regular file");
+    }
+    if buf.len() as u64 > MAX_SCHEMA_BYTES {
+        return schema_denied("is larger than 64 KiB");
+    }
+    if redact::contains_key_material(&String::from_utf8_lossy(&buf)) {
+        return Decision::Deny {
+            reason:
+                "Protected secret file blocked (.env.schema): the schema contains a secret value. \
+                     A schema holds keys and decorators only; move the value to `.env.local`."
+                    .into(),
+        };
+    }
+    Decision::Defer
+}
+
+/// Whether the final component of `path` is `.env.schema` (case-insensitive: the same file
+/// on a case-insensitive filesystem).
+fn is_env_schema(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|base| base.eq_ignore_ascii_case(".env.schema"))
+}
+
+fn schema_denied(why: &str) -> Decision {
+    Decision::Deny {
+        reason: format!("Protected secret file blocked (.env.schema): the schema {why}."),
+    }
 }
 
 /// Match a glob `pattern` against `candidate`, expanding a leading `~` in the pattern and
@@ -141,6 +209,30 @@ mod tests {
     fn allow_env_example() {
         assert_eq!(decide(".env.example", &policy()), Decision::Defer);
         assert_eq!(decide("/proj/.env.example", &policy()), Decision::Defer);
+    }
+
+    #[test]
+    fn allow_env_schema_but_not_its_siblings() {
+        assert_eq!(decide(".env.schema", &policy()), Decision::Defer);
+        assert_eq!(decide("/proj/sub/.env.schema", &policy()), Decision::Defer);
+        for name in [".env.schema.bak", ".env.schema.local", ".env.local"] {
+            assert!(
+                matches!(decide(name, &policy()), Decision::Deny { .. }),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_ignores_other_file_names() {
+        assert_eq!(
+            guard_env_schema("/nonexistent/.env.example", Path::new("/")),
+            Decision::Defer
+        );
+        assert_eq!(
+            guard_env_schema("/nonexistent/.env.schema", Path::new("/")),
+            Decision::Defer
+        );
     }
 
     #[test]

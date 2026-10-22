@@ -42,6 +42,7 @@ secrets:
     - "~/.superstack/config.json"     # holds the plaintext Copilot JWT
   allow_read_globs:
     - "**/.env.example"
+    - "**/.env.schema"                # varlock schema: keys + decorators only; read gate sniffs it for key material
 redact: { enabled: true }
 audit:  { enabled: true }
 catalog:
