@@ -59,6 +59,7 @@ secrets:
     - "~/.superstack/config.json"
   allow_read_globs:
     - "**/.env.example"
+    - "**/.env.schema"
 redact:
   enabled: true
 audit:
@@ -393,7 +394,7 @@ impl Default for SecretsPolicy {
                 "~/.config/solana/**".into(),
                 "~/.superstack/config.json".into(),
             ],
-            allow_read_globs: vec!["**/.env.example".into()],
+            allow_read_globs: vec!["**/.env.example".into(), "**/.env.schema".into()],
         }
     }
 }

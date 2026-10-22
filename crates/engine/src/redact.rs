@@ -165,6 +165,132 @@ pub(crate) fn find_seed_phrase(text: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Whether `text` holds key material: a keypair-style byte array, a base58-encoded 64-byte
+/// secret key, a PEM/OpenSSH private-key block, a JWT, an `sk-`/`sk_live_`/`sk_test_` token,
+/// or a literal value on a secret-named assignment (`*_API_KEY`, `*_SECRET`, `*_TOKEN`,
+/// `*PASSWORD*`, `*PRIVATE_KEY`).
+///
+/// High-confidence only. Unlike [`scrub`], an assignment whose value is empty, a placeholder
+/// (`<...>`, `xxx`, `changeme`, `your-...`), a reference (`$VAR`, `${VAR}`) or a function call
+/// (`varlock(...)`, `exec(...)`) is not a hit, so a schema line such as
+/// `HELIUS_API_KEY=varlock("local:...")` passes. `#` comment lines are skipped for assignments.
+pub(crate) fn contains_key_material(text: &str) -> bool {
+    if find_keypair_array(text).is_some() {
+        return true;
+    }
+    let mut spans = Vec::new();
+    collect_base58_secret_keys(text, &mut spans);
+    collect_jwts(text, &mut spans);
+    if !spans.is_empty() || has_secret_token(text) {
+        return true;
+    }
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+        return true;
+    }
+    text.lines().any(has_literal_secret_assignment)
+}
+
+/// A provider-style token (`sk-`, `sk_live_`, `sk_test_`) of at least 20 chars that starts a
+/// word, so prose such as `desk-lamp-description-text` is not a hit.
+fn has_secret_token(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for prefix in ["sk-", "sk_live_", "sk_test_"] {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel;
+            let mut end = start + prefix.len();
+            while end < bytes.len() && is_token_char(bytes[end]) {
+                end += 1;
+            }
+            if (start == 0 || !is_token_char(bytes[start - 1])) && end - start >= 20 {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
+/// A `KEY=value` line where `KEY` is secret-named and `value` is a non-empty literal.
+fn has_literal_secret_assignment(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    let key = key.trim().to_ascii_uppercase();
+    let secret_named = key.ends_with("_API_KEY")
+        || key == "API_KEY"
+        || key.ends_with("_SECRET")
+        || key == "SECRET"
+        || key.ends_with("_TOKEN")
+        || key == "TOKEN"
+        || key.contains("PASSWORD")
+        || key.contains("_SECRET_")
+        || key.ends_with("PRIVATE_KEY")
+        || (key.ends_with("_KEY")
+            && ["SECRET", "PRIVATE", "AUTH", "ACCESS"]
+                .iter()
+                .any(|w| key.contains(w)));
+    if !secret_named {
+        return false;
+    }
+    !is_non_literal_value(strip_value(value))
+}
+
+/// The assignment value without surrounding quotes or a trailing ` # comment`: a quoted
+/// value ends at its closing quote, an unquoted one at the first `#` that starts a word.
+fn strip_value(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\'' | '`'))
+    {
+        let inner = &value[1..];
+        return inner.split(quote).next().unwrap_or(inner);
+    }
+    let mut prev_ws = true;
+    for (i, c) in value.char_indices() {
+        if c == '#' && prev_ws {
+            return value[..i].trim_end();
+        }
+        prev_ws = c.is_whitespace();
+    }
+    value
+}
+
+/// Whether an assignment value is empty, a placeholder, a reference or a function call.
+fn is_non_literal_value(value: &str) -> bool {
+    if value.is_empty() || value.starts_with('$') || value.starts_with('<') {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("your-")
+        || lower.starts_with("your_")
+        || lower.starts_with("changeme")
+        || lower.starts_with("change-me")
+        || lower.starts_with("change_me")
+        || lower.chars().all(|c| c == 'x' || c == '*')
+    {
+        return true;
+    }
+    // `name(...)`: a resolver such as `varlock("local:...")` or `exec(...)`, never a literal.
+    match value.find('(') {
+        Some(open) if value.ends_with(')') => {
+            let name = &value[..open];
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        }
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Collectors (scrub-only)
 // ---------------------------------------------------------------------------
@@ -484,6 +610,60 @@ fn is_wordlist_shape(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_material_flags_credential_shapes() {
+        for text in [
+            "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+            "STRIPE=sk_\x6cive_abcdefghijklmnop1234",
+            "T=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij",
+            "HELIUS_API_KEY=0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+            "DB_PASSWORD=hunter2",
+            "export GH_TOKEN=\"ghp_abc123\"",
+            "APP_SECRET='s3cr3t'",
+            "SIGNER_PRIVATE_KEY=abc",
+            "DB_PASSWORD=pass(word",
+            "STRIPE_SECRET_KEY=abc123",
+            "SECRET_KEY=abc123",
+            "AUTH_KEY=abc123",
+            "AWS_ACCESS_KEY=AKIA1234",
+            "DB_SECRET_URL=abc123",
+            "PRIVATE_SIGNING_KEY=abc123",
+            "API_KEY=abc123 # note",
+            "API_KEY=\"abc123\" # note",
+        ] {
+            assert!(contains_key_material(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn key_material_passes_non_literals_and_prose() {
+        for text in [
+            "HELIUS_API_KEY=",
+            "HELIUS_API_KEY=varlock(\"local:abc\")",
+            "API_KEY=exec(`op read x`)",
+            "DB_PASSWORD=$DB_PASSWORD",
+            "DB_PASSWORD=${DB_PASSWORD}",
+            "DB_PASSWORD=<your password>",
+            "GH_TOKEN=xxxxxxxx",
+            "GH_TOKEN=changeme",
+            "GH_TOKEN=your-token-here",
+            "# OPENAI_API_KEY=hunter2",
+            "# a desk-lamp-with-a-long-description-here",
+            "SOLANA_CLUSTER=devnet",
+            "API_KEY= # @sensitive",
+            "API_KEY=# @sensitive",
+            "API_KEY=exec('op read x') # note",
+            "API_KEY=varlock(\"local:x\")\t# note",
+            "API_KEY=\"\" # note",
+            "SECRET_KEY=",
+            "STRIPE_SECRET_KEY=$STRIPE",
+            "PUBLIC_KEY=abc123",
+            "AUTH_KEY=<paste>",
+        ] {
+            assert!(!contains_key_material(text), "{text}");
+        }
+    }
 
     #[test]
     fn keypair_byte_array_redacted() {
