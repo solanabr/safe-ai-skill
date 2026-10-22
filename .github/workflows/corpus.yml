@@ -2,7 +2,8 @@
 #
 # Runs the scanner acceptance corpus against the ai-kit skill packs pinned in
 # crates/engine/tests/fixtures/corpus/aikit.manifest.tsv: 0 BLOCK, at most 14 HIGH,
-# every pack at its expected grade, and the scan under 5 s (release build).
+# every pack at its expected grade, and the scan under 5 s (release build, faster of
+# two passes).
 #
 # Opt-in because it fetches ai-kit and its 46 pack submodules over the network:
 # run it from the Actions tab, or add the `corpus` label to a PR that changes the

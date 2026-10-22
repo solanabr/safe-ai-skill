@@ -235,7 +235,8 @@ const RULES: &[RuleInfo] = &[
     RuleInfo { id: "bang_cmd", code: Severity::High, summary: "!`cmd` line executed when the skill loads (no Bash hook fires)" },
     // description
     RuleInfo { id: "description_url", code: Severity::Warn, summary: "skill description contains a URL (injected into every session)" },
-    RuleInfo { id: "description_injection", code: Severity::High, summary: "skill description carries shell syntax, a fetch-this URL or instructions" },
+    RuleInfo { id: "description_injection", code: Severity::High, summary: "skill description carries shell syntax, a URL with an action verb or next to a credential, or instructions" },
+    RuleInfo { id: "frontmatter_anomaly", code: Severity::High, summary: "SKILL.md frontmatter that never closes or runs past 200 lines" },
     RuleInfo { id: "prompt_injection", code: Severity::Warn, summary: "prompt-injection phrasing (ignore previous instructions, hide from user)" },
     RuleInfo { id: "hidden_instruction", code: Severity::Warn, summary: "HTML comment carrying instructions or commands" },
 ];
@@ -268,11 +269,11 @@ const COMBOS: &[(&str, &str)] = &[
     ),
     (
         "bang_exfil",
-        "!`cmd` with network or secret access, executed on skill load",
+        "!`cmd` with network or secret access (directly or in a pack script it runs), executed on skill load",
     ),
     (
         "description_injection",
-        "skill description with shell syntax, a fetch-this URL or injected instructions",
+        "skill description with shell syntax, a URL with an action verb or next to a credential, or injected instructions",
     ),
     (
         "lifecycle_network",
@@ -797,6 +798,40 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_emitted_rule_is_described() {
+        let sources = [
+            include_str!("mod.rs"),
+            include_str!("bang_cmd.rs"),
+            include_str!("binary_magic.rs"),
+            include_str!("combo.rs"),
+            include_str!("description.rs"),
+            include_str!("exec_sinks.rs"),
+            include_str!("harness_config.rs"),
+            include_str!("lifecycle.rs"),
+            include_str!("network_ctx.rs"),
+            include_str!("padding.rs"),
+            include_str!("secrets_ctx.rs"),
+            include_str!("symlink.rs"),
+            include_str!("unicode.rs"),
+        ];
+        let mut seen = 0;
+        for src in sources {
+            for (p, _) in src.match_indices("emit(") {
+                let rest = src[p + 5..].trim_start();
+                let Some(id) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                    continue;
+                };
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+                    continue;
+                }
+                seen += 1;
+                assert!(!super::describe(id).is_empty(), "undescribed rule {id}");
+            }
+        }
+        assert!(seen > 40, "{seen}");
+    }
+
     use super::testkit::*;
     use super::*;
 

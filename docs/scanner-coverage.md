@@ -12,7 +12,7 @@ context:
 
 | Context | What it covers |
 |---|---|
-| `code` | Executable source, decided by extension, shebang or exec bit, plus `` !`cmd` `` lines. Lines are joined into statements (open brackets, `\` continuations), and a tool and its marker must appear in the same command. |
+| `code` | Executable source, decided by extension, shebang or exec bit, plus `` !`cmd` `` lines. A lexer marks strings, regex literals, comments and interpolations; lines end at `\n`, `\r`, U+2028 or U+2029, and block comments, Python triple-quoted strings and JS template text carry across lines. Lines are joined into statements (open brackets, `\` continuations), and a tool and its marker must appear in the same command. |
 | `doc` | Markdown prose, fenced blocks and inline code, and any other text file (JSON, YAML, HTML …). |
 | `meta` | Pack structure: manifests, harness config, `SKILL.md` frontmatter, symlinks and binaries. |
 
@@ -27,24 +27,60 @@ The pack grade (`rules::grade`) is decided as follows:
   decided by the verify state machine, not by the scanner.
 
 A sink written inside a string literal or a comment (code-as-data: a help text, a rule table, a
-command built for a remote host) is graded WARN and never feeds a combination rule.
+command built for a remote host) is graded WARN and never feeds a combination rule. Interpolations
+are code, not data: JS template `${…}`, Python f-string `{…}` and shell `"$(…)"`. One exception:
+a real base64 payload (see `exec_b64_literal`) in the same command as a sink feeds the combo even
+when the sink is quoted. Google's `exec(base64.b64decode('{encoded_script}'))`, built as a
+string around a placeholder, stays WARN.
+
+### What is read
+
+* **Text decoding.** UTF-8 (a leading BOM dropped) and UTF-16 (by its BOM) are decoded. A text
+  or code file (known extension or shebang) with NUL bytes is read with the NULs stripped and gets
+  `nul_bytes` WARN. Only archive or executable magic, `.pyc`, or NULs in a file of no known text
+  type make a file binary.
+* **What is skipped.** The pack's own top-level `.git` (a nested one is scanned), and lockfiles by
+  exact name (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`,
+  `bun.lock(b)`, `deno.lock`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `pdm.lock`, `uv.lock`,
+  `Gemfile.lock`, `composer.lock`, `Podfile.lock`, `pubspec.lock`, `mix.lock`, `flake.lock`,
+  `packages.lock.json`) without an exec bit or shebang. Any other `*.lock` is scanned.
 
 ## Combination rules (the only BLOCKs)
 
 | Combo | Fires when |
 |---|---|
 | `padding_sink` | A run of 100+ whitespace characters (space, tab, Unicode Zs, blank-rendering fillers) has an exec, env-dump or network sink on the same line; or 50+ blank lines are followed by such a sink. Code only. |
-| `exec_b64_literal` | An execution sink and a quoted base64 literal of 64+ characters appear in the same command. The literal must not be hex, and either a decoder is present or the literal decodes to text, so signatures, hashes and keys don't count. |
-| `eval_decoder` | `eval` / `Function(` anywhere in the pack's code plus a decoder anywhere in it (a split payload). Build output (`dist/`, `build/`, `out/`, `.next/`, `node_modules/`, `*.min.js`, `*.bundle.js`) is left out of this cross-file rule. |
-| `symlink_escape` | A symlink target leaves the pack, judged lexically from the link's directory. An absolute target always counts. |
+| `exec_b64_literal` | An execution sink and a quoted base64 literal of 64+ characters appear in the same command, the sink itself possibly inside a string. The literal must not be hex, and either a decoder is present or the literal decodes to text, so signatures, hashes and keys don't count. |
+| `eval_decoder` | `eval` / `Function(` anywhere in the pack's code plus a decoder anywhere in it (a split payload). Only real bundles are left out of this cross-file rule: `*.min.js`, `node_modules/`, or a file carrying a bundler runtime (esbuild `__commonJS`/`__toESM`, webpack `__webpack_require__`, Rollup `commonjsGlobal`, Parcel `parcelRequire`) or a minified shape (1 KiB or more, averaging 1000+ bytes per line). A `dist/`, `build/` or `out/` directory alone proves nothing. |
+| `symlink_escape` | A symlink target leaves the pack, resolved from the link's directory with in-pack symlinks met on the way expanded (`a -> sub/l/..` with `sub/l -> ..` escapes). An absolute target always counts. Nothing outside the pack is read. |
 | `pyc_beside_py` | `x.pyc` (or `__pycache__/x.cpython-NNN.pyc`) ships next to `x.py`. |
 | `native_binary` | A native ELF, Mach-O or PE file. BPF and SBF `.so` files (e_machine 247 and 263) are exempt. |
 | `masquerade_referenced` | Archive or executable bytes sit behind a text extension, and a `SKILL.md` names the file, its stem or its disguised inner extension (`.docx` in `x.docx.txt`). |
-| `bang_exfil` | A `` !`cmd` `` outside a fence touches the network, a secret path, the environment or a credential variable. |
-| `description_injection` | A `SKILL.md` description carries shell syntax (`$(`, `\| sh`, `&&` …), a URL with a fetch/visit/follow verb in front of it, an instruction aimed at every turn ("before responding …"), or injection phrasing. Tag characters are decoded first. |
-| `lifecycle_network` | An npm `preinstall`, `install`, `postinstall` or `prepare` script reaches the network (curl, wget, npx, a URL …) or evaluates inline code (`node -e`, `python -c`, `eval`). |
-| `harness_bypass` | A shipped `.claude/settings*.json` contains `bypassPermissions`, `defaultMode` or `dangerously*`. |
+| `bang_exfil` | A `` !`cmd` `` outside a closed fence touches the network, a secret path, the environment or a credential variable, directly or by running a pack script that does (`bash scripts/x.sh`, `./x.sh`, `${CLAUDE_SKILL_DIR}/x.sh`). A fence that never closes hides nothing. |
+| `description_injection` | A `SKILL.md` description carries shell syntax (`$(`, `\| sh`, `&&` …), a URL with an action verb or next to a credential (see [Description URLs](#description-urls-a-deliberate-deviation-from-d24)), an instruction aimed at every turn ("before responding …", "first, always run …"), or injection phrasing. The description is read as YAML (escapes, quoted keys, block scalars) and line by line, and tag characters are decoded first. |
+| `lifecycle_network` | An install-time npm script (`preinstall`, `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare`, `dependencies`, `prepack`, `postpack`, pnpm's `pnpm:devPreinstall`) reaches the network (curl, wget, npx, a URL …) or evaluates inline code (`node -e`, `python -c`, `eval`). Names are compared after JSON decoding. |
+| `harness_bypass` | A shipped `.claude/settings*.json` contains `bypassPermissions`, a `defaultMode` key or `dangerously*`, compared after JSON decoding (`\u0064efaultMode` counts). |
 | `registry_hijack` | Code writes package-manager registry config (`.npmrc`, `.yarnrc`, `pip.conf`, `npm config set registry`, git `insteadOf` …) and names a registry host other than npmjs, yarnpkg, PyPI, crates.io or rubygems in the same file. A git `insteadOf` that only adds credentials to the same host is not a hijack. |
+
+## Description URLs: a deliberate deviation from D2.4
+
+D2.4 blocks a description URL only when a fetch verb comes before it. The scanner is stricter,
+because the description is injected into every session: an instruction there to fetch, send to or
+obey a URL acts before any task does.
+
+* **BLOCK** (`description_injection`) when a URL comes with an action verb in its sentence (up to
+  60 bytes before it or 40 after): fetch, curl, wget, download, get, visit, open, navigate, go to,
+  send, post, upload, submit, report, read, obey, consult, follow, load, retrieve, pull, run,
+  execute, source, install.
+* **BLOCK** when the description has any URL and also names a secret path (`~/.config/solana`,
+  `id.json`, `.ssh/`, `.env` …) or a credential term: private key, secret key, seed phrase,
+  recovery phrase, mnemonic, password, passphrase, ssh key, keypair file, wallet file, env vars,
+  environment variables, `process.env`, `os.environ`, `printenv`. A generic "API key" does not
+  count, because vendor descriptions name it (ai-kit's `alchemy-mcp` does).
+* **WARN** (`description_url`) for a bare URL, and for scheme-only mentions such as `s3://`.
+
+The trade-off: a vendor description that says "install …" or "send …" next to its own URL blocks.
+The pack can still be reviewed and pinned.
 
 ## ai-kit checklist coverage
 
@@ -58,7 +94,7 @@ The checklist from ai-kit's `docs/skill-packs.md` ("Non-official pack provenance
 | Env-var and keypair reads | `secret_read` HIGH / WARN (keypair, `.config/solana`, `.ssh`, `.aws/credentials`, `.netrc`, `.env*` except templates; a read call or a read command next to the path); `env_dump` INFO; `embedded_secret_key` INFO | Reading individual env-var names |
 | Hardcoded URLs and IPs in source | `telemetry_post` HIGH / WARN (a POST carrying usage words or local data to an external host); `network_post` WARN / INFO; `ip_literal` WARN / INFO (public IPv4 destinations) | Judging whether each endpoint is the vendor's own |
 | Pipe-to-shell installers | `download_and_run` HIGH / WARN (`curl … \| sh`, `sh -c "$(curl …)"`, `bash <(curl …)`, `iex (iwr …)`, eval of fetched content) | — |
-| Install lifecycle hooks (`preinstall`, `install`, `postinstall`, `prepare`) | `lifecycle_script` HIGH, at the key's line; every `package.json` script is scanned as shell code; combo `lifecycle_network` | What the script's own files do |
+| Install lifecycle hooks (`preinstall`, `install`, `postinstall`, `prepare` and the other install-time hooks) | `lifecycle_script` HIGH, at the key's line; every `package.json` script is scanned as shell code; combo `lifecycle_network`. A BOM is stripped first; a manifest that still does not parse gets `manifest_unparsed` WARN and each of its `"key": "value"` pairs is scanned as a script | What the script's own files do |
 | Invisible and bidirectional Unicode | `unicode_bidi`, `unicode_invisible` WARN / INFO; `unicode_tag` WARN. Emoji joiners, script joiners and a leading BOM are ignored. | Trojan Source review of flagged lines |
 | Symlinks (target, and whether it leaves the pack) | `symlink` INFO; combo `symlink_escape`. Links are never followed. | — |
 | Executables (`find -perm -u+x`, naming each) | `executable` INFO for each file with an exec bit; shebang and exec-bit files are scanned as code | **What each executable does** |
@@ -79,12 +115,14 @@ Beyond the checklist, the engine also covers:
 * **Load-time commands:** `bang_cmd` HIGH.
 * **Model-facing text:**
   * the `SKILL.md` description (`description_url` WARN, combo `description_injection`);
+  * a `SKILL.md` frontmatter that never closes or runs past 200 lines (`frontmatter_anomaly`
+    HIGH; the description is still read to the end);
   * prompt-injection phrasing;
   * instruction-carrying HTML comments;
   * unscoped `Bash` grants (`broad_tools` INFO).
 * **Unscanned tails:** `oversize_file`, HIGH for code past the 16 MiB scan cap.
 
-Lockfiles (`*.lock`, `package-lock.json`, `pnpm-lock.yaml` …) without an exec bit or shebang are
+Lockfiles (by exact name, see [What is read](#what-is-read)) without an exec bit or shebang are
 dependency data. They are inventoried at `verify add|check` (spec D7.2), not text-scanned.
 `build.rs`, proc-macro crates, `.cargo/config.toml`, `binding.gyp` and npm `hasInstallScript` are
 build-time execution, reported at `verify add|check` (D7.2), not at SessionStart.
@@ -113,6 +151,11 @@ rule ideas were reimplemented here; no rule lists were copied.
   issue #10 stealer, the scanner-research demo pack, harness bypass and bang exfil all **BLOCK**.
   Google's `exec(base64.b64decode('{encoded_script}'))` (built as a string) is **WARN**. Fixtures
   are inert: payloads decode to a `console.log`, and hosts are `example.invalid`.
+* **Evasions** (always run, `tests/rules_evasion.rs`): 42 cases from the WS-D2 review. They cover
+  interpolations, regex literals, line terminators, NUL/BOM/UTF-16, lockfile and `.git` scope,
+  split payloads in `build/`, `package.json` BOM, hooks and parse failures, escaped settings,
+  frontmatter forms, description URLs, indirect and fenced bangs, and symlink chains. Each
+  gets the verdict it must have.
 * **ai-kit** (opt-in): the 46 packs at the commit pinned in `aikit.manifest.tsv` give **0 BLOCK and
   13 HIGH** (limit 14), each HIGH a true behaviour, and every pack matches its expected grade. Run it with:
 
@@ -122,8 +165,10 @@ rule ideas were reimplemented here; no rule lists were copied.
   # and SAFE_AI_SKILL_CORPUS_VERBOSE=1 to list every combo, HIGH and WARN finding.
   ```
 
-  Release builds also assert that the scan stays under 5 s. It measures 2.3–3.6 s for 106 MB of
-  text across 13.5k files (about 0.5 s of that is file I/O).
+  Release builds also assert that the scan stays under 5 s, taking the faster of two passes so
+  that a cold page cache (a fresh clone, or a rebuild that evicted it) does not count. A warm
+  scan of the 106 MB of text across 13.5k files takes about 2.5 s. The lexer adds about 10% over
+  the pre-lexer engine, which took 2.3 s in the same runs.
 
 ## Known limits
 
@@ -131,8 +176,16 @@ rule ideas were reimplemented here; no rule lists were copied.
   benchmark puts rules-only recall at about 8% at HIGH. The runtime gates remain the backstop.
 * **Unpaired fragments.** A payload split so that no sink and decoder or padding ever meet in
   hand-written code grades HIGH at most.
-* **Multi-line strings.** Python docstrings and template literals spanning lines are not tracked
-  as strings across lines.
+* **Lexing is approximate per language family.** Shell heredocs, Ruby and Perl quoting, and Rust
+  raw strings are approximated. JS regex literals are told from division by the token before
+  the `/`.
+* **Bundle exemption.** A file can pose as a bundle (bundler helper names, a minified shape) to
+  stay out of the cross-file `eval_decoder` rule. It still grades HIGH for its own `eval`, and
+  in-statement combos still apply.
+* **Indirect load-time commands.** A `` !`cmd` `` is followed into a pack script one level deep,
+  and only when the script is named directly (an interpreter and a path, or a path).
+* **Descriptions.** Only `SKILL.md` frontmatter is checked, not the frontmatter of agent or
+  command files.
 * **Unknown endpoint variables.** An unresolved variable named like an endpoint (`$RPC_URL`) is
   treated as user-configured.
 * **History.** Full-history and docs-only-commit checks (D7.3) are not implemented at
