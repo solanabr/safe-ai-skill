@@ -545,14 +545,12 @@ fn solana_config_rpc_url() -> Option<String> {
 /// The plugin data dir path, resolved by [`crate::datadir::data_dir`] exactly as the hooks
 /// resolve it (never a `./.safe-ai-skill` fallback).
 ///
-/// Kept for the call sites that only need a path. When nothing resolves (no
-/// `CLAUDE_PLUGIN_DATA`, `CLAUDE_CONFIG_DIR`, `HOME` or `USERPROFILE`) it returns a
-/// fixed dir under the system temp dir, which [`crate::datadir`] would report untrusted.
+/// Kept for the call sites that only need a path. When nothing resolves it returns the
+/// [`crate::datadir::unresolved`] sentinel: reads under it find nothing and writes fail.
 pub fn plugin_data_dir() -> PathBuf {
-    match crate::datadir::data_dir() {
-        Ok(dir) => dir.path,
-        Err(_) => std::env::temp_dir().join("safe-ai-skill-unresolved"),
-    }
+    crate::datadir::data_dir()
+        .unwrap_or_else(|_| crate::datadir::unresolved())
+        .path
 }
 
 /// Project root for a session. Currently the cwd itself (reserved for a future git-root walk).

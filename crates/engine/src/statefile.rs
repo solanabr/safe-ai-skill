@@ -9,6 +9,10 @@
 //! This is tamper-evident, not tamper-proof: anything that can read the key can forge a
 //! MAC. It stops the model hand-editing state through a tool that cannot read the key.
 //!
+//! Floats round-trip exactly (serde_json `float_roundtrip`), which the MAC depends on: it is
+//! computed over the value as stored and re-checked over the value as parsed. NaN and
+//! infinities have no JSON form, so [`store`] refuses them.
+//!
 //! [`load`] never decides a fail direction: it reports [`Loaded::Missing`] or
 //! [`Loaded::Tampered`] and the caller picks (no relaxation, budget exhausted, ...).
 
@@ -52,6 +56,9 @@ pub enum Loaded<T> {
 /// A state file with no key file is [`Loaded::Tampered`] (the key cannot vanish on its own).
 /// Never creates the key.
 pub fn load<T: DeserializeOwned + Default>(dir: &DataDir, name: &str) -> Loaded<T> {
+    if dir.is_unresolved() {
+        return Loaded::Missing;
+    }
     if !valid_name(name) {
         return Loaded::Tampered;
     }
@@ -88,8 +95,18 @@ pub fn load<T: DeserializeOwned + Default>(dir: &DataDir, name: &str) -> Loaded<
 /// Write `v` to `${dir}/{name}` as a MAC'd envelope: a 0600 temp file in the same dir,
 /// fsync, then rename over the target. Creates the data dir and the key when missing.
 pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), EngineError> {
+    if dir.is_unresolved() {
+        return Err(Error::Other(
+            "the plugin data dir is unresolved; nothing is stored".to_string(),
+        ));
+    }
     if !valid_name(name) {
         return Err(Error::Other(format!("invalid state file name `{name}`")));
+    }
+    if has_non_finite_float(v) {
+        return Err(Error::Other(format!(
+            "refusing to store `{name}`: it holds a NaN or infinite number"
+        )));
     }
     create_dir_private(&dir.path)?;
     let key = load_or_create_key(&dir.path)?;
@@ -98,6 +115,22 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
     let envelope = serde_json::json!({ "v": VERSION, "mac": mac, "body": body });
     let bytes = serde_json::to_vec(&envelope).map_err(|e| Error::Parse(e.to_string()))?;
     write_atomic(&dir.path, name, &bytes)
+}
+
+/// Whether `v` serializes any NaN or infinite float. serde_json would write those as `null`,
+/// which then fails to load as the number type; serde_yaml keeps them, so walk its value.
+fn has_non_finite_float<T: Serialize>(v: &T) -> bool {
+    fn walk(y: &serde_yaml::Value) -> bool {
+        use serde_yaml::Value as Y;
+        match y {
+            Y::Number(n) => n.is_nan() || n.is_infinite(),
+            Y::Sequence(items) => items.iter().any(walk),
+            Y::Mapping(map) => map.iter().any(|(k, v)| walk(k) || walk(v)),
+            Y::Tagged(t) => walk(&t.value),
+            Y::Null | Y::Bool(_) | Y::String(_) => false,
+        }
+    }
+    serde_yaml::to_value(v).map(|y| walk(&y)).unwrap_or(false)
 }
 
 /// A state file name is one plain path component and never the key itself.
@@ -203,44 +236,107 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Read the key; any length other than [`KEY_LEN`] is an error.
+/// Seconds after which an empty key file counts as a crashed creation and may be replaced.
+const STALE_EMPTY_KEY_SECS: u64 = 60;
+
+/// Read the key. Refused (an error, so [`load`] reports `Tampered`) unless it is a regular
+/// file reached without following a symlink, holds exactly [`KEY_LEN`] bytes and, on unix,
+/// has no group/other permission bits and is owned by the effective user.
 fn read_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
-    let key = std::fs::read(dir.join(KEY_FILE))?;
+    use std::io::Read;
+    let bad = |why: &str| Error::Other(format!("state key refused: {why}"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = opts.open(dir.join(KEY_FILE))?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(bad("not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(bad("group or other permission bits set"));
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(bad("not owned by the current user"));
+        }
+    }
+    let mut key = Vec::with_capacity(KEY_LEN);
+    f.take(KEY_LEN as u64 + 1).read_to_end(&mut key)?;
     if key.len() != KEY_LEN {
-        return Err(Error::Other("state key is malformed".to_string()));
+        return Err(bad("wrong length"));
     }
     Ok(key)
 }
 
 /// Read the key, creating it with `O_EXCL` (mode 0600) when absent. Losing a creation race
 /// re-reads the winner's key, retrying briefly while the winner is still writing it.
+///
+/// Recovery: a creation that crashed leaves an empty `key`; once it is older than
+/// [`STALE_EMPTY_KEY_SECS`] it is replaced (no state can have been MAC'd under it). Any other
+/// bad key (wrong length, mode, owner, a symlink) is never replaced automatically: delete
+/// `${DATA}/key` together with the state files (they would no longer verify) to reset.
 fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
     let path = dir.join(KEY_FILE);
-    match open_new_private(&path) {
-        Ok(mut f) => {
-            let mut key = [0u8; KEY_LEN];
-            rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut key)
-                .map_err(|e| Error::Other(format!("OS random source: {e}")))?;
-            f.write_all(&key)?;
-            f.sync_all()?;
-            Ok(key.to_vec())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            for _ in 0..50 {
-                match std::fs::read(&path) {
-                    Ok(key) if key.len() == KEY_LEN => return Ok(key),
-                    Ok(key) if key.len() > KEY_LEN => break,
-                    _ => std::thread::sleep(std::time::Duration::from_millis(2)),
-                }
+    let mut replaced_stale = false;
+    loop {
+        match open_new_private(&path) {
+            Ok(mut f) => {
+                let mut key = [0u8; KEY_LEN];
+                rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut key)
+                    .map_err(|e| Error::Other(format!("OS random source: {e}")))?;
+                f.write_all(&key)?;
+                f.sync_all()?;
+                return Ok(key.to_vec());
             }
-            Err(Error::Other("state key is malformed".to_string()))
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !replaced_stale && is_stale_empty_key(&path) {
+                    replaced_stale = true;
+                    std::fs::remove_file(&path)?;
+                    continue;
+                }
+                let mut last = Error::Other("state key refused: wrong length".to_string());
+                for _ in 0..50 {
+                    match read_key(dir) {
+                        Ok(key) => return Ok(key),
+                        Err(e) => last = e,
+                    }
+                    // Only an empty or short key may still be being written.
+                    let len = std::fs::symlink_metadata(&path).map(|m| m.len());
+                    if !matches!(len, Ok(n) if n < KEY_LEN as u64) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                return Err(last);
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => Err(e.into()),
     }
 }
 
+/// An empty regular `key` (not a symlink) last modified over [`STALE_EMPTY_KEY_SECS`] ago.
+fn is_stale_empty_key(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let age = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .map(|d| d.as_secs());
+    meta.is_file() && meta.len() == 0 && age.is_some_and(|a| a > STALE_EMPTY_KEY_SECS)
+}
+
 /// `create_new` with mode 0600 on unix.
-fn open_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_new_private(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -252,7 +348,7 @@ fn open_new_private(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// `create_dir_all` with mode 0700 on unix for the dirs it creates.
-fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -470,6 +566,222 @@ mod tests {
             String::from_utf8(out).unwrap(),
             r#"{"a":{"x":null,"y":[1,{"p":"x","q":2}]},"b":1}"#
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_key_is_refused() {
+        let dir = tmp_data("keylink");
+        store(&dir, "grants.json", &demo()).unwrap();
+        let real = dir.path.join("real-key");
+        std::fs::rename(dir.path.join(KEY_FILE), &real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path.join(KEY_FILE)).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        assert!(store(&dir, "grants.json", &demo()).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_readable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_data("keymode");
+        store(&dir, "grants.json", &demo()).unwrap();
+        let key = dir.path.join(KEY_FILE);
+        for mode in [0o640, 0o604, 0o660] {
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                load::<Demo>(&dir, "grants.json"),
+                Loaded::Tampered,
+                "{mode:o}"
+            );
+            assert!(store(&dir, "grants.json", &demo()).is_err(), "{mode:o}");
+        }
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Valid(demo()));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn key_that_is_not_a_file_is_refused() {
+        let dir = tmp_data("keydir");
+        store(&dir, "grants.json", &demo()).unwrap();
+        std::fs::remove_file(dir.path.join(KEY_FILE)).unwrap();
+        std::fs::create_dir(dir.path.join(KEY_FILE)).unwrap();
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        assert!(store(&dir, "grants.json", &demo()).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn stale_empty_key_from_a_crashed_creation_is_replaced() {
+        let dir = tmp_data("stalekey");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        let key = dir.path.join(KEY_FILE);
+        let f = open_new_private(&key).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        f.set_modified(old).unwrap();
+        drop(f);
+        store(&dir, "grants.json", &demo()).unwrap();
+        assert_eq!(std::fs::read(&key).unwrap().len(), KEY_LEN);
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Valid(demo()));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn fresh_empty_key_is_not_replaced() {
+        // Another process may be writing it right now.
+        let dir = tmp_data("freshkey");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        drop(open_new_private(&dir.path.join(KEY_FILE)).unwrap());
+        assert!(store(&dir, "grants.json", &demo()).is_err());
+        assert!(std::fs::read(dir.path.join(KEY_FILE)).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn unresolved_sentinel_loads_nothing_and_refuses_stores() {
+        let dir = crate::datadir::unresolved();
+        assert!(store(&dir, "grants.json", &demo()).is_err());
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Missing);
+    }
+
+    /// SplitMix64: a deterministic stream for the property tests.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        /// Finite f64s from three shapes: any bit pattern, decimal-looking amounts, and small
+        /// integers' neighbours.
+        fn finite_f64(&mut self) -> f64 {
+            loop {
+                let r = self.next();
+                let v = match r % 3 {
+                    0 => f64::from_bits(self.next()),
+                    1 => (self.next() % 10_000_000_000) as f64 / 1e9,
+                    _ => {
+                        let base = (self.next() % 1000) as f64;
+                        f64::from_bits(base.to_bits().wrapping_add(self.next() % 5))
+                    }
+                };
+                if v.is_finite() {
+                    return v;
+                }
+            }
+        }
+    }
+
+    fn same_bits(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+
+    #[test]
+    fn known_bad_f64_round_trips() {
+        let dir = tmp_data("f64known");
+        for v in [
+            1.500_738_000_000_000_1,
+            0.1 + 0.2,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            f64::EPSILON,
+            5e-324,
+            -0.0,
+            2.225_073_858_507_201e-308,
+        ] {
+            store(&dir, "f.json", &v).unwrap();
+            match load::<f64>(&dir, "f.json") {
+                Loaded::Valid(got) => assert!(same_bits(got, v), "{v:e} -> {got:e}"),
+                other => panic!("{v:e}: {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn ten_thousand_random_f64_round_trip() {
+        let dir = tmp_data("f64prop");
+        let mut rng = Rng(0x5afe_a15c);
+        let values: Vec<f64> = (0..10_000).map(|_| rng.finite_f64()).collect();
+        store(&dir, "floats.json", &values).unwrap();
+        let Loaded::Valid(got) = load::<Vec<f64>>(&dir, "floats.json") else {
+            // Find a culprit for the message.
+            let bad = values.iter().find(|v| {
+                store(&dir, "one.json", v).unwrap();
+                !matches!(load::<f64>(&dir, "one.json"), Loaded::Valid(g) if same_bits(g, **v))
+            });
+            panic!("10k floats did not round-trip; e.g. {bad:?}");
+        };
+        assert!(values.iter().zip(&got).all(|(a, b)| same_bits(*a, *b)));
+        // A sample stored one by one, each its own envelope.
+        for v in values.iter().step_by(100) {
+            store(&dir, "one.json", v).unwrap();
+            match load::<f64>(&dir, "one.json") {
+                Loaded::Valid(g) => assert!(same_bits(g, *v), "{v:e} -> {g:e}"),
+                other => panic!("{v:e}: {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct Ledger {
+        total_sol: f64,
+        grants: Vec<GrantLike>,
+        caps: std::collections::BTreeMap<String, f64>,
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct GrantLike {
+        id: String,
+        max_tx_sol: f64,
+        spent: Option<f64>,
+        history: Vec<f64>,
+    }
+
+    #[test]
+    fn nested_structs_with_f64_round_trip() {
+        let dir = tmp_data("f64nested");
+        let mut rng = Rng(42);
+        for round in 0..20 {
+            let ledger = Ledger {
+                total_sol: rng.finite_f64(),
+                grants: (0..10)
+                    .map(|i| GrantLike {
+                        id: format!("g{round}-{i}"),
+                        max_tx_sol: rng.finite_f64(),
+                        spent: (i % 2 == 0).then(|| rng.finite_f64()),
+                        history: (0..20).map(|_| rng.finite_f64()).collect(),
+                    })
+                    .collect(),
+                caps: (0..5)
+                    .map(|i| (format!("c{i}"), rng.finite_f64()))
+                    .collect(),
+            };
+            store(&dir, "ledger.json", &ledger).unwrap();
+            assert_eq!(load::<Ledger>(&dir, "ledger.json"), Loaded::Valid(ledger));
+        }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn non_finite_f64_is_refused_at_store() {
+        let dir = tmp_data("nonfinite");
+        for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(store(&dir, "f.json", &v).is_err(), "{v}");
+            let nested = GrantLike {
+                history: vec![1.0, v],
+                ..GrantLike::default()
+            };
+            assert!(store(&dir, "f.json", &nested).is_err(), "{v} nested");
+        }
+        assert_eq!(load::<f64>(&dir, "f.json"), Loaded::Missing);
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     fn unhex(s: &str) -> Vec<u8> {

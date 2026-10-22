@@ -5,19 +5,36 @@
 //! 1. `CLAUDE_PLUGIN_DATA` (always set for a plugin hook);
 //! 2. else an existing `safe-ai-skill-*` dir under the plugin-data root(s):
 //!    `$CLAUDE_CONFIG_DIR/plugins/data` first when that var is set, then
-//!    `~/.claude/plugins/data` (`~` is `HOME`, else `USERPROFILE`). When several match,
-//!    `safe-ai-skill-safe-ai-skill` wins, then `safe-ai-skill-stbr`, then the
-//!    lexicographically smallest name;
+//!    `<home>/.claude/plugins/data`. `<home>` is the OS user-database home (see below),
+//!    falling back to `HOME`/`USERPROFILE` only when the lookup fails. In a root,
+//!    `safe-ai-skill-safe-ai-skill` wins, then `safe-ai-skill-stbr`; failing both, a lone
+//!    `safe-ai-skill-*` dir is used, and several are ambiguous (unresolved);
 //! 3. else `<first root>/safe-ai-skill-safe-ai-skill` (created on first write).
 //!
 //! There is no `./.safe-ai-skill` fallback: a relative state dir would let a repo plant it.
-//! With none of the variables set the dir is unresolvable and [`data_dir`] errors.
+//! When nothing resolves, [`data_dir`] errors; code that needs a path anyway uses
+//! [`unresolved`], a sentinel that loads nothing and refuses stores.
+//!
+//! ## Trust
 //!
 //! [`DataDir::trusted`] says whether state there may relax anything (grants, trust, mode).
-//! It is `false` when the canonical path is inside `CLAUDE_PROJECT_DIR` or the hook `cwd`,
-//! or outside every plugin-data root: a repo's `.claude/settings.json` can point
-//! `CLAUDE_PLUGIN_DATA` into its own tree. Callers still read untrusted state for
-//! tightening; they never relax on it.
+//! A repo's `.claude/settings.json` `env` can set `HOME`, `CLAUDE_CONFIG_DIR` and
+//! `CLAUDE_PLUGIN_DATA`, so the trust roots never come from the environment alone. The dir is
+//! trusted iff its canonical path is strictly inside one of:
+//!
+//! - `<passwd home>/.claude/plugins/data`, where `<passwd home>` is
+//!   `getpwuid_r(geteuid())->pw_dir` on unix. This root is trusted even when the project or
+//!   the hook cwd contains it (claude started in `$HOME`). On Windows there is no user
+//!   database lookup yet: `USERPROFILE` stands in, which a repo's settings env could override;
+//! - `$CLAUDE_CONFIG_DIR/plugins/data`, only when the canonical `CLAUDE_CONFIG_DIR` is not
+//!   inside `CLAUDE_PROJECT_DIR`, the hook cwd, `$TMPDIR` or `/tmp`.
+//!
+//! Everything else is untrusted. Callers still read untrusted state for tightening; they never
+//! relax on it.
+//!
+//! **Hooks must call [`data_dir_with_cwd`]`(Some(cwd))`** with the payload's `cwd`, so a
+//! `CLAUDE_CONFIG_DIR` inside the session's tree is distrusted even when
+//! `CLAUDE_PROJECT_DIR` is unset. The CLI uses [`data_dir`].
 
 use std::path::{Component, Path, PathBuf};
 
@@ -34,28 +51,64 @@ const PREFERRED: [&str; 2] = ["safe-ai-skill-safe-ai-skill", "safe-ai-skill-stbr
 pub struct DataDir {
     /// Where state lives (as resolved, not canonicalized).
     pub path: PathBuf,
-    /// `false` when the dir is under the project (or hook cwd) or outside the plugin-data roots.
+    /// Whether state here may relax anything; see the module docs.
     pub trusted: bool,
 }
 
+impl DataDir {
+    /// `true` for the [`unresolved`] sentinel.
+    pub fn is_unresolved(&self) -> bool {
+        self.path == unresolved_path()
+    }
+}
+
+/// The sentinel for an unresolvable data dir: untrusted, [`crate::statefile`] loads nothing
+/// from it and refuses to store into it, and its path lies under a device file, so plain
+/// filesystem reads and writes under it fail too.
+pub fn unresolved() -> DataDir {
+    DataDir {
+        path: unresolved_path(),
+        trusted: false,
+    }
+}
+
+fn unresolved_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(r"\\.\NUL\safe-ai-skill-unresolved")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/dev/null/safe-ai-skill-unresolved")
+    }
+}
+
 /// Resolve the data dir from the process environment, judging trust against
-/// `CLAUDE_PROJECT_DIR` only. See the module docs for the order.
+/// `CLAUDE_PROJECT_DIR` only. Hooks use [`data_dir_with_cwd`].
 pub fn data_dir() -> Result<DataDir, EngineError> {
     data_dir_with_cwd(None)
 }
 
-/// [`data_dir`], also distrusting a dir under the hook payload's `cwd`.
+/// [`data_dir`], also distrusting a `CLAUDE_CONFIG_DIR` inside the hook payload's `cwd`.
 pub fn data_dir_with_cwd(cwd: Option<&Path>) -> Result<DataDir, EngineError> {
-    resolve(&Env::from_lookup(|k| std::env::var_os(k)), cwd)
+    let mut env = Env::from_lookup(|k| std::env::var_os(k));
+    env.passwd_home = passwd_home();
+    env.temp_roots = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
+    resolve(&env, cwd)
 }
 
-/// The environment inputs of the resolution (empty values count as unset).
+/// The inputs of the resolution (empty variables count as unset).
 #[derive(Debug, Default, Clone)]
 struct Env {
     plugin_data: Option<PathBuf>,
     config_dir: Option<PathBuf>,
-    home: Option<PathBuf>,
+    /// `HOME`, else `USERPROFILE`: a discovery fallback only, never a trust root.
+    env_home: Option<PathBuf>,
     project_dir: Option<PathBuf>,
+    /// The OS user-database home: the trusted home root.
+    passwd_home: Option<PathBuf>,
+    /// Dirs a trusted `CLAUDE_CONFIG_DIR` may not be inside.
+    temp_roots: Vec<PathBuf>,
 }
 
 impl Env {
@@ -64,72 +117,166 @@ impl Env {
         Env {
             plugin_data: var("CLAUDE_PLUGIN_DATA"),
             config_dir: var("CLAUDE_CONFIG_DIR"),
-            home: var("HOME").or_else(|| var("USERPROFILE")),
+            env_home: var("HOME").or_else(|| var("USERPROFILE")),
             project_dir: var("CLAUDE_PROJECT_DIR"),
+            passwd_home: None,
+            temp_roots: Vec::new(),
         }
     }
 
-    /// The plugin-data roots, `$CLAUDE_CONFIG_DIR` first.
-    fn roots(&self) -> Vec<PathBuf> {
-        let mut roots = Vec::new();
-        if let Some(cfg) = &self.config_dir {
-            roots.push(cfg.join("plugins").join("data"));
-        }
-        if let Some(home) = &self.home {
-            roots.push(home.join(".claude").join("plugins").join("data"));
-        }
-        roots
+    fn config_root(&self) -> Option<PathBuf> {
+        self.config_dir
+            .as_ref()
+            .map(|c| c.join("plugins").join("data"))
     }
+
+    fn home_root(&self) -> Option<PathBuf> {
+        self.passwd_home
+            .as_ref()
+            .map(|h| h.join(".claude").join("plugins").join("data"))
+    }
+
+    /// Roots searched for an install dir, `$CLAUDE_CONFIG_DIR` first.
+    fn discovery_roots(&self) -> Vec<PathBuf> {
+        let home = self.passwd_home.as_ref().or(self.env_home.as_ref());
+        self.config_root()
+            .into_iter()
+            .chain(home.map(|h| h.join(".claude").join("plugins").join("data")))
+            .collect()
+    }
+}
+
+/// What a plugin-data root holds.
+enum Install {
+    None,
+    One(PathBuf),
+    Ambiguous,
 }
 
 fn resolve(env: &Env, cwd: Option<&Path>) -> Result<DataDir, EngineError> {
-    let roots = env.roots();
     let path = match &env.plugin_data {
         Some(dir) => dir.clone(),
-        None => match roots.iter().find_map(|r| pick_install_dir(r)) {
-            Some(dir) => dir,
-            None => roots.first().map(|r| r.join(PREFERRED[0])).ok_or_else(|| {
-                Error::Other(
-                    "cannot resolve the plugin data dir: CLAUDE_PLUGIN_DATA, CLAUDE_CONFIG_DIR, \
-                     HOME and USERPROFILE are all unset"
-                        .to_string(),
-                )
-            })?,
-        },
+        None => discover(&env.discovery_roots())?,
     };
-    let trusted = is_trusted(&path, &roots, env.project_dir.as_deref(), cwd);
+    let trusted = is_trusted(&path, env, cwd);
     Ok(DataDir { path, trusted })
 }
 
-/// The preferred existing `safe-ai-skill-*` dir directly under `root`, if any.
-fn pick_install_dir(root: &Path) -> Option<PathBuf> {
-    let mut names: Vec<String> = std::fs::read_dir(root)
-        .ok()?
+fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
+    for root in roots {
+        match pick_install_dir(root) {
+            Install::One(dir) => return Ok(dir),
+            Install::Ambiguous => {
+                return Err(Error::Other(format!(
+                    "cannot pick the plugin data dir: several safe-ai-skill-* dirs under {}; \
+                     set CLAUDE_PLUGIN_DATA",
+                    root.display()
+                )))
+            }
+            Install::None => {}
+        }
+    }
+    roots.first().map(|r| r.join(PREFERRED[0])).ok_or_else(|| {
+        Error::Other(
+            "cannot resolve the plugin data dir: no CLAUDE_PLUGIN_DATA, CLAUDE_CONFIG_DIR or home"
+                .to_string(),
+        )
+    })
+}
+
+/// The install dir under `root`: a preferred name, else the only `safe-ai-skill-*` dir.
+fn pick_install_dir(root: &Path) -> Install {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Install::None;
+    };
+    let names: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.starts_with(DIR_PREFIX))
         .collect();
-    names.sort();
-    let pick = PREFERRED
-        .iter()
-        .find(|p| names.iter().any(|n| n == *p))
-        .map(|p| p.to_string())
-        .or_else(|| names.into_iter().next())?;
-    Some(root.join(pick))
+    if let Some(p) = PREFERRED.iter().find(|p| names.iter().any(|n| n == *p)) {
+        return Install::One(root.join(p));
+    }
+    match names.as_slice() {
+        [] => Install::None,
+        [only] => Install::One(root.join(only)),
+        _ => Install::Ambiguous,
+    }
 }
 
-fn is_trusted(path: &Path, roots: &[PathBuf], project: Option<&Path>, cwd: Option<&Path>) -> bool {
+fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
     let Some(canon) = canonical_lenient(path) else {
         return false;
     };
-    let inside = |base: &Path| canonical_lenient(base).is_some_and(|b| canon.starts_with(&b));
-    if project.into_iter().chain(cwd).any(inside) {
-        return false;
+    let strictly_inside =
+        |root: &Path| canonical_lenient(root).is_some_and(|r| canon != r && canon.starts_with(&r));
+
+    if env.home_root().is_some_and(|r| strictly_inside(&r)) {
+        return true;
     }
-    roots
+
+    let (Some(cfg), Some(cfg_root)) = (&env.config_dir, env.config_root()) else {
+        return false;
+    };
+    let Some(cfg) = canonical_lenient(cfg) else {
+        return false;
+    };
+    let contains_cfg = |base: &Path| canonical_lenient(base).is_some_and(|b| cfg.starts_with(&b));
+    let forbidden = env
+        .project_dir
         .iter()
-        .any(|root| canonical_lenient(root).is_some_and(|r| canon != r && canon.starts_with(&r)))
+        .map(PathBuf::as_path)
+        .chain(cwd)
+        .chain(env.temp_roots.iter().map(PathBuf::as_path))
+        .any(contains_cfg);
+    !forbidden && strictly_inside(&cfg_root)
+}
+
+/// The effective user's home from the OS user database (`getpwuid_r`).
+#[cfg(unix)]
+fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut size = 1024usize;
+    while size <= 1 << 20 {
+        let mut buf: Vec<libc::c_char> = vec![0; size];
+        // SAFETY: `passwd` is plain old data; zeroed is a valid initial value for the out-param.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call and `buf.len()` is the buffer's size.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            size *= 2;
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: on success `pw_dir` points to a NUL-terminated string inside `buf`, which is
+        // alive until the end of this iteration; it is copied out before `buf` drops.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        let dir = std::ffi::OsStr::from_bytes(dir.to_bytes());
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    None
+}
+
+/// Windows has no user-database lookup here yet: `USERPROFILE` (repo-settable) stands in.
+#[cfg(not(unix))]
+fn passwd_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Canonicalize `path` even when its tail does not exist yet: canonicalize the deepest
@@ -183,9 +330,12 @@ mod tests {
         dir
     }
 
+    /// An environment whose user-database home is `home`. The sandbox lives under the real
+    /// temp dir, so no temp root is set (tests that need one set it).
     fn env_home(home: &Path) -> Env {
         Env {
-            home: Some(home.to_path_buf()),
+            env_home: Some(home.to_path_buf()),
+            passwd_home: Some(home.to_path_buf()),
             ..Env::default()
         }
     }
@@ -194,78 +344,91 @@ mod tests {
         home.join(".claude").join("plugins").join("data")
     }
 
+    fn with_plugin_data(env: Env, pd: PathBuf) -> Env {
+        Env {
+            plugin_data: Some(pd),
+            ..env
+        }
+    }
+
     #[test]
-    fn plugin_data_env_wins_and_is_trusted_under_the_root() {
+    fn plugin_data_under_the_home_root_is_trusted() {
         let home = tmp("envwins");
         let pd = data_root(&home).join("safe-ai-skill-x");
-        let env = Env {
-            plugin_data: Some(pd.clone()),
-            ..env_home(&home)
-        };
-        let d = resolve(&env, None).unwrap();
+        let d = resolve(&with_plugin_data(env_home(&home), pd.clone()), None).unwrap();
         assert_eq!(d.path, pd);
         assert!(d.trusted);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn data_dir_under_project_is_untrusted() {
+    fn data_dir_in_the_project_tree_is_untrusted() {
         let home = tmp("underproj");
         let project = home.join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let env = Env {
-            plugin_data: Some(project.join(".safe-ai-skill")),
             project_dir: Some(project.clone()),
-            ..env_home(&home)
-        };
-        assert!(!resolve(&env, None).unwrap().trusted);
-        // Inside a root too: the project check alone must distrust it.
-        let nested = data_root(&home).join("safe-ai-skill-x").join("proj");
-        std::fs::create_dir_all(&nested).unwrap();
-        let env = Env {
-            plugin_data: Some(nested.join("state")),
-            project_dir: Some(nested),
-            ..env_home(&home)
+            ..with_plugin_data(env_home(&home), project.join(".safe-ai-skill"))
         };
         assert!(!resolve(&env, None).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn project_containing_the_root_makes_it_untrusted() {
-        // A project dir that contains the plugin-data root (claude launched in `~`) distrusts it.
+    fn home_root_is_trusted_when_the_project_or_cwd_contains_it() {
+        // claude started in `$HOME`: the project and cwd are ancestors of the root.
         let home = tmp("projhome");
         let pd = data_root(&home).join("safe-ai-skill-safe-ai-skill");
         let env = Env {
-            plugin_data: Some(pd),
             project_dir: Some(home.clone()),
-            ..env_home(&home)
+            ..with_plugin_data(env_home(&home), pd)
         };
-        assert!(!resolve(&env, None).unwrap().trusted);
+        assert!(resolve(&env, Some(&home)).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn data_dir_under_hook_cwd_is_untrusted() {
-        let home = tmp("undercwd");
-        // The cwd holds a root, so only the cwd check can distrust the dir.
-        let cwd = home.join(".claude");
-        std::fs::create_dir_all(&cwd).unwrap();
+    fn project_nested_inside_the_home_root_is_trusted() {
+        let home = tmp("nested");
+        let nested = data_root(&home).join("safe-ai-skill-x").join("proj");
+        std::fs::create_dir_all(&nested).unwrap();
         let env = Env {
-            plugin_data: Some(data_root(&home).join("safe-ai-skill-x")),
-            ..env_home(&home)
+            project_dir: Some(nested.clone()),
+            ..with_plugin_data(env_home(&home), nested.join("state"))
         };
-        assert!(!resolve(&env, Some(&cwd)).unwrap().trusted);
+        assert!(resolve(&env, Some(&nested)).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn repo_set_home_is_not_a_trust_root() {
+        // The repo's settings env sets HOME=/tmp/x and points the data dir under it.
+        let real = tmp("realhome");
+        let fake = tmp("fakehome");
+        let env = Env {
+            env_home: Some(fake.clone()),
+            passwd_home: Some(real.clone()),
+            ..Env::default()
+        };
+        let pd = data_root(&fake).join("safe-ai-skill-safe-ai-skill");
+        assert!(
+            !resolve(&with_plugin_data(env.clone(), pd), None)
+                .unwrap()
+                .trusted
+        );
+        // Without CLAUDE_PLUGIN_DATA, discovery uses the passwd home, not HOME.
+        assert_eq!(
+            resolve(&env, None).unwrap().path,
+            data_root(&real).join("safe-ai-skill-safe-ai-skill")
+        );
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&fake);
     }
 
     #[test]
     fn data_dir_outside_the_roots_is_untrusted() {
         let home = tmp("outside");
-        let env = Env {
-            plugin_data: Some(home.join("elsewhere")),
-            ..env_home(&home)
-        };
+        let env = with_plugin_data(env_home(&home), home.join("elsewhere"));
         assert!(!resolve(&env, None).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -273,10 +436,7 @@ mod tests {
     #[test]
     fn the_root_itself_is_untrusted() {
         let home = tmp("rootitself");
-        let env = Env {
-            plugin_data: Some(data_root(&home)),
-            ..env_home(&home)
-        };
+        let env = with_plugin_data(env_home(&home), data_root(&home));
         assert!(!resolve(&env, None).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -291,11 +451,11 @@ mod tests {
             .join("..")
             .join("..")
             .join("loot");
-        let env = Env {
-            plugin_data: Some(escape),
-            ..env_home(&home)
-        };
-        assert!(!resolve(&env, None).unwrap().trusted);
+        assert!(
+            !resolve(&with_plugin_data(env_home(&home), escape), None)
+                .unwrap()
+                .trusted
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -303,18 +463,64 @@ mod tests {
     #[test]
     fn symlink_from_the_root_into_the_project_is_untrusted() {
         let home = tmp("symlink");
-        let project = home.join("proj");
+        let elsewhere = tmp("symlink_target");
         let root = data_root(&home);
-        std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(&project, root.join("safe-ai-skill-evil")).unwrap();
-        let env = Env {
-            plugin_data: Some(root.join("safe-ai-skill-evil")),
-            project_dir: Some(project),
-            ..env_home(&home)
-        };
+        std::os::unix::fs::symlink(&elsewhere, root.join("safe-ai-skill-evil")).unwrap();
+        let env = with_plugin_data(env_home(&home), root.join("safe-ai-skill-evil"));
         assert!(!resolve(&env, None).unwrap().trusted);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn config_dir_root_is_trusted_outside_project_cwd_and_temp() {
+        let base = tmp("cfgok");
+        let cfg = base.join("cfg");
+        let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
+        let env = Env {
+            config_dir: Some(cfg.clone()),
+            project_dir: Some(base.join("proj")),
+            ..with_plugin_data(env_home(&base.join("home")), pd)
+        };
+        std::fs::create_dir_all(base.join("proj")).unwrap();
+        assert!(resolve(&env, Some(&base.join("proj"))).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn config_dir_inside_the_project_or_cwd_is_untrusted() {
+        let base = tmp("cfgproj");
+        let project = base.join("proj");
+        let cfg = project.join(".cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
+        let env = Env {
+            config_dir: Some(cfg.clone()),
+            ..with_plugin_data(env_home(&base.join("home")), pd)
+        };
+        assert!(resolve(&env, None).unwrap().trusted, "control");
+        let in_project = Env {
+            project_dir: Some(project.clone()),
+            ..env.clone()
+        };
+        assert!(!resolve(&in_project, None).unwrap().trusted);
+        assert!(!resolve(&env, Some(&project)).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn config_dir_inside_a_temp_root_is_untrusted() {
+        let base = tmp("cfgtmp");
+        let cfg = base.join("cfg");
+        let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
+        let env = Env {
+            config_dir: Some(cfg),
+            temp_roots: vec![base.clone()],
+            ..with_plugin_data(env_home(&base.join("home")), pd)
+        };
+        assert!(!resolve(&env, None).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -330,15 +536,23 @@ mod tests {
             std::fs::create_dir_all(root.join(name)).unwrap();
         }
         let env = env_home(&home);
-        let pick = |env: &Env| resolve(env, None).unwrap();
-        let d = pick(&env);
+        let d = resolve(&env, None).unwrap();
         assert_eq!(d.path, root.join("safe-ai-skill-safe-ai-skill"));
         assert!(d.trusted);
         std::fs::remove_dir_all(root.join("safe-ai-skill-safe-ai-skill")).unwrap();
-        assert_eq!(pick(&env).path, root.join("safe-ai-skill-stbr"));
+        assert_eq!(
+            resolve(&env, None).unwrap().path,
+            root.join("safe-ai-skill-stbr")
+        );
         std::fs::remove_dir_all(root.join("safe-ai-skill-stbr")).unwrap();
+        // A lone non-preferred install is used.
+        assert_eq!(
+            resolve(&env, None).unwrap().path,
+            root.join("safe-ai-skill-aaa")
+        );
+        // Two non-preferred installs are ambiguous: unresolved, not a guess.
         std::fs::create_dir_all(root.join("safe-ai-skill-zzz")).unwrap();
-        assert_eq!(pick(&env).path, root.join("safe-ai-skill-aaa"));
+        assert!(resolve(&env, None).is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -361,7 +575,7 @@ mod tests {
             config_dir: Some(cfg.clone()),
             ..env_home(&home)
         };
-        // Nothing under the config root: the ~/.claude install is found.
+        // Nothing under the config root: the home install is found.
         assert_eq!(
             resolve(&env, None).unwrap().path,
             data_root(&home).join("safe-ai-skill-stbr")
@@ -375,8 +589,24 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_without_any_variable() {
+    fn unresolvable_without_any_input() {
         assert!(resolve(&Env::default(), None).is_err());
+    }
+
+    #[test]
+    fn unresolved_sentinel_is_untrusted_and_unusable() {
+        let d = unresolved();
+        assert!(d.is_unresolved());
+        assert!(!d.trusted);
+        assert!(std::fs::create_dir_all(d.path.join("x")).is_err());
+        assert!(std::fs::read(d.path.join("grants.json")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passwd_home_is_found() {
+        let home = passwd_home().unwrap();
+        assert!(home.is_absolute());
     }
 
     #[test]
@@ -387,7 +617,7 @@ mod tests {
             "CLAUDE_PLUGIN_DATA" => Some(OsString::new()),
             _ => None,
         });
-        assert_eq!(env.home, Some(PathBuf::from("/users/me")));
+        assert_eq!(env.env_home, Some(PathBuf::from("/users/me")));
         assert_eq!(env.plugin_data, None);
     }
 }

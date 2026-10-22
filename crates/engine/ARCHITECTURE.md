@@ -134,8 +134,9 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 
 `datadir::data_dir()` resolves `CLAUDE_PLUGIN_DATA`, else the preferred `safe-ai-skill-*` dir
 under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`; never a relative path.
-`DataDir::trusted` is false under `CLAUDE_PROJECT_DIR` (or the hook cwd) or outside those
-roots. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
+`DataDir::trusted` holds only inside `<passwd home>/.claude/plugins/data`, or inside
+`$CLAUDE_CONFIG_DIR/plugins/data` when that config dir is outside the project, the hook cwd
+and the temp dirs (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
 `key`).
 
 | File | Producer | Purpose |
