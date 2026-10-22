@@ -10,8 +10,22 @@ use super::context::{
 use super::network_ctx::VarCache;
 use super::{line_no, Ctx, FileOut, Severity, Signal};
 
-/// npm lifecycle scripts that run on `npm install` (spec D2.4).
-const LIFECYCLE: &[&str] = &["preinstall", "install", "postinstall", "prepare"];
+/// Scripts that run at install time (spec D2.4): on `npm install` / `npm ci` in the package
+/// (`prepublish` still runs there; `dependencies` runs when `node_modules` changes), on a git
+/// dependency (`prepack`, `postpack`), and pnpm's root install hook.
+const LIFECYCLE: &[&str] = &[
+    "preinstall",
+    "install",
+    "postinstall",
+    "prepublish",
+    "preprepare",
+    "prepare",
+    "postprepare",
+    "dependencies",
+    "prepack",
+    "postpack",
+    "pnpm:devPreinstall",
+];
 /// Package-manager configuration files that redirect where packages come from.
 const REGISTRY_FILES: &[&str] = &[
     ".npmrc",
@@ -138,23 +152,45 @@ fn same_host_rewrite(line: &str) -> bool {
 }
 
 /// Every `package.json` script is shell code; lifecycle scripts are HIGH on their own and feed
-/// `lifecycle_network` when they reach the network or evaluate inline code.
+/// `lifecycle_network` when they reach the network or evaluate inline code. A manifest that does
+/// not parse (npm strips a BOM; Bun accepts comments and trailing commas) is reported, and each
+/// of its `"key": "value"` string pairs is scanned as a script instead.
 pub(super) fn scan_package_json(doc: &Document<'_>, vars: &mut VarCache, out: &mut FileOut) {
-    let Ok(json) = serde_json::from_str::<Value>(doc.text) else {
-        return;
+    let text = doc.text.trim_start_matches('\u{feff}');
+    let scripts: Vec<(String, String, u32)> = match serde_json::from_str::<Value>(text) {
+        Ok(json) => {
+            let Some(scripts) = json.get("scripts").and_then(Value::as_object) else {
+                return;
+            };
+            let from = (0..doc.len())
+                .find(|&i| doc.lower_line(i).contains("\"scripts\""))
+                .unwrap_or(0);
+            scripts
+                .iter()
+                .filter_map(|(key, value)| {
+                    let script = value.as_str()?;
+                    Some((key.clone(), script.to_string(), key_line(doc, key, from)))
+                })
+                .collect()
+        }
+        Err(_) => {
+            out.emit("manifest_unparsed", Severity::Warn, None, Ctx::Meta);
+            let strings = context::json_strings(doc.text);
+            strings
+                .windows(2)
+                .filter(|pair| pair[0].key && !pair[1].key)
+                .map(|pair| {
+                    (
+                        pair[0].text.clone(),
+                        pair[1].text.clone(),
+                        doc.line_of(pair[0].offset),
+                    )
+                })
+                .collect()
+        }
     };
-    let Some(scripts) = json.get("scripts").and_then(Value::as_object) else {
-        return;
-    };
-    let from = (0..doc.len())
-        .find(|&i| doc.lower_line(i).contains("\"scripts\""))
-        .unwrap_or(0);
-    for (key, value) in scripts {
-        let Some(script) = value.as_str() else {
-            continue;
-        };
-        let line = key_line(doc, key, from);
-        let stmt = Stmt::owned(script, line, Lang::Shell, Ctx::Code);
+    for (key, script, line) in scripts {
+        let stmt = Stmt::owned(&script, line, Lang::Shell, Ctx::Code);
         super::scan_stmt(&stmt, doc, vars, out);
         if LIFECYCLE.contains(&key.as_str()) {
             out.emit("lifecycle_script", Severity::High, Some(line), Ctx::Meta);

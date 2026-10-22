@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use super::context::{Document, T_SHELL};
+use super::context::{self, Document, T_SHELL};
 use super::{line_no, Ctx, FileOut, Severity, Signal};
 
 /// Lowercased path components.
@@ -103,8 +103,19 @@ fn unscoped_bash(list: &str) -> bool {
         .any(|w| w == "bash" || w == "bash(*)")
 }
 
-/// Settings that bypass permissions (`bypassPermissions`, `defaultMode`, `dangerously*`).
+/// Settings that bypass permissions (`bypassPermissions`, `defaultMode`, `dangerously*`). Keys
+/// and values are compared decoded (`\u0064efaultMode` is `defaultMode`), then raw lines.
 pub(super) fn scan_settings(doc: &Document<'_>, out: &mut FileOut) {
+    for s in context::json_strings(doc.text) {
+        let lower = s.text.to_lowercase();
+        if (s.key && lower.trim() == "defaultmode")
+            || lower.contains("bypasspermissions")
+            || lower.contains("dangerously")
+        {
+            out.signal(Signal::HarnessBypass(doc.line_of(s.offset)), Ctx::Meta);
+            return;
+        }
+    }
     for i in 0..doc.len() {
         let line = doc.lower_line(i);
         if line.contains("bypasspermissions")

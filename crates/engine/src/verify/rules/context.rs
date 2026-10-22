@@ -153,6 +153,22 @@ fn shebang_lang(first: &str) -> Option<Lang> {
     Some(Lang::Other)
 }
 
+/// True when the file's extension or name says it is text (Markdown, documentation or code).
+pub(crate) fn is_text_like(rel: &Path) -> bool {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let ext = rel
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    MARKDOWN_EXTS.contains(&ext.as_str())
+        || DOC_EXTS.contains(&ext.as_str())
+        || code_lang_for_ext(&ext).is_some()
+        || code_lang_for_name(&name).is_some()
+}
+
 /// Classify a file by extension, then special name, then shebang, then exec bit.
 ///
 /// Known documentation extensions stay documentation even with the exec bit set.
@@ -293,6 +309,15 @@ impl<'a> Document<'a> {
     pub(crate) fn line(&self, i: usize) -> &str {
         let (s, e) = self.spans[i];
         &self.text[s..e]
+    }
+
+    /// 1-based line holding byte `off` of the text.
+    pub(crate) fn line_of(&self, off: usize) -> u32 {
+        line_no(
+            self.spans
+                .partition_point(|&(start, _)| start <= off)
+                .saturating_sub(1),
+        )
     }
 
     /// Lowercased text of line `i`.
@@ -1219,6 +1244,95 @@ pub(crate) fn find_call(hay: &str, name: &str, member: bool) -> Option<usize> {
         i = s + 1;
     }
     None
+}
+
+/// One JSON string literal, decoded.
+pub(crate) struct JsonStr {
+    /// Byte offset of the opening quote.
+    pub(crate) offset: usize,
+    pub(crate) text: String,
+    /// Followed by `:` (an object key).
+    pub(crate) key: bool,
+}
+
+/// Every double-quoted string in `text`, decoded as JSON decodes it (`\uXXXX` included), whether
+/// or not the whole document parses (comments, trailing commas, a stray byte).
+pub(crate) fn json_strings(text: &str) -> Vec<JsonStr> {
+    let b = text.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while let Some(q) = b.get(i..).and_then(|r| r.iter().position(|&c| c == b'"')) {
+        let start = i + q;
+        let Some((decoded, end)) = json_string(text, start) else {
+            i = start + 1;
+            continue;
+        };
+        let next = b[end..].iter().position(|c| !c.is_ascii_whitespace());
+        let key = next.is_some_and(|k| b[end + k] == b':');
+        found.push(JsonStr {
+            offset: start,
+            text: decoded,
+            key,
+        });
+        i = end;
+    }
+    found
+}
+
+/// Decode the JSON string whose opening quote is at `start`; returns it and the offset past the
+/// closing quote. `None` when it is unterminated on its line or carries a malformed escape.
+fn json_string(text: &str, start: usize) -> Option<(String, usize)> {
+    let b = text.as_bytes();
+    let mut out = String::new();
+    let mut units: Vec<u16> = Vec::new();
+    let mut i = start + 1;
+    loop {
+        let k = i + b
+            .get(i..)?
+            .iter()
+            .position(|&c| matches!(c, b'"' | b'\\' | b'\n'))?;
+        if k > i {
+            flush_utf16(&mut units, &mut out);
+            out.push_str(&text[i..k]);
+        }
+        match b[k] {
+            b'"' => {
+                flush_utf16(&mut units, &mut out);
+                return Some((out, k + 1));
+            }
+            b'\n' => return None,
+            _ => {
+                let esc = *b.get(k + 1)?;
+                if esc == b'u' {
+                    let unit = text
+                        .get(k + 2..k + 6)
+                        .and_then(|h| u16::from_str_radix(h, 16).ok())?;
+                    units.push(unit);
+                    i = k + 6;
+                    continue;
+                }
+                if !esc.is_ascii() {
+                    return None;
+                }
+                flush_utf16(&mut units, &mut out);
+                out.push(match esc {
+                    b'n' => '\n',
+                    b't' => '\t',
+                    b'r' => '\r',
+                    b'b' => '\u{8}',
+                    b'f' => '\u{c}',
+                    other => char::from(other),
+                });
+                i = k + 2;
+            }
+        }
+    }
+}
+
+fn flush_utf16(units: &mut Vec<u16>, out: &mut String) {
+    out.extend(
+        char::decode_utf16(units.drain(..)).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+    );
 }
 
 /// Largest char boundary of `s` at or below byte `i`.

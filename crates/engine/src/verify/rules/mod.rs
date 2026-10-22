@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use binary_magic::Content;
 use context::{Document, FileClass};
 
 /// Bytes scanned per file. A code file larger than this is itself a HIGH finding.
@@ -215,8 +216,10 @@ const RULES: &[RuleInfo] = &[
     RuleInfo { id: "bytecode", code: Severity::High, summary: "compiled Python bytecode (.pyc) shipped in the pack" },
     RuleInfo { id: "archive", code: Severity::Info, summary: "archive shipped in the pack (contents not scanned)" },
     RuleInfo { id: "executable", code: Severity::Info, summary: "file with the executable bit set" },
+    RuleInfo { id: "nul_bytes", code: Severity::Warn, summary: "NUL bytes in a text or code file (read with the NULs stripped)" },
     // lifecycle
     RuleInfo { id: "lifecycle_script", code: Severity::High, summary: "package.json install lifecycle script (runs on install)" },
+    RuleInfo { id: "manifest_unparsed", code: Severity::Warn, summary: "package.json that does not parse (scanned as code instead)" },
     RuleInfo { id: "registry_write", code: Severity::High, summary: "writes package-manager registry configuration" },
     RuleInfo { id: "git_hooks_write", code: Severity::High, summary: "writes git hooks or sets core.hooksPath" },
     RuleInfo { id: "unpinned_npx", code: Severity::Info, summary: "unpinned npx/uvx package or @latest (mutable supply chain)" },
@@ -489,7 +492,8 @@ fn scan_file(
     {
         return out;
     }
-    if binary_magic::scan(rel, buf, &mut out, facts) {
+    let content = binary_magic::scan(rel, buf, &mut out, facts);
+    if content == Content::Binary {
         return out;
     }
     if file
@@ -500,7 +504,7 @@ fn scan_file(
         return out;
     }
 
-    let text = String::from_utf8_lossy(buf);
+    let text = decode(buf, content);
     let first_line = text.lines().next().unwrap_or("");
     let name = rel
         .file_name()
@@ -521,6 +525,39 @@ fn scan_file(
     let doc = Document::new(&text, class);
     scan_text(&doc, rel, settings, &mut out, facts);
     out
+}
+
+/// Decode a text file: UTF-8 (BOM dropped), UTF-16 by its BOM, or NUL-stripped lossy UTF-8.
+fn decode(buf: &[u8], content: Content) -> std::borrow::Cow<'_, str> {
+    match content {
+        Content::Utf16 { little_endian } => {
+            let units = buf
+                .get(2..)
+                .unwrap_or(&[])
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| {
+                    if little_endian {
+                        u16::from_le_bytes(pair)
+                    } else {
+                        u16::from_be_bytes(pair)
+                    }
+                });
+            let text: String = char::decode_utf16(units)
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .filter(|&c| c != '\0')
+                .collect();
+            std::borrow::Cow::Owned(text)
+        }
+        Content::TextWithNul => {
+            let body = buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf);
+            std::borrow::Cow::Owned(String::from_utf8_lossy(body).replace('\0', ""))
+        }
+        Content::Utf8 | Content::Binary => {
+            String::from_utf8_lossy(buf.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(buf))
+        }
+    }
 }
 
 /// Run every text rule over one decoded file.

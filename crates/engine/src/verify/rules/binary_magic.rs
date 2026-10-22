@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::context;
 use super::{Ctx, FileOut, PackFacts, Severity, Signal};
 
 /// Extensions that promise text; archive or executable bytes behind one are a masquerade.
@@ -73,8 +74,22 @@ fn sniff(h: &[u8]) -> Option<Magic> {
     None
 }
 
-/// Inspect the head of a file; returns true when it is binary (the caller stops there).
-pub(super) fn scan(rel: &Path, head: &[u8], out: &mut FileOut, facts: &mut PackFacts) -> bool {
+/// How a file's bytes are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Content {
+    /// Archive, executable, bytecode or other binary data: no text rules.
+    Binary,
+    /// UTF-8 text (a leading BOM is dropped).
+    Utf8,
+    /// UTF-16 text announced by its byte-order mark.
+    Utf16 { little_endian: bool },
+    /// A text or code file carrying NUL bytes: decoded with the NULs stripped.
+    TextWithNul,
+}
+
+/// Inspect the head of a file and decide how to read it. A known text/code file (or a BOM)
+/// without archive/executable magic is always read as text: NUL bytes do not hide a script.
+pub(super) fn scan(rel: &Path, head: &[u8], out: &mut FileOut, facts: &mut PackFacts) -> Content {
     let ext = rel
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -82,10 +97,27 @@ pub(super) fn scan(rel: &Path, head: &[u8], out: &mut FileOut, facts: &mut PackF
     if ext == "pyc" || ext == "pyo" {
         out.emit("bytecode", Severity::High, None, Ctx::Meta);
         facts.pyc.push(rel.to_path_buf());
-        return true;
+        return Content::Binary;
+    }
+    if head.starts_with(&[0xFF, 0xFE]) {
+        return Content::Utf16 {
+            little_endian: true,
+        };
+    }
+    if head.starts_with(&[0xFE, 0xFF]) {
+        return Content::Utf16 {
+            little_endian: false,
+        };
     }
     let Some(magic) = sniff(head) else {
-        return head.contains(&0);
+        if !head.contains(&0) {
+            return Content::Utf8;
+        }
+        if context::is_text_like(rel) || head.starts_with(b"#!") {
+            out.emit("nul_bytes", Severity::Warn, None, Ctx::Meta);
+            return Content::TextWithNul;
+        }
+        return Content::Binary;
     };
     if TEXT_EXTS.contains(&ext.as_str()) {
         out.emit("archive_masquerade", Severity::High, None, Ctx::Meta);
@@ -107,7 +139,7 @@ pub(super) fn scan(rel: &Path, head: &[u8], out: &mut FileOut, facts: &mut PackF
             }
         }
     }
-    true
+    Content::Binary
 }
 
 #[cfg(test)]
