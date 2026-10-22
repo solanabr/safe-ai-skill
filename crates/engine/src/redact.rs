@@ -40,9 +40,17 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
     scrub_value(response, values)
 }
 
+/// Whether `text` carries a redaction marker this module writes (`***REDACTED:` or
+/// `«redacted:`).
+pub fn contains_marker(text: &str) -> bool {
+    text.contains("***REDACTED:") || text.contains("«redacted:")
+}
+
 /// The PostToolUse redact decision for one hook payload: [`scrub_response`], except that the
-/// response of an opted-in raw env Read is never rewritten (D8 v2 spec §2), since a scrubbed
-/// copy would be written back over the real values by the next Edit or Write. The exemption is
+/// response of an opted-in raw env Read skips the value scrub (D8 v2 spec §2), since a
+/// value-scrubbed copy would be written back over the real values by the next Edit or Write.
+/// Pattern redaction (keys, seeds, PEM, vendor tokens) still applies to it at every tier; the
+/// write gate refuses to write a redaction marker back into an env file. The exemption is
 /// verified here, not inferred from the response having arrived: the tool is `Read`, both the
 /// requested file and the response's file are env class (by name or resolved target), and the
 /// read gate, re-run on the request with this `policy` (its runtime tier, `env_read` and
@@ -56,7 +64,7 @@ pub fn scrub_tool_response(
     policy: &Policy,
 ) -> Option<Value> {
     if is_permitted_env_read(input, response, cwd, policy) {
-        return None;
+        return scrub_response(response, &[]);
     }
     scrub_response(response, values)
 }

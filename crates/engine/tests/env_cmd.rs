@@ -1218,21 +1218,59 @@ fn never_prints_values() {
 // D8 v2 tier check: an agent's `env set|unset` (spec §2)
 // ---------------------------------------------------------------------------------------
 
-/// `safe-ai-skill env <args>` as a Claude Code session runs it (`CLAUDECODE=1`) at `tier`
-/// (raised through the env hint, which needs no trusted data dir), or from the user's own
-/// terminal when `agent` is false.
-fn run_env_at(dir: &Path, args: &[&str], stdin: Option<&str>, tier: &str, agent: bool) -> Run {
+/// `safe-ai-skill env <args>` as a Claude Code session runs it (marker `marker=1`) at `tier`
+/// (raised through the env hint, which needs no trusted data dir).
+fn run_env_as_agent(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    tier: &str,
+    marker: &str,
+) -> Run {
     let mut full = vec!["env"];
     full.extend_from_slice(args);
     let mut inv = Invocation::new(&full)
         .cwd(dir)
         .home(dir)
         .env("SAFE_AI_SKILL_TIER", tier)
-        .env("CLAUDECODE", if agent { "1" } else { "" });
+        .env(marker, "1");
     if let Some(body) = stdin {
         inv = inv.stdin(body);
     }
     inv.run()
+}
+
+/// `safe-ai-skill env <args>` from the user's own terminal: a cleared environment (no Claude
+/// Code marker of any kind), `HOME` and the Claude config dir pinned to `dir`.
+fn run_env_in_terminal(dir: &Path, args: &[&str], stdin: &str, tier: &str) -> Run {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(common::bin())
+        .arg("env")
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .env("HOME", dir)
+        .env("CLAUDE_CONFIG_DIR", dir.join(".claude"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAFE_AI_SKILL_TIER", tier)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    Run {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code(),
+    }
 }
 
 #[test]
@@ -1242,24 +1280,58 @@ fn agent_set_and_unset_are_refused_at_medium_and_high() {
     let env = d.join(".env");
     fs::write(&env, "A=1\nB=2\n").unwrap();
     for tier in ["medium", "high"] {
-        let r = run_env_at(
-            d,
-            &["set", ".env", "A"],
-            Some("secret_value_123"),
-            tier,
-            true,
-        );
-        assert_eq!(r.code, Some(1), "{tier}: {}", r.stderr);
-        assert!(r.stderr.contains(&format!("tier {tier}")), "{}", r.stderr);
-        assert!(r.stderr.contains("own terminal"), "{}", r.stderr);
-        assert!(!r.stderr.contains("secret_value_123"), "{}", r.stderr);
-        let r = run_env_at(d, &["unset", ".env", "B"], None, tier, true);
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_PROJECT_DIR",
+            "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ] {
+            let r = run_env_as_agent(
+                d,
+                &["set", ".env", "A"],
+                Some("secret_value_123"),
+                tier,
+                marker,
+            );
+            assert_eq!(r.code, Some(1), "{tier} {marker}: {}", r.stderr);
+            assert!(r.stderr.contains(&format!("tier {tier}")), "{}", r.stderr);
+            assert!(r.stderr.contains("own terminal"), "{}", r.stderr);
+            assert!(!r.stderr.contains("secret_value_123"), "{}", r.stderr);
+        }
+        let r = run_env_as_agent(d, &["unset", ".env", "B"], None, tier, "CLAUDECODE");
         assert_eq!(r.code, Some(1), "{tier}: {}", r.stderr);
         assert_eq!(read(&env), "A=1\nB=2\n", "{tier}: file untouched");
         // `keys` works at every tier.
-        let k = run_env_at(d, &["keys", ".env"], None, tier, true);
-        ok(&k);
+        ok(&run_env_as_agent(
+            d,
+            &["keys", ".env"],
+            None,
+            tier,
+            "CLAUDECODE",
+        ));
     }
+}
+
+#[test]
+fn the_backstop_uses_the_target_files_project_tier() {
+    // The repo raises its own tier to medium; the command runs from elsewhere.
+    let proj = TempDir::new("env-tier-proj");
+    let elsewhere = TempDir::new("env-tier-cwd");
+    fs::create_dir_all(proj.join(".safe-ai-skill")).unwrap();
+    fs::write(proj.join(".safe-ai-skill/policy.yaml"), "tier: medium\n").unwrap();
+    let env = proj.join(".env");
+    fs::write(&env, "A=1\n").unwrap();
+    let target = env.to_str().unwrap();
+    let r = run_env_as_agent(
+        elsewhere.path(),
+        &["set", target, "NEWK"],
+        Some("v"),
+        "relaxed",
+        "CLAUDECODE",
+    );
+    assert_eq!(r.code, Some(1), "{}", r.stderr);
+    assert!(r.stderr.contains("tier medium"), "{}", r.stderr);
+    assert_eq!(read(&env), "A=1\n");
 }
 
 #[test]
@@ -1269,21 +1341,15 @@ fn set_works_from_the_users_terminal_and_below_medium() {
     let env = d.join(".env");
     fs::write(&env, "A=1\n").unwrap();
     // The user's own terminal, at high.
-    ok(&run_env_at(
-        d,
-        &["set", ".env", "A"],
-        Some("v2"),
-        "high",
-        false,
-    ));
+    ok(&run_env_in_terminal(d, &["set", ".env", "A"], "v2", "high"));
     assert_eq!(read(&env), "A=v2\n");
     // A Claude Code session at relaxed.
-    ok(&run_env_at(
+    ok(&run_env_as_agent(
         d,
         &["set", ".env", "A"],
         Some("v3"),
         "relaxed",
-        true,
+        "CLAUDECODE",
     ));
     assert_eq!(read(&env), "A=v3\n");
 }

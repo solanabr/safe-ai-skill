@@ -7,6 +7,9 @@
 //! | `ask`, sandbox `On`           | ask  | ask     | ask    | deny |
 //! | `tier`/`ask`, sandbox not On  | deny | deny    | deny   | deny |
 //!
+//! The opt-in rows apply only in builds with the `env-read-opt-in` cargo feature (off by
+//! default until the env-to-network exfil row exists); otherwise `tier`/`ask` deny like `deny`.
+//!
 //! Only the user's authenticated `tier.json` can set `env_read` above `deny`; the plugin
 //! policy is pinned to `deny` and a repo or env can only tighten it (`policy::tier::resolve`),
 //! so `env_read` here is already the effective value. The varlock value printers follow the
@@ -25,6 +28,26 @@ use crate::sandbox::SandboxState;
 /// The reason fragment for an opt-in that does not apply because the sandbox is not on.
 pub const SUSPENDED: &str = "opt-in suspended: sandbox not on";
 
+/// The reason for an opt-in in a build without the `env-read-opt-in` feature.
+pub const UNAVAILABLE: &str =
+    "raw env read opt-in not available in this build; use `safe-ai-skill env keys` / `env set`";
+
+/// Whether this build honours the `env_read: ask|tier` opt-in (cargo feature
+/// `env-read-opt-in`). It ships off until the "project env file to network" exfil row exists
+/// (spec §2/§5): an opted-in raw read could otherwise be piped to the network unchallenged.
+pub const OPT_IN_AVAILABLE: bool = cfg!(feature = "env-read-opt-in");
+
+/// The note for `safe-ai-skill tier --env-read <x>`: `Some` when `x` loosens and this build
+/// does not honour it (the setting is stored but inactive).
+pub fn inactive_note(env_read: EnvRead) -> Option<String> {
+    (env_read != EnvRead::Deny && !OPT_IN_AVAILABLE).then(|| {
+        format!(
+            "`env_read: {}` is accepted but inactive in this build: {UNAVAILABLE}.",
+            env_read.label()
+        )
+    })
+}
+
 /// The verdict for a raw read of project env values. `reason` is the actionable message (the
 /// `safe-ai-skill env` commands, and the varlock hint where it applies); `None` is no opinion
 /// (an opted-in read at Off or Relaxed).
@@ -38,6 +61,12 @@ pub fn verdict(
     if env_read == EnvRead::Deny {
         return Some(Verdict::Deny(reason));
     }
+    if !OPT_IN_AVAILABLE {
+        return Some(Verdict::Deny(format!(
+            "safe-ai-skill: your `env_read: {}`: {UNAVAILABLE}. {reason}",
+            env_read.label()
+        )));
+    }
     if sandbox != SandboxState::On {
         return Some(Verdict::Deny(format!(
             "safe-ai-skill: your `env_read: {}` {SUSPENDED} (declared sandbox: {}). Raw env reads open only while the Claude Code sandbox is enabled. {reason}",
@@ -48,7 +77,7 @@ pub fn verdict(
     match (env_read, tier) {
         (EnvRead::Tier, Tier::Off | Tier::Relaxed) => None,
         (EnvRead::Ask, Tier::Off | Tier::Relaxed | Tier::Medium) => Some(Verdict::Ask(format!(
-            "Raw read of an env file (secrets.env_read: ask): approving shows its values to the model. {reason}"
+            "Raw read of an env file (your `env_read: ask`, set with `safe-ai-skill tier --env-read`): approving shows its values to the model. {reason}"
         ))),
         _ => Some(Verdict::Deny(format!(
             "safe-ai-skill: tier {} denies raw env reads even with your `env_read: {}`. {reason}",
@@ -83,6 +112,7 @@ fn with_env_commands(reason: String) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "env-read-opt-in")]
     fn kind(v: Option<Verdict>) -> &'static str {
         match v {
             None | Some(Verdict::NoOpinion) => "",
@@ -92,6 +122,23 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "env-read-opt-in"))]
+    #[test]
+    fn without_the_feature_every_opt_in_denies() {
+        for t in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+            for e in [EnvRead::Ask, EnvRead::Tier] {
+                let Some(Verdict::Deny(why)) = verdict(t, e, SandboxState::On, String::new())
+                else {
+                    panic!("{t:?} {e:?}: expected deny");
+                };
+                assert!(why.contains(UNAVAILABLE), "{why}");
+            }
+            assert!(inactive_note(EnvRead::Tier).is_some());
+            assert!(inactive_note(EnvRead::Deny).is_none());
+        }
+    }
+
+    #[cfg(feature = "env-read-opt-in")]
     #[test]
     fn opt_ins_follow_the_tier_only_while_the_sandbox_is_on() {
         use SandboxState as S;

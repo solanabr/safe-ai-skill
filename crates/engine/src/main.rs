@@ -1806,6 +1806,9 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         clear,
     };
     let summary = tierstate::summary(&change);
+    if let Some(note) = env_read.and_then(safe_ai_skill::gates::envread::inactive_note) {
+        let _ = writeln!(std::io::stderr(), "safe-ai-skill tier: {note}");
+    }
     match tierstate::plan(&dir, &change) {
         Plan::NeedsConfirm => park_pending(
             "tier",

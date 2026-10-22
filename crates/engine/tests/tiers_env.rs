@@ -72,7 +72,7 @@ impl Setup {
         self
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
     fn sandbox_unknown(mut self) -> Self {
         self.unknown_sandbox = true;
         self
@@ -247,6 +247,56 @@ fn text(v: &Option<Verdict>) -> String {
     }
 }
 
+#[cfg(not(feature = "env-read-opt-in"))]
+#[test]
+fn without_the_opt_in_feature_every_raw_env_read_denies() {
+    for env_read in [EnvRead::Deny, EnvRead::Ask, EnvRead::Tier] {
+        for sandbox in [SandboxState::On, SandboxState::Off, SandboxState::Unknown] {
+            for tier in TIERS {
+                let v = envread::verdict(tier, env_read, sandbox, String::new());
+                assert_eq!(kind(&v), "deny", "{env_read:?} {sandbox:?} {tier:?}");
+                if env_read != EnvRead::Deny {
+                    assert!(text(&v).contains(envread::UNAVAILABLE), "{}", text(&v));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "test-hooks", not(feature = "env-read-opt-in")))]
+#[test]
+fn without_the_opt_in_feature_a_user_opt_in_still_denies_through_the_binary() {
+    let p = Proj::new();
+    for env_read in [EnvRead::Tier, EnvRead::Ask] {
+        let opted = Setup::at(Tier::Relaxed)
+            .env_read(env_read)
+            .sandbox(SandboxMode::On);
+        assert_raw_row(&p, opted, ["deny"; 4]);
+        let why = reason(&p.read(opted, ".env"));
+        assert!(why.contains("not available in this build"), "{why}");
+        assert!(why.contains("env keys"), "{why}");
+    }
+}
+
+#[test]
+fn tier_env_read_reports_an_inactive_opt_in() {
+    let p = Proj::new();
+    let run = Invocation::new(&["tier", "--env-read", "tier"])
+        .plugin_data(p.data.path())
+        .home(p.home.path())
+        .cwd(p.project.path())
+        .run();
+    let inactive = run.stderr.contains("accepted but inactive in this build");
+    assert_eq!(
+        inactive,
+        !envread::OPT_IN_AVAILABLE,
+        "{}\n{}",
+        run.stdout,
+        run.stderr
+    );
+}
+
+#[cfg(feature = "env-read-opt-in")]
 #[test]
 fn envread_verdict_table_matches_the_spec() {
     let msg = || "safe-ai-skill: .env is an env file. Use safe-ai-skill env keys .env".to_string();
@@ -347,7 +397,7 @@ fn a_repo_env_read_ask_stays_deny() {
     );
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn user_env_read_tier_with_the_sandbox_on_follows_the_tier() {
     let p = Proj::new();
@@ -357,7 +407,7 @@ fn user_env_read_tier_with_the_sandbox_on_follows_the_tier() {
     assert_raw_row(&p, base, ["", "", "deny", "deny"]);
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn user_env_read_ask_with_the_sandbox_on_asks_below_high() {
     let p = Proj::new();
@@ -367,7 +417,7 @@ fn user_env_read_ask_with_the_sandbox_on_asks_below_high() {
     assert_raw_row(&p, base, ["ask", "ask", "ask", "deny"]);
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn the_opt_in_is_suspended_unless_the_sandbox_is_on() {
     let p = Proj::new();
@@ -423,7 +473,7 @@ fn headless_turns_an_opted_in_ask_into_deny() {
     assert_eq!(decision_label(&run), "deny");
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn an_opted_in_read_never_opens_key_material() {
     let p = Proj::new();
@@ -544,6 +594,42 @@ fn writes_to_project_env_files_deny_at_medium_and_high() {
 }
 
 #[test]
+fn a_redaction_marker_is_never_written_into_an_env_file() {
+    let p = Proj::new();
+    for tier in tiers() {
+        for (tool, input) in [
+            (
+                "Write",
+                json!({ "file_path": ".env", "content": "K=***REDACTED:base58_secret_key***\n" }),
+            ),
+            (
+                "Edit",
+                json!({ "file_path": ".env", "old_string": "CLUSTER=devnet", "new_string": "CLUSTER=«redacted:CLUSTER»" }),
+            ),
+            (
+                "MultiEdit",
+                json!({ "file_path": ".envrc", "edits": [{ "old_string": "a", "new_string": "x=***REDACTED:seed_phrase***" }] }),
+            ),
+        ] {
+            let run = p.tamper(Setup::at(tier), tool, input.clone());
+            assert_eq!(decision_label(&run), "deny", "{tool} at {}", tier.label());
+            assert!(
+                reason(&run).contains("redaction marker"),
+                "{}",
+                reason(&run)
+            );
+        }
+        // Not an env file: no opinion.
+        let run = p.tamper(
+            Setup::at(tier),
+            "Write",
+            json!({ "file_path": "notes.md", "content": "***REDACTED:keypair***" }),
+        );
+        assert_eq!(decision_label(&run), "", "notes.md at {}", tier.label());
+    }
+}
+
+#[test]
 fn writes_to_templates_schemas_and_plain_files_have_no_opinion() {
     let p = Proj::new();
     for tier in tiers() {
@@ -644,7 +730,7 @@ fn bash_in_place_edits_are_not_claimed_by_the_write_gate() {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn bash_in_place_edits_have_no_opinion_once_raw_reads_are_open() {
     let p = Proj::new();
@@ -780,7 +866,7 @@ fn other_reads_and_bash_dumps_of_env_values_are_scrubbed() {
         .contains("«redacted:HELIUS_KEY»"));
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn an_opted_in_env_read_response_is_never_rewritten() {
     let p = Proj::new();
@@ -810,7 +896,39 @@ fn an_opted_in_env_read_response_is_never_rewritten() {
     }
 }
 
-#[cfg(all(unix, feature = "test-hooks"))]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[test]
+fn an_opted_in_env_read_still_gets_pattern_redaction() {
+    let p = Proj::new();
+    let wallet = format!("WALLET_SECRET={}", bs58_secret());
+    let words =
+        "abandon ability able about above absent absorb abstract absurd abuse access accident";
+    p.write(
+        ".env",
+        &format!("HELIUS_KEY={HELIUS}\n{wallet}\nMNEMONIC=\"{words}\"\n"),
+    );
+    let env = p.project.join(".env");
+    for env_read in [EnvRead::Tier, EnvRead::Ask] {
+        let opted = Setup::at(Tier::Relaxed)
+            .env_read(env_read)
+            .sandbox(SandboxMode::On);
+        let out = updated(&env_read_post(&p, opted, &env));
+        let content = out["file"]["content"].as_str().unwrap();
+        assert!(
+            content.contains(&format!("HELIUS_KEY={HELIUS}\n")),
+            "{content}"
+        );
+        assert!(!content.contains(&bs58_secret()), "{content}");
+        assert!(!content.contains(words), "{content}");
+        assert!(content.contains("***REDACTED:"), "{content}");
+        assert!(
+            !content.contains("«redacted:"),
+            "value scrub skipped: {content}"
+        );
+    }
+}
+
+#[cfg(all(unix, feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn an_opted_in_read_through_a_symlink_to_an_env_file_is_never_rewritten() {
     let p = Proj::new();
@@ -831,7 +949,7 @@ fn a_non_opted_env_read_never_reaches_redact() {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 /// Apply an Edit the way Claude Code does: `old_string` must occur exactly once in the file.
 fn apply_edit(file: &Path, old: &str, new: &str) {
     let text = std::fs::read_to_string(file).unwrap();
@@ -843,10 +961,15 @@ fn apply_edit(file: &Path, old: &str, new: &str) {
     std::fs::write(file, text.replacen(old, new, 1)).unwrap();
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn opted_in_read_then_edit_keeps_the_real_values() {
     let p = Proj::new();
+    let wallet = format!("WALLET_SECRET={}", bs58_secret());
+    p.write(
+        ".env",
+        &format!("HELIUS_KEY={HELIUS}\nCLUSTER=devnet\n{wallet}\nDATABASE_URL={DB_URL}\n"),
+    );
     let opted = Setup::at(Tier::Relaxed)
         .env_read(EnvRead::Tier)
         .sandbox(SandboxMode::On);
@@ -855,15 +978,22 @@ fn opted_in_read_then_edit_keeps_the_real_values() {
 
     // 1. Read is allowed (no opinion) ...
     assert_eq!(decision_label(&p.read(opted, ".env")), "");
-    // 2. ... and its response reaches the model unchanged.
+    // 2. ... and its response reaches the model value-unscrubbed; only the key-material line
+    //    is pattern-redacted.
     let post = p.redact(
         opted,
         "Read",
         json!({ "file_path": env }),
         read_response(&env, &before),
     );
-    assert!(post.stdout.trim().is_empty(), "{}", post.stdout);
-    let seen = before.clone();
+    let seen = updated(&post)["file"]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(seen.contains(&format!("HELIUS_KEY={HELIUS}\n")), "{seen}");
+    assert!(seen.contains(&format!("DATABASE_URL={DB_URL}\n")), "{seen}");
+    assert!(!seen.contains(&wallet), "{seen}");
+    assert!(seen.contains("***REDACTED:"), "{seen}");
 
     // 3. The model edits one line, quoting what it saw, and the write gate lets it through.
     let old = seen.lines().find(|l| l.starts_with("CLUSTER=")).unwrap();
@@ -871,19 +1001,35 @@ fn opted_in_read_then_edit_keeps_the_real_values() {
     assert_eq!(decision_label(&p.tamper(opted, "Edit", edit)), "");
     apply_edit(&env, old, "CLUSTER=localnet");
 
-    // 4. A whole-file Write of what it saw, with that line changed, is equally safe.
-    let rewritten = std::fs::read_to_string(&env).unwrap();
-    let write = json!({ "file_path": env, "content": rewritten });
+    // 4. A whole-file Write built from what the model saw would put the marker over the real
+    //    key: the write gate refuses it at every tier, so the file keeps the real key.
+    let from_seen = seen.replace(old, "CLUSTER=localnet");
+    let write = json!({ "file_path": env, "content": from_seen });
+    for tier in TIERS {
+        let run = p.tamper(Setup { tier, ..opted }, "Write", write.clone());
+        assert_eq!(decision_label(&run), "deny", "at {}", tier.label());
+    }
+    // Every value line the model saw is the real one: a Write of those lines alone is allowed.
+    let values_only: String = from_seen
+        .lines()
+        .filter(|l| !l.contains("REDACTED"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(values_only.contains(&format!("HELIUS_KEY={HELIUS}\n")));
+    let write = json!({ "file_path": env, "content": values_only });
     assert_eq!(decision_label(&p.tamper(opted, "Write", write)), "");
 
     let after = std::fs::read_to_string(&env).unwrap();
     assert!(after.contains(&format!("HELIUS_KEY={HELIUS}\n")), "{after}");
+    assert!(after.contains(&format!("{wallet}\n")), "{after}");
     assert!(
         after.contains(&format!("DATABASE_URL={DB_URL}\n")),
         "{after}"
     );
-    assert!(after.contains("CLUSTER=localnet\n"), "{after}");
-    assert!(!after.contains("redacted"), "{after}");
+    assert!(
+        !after.contains("REDACTED") && !after.contains("redacted"),
+        "{after}"
+    );
     assert_eq!(after, before.replace("CLUSTER=devnet", "CLUSTER=localnet"));
 }
 
@@ -899,7 +1045,7 @@ fn a_scrubbed_read_would_have_clobbered_the_file() {
 
 /// An opted-in env argument (no opinion) must not end the scan: key material after it, in
 /// arguments, redirects or `git show` paths, still denies.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn an_opted_in_env_argument_does_not_hide_key_material_after_it() {
     let p = Proj::new();
@@ -937,7 +1083,7 @@ fn an_opted_in_env_argument_does_not_hide_key_material_after_it() {
 /// Same for a directory Grep whose glob names an env file and key material: the opted-in env
 /// glob is no opinion, so the key-material exclusion rewrite still applies (without the
 /// env-file globs the user opted into).
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn an_opted_in_grep_glob_keeps_the_key_material_exclusion() {
     let p = Proj::new();

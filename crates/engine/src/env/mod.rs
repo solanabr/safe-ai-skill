@@ -7,7 +7,8 @@
 //! byte-minimal ([`parse`] is lossless), verified by re-parsing, and atomic ([`write`]). Only
 //! env-class files are accepted ([`is_env_class`]), so `env` is not a general file reader or
 //! writer. `env keys` is never gated; an agent's `env set|unset` is denied at tier Medium and
-//! High (by the `gate-bash-secrets` hook, and here as a backstop under `CLAUDECODE`).
+//! High by the `gate-bash-secrets` hook (the primary control), and refused here as a
+//! best-effort backstop when a Claude Code marker env is present.
 //!
 //! Exit codes: 0 ok; 1 refused or missing file, rejected stdin value, I/O error; 3 usage error
 //! (bad arguments or key name) or a `--require`d key that is missing, empty or a placeholder.
@@ -46,7 +47,7 @@ the value from stdin (one trailing newline is stripped); --multiline allows line
 --all updates every duplicate. `keys --require` exits 3 when a key is missing, empty or a
 placeholder. `keys` reads a varlock .env.schema beside FILE and annotates each key;
 `init-schema` writes that schema from FILE's keys (no values copied, never overwrites).
-From a Claude Code session, `set` and `unset` are refused at tier medium and high.
+From a Claude Code session, `set` and `unset` are refused at tier medium and high\n(the session's hook denies them first).
 ";
 
 /// Whether `path` names an env-class file (spec D3.1, case-insensitive): `.env`, `.env.*`,
@@ -138,33 +139,63 @@ fn is_valid_key(key: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
-/// Set by Claude Code in the environment of the commands it runs (the agent's Bash tool, and
-/// the user's `!` commands).
-const AGENT_ENV: &str = "CLAUDECODE";
+/// Env vars that mark a process started from a Claude Code session (the agent's Bash tool, a
+/// hook, or the user's `!` command): `CLAUDECODE`, `CLAUDE_PROJECT_DIR`, `CLAUDE_PLUGIN_ROOT`,
+/// and any `CLAUDE_CODE_*`. An empty value does not count.
+fn in_claude_code(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> bool {
+    vars.into_iter().any(|(k, v)| {
+        let k = k.to_string_lossy();
+        !v.is_empty()
+            && (k == "CLAUDECODE"
+                || k == "CLAUDE_PROJECT_DIR"
+                || k == "CLAUDE_PLUGIN_ROOT"
+                || k.starts_with("CLAUDE_CODE_"))
+    })
+}
 
 /// The tier check for `env set|unset` run from a Claude Code session (D8 v2 spec §2: agent
-/// writes to project env files are denied at Medium and High). The `gate-bash-secrets` hook
-/// denies the command first; this is the backstop for a form the hook did not recognise. The
-/// tier is resolved for the process cwd exactly as for a hook, so a repo or env can only raise
-/// it. Run from the user's own terminal (no `CLAUDECODE`), `env` is never refused.
+/// writes to project env files are denied at Medium and High).
+///
+/// The `gate-bash-secrets` hook is the primary control: it denies the command before it runs.
+/// This is a best-effort backstop for a form the hook did not recognise; a command that also
+/// clears every Claude Code marker from its environment escapes it. The tier is resolved, as a
+/// hook does (a repo or env can only raise it), for both the process cwd and the target file's
+/// project, and the stricter applies. From the user's own terminal `env` is never refused.
 fn agent_write_refusal(args: &[String]) -> Option<String> {
     let action = args.first().map(String::as_str)?;
     if !matches!(action, "set" | "unset") {
         return None;
     }
-    std::env::var_os(AGENT_ENV).filter(|v| !v.is_empty())?;
+    if !in_claude_code(std::env::vars_os()) {
+        return None;
+    }
     let cwd = std::env::current_dir().ok()?;
-    let dir = crate::datadir::data_dir_with_cwd(Some(&cwd))
+    let mut dirs = vec![cwd.clone()];
+    if let Some(file) = args.iter().skip(1).find(|a| !a.starts_with('-')) {
+        let path = cwd.join(expand_tilde(file));
+        let parent = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.clone());
+        dirs.push(fs::canonicalize(&parent).unwrap_or(parent));
+    }
+    let tier = dirs.iter().map(|dir| tier_for(dir)).max()?;
+    tier_refusal(action, tier)
+}
+
+/// The effective tier for a session rooted at `dir`.
+fn tier_for(dir: &Path) -> crate::policy::tier::Tier {
+    let data = crate::datadir::data_dir_with_cwd(Some(dir))
         .unwrap_or_else(|_| crate::datadir::unresolved());
-    let root = crate::policy::tier::project_root(&cwd);
+    let root = crate::policy::tier::project_root(dir);
     let (policy, _) = crate::policy::load_runtime(
-        &cwd,
-        &dir,
+        dir,
+        &data,
         &|k| std::env::var(k).ok(),
         crate::sandbox::state(&root),
         false,
     );
-    tier_refusal(action, policy.tier())
+    policy.tier()
 }
 
 /// The refusal text for an agent's `env <action>` at `tier`, if that tier denies it.
@@ -806,6 +837,30 @@ mod tests {
         }
         assert!(agent_write_refusal(&["keys".to_string()]).is_none());
         assert!(agent_write_refusal(&[]).is_none());
+    }
+
+    #[test]
+    fn any_claude_code_marker_counts() {
+        use std::ffi::OsString;
+        let vars = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        for k in [
+            "CLAUDECODE",
+            "CLAUDE_PROJECT_DIR",
+            "CLAUDE_PLUGIN_ROOT",
+            "CLAUDE_CODE_ENTRYPOINT",
+        ] {
+            assert!(in_claude_code(vars(&[(k, "1")])), "{k}");
+            assert!(!in_claude_code(vars(&[(k, "")])), "{k} empty");
+        }
+        assert!(!in_claude_code(vars(&[
+            ("CLAUDE_CONFIG_DIR", "/x"),
+            ("HOME", "/h")
+        ])));
     }
 
     #[test]

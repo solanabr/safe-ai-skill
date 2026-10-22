@@ -31,9 +31,6 @@ pub fn decide_file(
     tier: Tier,
 ) -> Option<Verdict> {
     let _ = policy;
-    if tier < Tier::Medium {
-        return None;
-    }
     let input = tool_input?.as_object()?;
     let file = ["file_path", "notebook_path"]
         .iter()
@@ -45,6 +42,16 @@ pub fn decide_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| ".env".to_string());
+    // At every tier: a redaction marker written into an env file replaces a real secret with
+    // the marker (the model saw a pattern-redacted Read and copied it back).
+    if writes_redaction_marker(input) {
+        return Some(Verdict::Deny(format!(
+            "safe-ai-skill: this write would put a redaction marker (`***REDACTED:…***` / `«redacted:…»`) into {label}, overwriting a real secret. Edit only the lines you need, or ask the user to set the value: `printf %s '<value>' | safe-ai-skill env set {label} KEY`."
+        )));
+    }
+    if tier < Tier::Medium {
+        return None;
+    }
     Some(Verdict::Deny(format!(
         "safe-ai-skill: tier {} denies agent writes to project env files ({label}). Ask the user to edit it, or to set a value in their own terminal: `printf %s '<value>' | safe-ai-skill env set {label} KEY`. `safe-ai-skill env keys {label}` lists the keys.",
         tier.label()
@@ -63,6 +70,22 @@ pub fn decide_cli(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Opt
         "safe-ai-skill: tier {} denies agent writes to project env files (`safe-ai-skill env {action}`). Ask the user to run it in their own terminal (`printf %s '<value>' | safe-ai-skill env set FILE KEY`), or to edit the file. `safe-ai-skill env keys FILE` still works.",
         tier.label()
     )))
+}
+
+/// Whether the new text of a Write (`content`), Edit (`new_string`), MultiEdit
+/// (`edits[].new_string`) or NotebookEdit (`new_source`) holds a redaction marker.
+fn writes_redaction_marker(input: &serde_json::Map<String, Value>) -> bool {
+    let marked = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(crate::redact::contains_marker)
+    };
+    marked(input.get("content"))
+        || marked(input.get("new_string"))
+        || marked(input.get("new_source"))
+        || input
+            .get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(|edits| edits.iter().any(|e| marked(e.get("new_string"))))
 }
 
 /// Whether `file` (absolute, or relative to `cwd`) is a project env file, by its name or, for
@@ -161,19 +184,35 @@ fn segments(command: &str) -> Vec<String> {
 
 /// The action of one simple command (already tokenized, quotes removed).
 fn segment_action(tokens: &[String], depth: usize) -> Option<&'static str> {
+    if depth > MAX_NESTING {
+        return None;
+    }
+    let deeper = depth.saturating_add(1);
     let rest = skip_prefix(tokens);
     let (program, args) = rest.split_first()?;
     let name = base_name(program);
     if is_shell(&name) {
         let script = shell_script(args)?;
-        return env_write_action(script, depth + 1);
+        return env_write_action(script, deeper);
     }
-    if name == "eval" {
-        return env_write_action(&args.join(" "), depth + 1);
+    match name.as_str() {
+        "eval" => return env_write_action(&args.join(" "), deeper),
+        "watch" => {
+            return env_write_action(&skip_options(args, &["-n", "--interval"]).join(" "), deeper)
+        }
+        "script" => return script_action(args, deeper),
+        "find" => return find_exec_action(args, deeper),
+        "node" | "bun" | "deno" => return node_cli_action(args),
+        _ => {}
     }
-    if name != "safe-ai-skill" {
+    if !is_engine_binary(&name) {
         return None;
     }
+    env_action(args)
+}
+
+/// `env set|unset` among the arguments of a safe-ai-skill invocation.
+fn env_action(args: &[String]) -> Option<&'static str> {
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     if positional.next().map(String::as_str) != Some("env") {
         return None;
@@ -185,6 +224,78 @@ fn segment_action(tokens: &[String], depth: usize) -> Option<&'static str> {
     }
 }
 
+/// The engine binary: `safe-ai-skill`, or a per-platform build `safe-ai-skill-<os>-<arch>`.
+fn is_engine_binary(name: &str) -> bool {
+    name == "safe-ai-skill" || name.starts_with("safe-ai-skill-")
+}
+
+/// `node …/safe-ai-skill/…/cli.js env set …` (the npm launcher).
+fn node_cli_action(args: &[String]) -> Option<&'static str> {
+    let rest = skip_options(args, &[]);
+    let (script, tail) = rest.split_first()?;
+    let script = script.to_ascii_lowercase();
+    if script.contains("safe-ai-skill") && script.ends_with(".js") {
+        return env_action(tail);
+    }
+    None
+}
+
+/// `find … -exec|-execdir|-ok|-okdir CMD … ;|+`: each command run.
+fn find_exec_action(args: &[String], depth: usize) -> Option<&'static str> {
+    let mut rest = args;
+    while let Some(i) = rest
+        .iter()
+        .position(|a| matches!(a.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+    {
+        let after = rest.get(i.checked_add(1)?..)?;
+        let end = after
+            .iter()
+            .position(|a| matches!(a.as_str(), ";" | "\\;" | "+"))
+            .unwrap_or(after.len());
+        let command = after.get(..end)?;
+        if let Some(action) = segment_action(command, depth) {
+            return Some(action);
+        }
+        rest = after.get(end..)?;
+    }
+    None
+}
+
+/// `script -c CMD [file]` (util-linux) or `script [-q…] FILE CMD …` (BSD).
+fn script_action(args: &[String], depth: usize) -> Option<&'static str> {
+    if let Some(i) = args.iter().position(|a| a == "-c" || a == "--command") {
+        let command = args.get(i.checked_add(1)?)?;
+        return env_write_action(command, depth);
+    }
+    let rest = skip_options(args, &["-t", "-T", "-F"]);
+    let (_file, command) = rest.split_first()?;
+    segment_action(command, depth)
+}
+
+/// `args` without leading options (and the values of those in `takes_value`).
+fn skip_options<'a>(args: &'a [String], takes_value: &[&str]) -> &'a [String] {
+    let mut rest = args;
+    while let Some((opt, after)) = rest.split_first() {
+        if opt == "--" {
+            return after;
+        }
+        if !(opt.starts_with('-') && opt.len() > 1) {
+            break;
+        }
+        rest = after;
+        if takes_value.contains(&opt.as_str()) {
+            rest = rest.split_first().map_or(rest, |(_, r)| r);
+        }
+    }
+    rest
+}
+
+/// Shell keywords and grouping words that put the next word in command position.
+const KEYWORDS: &[&str] = &[
+    "{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "case",
+    "esac", "function",
+];
+
 /// `tokens` without leading assignments (`FOO=1`) and wrappers that run the rest of the line,
 /// with their options.
 fn skip_prefix(tokens: &[String]) -> &[String] {
@@ -193,7 +304,7 @@ fn skip_prefix(tokens: &[String]) -> &[String] {
         let Some((first, tail)) = rest.split_first() else {
             return rest;
         };
-        if is_assignment(first) {
+        if is_assignment(first) || KEYWORDS.contains(&first.as_str()) {
             rest = tail;
             continue;
         }
@@ -259,7 +370,7 @@ fn shell_script(args: &[String]) -> Option<&str> {
     let i = args
         .iter()
         .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))?;
-    args.get(i + 1).map(String::as_str)
+    args.get(i.checked_add(1)?).map(String::as_str)
 }
 
 fn is_shell(name: &str) -> bool {
@@ -274,13 +385,21 @@ fn is_assignment(tok: &str) -> bool {
     })
 }
 
-/// The last path component, lowercased, without `.exe`.
+/// The last path component, lowercased, without `.exe`. A backslash is a Windows separator
+/// unless dropping backslashes (shell escapes: `safe\\-ai\\-skill`) names the engine.
 fn base_name(word: &str) -> String {
-    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
-    let base = base.to_ascii_lowercase();
-    base.strip_suffix(".exe")
-        .map(str::to_string)
-        .unwrap_or(base)
+    let normal = |base: &str| {
+        let base = base.to_ascii_lowercase();
+        base.strip_suffix(".exe")
+            .map(str::to_string)
+            .unwrap_or(base)
+    };
+    let unescaped: String = word.chars().filter(|c| *c != '\\').collect();
+    let unescaped = normal(unescaped.rsplit('/').next().unwrap_or_default());
+    if is_engine_binary(&unescaped) {
+        return unescaped;
+    }
+    normal(word.rsplit(['/', '\\']).next().unwrap_or(word))
 }
 
 #[cfg(test)]
@@ -309,6 +428,48 @@ mod tests {
                 "bash -c \"sh -c 'safe-ai-skill env set .env K'\"",
                 Some("set"),
             ),
+            (
+                "unset CLAUDECODE; { safe-ai-skill env set .env K; }",
+                Some("set"),
+            ),
+            (
+                "if true; then safe-ai-skill env set .env K; fi",
+                Some("set"),
+            ),
+            (
+                "while true; do safe-ai-skill env unset .env K; done",
+                Some("unset"),
+            ),
+            ("! safe-ai-skill env set .env K", Some("set")),
+            (
+                "~/.claude/plugins/x/bin/safe-ai-skill-darwin-arm64 env set .env K",
+                Some("set"),
+            ),
+            ("safe\\-ai\\-skill env set .env K", Some("set")),
+            (
+                "C:\\tools\\safe-ai-skill.exe env unset .env K",
+                Some("unset"),
+            ),
+            (
+                "find . -name .env -exec safe-ai-skill env unset {} K \\;",
+                Some("unset"),
+            ),
+            ("find . -execdir safe-ai-skill env set {} K +", Some("set")),
+            ("watch -n 5 safe-ai-skill env set .env K", Some("set")),
+            (
+                "script -q /dev/null safe-ai-skill env set .env K",
+                Some("set"),
+            ),
+            (
+                "script -c 'safe-ai-skill env unset .env K' /dev/null",
+                Some("unset"),
+            ),
+            (
+                "node npm/safe-ai-skill/bin/cli.js env set .env K",
+                Some("set"),
+            ),
+            ("node app.js env set .env K", None),
+            ("find . -name .env -exec cat {} \\;", None),
             ("safe-ai-skill env keys .env", None),
             ("safe-ai-skill env init-schema", None),
             ("safe-ai-skill tier medium", None),

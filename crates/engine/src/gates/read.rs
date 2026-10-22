@@ -718,6 +718,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "env-read-opt-in")]
     #[test]
     fn env_read_ask_policy() {
         let mut p = policy();

@@ -40,7 +40,7 @@ impl Sandbox {
 
     /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`), with the
     /// sandbox declared on (the opt-in applies only then, D8 v2 spec §1.4).
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
     fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
         self.user_env_read = Some(env_read);
         self.sandbox = Some(common::SandboxMode::On);
@@ -48,7 +48,7 @@ impl Sandbox {
     }
 
     /// The declared sandbox (with `test-hooks`, the engine override).
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
     fn with_sandbox(mut self, mode: common::SandboxMode) -> Self {
         self.sandbox = Some(mode);
         self
@@ -339,7 +339,7 @@ fn the_plugin_policy_cannot_loosen_env_read() {
     assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
     let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
@@ -349,7 +349,7 @@ fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
     assert_eq!(sb.read("k.json"), "deny");
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn the_env_read_opt_in_is_suspended_without_the_sandbox() {
     let sb = Sandbox::new()
@@ -612,7 +612,7 @@ fn bash_varlock_safe_commands_have_no_opinion_or_ask() {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn bash_env_read_ask_applies_to_readers_and_varlock() {
     let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
