@@ -248,6 +248,20 @@ const BASH_DENIED: &[&str] = &[
     "ssh -i ~/.ssh/id_rsa host cat ~/.aws/credentials",
     "ssh -F ~/.aws/credentials host",
     "sftp ~/.ssh/id_rsa",
+    // fix round 2 R1: `..` cannot widen the Solana signer exemption
+    "solana-keygen pubkey ~/.config/solana/../../.aws/credentials",
+    "anchor run x ~/.config/solana/../../.ssh/id_rsa",
+    "solana balance --keypair ~/.config/solana/../../.npmrc",
+    "solana-keygen pubkey ~/.config/solanax/../../.aws/credentials",
+    // R2: the SSH identity exemption is for keys under ~/.ssh only
+    "ssh -i ~/.aws/credentials host",
+    "ssh -o IdentityFile=~/.aws/credentials host",
+    "ssh -oIdentityFile=~/.aws/credentials host",
+    "sftp -i ~/.git-credentials host",
+    "scp -i ~/.npmrc a host:",
+    "ssh-keygen -y -f ~/.aws/credentials",
+    "ssh -i ~/.ssh/../.aws/credentials host",
+    "ssh-keygen -y -f ~/.ssh/../.aws/credentials",
 ];
 
 const BASH_QUIET: &[&str] = &[
@@ -314,6 +328,8 @@ const BASH_QUIET: &[&str] = &[
     "ssh-keygen -y -f ~/.ssh/id_ed25519",
     "ssh-keygen -yf ~/.ssh/id_ed25519",
     "ssh-keygen -y -f~/.ssh/id_ed25519",
+    "solana-keygen pubkey ~/.config/solana/./id.json",
+    "ssh -i ~/.ssh/./id_rsa host",
 ];
 
 #[test]
@@ -525,6 +541,28 @@ fn mcp_home_spellings_deny() {
         ] {
             let run = w.pre(tier, "gate-mcp", "mcp__fs__read", json!({ "p": p }));
             assert_eq!(decision_label(&run), "deny", "{tier:?} {p}");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn exemptions_follow_symlinks_out_of_their_tree() {
+    let w = World::new("cp-exempt-link");
+    plant_home_files(&w);
+    std::fs::create_dir_all(w.home.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(w.home.join(".aws/credentials"), w.home.join(".ssh/id_x")).unwrap();
+    std::os::unix::fs::symlink(w.home.join(".npmrc"), w.proj.join("x-keypair.json")).unwrap();
+    for tier in tiers() {
+        for cmd in [
+            "ssh -i ~/.ssh/id_x host",
+            "solana-keygen pubkey ./x-keypair.json",
+        ] {
+            assert_eq!(
+                bash_in(&w, tier, w.proj.path(), cmd),
+                "deny",
+                "{tier:?} {cmd}"
+            );
         }
     }
 }

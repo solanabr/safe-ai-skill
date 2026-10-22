@@ -143,10 +143,14 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
         let identity = identity_values(&program, cmd);
         for (i, word) in cmd.words.iter().enumerate().skip(skip) {
             budget = budget.checked_sub(1)?;
-            if identity.contains(&i) {
-                continue;
-            }
-            if let Some(hit) = word_hit(&word.text, &cwds, signer) {
+            let exempt = if identity.contains(&i) {
+                Exempt::SshKey
+            } else if signer {
+                Exempt::Solana
+            } else {
+                Exempt::None
+            };
+            if let Some(hit) = word_hit(&word.text, &cwds, exempt) {
                 return Some(format!("{program} {hit}"));
             }
         }
@@ -381,7 +385,7 @@ fn is_bare(word: &str) -> bool {
 }
 
 /// Whether the word `text` names a credential path (see the module docs); the hit's text.
-fn word_hit(text: &str, cwds: &[PathBuf], signer: bool) -> Option<String> {
+fn word_hit(text: &str, cwds: &[PathBuf], exempt: Exempt) -> Option<String> {
     if text.len() > 4096 || (text.starts_with('-') && !text.contains('=')) {
         return None;
     }
@@ -391,7 +395,7 @@ fn word_hit(text: &str, cwds: &[PathBuf], signer: bool) -> Option<String> {
         }
         for variant in expand_braces(&piece) {
             for expanded in expand_vars(&variant) {
-                if candidate_hit(&expanded, cwds, signer) {
+                if candidate_hit(&expanded, cwds, exempt) {
                     return Some(expanded);
                 }
             }
@@ -400,36 +404,59 @@ fn word_hit(text: &str, cwds: &[PathBuf], signer: bool) -> Option<String> {
     None
 }
 
-/// A signer's own inputs: keypairs under the Solana config tree and `*-keypair.json`.
-fn signer_input(path: &Path) -> bool {
-    let text = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    text.contains("/.config/solana") || text.ends_with("-keypair.json")
+/// Which credential paths a word may name without being a hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exempt {
+    /// None.
+    None,
+    /// A Solana signer's own inputs: keypairs under `.config/solana` and `*-keypair.json`.
+    Solana,
+    /// An SSH identity value: a key under `.ssh/`.
+    SshKey,
 }
 
-fn candidate_hit(word: &str, cwds: &[PathBuf], signer: bool) -> bool {
+impl Exempt {
+    /// Whether `path` is exempt. The path is folded lexically first (`..` cannot widen the
+    /// exemption), and it is asked of the literal path and of its symlink-resolved form
+    /// separately: a link out of the tree is judged by where it leads.
+    fn allows(self, path: &Path) -> bool {
+        let text = crate::gates::secretpath::normalize(&path.to_string_lossy(), None);
+        let segs: Vec<&str> = text.split('/').filter(|s| !s.is_empty()).collect();
+        match self {
+            Exempt::None => false,
+            Exempt::Solana => {
+                segs.windows(2).any(|w| w == [".config", "solana"])
+                    || segs.last().is_some_and(|n| n.ends_with("-keypair.json"))
+            }
+            Exempt::SshKey => segs
+                .iter()
+                .position(|s| *s == ".ssh")
+                .is_some_and(|i| i + 1 < segs.len()),
+        }
+    }
+}
+
+/// [`credpaths::is_credential`] of `path` and of its resolved form, each form unless exempt.
+fn literal_hit(path: &Path, exempt: Exempt) -> bool {
+    if !exempt.allows(path) && credpaths::is_credential(path) {
+        return true;
+    }
+    std::fs::canonicalize(path)
+        .is_ok_and(|real| !exempt.allows(&real) && credpaths::is_credential(&real))
+}
+
+fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
     if word.is_empty() {
         return false;
     }
     let wild = word.contains(['*', '?', '[']);
     let bare = is_bare(word);
     let judged = |path: &Path| -> bool {
-        if signer && signer_input(path) {
-            return false;
-        }
-        let mut hit = if wild {
-            credpaths::is_credential_glob(path)
+        if wild {
+            !exempt.allows(path) && credpaths::is_credential_glob(path)
         } else {
-            credpaths::is_credential(path)
-        };
-        if !wild {
-            if let Ok(real) = std::fs::canonicalize(path) {
-                hit |= credpaths::is_credential(&real);
-            }
+            literal_hit(path, exempt)
         }
-        hit
     };
     for path in resolve_all(word, cwds) {
         if wild {
@@ -438,12 +465,7 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], signer: bool) -> bool {
             let matches: Vec<PathBuf> = glob::glob(&pattern)
                 .map(|g| g.filter_map(Result::ok).take(MAX_GLOB_MATCHES).collect())
                 .unwrap_or_default();
-            if matches.iter().any(|m| {
-                !(signer && signer_input(m))
-                    && (credpaths::is_credential(m)
-                        || std::fs::canonicalize(m)
-                            .is_ok_and(|real| credpaths::is_credential(&real)))
-            }) {
+            if matches.iter().any(|m| literal_hit(m, exempt)) {
                 return true;
             }
             if !bare && judged(&path) {
@@ -841,9 +863,46 @@ mod tests {
             "ssh-keygen -p -f ~/.ssh/id_rsa",
             "ssh -o StrictHostKeyChecking=no ~/.ssh/id_rsa",
             "ssh -i ~/.ssh/a host cat ~/.aws/credentials",
+            "ssh -i ~/.aws/credentials host",
+            "ssh -o IdentityFile=~/.git-credentials host",
+            "ssh-keygen -y -f ~/.aws/credentials",
+            "ssh -i ~/.ssh/../.aws/credentials host",
+            "solana-keygen pubkey ~/.config/solana/../../.aws/credentials",
         ] {
             assert!(matches!(d(c), Some(Verdict::Deny(_))), "{c}");
         }
+    }
+
+    #[test]
+    fn exemptions_are_judged_on_the_folded_path() {
+        let p = |t: &str| Path::new(t).to_path_buf();
+        for t in [
+            "/h/.config/solana/id.json",
+            "/p/x-keypair.json",
+            "~/.config/solana/./id.json",
+        ] {
+            assert!(Exempt::Solana.allows(&p(t)), "{t}");
+        }
+        for t in [
+            "/h/.config/solana/../../.aws/credentials",
+            "/h/.config/solanax/id.json",
+            "/h/.config/other/solana/id.json2",
+            "/h/.aws/credentials",
+        ] {
+            assert!(!Exempt::Solana.allows(&p(t)), "{t}");
+        }
+        for t in ["/h/.ssh/id_rsa", "~/.ssh/./id_ed25519", "/root/.ssh/k/id"] {
+            assert!(Exempt::SshKey.allows(&p(t)), "{t}");
+        }
+        for t in [
+            "/h/.ssh/../.aws/credentials",
+            "/h/.aws/credentials",
+            "/h/.ssh",
+            "/h/.sshx/id",
+        ] {
+            assert!(!Exempt::SshKey.allows(&p(t)), "{t}");
+        }
+        assert!(!Exempt::None.allows(&p("/h/.ssh/id_rsa")));
     }
 
     #[test]
