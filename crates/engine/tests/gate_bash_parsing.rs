@@ -536,7 +536,7 @@ fn expansion_built_family_commands_ask_as_hard_guard() {
         unparsed.reason().contains("Could not parse"),
         "{unparsed:?}"
     );
-    assert!(unseen.reason().contains("cannot fully see"), "{unseen:?}");
+    assert!(unseen.reason().contains("expansion"), "{unseen:?}");
 }
 
 /// Round-3 rows: path-qualified programs in opaque code, write-then-run variants, and
@@ -584,6 +584,96 @@ fn e2e_round3_rows_ask_in_the_secrets_hook() {
     for cmd in round3_rows() {
         let run = run_hook("gate-bash-secrets", &cmd, bin.path(), project.path(), &[]);
         assert_eq!(label(&run).as_deref(), Some("ask"), "{cmd}: {}", run.stdout);
+    }
+}
+
+/// Fix round 4: ordinary commands that redirect, `tee`, or run a script, and English words
+/// after an expanded program. Only emitted script text counts as a write, and a dynamic
+/// program asks only when it could spell a family name: no opinion from either hook.
+fn round4_quiet_rows() -> Vec<&'static str> {
+    vec![
+        "anchor build 2>&1 | tee build.log && ./scripts/post-build.sh",
+        "grep solana Cargo.toml > deps.txt && ./scripts/check.sh",
+        "cargo tree | grep solana > tree.txt; python3 analyze.py tree.txt",
+        "git log --oneline | grep anchor > log.txt && bash scripts/summary.sh",
+        "ls ~/.config/solana > out.txt; ./bin/report",
+        "echo \"anchor build failed\" > notes.md; ./scripts/ci.sh",
+        "$EDITOR close-notes.md",
+        "$CARGO run --bin stake-pool-cli",
+        "$PKG run deploy",
+        "\"$PYTHON\" scripts/mint_nft.py create",
+        "$GIT branch -d close-old-branch",
+        "${CC:-cc} -o wrap wrap.c",
+        "$(npm bin)/hardhat deploy",
+    ]
+}
+
+#[test]
+fn round4_quiet_rows_have_no_opinion() {
+    let policy = Policy::default();
+    for cmd in round4_quiet_rows() {
+        let (d, _) = decide(cmd, Network::Mainnet);
+        assert_eq!(d, Decision::Defer, "{cmd}");
+        assert_eq!(
+            bash::indirection_prefilter(cmd, Path::new("."), &policy),
+            None,
+            "{cmd}"
+        );
+    }
+}
+
+/// Fix round 4: emitted scripts that are then run (every shape), and expansions that spell a
+/// family program. Each is a hard-guard ask from both hooks.
+fn round4_ask_rows() -> Vec<String> {
+    let t = format!("solana transfer -um {DEST} 1");
+    vec![
+        format!("echo '{t}' > x.sh; cat x.sh | bash"),
+        format!("echo '{t}' > x.sh; sh < x.sh"),
+        format!("printf '{t}' | tee x.sh >/dev/null; bash x.sh"),
+        format!("echo \"import os; os.system('{t}')\" > x.py && python3 x.py"),
+        format!("echo '{t}' >> x.sh && zsh x.sh"),
+        format!("echo '{t}' > x.sh; chmod +x x.sh; x.sh"),
+        format!("echo '{t}' > x.sh; . ./x.sh"),
+        format!("cat > x.sh <<EOF\n{t}\nEOF\nbash x.sh"),
+        format!("cat <<< '{t}' > x.sh; bash x.sh"),
+        format!("echo '{t}' > x.sh; xargs -a x.sh -I{{}} sh -c '{{}}'"),
+        format!("$(echo sol)ana transfer -um {DEST} 1"),
+        format!("$(printf %s ./solana) transfer -um {DEST} 1"),
+        format!("${{S}}olana transfer -um {DEST} 1"),
+        format!("$X transfer -um {DEST} 1"),
+    ]
+}
+
+#[test]
+fn round4_ask_rows_ask_as_hard_guard_from_both_hooks() {
+    let policy = Policy::default();
+    for cmd in round4_ask_rows() {
+        let (d, meta) = decide(&cmd, Network::Devnet);
+        assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
+        match bash::indirection_prefilter(&cmd, Path::new("."), &policy) {
+            Some((Decision::Ask { .. }, meta)) => assert!(meta.hard_guard, "{cmd}"),
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+    // The dynamic-program case has its own reason.
+    let (d, _) = decide(
+        &format!("${{S}}olana transfer -um {DEST} 1"),
+        Network::Devnet,
+    );
+    assert!(d.reason().contains("expansion"), "{d:?}");
+}
+
+#[test]
+fn e2e_round4_rows_in_the_secrets_hook() {
+    let bin = stub_solana(MAINNET_STUB);
+    let project = TempDir::new("round4-proj");
+    for cmd in round4_ask_rows() {
+        let run = run_hook("gate-bash-secrets", &cmd, bin.path(), project.path(), &[]);
+        assert_eq!(label(&run).as_deref(), Some("ask"), "{cmd}: {}", run.stdout);
+    }
+    for cmd in round4_quiet_rows() {
+        let run = run_hook("gate-bash-secrets", cmd, bin.path(), project.path(), &[]);
+        assert_eq!(label(&run), None, "{cmd}: {}", run.stdout);
     }
 }
 

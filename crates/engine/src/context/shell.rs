@@ -126,6 +126,139 @@ fn is_mention_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
 }
 
+/// Value-moving subcommands of the solana CLIs. An expansion run as a program followed by one
+/// of these (`$X transfer …`) may be a family command.
+pub const FAMILY_VERBS: &[&str] = &[
+    "transfer",
+    "program",
+    "deploy",
+    "upgrade",
+    "close",
+    "close-mint",
+    "close-vote-account",
+    "withdraw-stake",
+    "withdraw-from-vote-account",
+    "withdraw-from-nonce-account",
+    "withdraw-withheld-tokens",
+    "delegate-stake",
+    "deactivate-stake",
+    "split-stake",
+    "merge-stake",
+    "redelegate-stake",
+    "create-stake-account",
+    "create-stake-account-checked",
+    "create-vote-account",
+    "create-nonce-account",
+    "create-token",
+    "create-account",
+    "stake-authorize",
+    "stake-authorize-checked",
+    "stake-set-lockup",
+    "vote-authorize-voter",
+    "vote-authorize-withdrawer",
+    "authorize",
+    "authorize-nonce-account",
+    "mint",
+    "burn",
+    "approve",
+    "revoke",
+    "wrap",
+    "unwrap",
+    "idl",
+    "migrate",
+];
+
+/// Programs whose arguments (or here-string) are the text they write: `echo 'solana …' > x.sh`.
+const EMITTERS: &[&str] = &["echo", "printf", "print"];
+
+/// Whether an expansion used as a program word could spell a solana-family program: it names
+/// one (`$(printf %s ./solana)`), or a literal fragment of it is part of a family name
+/// (`$(echo sol)ana`, `${S}olana`, `$SOLANA_BIN`).
+pub fn could_spell_family(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    mentions_family(&lower)
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|f| f.len() >= 3)
+            .any(|f| {
+                ["solana", "anchor", "spltoken"]
+                    .iter()
+                    .any(|n| n.contains(f))
+            })
+}
+
+/// Whether the text a command writes is a script that runs a value-moving solana-family
+/// command: parsed as shell, a family program in command position with a value-moving or
+/// expanded word; else, as interpreter code, a quoted string that is such a script
+/// (`os.system('solana transfer …')`) or a family program string beside a value-moving one
+/// (`['solana', 'transfer', …]`). Prose naming a program (`anchor build failed`) is not.
+fn script_runs_family(text: &str, depth: usize) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    if depth >= MAX_DEPTH {
+        return mentions_family(text);
+    }
+    let mut parsed = Parsed::default();
+    parse_into(text, depth + 1, true, &mut parsed);
+    let runs = parsed.opaque_mention
+        || parsed.write_then_run
+        || (parsed.unparseable && mentions_family(text) && quoted_segments(text).is_empty())
+        || parsed.commands.iter().any(|c| {
+            c.is_family()
+                && c.words
+                    .iter()
+                    .skip(1)
+                    .any(|w| w.dynamic || is_gated_word(&w.text))
+        });
+    if runs {
+        return true;
+    }
+    let segments = quoted_segments(text);
+    segments.iter().any(|s| script_runs_family(s, depth + 1))
+        || (segments
+            .iter()
+            .any(|s| FAMILY.contains(&base_name(s.trim()).as_str()))
+            && segments.iter().any(|s| is_gated_word(s.trim())))
+}
+
+/// The contents of the `'…'` and `"…"` strings in `text` (interpreter code).
+fn quoted_segments(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(['\'', '"']) {
+        let quote = rest[start..].chars().next().unwrap_or('"');
+        let body = &rest[start + 1..];
+        let Some(end) = body.find(quote) else {
+            break;
+        };
+        out.push(&body[..end]);
+        rest = &body[end + 1..];
+    }
+    out
+}
+
+/// The text an emitter writes (`echo`/`printf` arguments, a here-string), with `\n` read as a
+/// newline. `None` for any other program: what it writes is its output, not its words.
+fn emitted_text(program: &str, args: &[Word], herestrings: &[Word]) -> Option<String> {
+    let words: Vec<&str> = if EMITTERS.contains(&program) {
+        args.iter()
+            .map(|w| w.text.as_str())
+            .skip_while(|t| {
+                program != "printf"
+                    && t.len() > 1
+                    && t.starts_with('-')
+                    && t[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E' | 'r'))
+            })
+            .collect()
+    } else if !herestrings.is_empty() && matches!(program, "cat" | "tee") {
+        herestrings.iter().map(|w| w.text.as_str()).collect()
+    } else {
+        return None;
+    };
+    Some(words.join(" ").replace("\\n", "\n"))
+}
+
 /// Reserved words stripped from the head of a simple command.
 const RESERVED: &[&str] = &[
     "!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "case",
@@ -248,6 +381,9 @@ pub struct Parsed {
     pub opaque: bool,
     /// Holds a command or process substitution.
     pub substitution: bool,
+    /// Assigns a value naming a solana-family program (`X=solana`, `export X=…`, `for X in
+    /// solana`): an expansion run as a program may be it.
+    pub assigns_family: bool,
     /// Sets a variable the solana CLIs read their config through (`HOME`, `XDG_CONFIG_HOME`,
     /// `SOLANA_*`, `ANCHOR_*`), or sources a file that may.
     pub env_changed: bool,
@@ -256,11 +392,12 @@ pub struct Parsed {
     /// An opaque input (see [`Parsed::opaque`]) whose text names a solana-family program: a
     /// solana command runs that the parser cannot read.
     pub opaque_mention: bool,
-    /// Writes a file whose content names a solana-family program (`echo 'solana …' > x.sh`,
-    /// `cat > x.sh <<EOF`, `printf 'solana …' | tee x.sh`).
+    /// Writes a file with emitted script text that runs a value-moving solana-family command
+    /// (`echo 'solana transfer …' > x.sh`, `cat > x.sh <<EOF`, `printf 'solana …' | tee x.sh`).
+    /// A command's output (`grep solana … > f`, `anchor build | tee log`) is not script text.
     pub writes_family_text: bool,
     /// After such a write, runs a file or standard input as code (`bash x.sh`, `cat x.sh |
-    /// bash`, `sh < x.sh`, `python3 x.py`, `source x`, `./x`).
+    /// bash`, `sh < x.sh`, `python3 x.py`, `source x`, `./x`, `xargs … sh -c`).
     pub write_then_run: bool,
 }
 
@@ -413,6 +550,8 @@ struct Pending {
     after_pipe: bool,
     /// The words of the earlier stages of its pipeline (what a shell reading the pipe runs).
     upstream: String,
+    /// The text emitters upstream in its pipeline write to it (`printf '…' | tee x.sh`).
+    upstream_emits: String,
 }
 
 struct Lexer<'p> {
@@ -464,7 +603,7 @@ impl Lexer<'_> {
                             Reads::Interpreter => opaque(self.out, &body),
                             Reads::Data => {
                                 self.out.writes_family_text |=
-                                    self.line_writes && mentions_family(&body);
+                                    self.line_writes && script_runs_family(&body, self.depth);
                                 if doc.expands {
                                     self.scan_expansions(&body);
                                 }
@@ -583,6 +722,7 @@ impl Lexer<'_> {
         if pipe_next {
             let words: Vec<&str> = pending.words.iter().map(|w| w.text.as_str()).collect();
             cmd.upstream = format!("{} {}", pending.upstream, words.join(" "));
+            cmd.upstream_emits = pipe_emits(&pending);
         }
         self.line_writes |= pending.writes_file;
         if pending.words.is_empty() {
@@ -1122,6 +1262,28 @@ fn is_config_var(name: &str) -> bool {
         || name.starts_with("ANCHOR_")
 }
 
+/// The script text a pipeline stage hands the next one: an emitter's words or here-string, or
+/// what a pass-through `tee`/`cat` received from its own upstream.
+fn pipe_emits(pending: &Pending) -> String {
+    let words: Vec<&Word> = pending
+        .words
+        .iter()
+        .skip_while(|w| assignment_name(w).is_some())
+        .collect();
+    let Some(first) = words.first() else {
+        return String::new();
+    };
+    let program = base_name(&first.text);
+    let args: Vec<Word> = words.iter().skip(1).map(|w| (*w).clone()).collect();
+    if let Some(text) = emitted_text(&program, &args, &pending.herestrings) {
+        return text;
+    }
+    if matches!(program.as_str(), "tee" | "cat") && pending.piped_in {
+        return pending.upstream_emits.clone();
+    }
+    String::new()
+}
+
 /// Strip, classify and record one simple command. Returns what it reads from its standard
 /// input (so a here-document on its line is a script, interpreter code or data).
 fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Parsed) -> Reads {
@@ -1132,6 +1294,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         piped_in,
         after_pipe,
         upstream,
+        upstream_emits,
     } = pending;
     let mut indirect = indirect || after_pipe;
     let canonical_head = words
@@ -1148,6 +1311,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 skip += 1;
             } else if let Some(name) = assignment_name(word) {
                 out.env_changed |= is_config_var(name);
+                out.assigns_family |= mentions_family(&word.text[name.len()..]);
                 skip += 1;
             } else {
                 break;
@@ -1184,6 +1348,19 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         }
         let appends = program == "xargs";
         words.drain(..skip.min(words.len()));
+        if appends
+            && words.first().is_some_and(|w| {
+                let p = base_name(&w.text);
+                SHELLS.contains(&p.as_str()) || INTERPRETERS.contains(&p.as_str())
+            })
+        {
+            // `xargs -a x.sh sh -c '{}'`: its input becomes code.
+            executes(out);
+            if piped_in && script_runs_family(&upstream_emits, depth) {
+                out.opaque = true;
+                out.opaque_mention = true;
+            }
+        }
         if appends {
             // xargs appends arguments the command line does not show.
             words.push(Word {
@@ -1213,10 +1390,12 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
     let args = words.get(1..).unwrap_or_default();
     let mut reads = Reads::Data;
     if writes_file {
-        let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
-        out.writes_family_text |= mentions_family(&text.join(" "));
+        if let Some(text) = emitted_text(&program, args, &herestrings) {
+            out.writes_family_text |= script_runs_family(&text, depth);
+        }
     }
-    // `tee x.sh`, `dd of=x.sh`: they write what the pipe carries.
+    // `tee x.sh`, `dd of=x.sh`: they write what the pipe carries, script text only when an
+    // emitter upstream wrote it.
     let writes_pipe = match program.as_str() {
         "tee" => args
             .iter()
@@ -1225,7 +1404,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         _ => false,
     };
     if writes_pipe && piped_in {
-        out.writes_family_text |= mentions_family(&upstream);
+        out.writes_family_text |= script_runs_family(&upstream_emits, depth);
     }
     let family_program = FAMILY.contains(&program.as_str());
     if !family_program && (first.text.contains('/') || program.ends_with(".sh")) {
@@ -1237,6 +1416,14 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         "cd" | "pushd" | "popd" => out.cwd_changed = true,
         "export" | "declare" | "typeset" | "local" | "readonly" => {
             out.env_changed |= args.iter().filter_map(assignment_name).any(is_config_var);
+            out.assigns_family |= args
+                .iter()
+                .filter_map(|w| w.text.split_once('=').map(|(_, v)| v))
+                .any(mentions_family);
+        }
+        "for" | "select" => {
+            let text: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+            out.assigns_family |= mentions_family(&text.join(" "));
         }
         "source" | "." => {
             out.env_changed = true;
@@ -1953,6 +2140,57 @@ mod tests {
         assert!(!parse("echo 'solana balance' > notes.txt").write_then_run);
         // The run must come after the write.
         assert!(!parse("bash x.sh; echo 'solana transfer' > x.sh").write_then_run);
+    }
+
+    #[test]
+    fn only_emitted_scripts_count_as_written() {
+        for command in [
+            "echo 'solana transfer X 1' >> x.sh && zsh x.sh",
+            "echo 'solana transfer X 1' > x.sh; chmod +x x.sh; x.sh",
+            "echo 'solana transfer X 1' > x.sh; . ./x.sh",
+            "cat <<< 'solana transfer X 1' > x.sh; bash x.sh",
+            "printf 'cd a\\nsolana transfer X 1' > x.sh; bash x.sh",
+            "printf 'solana transfer X 1' | tee a | tee x.sh; bash x.sh",
+            "echo \"subprocess.run(['solana', 'transfer', 'X', '1'])\" > x.py; python3 x.py",
+            "echo 'solana transfer X 1' > x.sh; xargs -a x.sh -I{} sh -c '{}'",
+        ] {
+            assert!(parse(command).write_then_run, "{command}");
+        }
+        for command in [
+            "anchor build 2>&1 | tee build.log && ./scripts/post-build.sh",
+            "grep solana Cargo.toml > deps.txt && ./scripts/check.sh",
+            "cargo tree | grep solana > tree.txt; python3 analyze.py tree.txt",
+            "ls ~/.config/solana > out.txt; ./bin/report",
+            "echo \"anchor build failed\" > notes.md; ./scripts/ci.sh",
+            "echo 'see solana transfer docs' > notes.md; ./scripts/ci.sh",
+        ] {
+            assert!(!parse(command).write_then_run, "{command}");
+        }
+    }
+
+    #[test]
+    fn expansions_that_could_spell_a_family_program() {
+        for word in [
+            "$(echo sol)ana",
+            "${S}olana",
+            "$(printf %s ./solana)",
+            "$SOLANA_BIN",
+        ] {
+            assert!(could_spell_family(word), "{word}");
+        }
+        for word in [
+            "$EDITOR",
+            "$CARGO",
+            "\"$PYTHON\"",
+            "${CC:-cc}",
+            "$GIT",
+            "$X",
+        ] {
+            assert!(!could_spell_family(word), "{word}");
+        }
+        assert!(parse("X=solana; $X $Y").assigns_family);
+        assert!(parse("for p in solana; do $p transfer; done").assigns_family);
+        assert!(!parse("X=1; $X $Y").assigns_family);
     }
 
     #[test]
