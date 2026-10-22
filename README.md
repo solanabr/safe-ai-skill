@@ -14,7 +14,29 @@
 
 safe-ai-skill is a Claude Code security plugin — a Rust hook-based firewall and registry-free supply-chain verifier that works with **any skills, MCPs, or agents** to add a policy-driven security layer. It was built with `solanabr/solana-ai-kit` as the reference integration (gating Solana transactions and deploys, verifying its `ext/` submodules and `skill-registry.json` catalog), but the gates, guards, and verifier are general-purpose and protect any Claude Code setup.
 
-At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never relaxed by any profile, grant or flag.
+At `PreToolUse` it intercepts commands, MCP calls, and secret-file reads before they execute. At `SessionStart` it walks every installed skill and MCP submodule, pins content to git SHAs, and reports anything that drifted. Hard guards — mainnet deploys, authority changes, account closes, secret reads — are never relaxed by any tier, grant or flag.
+
+## Read this first: what this plugin cannot protect on its own
+
+> [!WARNING]
+> **safe-ai-skill's firewall is hook-level string analysis, and it has known holes.** Every gate reads the text of a tool call and decides from that text. None of them watches what the call does once it runs, so a determined or prompt-injected model can get past them. Each adversarial review round of this engine found new bypasses, and we don't think that tail is exhausted. A Claude Code plugin can't ship `sandbox` or `permissions` settings (Claude Code drops both keys from a plugin), so the plugin can't close these holes itself.
+>
+> **The [solana-ai-kit](https://github.com/solanabr/ai-kit) implementation (OS sandbox plus permission rules) closes most of them. Run both.** Without the kit, turn on Claude Code's own sandbox with the recommended `denyRead` and `deniedDomains` entries in [SECURITY.md](SECURITY.md#recommended-setup).
+
+Known holes, in short (the full table, with what closes each, is in [SECURITY.md](SECURITY.md#known-holes)):
+
+- **Cross-call write-then-run:** a script written in one call and run in a later one.
+- **Encoded and indirect forms:** `base64 -d`, `$'…'`, variables, runtime-built paths, `python3 -c` one-liners.
+- **Bash writes to `.env`** (`sed -i`, `perl -pi`): not covered at any tier.
+- **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
+- **Values already in context:** a secret that was read has reached the model provider and the transcripts; nothing recalls it.
+- **Egress:** the exfil tripwire is best-effort and misses IP literals, redirects, DNS, unlisted hosts and `WebFetch` URLs.
+- **Directory search through Bash `grep`/`rg`:** only a pattern nudge applies there.
+- **Engine crash or tampering by code running as you:** the confidentiality gates fail open, and the state's HMAC makes tampering evident, not impossible.
+
+The kit's sandbox and permission rules close most of these because they enforce file and network policy on every sandboxed process, not on command text. Neither layer closes values already in context, `WebFetch` URLs [unverified], DNS, MCP server processes, or commands the kit leads with `excludedCommands` (`anchor test*` and `surfpool *` run unsandboxed).
+
+**Recommended:** run safe-ai-skill together with solana-ai-kit's firewall at Relaxed or above, or enable Claude Code's own sandbox with the `denyRead` and `deniedDomains` entries in [SECURITY.md](SECURITY.md#recommended-setup). `safe-ai-skill doctor` checks your settings and prints the snippet. The scope split between the two projects is proposed in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265); until the kit moves its plugin pin, it still ships safe-ai-skill 1.0.0.
 
 ## Install
 
@@ -97,12 +119,13 @@ The npm and standalone paths download the binary matching their release tag and 
 - CLI commands: any `solana`, `spl-token`, `anchor`, or arbitrary shell command matching policy
 - MCP calls: value-moving and authority-changing verbs (`send*`, `stake*`, `delegate*`, `mint*`, `bridge*`, `lend*`, `borrow*`) across any connected MCP
 - Secret reads: `.env` and other env files, keypair files (by name and by content), private keys, credential paths — on Read, Grep and MCP path arguments, matched case-insensitively and through symlinks (see [Secrets and `.env`](#secrets-and-env)). A [varlock](https://varlock.dev) `.env.schema` stays readable but is denied when it holds key material (a keypair, a private-key block, an API token, or a literal value on a secret-named key; `varlock(...)` calls, `$VAR` references and placeholders don't count), is over 64 KiB, or is not a regular `.env.schema` file. safe-ai-skill never runs `varlock`.
+- Naive-exfil tripwire (best-effort): a network-capable command (`curl`, `wget`, `nc`, `scp`, `git push` to a new remote, an interpreter one-liner naming a URL, …) that takes a secret file as input is denied (key material at every tier, project env files from Relaxed), and so is any request to a known request-bin, tunnel or paste host (a list of 70, 79 or 84 hosts by tier). It stops accidental and naive exfiltration, not IP literals, redirects, DNS or unlisted hosts
 - Interactive gate breakage: replaces broken `read -r` prompts (no TTY in hook context) with a functioning `ask` decision
 
 **Supply-chain (SessionStart verifier)**
 
 - Skill packs: sweeps the project's `.claude/skills`; `~/.claude/skills` only when a project's `.safe-ai-skill/policy.yaml` adds it to `supply_chain.verify_skills_dirs` (the only dir outside the project a project may add), plus packs installed there with `install --from`
-- Pack state: each skill pack and `ext/` submodule is graded (clean, warned, unreviewed, blocked) and pinned by content (ext submodules also by git SHA). A combination rule, drift from the pin, or a mismatch with a committed `.safe-ai-skill/packs.lock` blocks the pack: it is denied in place (Skill tool, `/name`, reads and Bash access inside it), never moved unless `supply_chain.on_block: move`. `safe-ai-skill verify approve <name>` (or `verify trust <dir>`, which follows the content to other worktrees) clears drift, unreviewed and reviewed lock mismatches after you confirm it; nothing clears a combination rule.
+- Pack state: each skill pack and `ext/` submodule is graded (clean, warned, unreviewed, blocked) and pinned by content (ext submodules also by git SHA). A combination rule, drift from the pin, or a mismatch with a committed `.safe-ai-skill/packs.lock` blocks the pack: it is denied in place (Skill tool, `/name`, reads and Bash access inside it) at Relaxed and above, and only reported at Off. A HIGH heuristic (unreviewed) is denied only at High. Nothing is moved unless `supply_chain.on_block: move`. `safe-ai-skill verify approve <name>` (or `verify trust <dir>`, which follows the content to other worktrees) clears drift, unreviewed and reviewed lock mismatches after you confirm it; nothing clears a combination rule.
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute
 - MCP version tracking: flags `@latest` entries as informational — does not silently rewrite them
@@ -113,13 +136,51 @@ The npm and standalone paths download the binary matching their release tag and 
 
 `mainnet_deploy` · `set_authority` · `account_close` · `secret_read`
 
-No profile, grant, flag or repo policy relaxes them. Mainnet deploys, authority changes and account closes always ask you (a mainnet `--final` deploy is denied), and secret reads are denied. Non-final deploys to other clusters are not hard guards, so a grant or profile can relax them.
+No tier, grant, flag or repo policy relaxes them. Mainnet deploys, authority changes and account closes ask you (they deny at High), and secret reads are denied. Non-final deploys to other clusters are not hard guards, so a grant can relax them below High. Irreversible actions (`--final`, program close, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, IDL erase/close, …) deny on mainnet or any cluster not positively identified as localnet or devnet, ask on an identified localnet or devnet, and no grant, tier, repo setting or env var changes either answer.
+
+## Firewall tiers
+
+The plugin takes a tier as an input: `off < relaxed < medium < high`, default `relaxed`. (The `strict`, `paranoid` and `autopilot` profiles of 1.0 map onto these; see [Upgrading to 1.1.0](#upgrading-to-110-read-before-upgrading).) **`off` is not `SAFE_AI_SKILL_DISABLE=1`:** every `deny` row below holds at Off, and nothing but a user-scope tier can lower the tier. The table is the behaviour of each gate at each tier; `n/o` means no opinion (empty stdout, the call goes on to Claude Code's own permission flow).
+
+| Gate | Off | Relaxed | Medium | High |
+|---|---|---|---|---|
+| Credential stores and key files, read by path or by command | deny | deny | deny | deny |
+| Key material sent to a network command | deny | deny | deny | deny |
+| Project env file, raw read (default `env_read: deny`) | deny | deny | deny | deny |
+| … user-scope `env_read: tier`, sandbox `On` | n/o | n/o | deny | deny |
+| … user-scope `env_read: ask`, sandbox `On` | ask | ask | ask | deny |
+| varlock commands that print values | = raw-read row | = | = | = |
+| `.env.schema` and templates (content guard applies) | n/o | n/o | n/o | n/o |
+| Write/Edit/MultiEdit to a project env file; agent `env set\|unset` | n/o | n/o | deny | deny |
+| `env keys` | n/o | n/o | n/o | n/o |
+| Pattern redaction (keys, seeds, PEM, vendor tokens) | on | on | on | on |
+| Value scrub of project env values in tool output, except an opted-in raw read | on | on | on | on |
+| Irreversible on-chain action (`--final`, program close, `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
+| … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
+| Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
+| Value-moving or authority-changing action on mainnet or an unknown cluster | ask | ask | ask | deny |
+| … with a live confirmed grant covering it (grantable scopes only) | allow | allow | allow | deny |
+| … on an identified test cluster: deploy/upgrade | n/o | n/o | n/o | n/o |
+| … transfer within spend caps | allow | allow | allow | n/o |
+| … authority change, recoverable close | ask | ask | ask | ask |
+| Solana command the parser cannot read (opaque or dynamic) | ask | ask | ask | deny |
+| MCP value-moving or signing tool (`gate-mcp`) | ask | ask | ask | deny |
+| Exfil tripwire: project env file to a network command | n/o | deny | deny | deny |
+| Exfil tripwire: known exfil host (list size) | n/o | deny (70) | deny (79) | deny (84) |
+| Inline `curl`/`wget` POST body to a non-localhost host | n/o | n/o | n/o | ask |
+| Supply chain: combination rule, drift, lock mismatch, unscanned pack | report | deny in place | deny in place | deny in place |
+| Supply chain: HIGH heuristic (unreviewed pack) | report | report | report | deny in place |
+| Tamper tripwire, authenticated state, prompt guard | on | on | on | on |
+
+What each row covers is explained in [docs/tiers.md](docs/tiers.md#behaviour-per-gate). At High the engine never emits `allow` (a grant or a within-cap transfer falls back to Claude Code's own flow), no tier emits `defer`, and headless runs turn every `ask` into a `deny`.
+
+Choose a tier with `safe-ai-skill tier` ([Usage tiers](#tier-1--gate-installs-before-they-run) lists the command). Only a user-scope tier, written by that command and confirmed by you in the prompt, can go below the default. A tier named by solana-ai-kit's `.claude/security.json`, by a repo's `.safe-ai-skill/policy.yaml` or by `SAFE_AI_SKILL_TIER` can only raise it. Without Claude Code's sandbox declared on, the label reads `relaxed (hooks only)`. Selection, the confirmation flow, migration from profiles and the headless rule are in [docs/tiers.md](docs/tiers.md).
 
 ## Secrets and `.env`
 
-Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Keypair files, private keys, `~/.ssh/id_*` and the Solana config tree are never readable. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory has env and key files excluded from its results (this also hides `.env.example` and `.env.schema` from directory searches; read them directly), and a Grep over `$HOME` or another directory containing `~/.ssh` or `~/.config/solana` is denied; Glob only lists names and is not gated. Tool output that still contains a value from a project env file is shown as `«redacted:KEY»`.
+Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Key material and home credential stores are denied at every tier, Off included, through Read, Grep, MCP path arguments and Bash readers: Solana keypairs and the Solana config tree (except `cli/config.yml`), `~/.ssh/**` (except `config`, `known_hosts` and `*.pub`), `~/.gnupg`, `~/.aws`, `~/.kube/config`, the `~/.claude/.credentials.json` token file, registry and git-host tokens (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `gh/hosts.yml`, …), keychains and password-manager stores, browser profiles and wallet-extension data. Commands that print a credential (`gh auth token`, `git credential fill`, `security find-generic-password -w`, `aws configure get *secret*`, `npm config get *_authToken`, `docker-credential-* get`, `pass show`, `op read`, `bw get`, …) are denied the same way. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory gets env, key and credential globs excluded from its results, including one rooted at or above `$HOME` (this also hides `.env.example` and `.env.schema` from directory searches; read them directly), and a Grep rooted inside a credential store is denied; Glob only lists names and is not gated. Tool output that still contains a value from a project env file, and any key, seed, PEM or vendor-token pattern, is shown redacted (`«redacted:KEY»`) at every tier. Reads of Claude Code transcripts (`~/.claude/projects/**`) are denied, which also stops the agent reading its own auto-memory files with its tools; open those yourself.
 
-Three tiers, pick the one that fits; each keeps working without the next:
+Three options, pick the one that fits; each keeps working without the next:
 
 1. **Plain `.env` + `safe-ai-skill env`.** The agent works with keys, never values:
 
@@ -132,17 +193,24 @@ Three tiers, pick the one that fits; each keeps working without the next:
 2. **Add a `.env.schema`** ([env-spec](https://varlock.dev/env-spec/), the format varlock uses). It lists keys, types and `@sensitive`/`@required` decorators and is committed, so the agent can read it directly. `safe-ai-skill env init-schema` writes one from your `.env` (keys only, every key sensitive by default), and `env keys` then annotates each key and lists declared keys that are unset. safe-ai-skill parses the schema itself: it never runs varlock, because loading a schema with varlock executes `$(…)`/`exec()` values and plugins.
 3. **varlock** with a secret provider or `varlock("local:…")` encryption. Run tools with `varlock run -- <cmd>` and inspect with `varlock load --agent`. Commands that print resolved values (`varlock printenv`, `reveal`, `load --format json|env|shell` without `--agent`, …) are treated like `cat .env`.
 
-Opt in to prompted raw reads with `secrets.env_read: ask` in the plugin's `policy/default.policy.yaml` (a project policy can't loosen it). The hooks stop a careless or prompt-injected model; for a hard boundary enable Claude Code's sandbox with `sandbox.filesystem.denyRead` — `safe-ai-skill doctor` checks your settings and prints the globs to add.
+Writes follow the tier: Write, Edit and MultiEdit to a project env file, and an agent-run `env set|unset`, are allowed at Off and Relaxed and denied at Medium and High. A write through Bash (`sed -i`, `perl -pi`, `python3 -c`) is not covered at any tier.
+
+Opt in to raw reads with `safe-ai-skill tier --env-read ask|tier` (`ask` prompts on every read below High; `tier` leaves reads alone at Off and Relaxed and denies them at Medium and High). The setting is user-scope only: lowering it needs your confirmation in the prompt, and a repo policy, a kit file or an env var can only tighten it. It works only while Claude Code's sandbox is declared on (`sandbox.enabled` in your settings, on macOS or Linux with `bwrap`); otherwise reads stay denied. The sandbox status is declared configuration, not a runtime proof. The response to an opted-in raw read isn't value-scrubbed, so the agent sees the real values and an Edit of one line leaves the others intact.
+
+The hooks stop a careless or prompt-injected model; for a hard boundary enable Claude Code's sandbox with `sandbox.filesystem.denyRead` — `safe-ai-skill doctor` checks your settings and prints the globs to add.
 
 ## Threat model
 
-safe-ai-skill protects against a careless model and prompt-injected instructions. It is not a sandbox. Code that runs unsandboxed as your user can rewrite any user-space state, including the plugin's grants, pins and settings, so the Claude Code sandbox is the hard boundary. A tamper tripwire denies agent tool calls that would loosen the firewall from the inside, but encoded commands, variable indirection and scripts written now and run later can get past it. Run `allow`, `mode <profile>` and `verify approve` yourself in a terminal.
+safe-ai-skill protects against a careless model and prompt-injected instructions. It is not a sandbox. Code that runs unsandboxed as your user can rewrite any user-space state, including the plugin's grants, pins and settings, so the Claude Code sandbox is the hard boundary. A tamper tripwire denies agent tool calls that would loosen the firewall from the inside, but encoded commands, variable indirection and scripts written now and run later can get past it. [What this plugin cannot protect on its own](#read-this-first-what-this-plugin-cannot-protect-on-its-own) lists the known holes. Run `allow`, `tier <lower>` and `verify approve` yourself in a terminal.
 
 If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE, but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
 
 ## Upgrading to 1.1.0 (read before upgrading)
 
-- **Relaxations need a code only you see.** Unexpired 1.0 grants and an `autopilot` mode become pending requests at your first 1.1.0 session; confirm each with the code shown then (type `safe-ai-skill confirm <code>` as your whole prompt), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Nothing can be confirmed in headless `claude -p`.
+- **Relaxations need a code only you see.** Unexpired 1.0 grants become pending requests at your first 1.1.0 session; confirm each as described under [Usage tiers](#tier-1--gate-installs-before-they-run), or re-create it. The 1.0 spend ledger counts as spent for the rest of that UTC day. Lowering the tier needs the same confirmation, and nothing can be confirmed in headless `claude -p`.
+- **Profiles became tiers.** `strict` (the 1.0 default) becomes `relaxed`, `paranoid` becomes `high`, and `autopilot` becomes `relaxed` (the notice names `safe-ai-skill allow --scope transfer` for what autopilot's higher cap did). A tier below `relaxed` is never migrated: a 1.0 `off` is set aside with a hint to run `safe-ai-skill tier off` (confirmed) or set `SAFE_AI_SKILL_DISABLE=1`. Your first session prints one line about it. Raw `.env` reads stay denied for everyone after the upgrade.
+- **What `relaxed` no longer asks, and now denies.** An inline `curl`/`wget` POST body to a non-localhost host no longer asks below High (JSON-RPC calls included), so CI runs stop failing on it. Irreversible actions (`--final`, program close, `spl-token close-mint|close|burn`, `authorize --disable`, IDL erase/close, `close-vote-account`) now deny on mainnet, testnet and any cluster that isn't positively identified as localnet or devnet, and still ask on an identified localnet or devnet. Sending a project env file to a network command, or any request to a known exfil host, is denied at Relaxed and above. Credential stores beyond `~/.ssh/id_*` (`~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.npmrc`, keychains, browser and wallet-extension data, and more) are read-denied at every tier.
+- **Headless asks become denies.** Under `claude -p` or CI (`CI`, `GITHUB_ACTIONS`, no `/dev/tty`, …), every `ask` is a `deny`; only a grant you confirmed interactively beforehand passes. `CONFIRM_MAINNET`-style env variables are ignored, and no setting turns headless off.
 - **Skill-pack drift is a BLOCK.** A pinned pack whose content changes is denied (the Skill tool, `/name`, reads and Bash access inside it) until you run `safe-ai-skill verify approve <name>` in a terminal and confirm it. A pack the SessionStart sweep could not fully scan in its time budget is denied the same way until a later sweep scans it; `safe-ai-skill verify check <dir>` scans it without a budget.
 - **The agent can't read Claude Code transcripts (`~/.claude/projects`) or the plugin's state key**, through Read, Grep or Bash. `safe-ai-skill doctor` recommends matching sandbox `denyRead` entries.
 - **The Skill hook fails closed**: a broken engine blocks the Skill tool until it is fixed.
@@ -153,6 +221,8 @@ If the engine can't run on a platform (no prebuilt binary, wrong executable form
 **Supply-chain threats** — skill hubs ship external submodules from third-party sources. Each submodule is its own supply-chain unit and can contain telemetry preambles, `curl | bash` installer scripts, or unpinned MCP packages. Opt-in skill catalogs include high-risk entry classes that can execute privileged code. safe-ai-skill catches all of this at session start, before any skill or MCP is active.
 
 ## Usage tiers
+
+These are levels of use (install and go, gate installs, verified hub install), not the [firewall tiers](#firewall-tiers).
 
 ### Tier 0 — install and go
 
@@ -168,45 +238,50 @@ safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.jso
 safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
 safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
-safe-ai-skill status                 # pins, active profile, live grants, spend, recent decisions
-safe-ai-skill mode <profile>         # strict (default) | paranoid | autopilot (needs confirmation)
+safe-ai-skill status                 # pins, tier, live grants, spend, recent decisions
+safe-ai-skill tier                   # show the tier, where it came from, and the sandbox state
+safe-ai-skill tier <name> [--project] [--env-read deny|ask|tier]
+                                     # off | relaxed (default) | medium | high; lowering needs confirmation
+safe-ai-skill tier --clear [--project]
 safe-ai-skill allow --scope transfer --for 30m --max-tx 1 --budget 5 [--to <addr>]
                                      # request a time-boxed grant (needs confirmation)
 safe-ai-skill revoke                 # drop every grant at once
 safe-ai-skill session                # show active session state
 ```
 
-`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. The agent may run `allow` and `mode`: they only create a request it cannot confirm. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
+`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
 
-**Relaxations need your confirmation in the prompt.** `allow` and `mode autopilot` change
-nothing on their own: they record a request (`request r3fa91c`) and print no code. Claude Code
+**Relaxations need your confirmation in the prompt.** `allow` and a `tier` lowering (or an `--env-read` loosening) change
+nothing on their own (the agent may run them, because they only create a request it cannot confirm): they record a request (`request r3fa91c`) and print no code. Claude Code
 then shows **you** a confirmation code in a hook message (right after the command, or at your
 next prompt or session start) that is never put in the agent's context. The request takes
 effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
 (within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
-pasted text is refused, and three wrong codes cancel every pending request. The agent may run
-`allow` itself: it only creates a request it cannot confirm. In headless `claude -p`, where
-hook messages aren't shown, nothing can be confirmed. A stricter `mode` and `revoke` apply at
+pasted text is refused, and three wrong codes cancel every pending request. In headless `claude -p`, where
+hook messages aren't shown, nothing can be confirmed. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 
-**Profiles.** `strict` is the default. `paranoid` asks for every Solana CLI command and
-disables every automatic allow, grants included (it does not add prompts for MCP tools or file
-reads that otherwise have no opinion). `autopilot` raises the per-transaction cap
-to 2 SOL and applies only through a confirmed `safe-ai-skill mode autopilot`.
-`SAFE_AI_SKILL_PROFILE` can only pick a stricter profile. To turn the hooks off, set
+**Tiers.** `relaxed` is the default; see [Firewall tiers](#firewall-tiers) for what each tier
+does. `safe-ai-skill tier` writes the user-scope tier (`--project` scopes it to the current
+repository). Raising it applies at once; lowering it, or loosening `--env-read`, waits for your
+confirmation. `SAFE_AI_SKILL_TIER` (alias `SAFE_AI_SKILL_PROFILE`), a repo's
+`.safe-ai-skill/policy.yaml` `tier` and solana-ai-kit's `.claude/security.json` can only
+raise the tier, so a repo or an env block can't loosen your firewall. `mode` is a deprecated
+alias for `tier`. The tier `off` keeps every `deny` row; to turn the hooks off entirely, set
 `SAFE_AI_SKILL_DISABLE=1`.
 
-**State is authenticated.** Grants, the mode, the daily spend ledger and session metadata are
+**State is authenticated.** Grants, the tier, the daily spend ledger and session metadata are
 signed with a per-install key in the plugin data directory, and each file carries a
 generation, so a hand-edited file or an older copy put back is ignored, and a deleted or edited
 spend ledger counts as today's budget spent. This is tamper-evident, not tamper-proof: code
 running as you outside the Claude Code sandbox can read the key, run the hook commands itself
 or restore a snapshot of the whole directory. The sandbox is the hard boundary. At the first
-1.1.0 session, unexpired 1.0 grants and an `autopilot` mode become pending requests you can
+1.1.0 session, unexpired 1.0 grants become pending requests you can
 confirm with the codes shown then; the 1.0 spend ledger becomes today's exhausted budget. Every session start
-lists what is currently loosened: a profile env var, a non-default mode, live grants, ignored
-repo policy, state that failed authentication, and a Claude Code sandbox that is off.
+prints `tier: <t> (<source>); sandbox: <state>` and lists what is currently loosened: a
+tier below the default, live grants, ignored repo policy and ignored tier hints, state that failed
+authentication, and a Claude Code sandbox that is off.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 
@@ -236,6 +311,17 @@ At SessionStart: block on a combination rule or drift, report a HIGH as unreview
 ## Integration model
 
 Install any skill hub (e.g. `solanabr/solana-ai-kit`) alongside safe-ai-skill as a plugin. No `settings.json` merge is needed — Claude Code merges plugin hooks with project hooks automatically. safe-ai-skill's `deny` decisions survive `enableAllProjectMcpServers: true` and `bypassPermissions`.
+
+### Using with solana-ai-kit
+
+The kit's `stbr` marketplace installs this plugin; don't add this marketplace too (only one copy's hooks register). The kit pins a specific plugin commit (1.0.0, `2997280e`, as of kit 2.4.0), so a release here reaches kit users when the kit moves the pin.
+
+- **The kit owns:** the OS sandbox, permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), and the git, publish, fetch-and-execute, `gh` and MCP tool-name gates.
+- **This plugin owns:** the Solana-semantic gates (cluster, amounts, irreversible and authority actions, mainnet, grants), secrets for plugin-only users (key material and home stores, `.env` through the `env` CLI, varlock and redaction), supply chain (scan, pins, Skill and slash deny, no moves) and a labelled best-effort exfil tripwire. It takes the kit's tier as an input: `.claude/security.json` can raise the plugin's tier, never lower it.
+- **Shared:** versioned list files in [`policy/shared/`](docs/tiers.md#shared-lists) (credential globs, exfil hosts, on-chain verbs), which the kit vendors and pins, and a conformance corpus both parsers run.
+- Duplicated hard denies are kept as defence in depth (default-wallet `solana-keygen --force`, irreversible actions on mainnet); two denies never conflict.
+
+The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs); the proposed kit-side changes are drafted in [docs/drafts/aikit-firewall-split.md](docs/drafts/aikit-firewall-split.md). Until the kit change lands, `/firewall` does not run `safe-ai-skill tier`; run `safe-ai-skill tier <t> --project` yourself. Today both hook sets run on every Bash call.
 
 safe-ai-skill is standalone — it can be installed independently of any particular skill hub. It adds a security and control layer over whatever skills, MCPs, and agents you already have.
 
