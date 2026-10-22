@@ -1,10 +1,17 @@
 //! Model-facing text (spec D2.4, D2.3 `prompt_injection`): the `SKILL.md` description is
-//! injected into every session, so shell syntax, a fetch-this URL or injected instructions in it
-//! block; a bare URL warns. Prompt-injection phrasing and instruction-carrying HTML comments
-//! warn anywhere.
+//! injected into every session, so shell syntax, a URL with an action verb or next to a
+//! credential, or injected instructions in it block; a bare URL warns. A frontmatter that never
+//! closes or runs past [`MAX_FRONTMATTER_LINES`] is HIGH. Prompt-injection phrasing and
+//! instruction-carrying HTML comments warn anywhere.
 
-use super::context::{self, find_word, Document, T_INJECT};
+use serde::Deserialize;
+
+use super::context::{self, find_word, Document, Frontmatter, MAX_FRONTMATTER_LINES, T_INJECT};
+use super::secrets_ctx::has_secret_path;
 use super::{line_no, Ctx, FileOut, Severity, Signal};
+
+/// Bytes of frontmatter handed to the YAML parser (aliases in other keys are never expanded).
+const MAX_YAML_BYTES: usize = 64 * 1024;
 
 /// Shell metasyntax that has no business in a description.
 const SHELL_SYNTAX: &[&str] = &[
@@ -37,11 +44,34 @@ const SHELL_SYNTAX: &[&str] = &[
     "iex(",
     "iex (",
 ];
-/// Verbs that turn a URL into an instruction to fetch it.
-const FETCH_VERBS: &[&str] = &[
-    "fetch", "download", "curl", "wget", "visit", "navigate", "open", "follow", "load", "retrieve",
-    "pull", "run", "execute", "source", "go to",
+/// Verbs that turn a URL into an instruction: fetch it, send something to it, or obey it.
+const URL_VERBS: &[&str] = &[
+    "fetch", "curl", "wget", "download", "get", "visit", "open", "navigate", "go to", "send",
+    "post", "upload", "submit", "report", "read", "obey", "consult", "follow", "load", "retrieve",
+    "pull", "run", "execute", "source", "install",
 ];
+/// Credential and environment terms that make any URL in the description a destination for
+/// them (secret paths count too). A generic "API key" does not: vendor descriptions name it.
+const CREDENTIAL_TERMS: &[&str] = &[
+    "private key",
+    "secret key",
+    "seed phrase",
+    "recovery phrase",
+    "mnemonic",
+    "password",
+    "passphrase",
+    "ssh key",
+    "keypair file",
+    "wallet file",
+    "env vars",
+    "environment variables",
+    "process.env",
+    "os.environ",
+    "printenv",
+];
+/// Bytes before and after a URL searched for an action verb (same sentence only).
+const VERB_WINDOW_BEFORE: usize = 60;
+const VERB_WINDOW_AFTER: usize = 40;
 /// Instructions aimed at every turn rather than at a task.
 const PRE_TASK: &[&str] = &[
     "before responding",
@@ -54,6 +84,11 @@ const PRE_TASK: &[&str] = &[
     "before every response",
     "before each response",
     "before doing anything else",
+    "before anything",
+    "first, always run",
+    "first always run",
+    "always run this first",
+    "always run the following first",
     "before any other task",
     "before any other action",
     "at the start of every session",
@@ -172,12 +207,26 @@ const INJECTION: &[&[Slot]] = &[
     ],
 ];
 
-/// The `description` of a `SKILL.md` (injected into every session's skill listing).
+/// The `description` of a `SKILL.md` (injected into every session's skill listing). It is read
+/// twice: as YAML (quotes, escapes and block scalars decoded), and line by line for a top-level
+/// key with optional quotes and spaces before the colon, so a frontmatter YAML rejects is still
+/// read. Every reading is checked.
 pub(super) fn scan_frontmatter(doc: &Document<'_>, out: &mut FileOut) {
+    match doc.frontmatter_shape() {
+        Frontmatter::Absent => return,
+        Frontmatter::Unterminated => {
+            out.emit("frontmatter_anomaly", Severity::High, Some(1), Ctx::Meta);
+        }
+        Frontmatter::Closed { end } if end > MAX_FRONTMATTER_LINES => {
+            out.emit("frontmatter_anomaly", Severity::High, Some(1), Ctx::Meta);
+        }
+        Frontmatter::Closed { .. } => {}
+    }
     let range = doc.frontmatter();
+    let mut readings: Vec<(u32, String)> = Vec::new();
     let mut i = range.start;
     while i < range.end {
-        let Some(rest) = doc.line(i).strip_prefix("description:") else {
+        let Some(rest) = description_value(doc.line(i)) else {
             i += 1;
             continue;
         };
@@ -194,8 +243,69 @@ pub(super) fn scan_frontmatter(doc: &Document<'_>, out: &mut FileOut) {
             text.push_str(doc.line(i).trim());
             i += 1;
         }
-        check_description(&normalize(&text), line_no(start), out);
+        let entry: Vec<&str> = (start..i).map(|k| doc.line(k)).collect();
+        if let Some(decoded) = yaml_description(&entry.join("\n")) {
+            readings.push((line_no(start), decoded));
+        }
+        readings.push((line_no(start), text));
     }
+    let body: Vec<&str> = range.clone().map(|k| doc.line(k)).collect();
+    if let Some(decoded) = yaml_description(&body.join("\n")) {
+        let line = readings.first().map_or(line_no(range.start), |r| r.0);
+        readings.push((line, decoded));
+    }
+    let mut url_line = None;
+    for (line, text) in &readings {
+        match check_description(&normalize(text)) {
+            Verdict::Injected => {
+                out.emit(
+                    "description_injection",
+                    Severity::High,
+                    Some(*line),
+                    Ctx::Meta,
+                );
+                out.signal(Signal::DescInjection(*line), Ctx::Meta);
+                return;
+            }
+            Verdict::Url => {
+                url_line.get_or_insert(*line);
+            }
+            Verdict::Clean => {}
+        }
+    }
+    if let Some(line) = url_line {
+        out.emit("description_url", Severity::Warn, Some(line), Ctx::Meta);
+    }
+}
+
+/// The value after a top-level `description` key (`description:`, `"description":`,
+/// `description :`, any case). Indented keys belong to nested mappings.
+fn description_value(line: &str) -> Option<&str> {
+    const KEY: &str = "description";
+    let (quote, rest) = match line.as_bytes().first()? {
+        q @ (b'"' | b'\'') => (Some(*q), &line[1..]),
+        _ => (None, line),
+    };
+    if !rest.get(..KEY.len())?.eq_ignore_ascii_case(KEY) {
+        return None;
+    }
+    let mut rest = &rest[KEY.len()..];
+    if let Some(q) = quote {
+        rest = rest.strip_prefix(char::from(q))?;
+    }
+    rest.trim_start_matches([' ', '\t']).strip_prefix(':')
+}
+
+/// The decoded `description` string of a YAML document, when it parses.
+fn yaml_description(yaml: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Front {
+        description: Option<String>,
+    }
+    if yaml.len() > MAX_YAML_BYTES {
+        return None;
+    }
+    serde_yaml::from_str::<Front>(yaml).ok()?.description
 }
 
 /// Lowercase, decode tag characters to ASCII and drop zero-width characters.
@@ -210,43 +320,78 @@ fn normalize(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn check_description(d: &str, line: u32, out: &mut FileOut) {
+enum Verdict {
+    Clean,
+    Url,
+    Injected,
+}
+
+fn check_description(d: &str) -> Verdict {
     let injected = SHELL_SYNTAX.iter().any(|m| d.contains(m))
-        || fetch_this_url(d)
+        || url_instruction(d)
         || PRE_TASK.iter().any(|m| d.contains(m))
         || injection_phrase(d);
     if injected {
-        out.emit(
-            "description_injection",
-            Severity::High,
-            Some(line),
-            Ctx::Meta,
-        );
-        out.signal(Signal::DescInjection(line), Ctx::Meta);
+        Verdict::Injected
     } else if d.contains("://") || d.contains("www.") {
-        out.emit("description_url", Severity::Warn, Some(line), Ctx::Meta);
+        Verdict::Url
+    } else {
+        Verdict::Clean
     }
 }
 
-/// A URL with a fetch/visit/follow verb in front of it, in the same sentence.
-fn fetch_this_url(d: &str) -> bool {
+/// A URL that comes with an action verb in its sentence, or any URL in a description that also
+/// names a secret path or a credential term (spec D2.4 deviation, see `docs/scanner-coverage.md`).
+fn url_instruction(d: &str) -> bool {
+    let urls = url_spans(d);
+    if urls.is_empty() {
+        return false;
+    }
+    if has_secret_path(d) || CREDENTIAL_TERMS.iter().any(|t| d.contains(t)) {
+        return true;
+    }
+    urls.iter().any(|&(start, end)| {
+        let sentence_start = d[..start].rfind(['.', '!', '?', ';']).map_or(0, |q| q + 1);
+        let lo = sentence_start.max(start.saturating_sub(VERB_WINDOW_BEFORE));
+        let lo = context::floor_char_boundary(d, lo);
+        let tail = &d[end..];
+        let sentence_end = tail.find(['.', '!', '?', ';']).unwrap_or(tail.len());
+        let hi = context::floor_char_boundary(tail, sentence_end.min(VERB_WINDOW_AFTER));
+        let around = [&d[lo..start], &tail[..hi]];
+        around
+            .iter()
+            .any(|w| URL_VERBS.iter().any(|v| find_word(w, v).is_some()))
+    })
+}
+
+/// Byte spans of the URLs in `d`: a `scheme://host…` with a host, or a `www.` name.
+fn url_spans(d: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let end_of = |from: usize| {
+        d[from..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ')' | '>' | ']'))
+            .map_or(d.len(), |q| from + q)
+    };
     let mut from = 0;
-    while let Some((p, _)) = context::next_url_host(d, from) {
+    while let Some((p, host)) = context::next_url_host(d, from) {
         from = p + 3;
-        let scheme = d[..p]
-            .rfind(|c: char| !c.is_ascii_alphanumeric())
+        if host.is_empty() {
+            continue;
+        }
+        let start = d[..p]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '+' | '-' | '.'))
             .map_or(0, |q| q + 1);
-        let sentence = d[..scheme].rfind(['.', '!', '?', ';']).map_or(0, |q| q + 1);
-        let lo = sentence.max(scheme.saturating_sub(60));
-        let lo = (lo..=scheme)
-            .find(|&k| d.is_char_boundary(k))
-            .unwrap_or(scheme);
-        let window = &d[lo..scheme];
-        if FETCH_VERBS.iter().any(|v| find_word(window, v).is_some()) {
-            return true;
+        spans.push((start, end_of(p + 3)));
+    }
+    let mut from = 0;
+    while let Some(p) = d.get(from..).and_then(|r| r.find("www.")).map(|p| p + from) {
+        from = p + 4;
+        let boundary = p == 0 || !d.as_bytes()[p - 1].is_ascii_alphanumeric();
+        if boundary && !spans.iter().any(|&(s, e)| s <= p && p < e) {
+            spans.push((p, end_of(p)));
         }
     }
-    false
+    spans
 }
 
 /// True when (lowercased) `text` carries a prompt-injection phrase.
@@ -408,6 +553,29 @@ mod tests {
             .collect();
         let r = scan_one("SKILL.md", &skill(&format!("Formats text.{hidden}")));
         assert!(combo(&r, "description_injection").is_some(), "{r:?}");
+    }
+
+    #[test]
+    fn description_key_forms() {
+        use super::description_value;
+        assert_eq!(description_value("description: x"), Some(" x"));
+        assert_eq!(description_value("\"description\": x"), Some(" x"));
+        assert_eq!(description_value("'Description' : x"), Some(" x"));
+        assert_eq!(description_value("description\t:x"), Some("x"));
+        assert_eq!(description_value("  description: x"), None);
+        assert_eq!(description_value("descriptions: x"), None);
+        assert_eq!(description_value("description_long: x"), None);
+        assert_eq!(description_value("\"description: x"), None);
+    }
+
+    #[test]
+    fn frontmatter_shapes() {
+        let ok = scan_one("SKILL.md", &skill("Formats text."));
+        assert!(!has(&ok, "frontmatter_anomaly"), "{ok:?}");
+        let open = scan_one("SKILL.md", "---\nname: s\ndescription: Formats text.\n");
+        assert!(has(&open, "frontmatter_anomaly"), "{open:?}");
+        let readme = scan_one("README.md", "---\nname: s\n");
+        assert!(!has(&readme, "frontmatter_anomaly"), "{readme:?}");
     }
 
     #[test]

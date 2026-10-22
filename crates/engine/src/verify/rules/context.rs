@@ -13,8 +13,8 @@ use super::{line_no, Ctx};
 
 /// Longest statement (in lines) the builder joins, bounding cross-line co-occurrence.
 const MAX_STMT_LINES: usize = 32;
-/// Frontmatter longer than this is treated as prose (a stray `---` rule).
-const MAX_FRONTMATTER_LINES: usize = 200;
+/// A frontmatter longer than this is an anomaly: real ones are a handful of keys.
+pub(crate) const MAX_FRONTMATTER_LINES: usize = 200;
 
 /// Language family of a unit: drives comment syntax and the sink vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +219,17 @@ pub(crate) fn fence_lang(info: &str) -> Lang {
     }
 }
 
+/// How a Markdown file opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Frontmatter {
+    /// The first line is not `---`.
+    Absent,
+    /// `---` closed by `---` or `...` on line index `end`.
+    Closed { end: usize },
+    /// `---` that never closes.
+    Unterminated,
+}
+
 /// One decoded file, split into lines with roles and analysis units.
 pub(crate) struct Document<'a> {
     pub(crate) text: &'a str,
@@ -230,6 +241,7 @@ pub(crate) struct Document<'a> {
     bits: Vec<u32>,
     roles: Vec<Role>,
     units: Vec<Unit>,
+    fm: Frontmatter,
 }
 
 impl<'a> Document<'a> {
@@ -275,6 +287,7 @@ impl<'a> Document<'a> {
             bits,
             roles: Vec::new(),
             units: Vec::new(),
+            fm: Frontmatter::Absent,
         };
         match class {
             FileClass::Code(lang) => {
@@ -350,17 +363,18 @@ impl<'a> Document<'a> {
         &self.units
     }
 
-    /// Line indices of the frontmatter body (between the `---` delimiters).
+    /// How the file opens (Markdown only; other files are [`Frontmatter::Absent`]).
+    pub(crate) fn frontmatter_shape(&self) -> Frontmatter {
+        self.fm
+    }
+
+    /// Line indices of the frontmatter body: between the `---` delimiters, or every line after
+    /// an opening `---` that never closes (those lines stay prose for every other rule).
     pub(crate) fn frontmatter(&self) -> std::ops::Range<usize> {
-        let end = self
-            .roles
-            .iter()
-            .position(|r| *r != Role::Frontmatter)
-            .unwrap_or(self.roles.len());
-        if end >= 2 {
-            1..end - 1
-        } else {
-            0..0
+        match self.fm {
+            Frontmatter::Absent => 0..0,
+            Frontmatter::Closed { end } => 1..end,
+            Frontmatter::Unterminated => 1..self.len(),
         }
     }
 
@@ -368,20 +382,17 @@ impl<'a> Document<'a> {
         let n = self.spans.len();
         self.roles = vec![Role::Prose; n];
         let mut i = 0;
-        if n > 0 && self.line(0).trim_end() == "---" {
-            let mut j = 1;
-            while j < n && j < MAX_FRONTMATTER_LINES {
-                let t = self.line(j).trim_end();
-                if t == "---" || t == "..." {
-                    break;
+        if n > 0 && self.line(0).trim_start_matches('\u{feff}').trim_end() == "---" {
+            let close = (1..n).find(|&j| matches!(self.line(j).trim_end(), "---" | "..."));
+            match close {
+                Some(j) => {
+                    for role in &mut self.roles[..=j] {
+                        *role = Role::Frontmatter;
+                    }
+                    self.fm = Frontmatter::Closed { end: j };
+                    i = j + 1;
                 }
-                j += 1;
-            }
-            if j < n && j < MAX_FRONTMATTER_LINES {
-                for role in &mut self.roles[..=j] {
-                    *role = Role::Frontmatter;
-                }
-                i = j + 1;
+                None => self.fm = Frontmatter::Unterminated,
             }
         }
         while i < n {
