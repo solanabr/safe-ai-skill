@@ -284,6 +284,8 @@ const BOOL_FLAGS: &[&str] = &[
     // Irreversible-action flags.
     "--final",
     "--disable",
+    // `solana program close <program-id>` confirmation (Class U).
+    "--bypass-warning",
 ];
 
 /// Short flags that take a value, with the long flag each stands for (`-p` differs by CLI).
@@ -1312,5 +1314,15 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_PLUGIN_DATA", v),
             None => std::env::remove_var("CLAUDE_PLUGIN_DATA"),
         }
+    }
+
+    #[test]
+    fn bypass_warning_is_boolean_and_leaves_the_cluster_flag_alone() {
+        let tokens = tokenize("solana program close P --bypass-warning -ud");
+        let argv = Argv::parse(&tokens);
+        assert!(argv.has_flag("--bypass-warning"));
+        assert_eq!(argv.network(), Some(Network::Devnet));
+        assert_eq!(argv.positionals, vec!["program", "close", "P"]);
+        assert_eq!(argv.uncertain_from, None);
     }
 }

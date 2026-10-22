@@ -255,10 +255,9 @@ fn family_decision(
 ) -> (Decision, GateMeta) {
     let tier = policy.tier();
     let program = cmd.program();
-    let (words, extra) = split_extra_bools(&cmd.words);
-    let argv = Argv::from_shell(&words);
+    let argv = Argv::from_shell(&cmd.words);
     let cluster = command_cluster(cmd, &argv, &program, ctx, parsed);
-    let irreversible = match irreversible_match(&program, &argv, &extra) {
+    let irreversible = match irreversible_match(&program, &argv) {
         Ok(found) => found,
         Err(_) => return unreadable_at(ask_lists_unavailable(&program), tier),
     };
@@ -302,11 +301,10 @@ fn dynamic_decision(
     if !cmd.words.first().is_some_and(|w| w.dynamic) {
         return None;
     }
-    let (words, extra) = split_extra_bools(&cmd.words);
-    let argv = Argv::from_shell(&words);
+    let argv = Argv::from_shell(&cmd.words);
     let irreversible = shell::FAMILY
         .iter()
-        .find_map(|program| irreversible_match(program, &argv, &extra).ok().flatten());
+        .find_map(|program| irreversible_match(program, &argv).ok().flatten());
     let dynamic = shell::dynamic_family_program(cmd, parsed);
     if !dynamic && irreversible.is_none() {
         return None;
@@ -453,30 +451,6 @@ fn command_cluster(
     Cluster { network, source }
 }
 
-/// Boolean flags of Class U rows that the shared flag model ([`Argv`]) does not list: read
-/// as unknown, they would make the next word (`--bypass-warning -ud`) a possible value.
-const EXTRA_BOOL_FLAGS: &[&str] = &["--bypass-warning"];
-
-/// `words` without the [`EXTRA_BOOL_FLAGS`], and the ones present.
-fn split_extra_bools(words: &[shell::Word]) -> (Vec<shell::Word>, Vec<&'static str>) {
-    let mut found: Vec<&'static str> = Vec::new();
-    let kept = words
-        .iter()
-        .enumerate()
-        .filter(|(i, w)| {
-            let extra = (*i > 0)
-                .then(|| EXTRA_BOOL_FLAGS.iter().find(|f| w.text == **f))
-                .flatten();
-            if let Some(flag) = extra {
-                found.push(flag);
-            }
-            extra.is_none()
-        })
-        .map(|(_, w)| w.clone())
-        .collect();
-    (kept, found)
-}
-
 /// Class U rows the shared list does not spell but this gate also treats as Class U (same
 /// argv grammar): `anchor program close` of a program, and `--final` on the other deploy
 /// commands. `anchor legacy-idl …` is read as `anchor idl …`.
@@ -492,7 +466,6 @@ const EXTRA_IRREVERSIBLE: &[&[&str]] = &[
 fn irreversible_match(
     program: &str,
     argv: &Argv,
-    extra: &[&str],
 ) -> Result<Option<String>, lists::ListsUnavailable> {
     let mut tokens: Vec<String> = Vec::with_capacity(argv.positionals.len() + 1);
     tokens.push(program.to_ascii_lowercase());
@@ -508,7 +481,7 @@ fn irreversible_match(
     let built_in = EXTRA_IRREVERSIBLE.iter().map(|r| r.to_vec());
     Ok(listed
         .chain(built_in)
-        .find(|row| row_matches(row, &tokens, |f| argv.has_flag(f) || extra.contains(&f)))
+        .find(|row| row_matches(row, &tokens, |f| argv.has_flag(f)))
         .map(|row| describe_row(&row, &tokens)))
 }
 

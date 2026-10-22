@@ -607,7 +607,8 @@ fn high_never_allows_and_paranoid_is_its_alias() {
         ("SAFE_AI_SKILL_PROFILE", "paranoid"),
     ] {
         assert_eq!(sb.bash(&devnet_transfer("0.5"), &[env]), "", "{env:?}");
-        assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[env]), "ask", "{env:?}");
+        // Spec §2: Class C on mainnet denies at High.
+        assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[env]), "deny", "{env:?}");
     }
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "allow");
     assert_eq!(

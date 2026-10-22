@@ -245,7 +245,7 @@ fn hooks_json_wires_the_shared_contract_hooks() {
     ));
 }
 
-/// The final 1.1.0 shape: `onFailure: block` on the three Solana CLI entries and the Skill
+/// The final shape: `onFailure: block` on the unconditional Bash `gate-bash` entry and the Skill
 /// matcher only, `continue` everywhere else, and every hook the workstreams added is present.
 #[test]
 fn hooks_json_final_shape() {
@@ -272,15 +272,11 @@ fn hooks_json_final_shape() {
         }
     }
     blocking.sort();
-    let want: Vec<(String, String, String)> = [
-        ("Bash", "gate-bash", "Bash(anchor *)"),
-        ("Bash", "gate-bash", "Bash(solana *)"),
-        ("Bash", "gate-bash", "Bash(spl-token *)"),
-        ("Skill", "gate-skill", ""),
-    ]
-    .iter()
-    .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
-    .collect();
+    let want: Vec<(String, String, String)> =
+        [("Bash", "gate-bash", ""), ("Skill", "gate-skill", "")]
+            .iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+            .collect();
     assert_eq!(blocking, want);
     let has = |event: &str, matcher: &str, sub: &str| {
         entries(event).into_iter().any(|(m, h)| {
