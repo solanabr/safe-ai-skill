@@ -228,8 +228,14 @@ impl PendingLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NONBLOCK: a planted FIFO fails open() instead of hanging the hook.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(dir.path.join(LOCK_FILE))?;
+        if !file.metadata()?.is_file() {
+            return Err(Error::Other(
+                "pending lock is not a regular file".to_string(),
+            ));
+        }
         let deadline = std::time::Instant::now() + LOCK_WAIT;
         loop {
             // SAFETY: the fd is open for the lifetime of `file`.
@@ -243,7 +249,8 @@ impl PendingLock {
         }
     }
 
-    /// An `O_EXCL` lock file, removed on drop; one older than 10 s is taken as stale.
+    /// An `O_EXCL` lock file, removed on drop; one older than 10 s is taken as stale and broken
+    /// with [`statefile::break_stale`] (rename aside, then remove).
     #[cfg(not(unix))]
     fn acquire(dir: &DataDir) -> Result<PendingLock, EngineError> {
         let path = dir.path.join(LOCK_FILE);
@@ -258,7 +265,7 @@ impl PendingLock {
                         .and_then(|m| m.elapsed().ok())
                         .is_some_and(|age| age.as_secs() > 10);
                     if stale {
-                        let _ = std::fs::remove_file(&path);
+                        statefile::break_stale(&path)?;
                         continue;
                     }
                 }
@@ -584,6 +591,21 @@ mod tests {
                 "{n}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_lock_is_refused_without_hanging() {
+        let dir = tmp_data("lockfifo");
+        let n = grant(&dir);
+        std::fs::remove_file(dir.path.join(LOCK_FILE)).unwrap();
+        crate::statefile::tests::mkfifo(&dir.path.join(LOCK_FILE));
+        assert!(create_pending(&dir, PendingKind::Mode, "m", json!(null)).is_err());
+        assert_eq!(
+            confirm_from_prompt(&dir, &confirm_line(&n), now_secs()),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

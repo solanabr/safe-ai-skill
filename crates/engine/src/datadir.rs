@@ -26,8 +26,10 @@
 //!   `getpwuid_r(geteuid())->pw_dir` on unix. This root is trusted even when the project or
 //!   the hook cwd contains it (claude started in `$HOME`). On Windows there is no user
 //!   database lookup yet: `USERPROFILE` stands in, which a repo's settings env could override;
-//! - `$CLAUDE_CONFIG_DIR/plugins/data`, only when the canonical `CLAUDE_CONFIG_DIR` is not
-//!   inside `CLAUDE_PROJECT_DIR`, the hook cwd, `$TMPDIR` or `/tmp`.
+//! - `$CLAUDE_CONFIG_DIR/plugins/data`, only when the canonical `CLAUDE_CONFIG_DIR` is under
+//!   the passwd home and not inside `CLAUDE_PROJECT_DIR` or the hook cwd, and the data dir
+//!   itself is not inside either. (An allow-list: a deny-list of temp dirs would trust
+//!   whatever a repo-set `TMPDIR` leaves out.)
 //!
 //! Everything else is untrusted. Callers still read untrusted state for tightening; they never
 //! relax on it.
@@ -93,7 +95,6 @@ pub fn data_dir() -> Result<DataDir, EngineError> {
 pub fn data_dir_with_cwd(cwd: Option<&Path>) -> Result<DataDir, EngineError> {
     let mut env = Env::from_lookup(|k| std::env::var_os(k));
     env.passwd_home = passwd_home();
-    env.temp_roots = vec![std::env::temp_dir(), PathBuf::from("/tmp")];
     resolve(&env, cwd)
 }
 
@@ -107,8 +108,6 @@ struct Env {
     project_dir: Option<PathBuf>,
     /// The OS user-database home: the trusted home root.
     passwd_home: Option<PathBuf>,
-    /// Dirs a trusted `CLAUDE_CONFIG_DIR` may not be inside.
-    temp_roots: Vec<PathBuf>,
 }
 
 impl Env {
@@ -120,7 +119,6 @@ impl Env {
             env_home: var("HOME").or_else(|| var("USERPROFILE")),
             project_dir: var("CLAUDE_PROJECT_DIR"),
             passwd_home: None,
-            temp_roots: Vec::new(),
         }
     }
 
@@ -216,21 +214,25 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
         return true;
     }
 
-    let (Some(cfg), Some(cfg_root)) = (&env.config_dir, env.config_root()) else {
+    // `$CLAUDE_CONFIG_DIR` is env-settable, so its root is allow-listed: the config dir must
+    // be under the passwd home, and neither it nor the data dir inside the project or cwd.
+    let (Some(cfg), Some(cfg_root), Some(home)) =
+        (&env.config_dir, env.config_root(), &env.passwd_home)
+    else {
         return false;
     };
-    let Some(cfg) = canonical_lenient(cfg) else {
+    let (Some(cfg), Some(home)) = (canonical_lenient(cfg), canonical_lenient(home)) else {
         return false;
     };
-    let contains_cfg = |base: &Path| canonical_lenient(base).is_some_and(|b| cfg.starts_with(&b));
-    let forbidden = env
+    let session_dirs: Vec<PathBuf> = env
         .project_dir
         .iter()
         .map(PathBuf::as_path)
         .chain(cwd)
-        .chain(env.temp_roots.iter().map(PathBuf::as_path))
-        .any(contains_cfg);
-    !forbidden && strictly_inside(&cfg_root)
+        .filter_map(canonical_lenient)
+        .collect();
+    let in_session = |p: &Path| session_dirs.iter().any(|d| p.starts_with(d));
+    cfg.starts_with(&home) && !in_session(&cfg) && !in_session(&canon) && strictly_inside(&cfg_root)
 }
 
 /// The effective user's home from the OS user database (`getpwuid_r`).
@@ -330,8 +332,7 @@ mod tests {
         dir
     }
 
-    /// An environment whose user-database home is `home`. The sandbox lives under the real
-    /// temp dir, so no temp root is set (tests that need one set it).
+    /// An environment whose user-database home is `home`.
     fn env_home(home: &Path) -> Env {
         Env {
             env_home: Some(home.to_path_buf()),
@@ -474,30 +475,49 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_root_is_trusted_outside_project_cwd_and_temp() {
-        let base = tmp("cfgok");
-        let cfg = base.join("cfg");
+    fn config_dir_under_the_passwd_home_is_trusted_outside_project_and_cwd() {
+        let home = tmp("cfgok");
+        let cfg = home.join(".claude-alt");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
         let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
         let env = Env {
-            config_dir: Some(cfg.clone()),
-            project_dir: Some(base.join("proj")),
-            ..with_plugin_data(env_home(&base.join("home")), pd)
+            config_dir: Some(cfg),
+            project_dir: Some(project.clone()),
+            ..with_plugin_data(env_home(&home), pd)
         };
-        std::fs::create_dir_all(base.join("proj")).unwrap();
-        assert!(resolve(&env, Some(&base.join("proj"))).unwrap().trusted);
-        let _ = std::fs::remove_dir_all(&base);
+        assert!(resolve(&env, Some(&project)).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn config_dir_outside_the_passwd_home_is_untrusted() {
+        // A repo sets CLAUDE_CONFIG_DIR (and TMPDIR, so no deny-list can help) elsewhere.
+        let home = tmp("cfghome");
+        let elsewhere = tmp("cfgelsewhere");
+        let pd = elsewhere
+            .join("plugins")
+            .join("data")
+            .join("safe-ai-skill-stbr");
+        let env = Env {
+            config_dir: Some(elsewhere.clone()),
+            ..with_plugin_data(env_home(&home), pd)
+        };
+        assert!(!resolve(&env, None).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
     fn config_dir_inside_the_project_or_cwd_is_untrusted() {
-        let base = tmp("cfgproj");
-        let project = base.join("proj");
+        let home = tmp("cfgproj");
+        let project = home.join("proj");
         let cfg = project.join(".cfg");
         std::fs::create_dir_all(&cfg).unwrap();
         let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
         let env = Env {
             config_dir: Some(cfg.clone()),
-            ..with_plugin_data(env_home(&base.join("home")), pd)
+            ..with_plugin_data(env_home(&home), pd)
         };
         assert!(resolve(&env, None).unwrap().trusted, "control");
         let in_project = Env {
@@ -506,21 +526,28 @@ mod tests {
         };
         assert!(!resolve(&in_project, None).unwrap().trusted);
         assert!(!resolve(&env, Some(&project)).unwrap().trusted);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn config_dir_inside_a_temp_root_is_untrusted() {
-        let base = tmp("cfgtmp");
-        let cfg = base.join("cfg");
-        let pd = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
+    fn data_dir_in_the_project_under_a_config_root_is_untrusted() {
+        // The config dir itself is fine; the project sits inside its data root.
+        let home = tmp("cfgdataproj");
+        let cfg = home.join(".claude-alt");
+        let project = cfg.join("plugins").join("data").join("safe-ai-skill-x");
+        std::fs::create_dir_all(&project).unwrap();
         let env = Env {
             config_dir: Some(cfg),
-            temp_roots: vec![base.clone()],
-            ..with_plugin_data(env_home(&base.join("home")), pd)
+            ..with_plugin_data(env_home(&home), project.join("state"))
         };
-        assert!(!resolve(&env, None).unwrap().trusted);
-        let _ = std::fs::remove_dir_all(&base);
+        assert!(resolve(&env, None).unwrap().trusted, "control");
+        let in_project = Env {
+            project_dir: Some(project.clone()),
+            ..env.clone()
+        };
+        assert!(!resolve(&in_project, None).unwrap().trusted);
+        assert!(!resolve(&env, Some(&project)).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

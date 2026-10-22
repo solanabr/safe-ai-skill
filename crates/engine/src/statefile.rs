@@ -103,7 +103,7 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
     if !valid_name(name) {
         return Err(Error::Other(format!("invalid state file name `{name}`")));
     }
-    if has_non_finite_float(v) {
+    if has_non_finite_float(v)? {
         return Err(Error::Other(format!(
             "refusing to store `{name}`: it holds a NaN or infinite number"
         )));
@@ -118,8 +118,9 @@ pub fn store<T: Serialize>(dir: &DataDir, name: &str, v: &T) -> Result<(), Engin
 }
 
 /// Whether `v` serializes any NaN or infinite float. serde_json would write those as `null`,
-/// which then fails to load as the number type; serde_yaml keeps them, so walk its value.
-fn has_non_finite_float<T: Serialize>(v: &T) -> bool {
+/// which then fails to load as the number type; serde_yaml keeps them, so walk its value. A
+/// value serde_yaml cannot represent is an error: unscanned, it is not stored.
+fn has_non_finite_float<T: Serialize>(v: &T) -> Result<bool, EngineError> {
     fn walk(y: &serde_yaml::Value) -> bool {
         use serde_yaml::Value as Y;
         match y {
@@ -130,7 +131,9 @@ fn has_non_finite_float<T: Serialize>(v: &T) -> bool {
             Y::Null | Y::Bool(_) | Y::String(_) => false,
         }
     }
-    serde_yaml::to_value(v).map(|y| walk(&y)).unwrap_or(false)
+    serde_yaml::to_value(v)
+        .map(|y| walk(&y))
+        .map_err(|e| Error::Other(format!("state value cannot be checked for NaN/inf: {e}")))
 }
 
 /// A state file name is one plain path component and never the key itself.
@@ -250,7 +253,8 @@ fn read_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK: a planted FIFO must not hang the hook in open(); regular files ignore it.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let f = opts.open(dir.join(KEY_FILE))?;
     let meta = f.metadata()?;
@@ -299,7 +303,7 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if !replaced_stale && is_stale_empty_key(&path) {
                     replaced_stale = true;
-                    std::fs::remove_file(&path)?;
+                    break_stale_with(&path, |moved| moved.is_file() && moved.len() == 0)?;
                     continue;
                 }
                 let mut last = Error::Other("state key refused: wrong length".to_string());
@@ -319,6 +323,46 @@ fn load_or_create_key(dir: &Path) -> Result<Vec<u8>, EngineError> {
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Break a stale lock-like file without racing whoever replaced it meanwhile: rename it to a
+/// unique name (atomic, so exactly one breaker gets it), then remove that name. A path that
+/// is already gone is not an error.
+#[cfg(any(test, not(unix)))]
+pub(crate) fn break_stale(path: &Path) -> std::io::Result<()> {
+    break_stale_with(path, |_| true)
+}
+
+/// [`break_stale`], re-checking the file actually moved with `still_stale`: if a fresh file
+/// replaced the stale one between the caller's check and the rename, it is linked back
+/// (best-effort; never over an existing path) before the aside name is removed.
+fn break_stale_with(
+    path: &Path,
+    still_stale: impl Fn(&std::fs::Metadata) -> bool,
+) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let aside = path.with_file_name(format!(".{name}.stale.{}.{nanos}", std::process::id()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    if let Ok(moved) = std::fs::symlink_metadata(&aside) {
+        if !still_stale(&moved) {
+            let _ = std::fs::hard_link(&aside, path);
+        }
+    }
+    match std::fs::remove_file(&aside) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -385,7 +429,7 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), EngineError>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde::Deserialize;
 
@@ -644,6 +688,71 @@ mod tests {
         let dir = crate::datadir::unresolved();
         assert!(store(&dir, "grants.json", &demo()).is_err());
         assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Missing);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_key_is_refused_without_hanging() {
+        let dir = tmp_data("keyfifo");
+        store(&dir, "grants.json", &demo()).unwrap();
+        std::fs::remove_file(dir.path.join(KEY_FILE)).unwrap();
+        mkfifo(&dir.path.join(KEY_FILE));
+        assert_eq!(load::<Demo>(&dir, "grants.json"), Loaded::Tampered);
+        assert!(store(&dir, "grants.json", &demo()).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn stale_key_break_moves_the_file_aside_and_leaves_no_debris() {
+        let dir = tmp_data("stalebreak");
+        std::fs::create_dir_all(&dir.path).unwrap();
+        let key = dir.path.join(KEY_FILE);
+        let f = open_new_private(&key).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        drop(f);
+        store(&dir, "grants.json", &demo()).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(&dir.path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["grants.json", "key"]);
+        // Breaking a stale file someone else already removed is not an error.
+        assert!(break_stale(&dir.path.join("gone")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    /// Fails its first serialization and succeeds afterwards. serde_yaml accepts everything
+    /// serde_json does in practice, so this is how the NaN scan's own failure is exercised
+    /// (the scan serializes first).
+    struct FailsOnce(std::cell::Cell<bool>);
+    impl Serialize for FailsOnce {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            if self.0.replace(true) {
+                s.serialize_u8(1)
+            } else {
+                Err(serde::ser::Error::custom("first serialization fails"))
+            }
+        }
+    }
+
+    #[test]
+    fn value_the_nan_scan_cannot_serialize_is_refused_at_store() {
+        let dir = tmp_data("unscannable");
+        assert!(store(&dir, "b.json", &FailsOnce(std::cell::Cell::new(false))).is_err());
+        assert!(!dir.path.join("b.json").exists());
+        // Control: once past the scan it would have stored fine.
+        assert!(store(&dir, "b.json", &FailsOnce(std::cell::Cell::new(true))).is_ok());
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     /// SplitMix64: a deterministic stream for the property tests.
