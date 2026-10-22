@@ -28,6 +28,7 @@ mod context;
 mod description;
 mod exec_sinks;
 mod harness_config;
+mod lexer;
 mod lifecycle;
 mod network_ctx;
 mod padding;

@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use super::lexer::{self, Carry};
 use super::{line_no, Ctx};
 
 /// Longest statement (in lines) the builder joins, bounding cross-line co-occurrence.
@@ -221,23 +222,29 @@ impl<'a> Document<'a> {
         let bytes = text.as_bytes();
         let mut spans = Vec::new();
         let mut start = 0;
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'\n' {
-                let end = if i > start && bytes[i - 1] == b'\r' {
-                    i - 1
-                } else {
-                    i
-                };
-                spans.push((start, end));
-                start = i + 1;
-            }
+        let mut i = 0;
+        // Line terminators: `\n`, `\r\n`, a lone `\r`, and U+2028 / U+2029 (JS line breaks).
+        while i < bytes.len() {
+            let width = match bytes[i] {
+                b'\n' => 1,
+                b'\r' if bytes.get(i + 1) == Some(&b'\n') => 2,
+                b'\r' => 1,
+                0xE2 if bytes.get(i + 1) == Some(&0x80)
+                    && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9)) =>
+                {
+                    3
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            spans.push((start, i));
+            i += width;
+            start = i;
         }
         if start < bytes.len() {
-            let mut end = bytes.len();
-            if bytes[end - 1] == b'\r' {
-                end -= 1;
-            }
-            spans.push((start, end));
+            spans.push((start, bytes.len()));
         }
         let bits = spans
             .iter()
@@ -451,6 +458,8 @@ pub(crate) struct Stmt<'d> {
     first_line: u32,
     /// `(byte offset, line)` where each joined line after the first begins.
     breaks: Vec<(usize, u32)>,
+    /// Sorted byte ranges of string/regex literals and comments (everything else is code).
+    regions: Vec<(usize, usize)>,
     pub(crate) lang: Lang,
     pub(crate) ctx: Ctx,
     /// Trigger bits of the joined lines.
@@ -462,11 +471,30 @@ impl<'d> Stmt<'d> {
     pub(crate) fn owned(text: &str, line: u32, lang: Lang, ctx: Ctx) -> Stmt<'static> {
         let lower = text.to_ascii_lowercase();
         let bits = line_bits(&lower, text);
+        let mut regions = Vec::new();
+        lexer::lex(&lower, lang, Carry::Code, 0, &mut regions);
         Stmt {
             lower: Cow::Owned(lower),
             orig: Cow::Owned(text.to_string()),
             first_line: line,
             breaks: Vec::new(),
+            regions,
+            lang,
+            ctx,
+            bits,
+        }
+    }
+
+    /// A one-line statement borrowed from a document line or span.
+    fn borrowed(lower: &'d str, orig: &'d str, line: u32, lang: Lang, ctx: Ctx, bits: u32) -> Self {
+        let mut regions = Vec::new();
+        lexer::lex(lower, lang, Carry::Code, 0, &mut regions);
+        Stmt {
+            lower: Cow::Borrowed(lower),
+            orig: Cow::Borrowed(orig),
+            first_line: line,
+            breaks: Vec::new(),
+            regions,
             lang,
             ctx,
             bits,
@@ -483,10 +511,15 @@ impl<'d> Stmt<'d> {
             .unwrap_or(self.first_line)
     }
 
-    /// The statement split into commands on top-level `;`, `&&` and `||`. Commands carry the
-    /// statement's trigger bits (a superset; every rule re-checks its own words).
+    /// True when byte `off` is inside a string/regex literal or a comment.
+    pub(crate) fn is_quoted(&self, off: usize) -> bool {
+        lexer::in_regions(&self.regions, off)
+    }
+
+    /// The statement split into commands on `;`, `&&` and `||` outside literals and comments.
+    /// Commands carry the statement's trigger bits (a superset; every rule re-checks its words).
     pub(crate) fn commands(&self) -> impl Iterator<Item = Cmd<'_>> + '_ {
-        split_commands(&self.lower).map(move |(start, end)| Cmd {
+        split_commands(&self.lower, &self.regions).map(move |(start, end)| Cmd {
             stmt: self,
             start,
             end,
@@ -519,6 +552,11 @@ impl<'s> Cmd<'s> {
         self.stmt.line_at(self.start + off)
     }
 
+    /// True when byte `off` of this command is inside a literal or comment.
+    pub(crate) fn quoted(&self, off: usize) -> bool {
+        self.stmt.is_quoted(self.start + off)
+    }
+
     pub(crate) fn lang(&self) -> Lang {
         self.stmt.lang
     }
@@ -530,32 +568,55 @@ impl<'s> Cmd<'s> {
 
 /// Join the lines of `unit` into statements and hand each one with trigger words to `f`.
 ///
-/// Code (and JS/Python/Rust fences) joins lines while brackets are open; every unit honours a
-/// trailing `\`, `|`, `&&` or `||`. Shell fences drop a leading `$ `/`% ` prompt.
+/// Every line is lexed (block comments, triple-quoted strings and template text carry to the
+/// next line). Code (and JS/Python/Rust fences) joins lines while brackets are open; every unit
+/// honours a trailing `\`, `|` or `&&`. Shell fences drop a leading `$ `/`% ` prompt.
 pub(crate) fn for_each_stmt<'d>(doc: &'d Document<'d>, unit: &Unit, mut f: impl FnMut(&Stmt<'d>)) {
     let brackets =
         unit.ctx == Ctx::Code || matches!(unit.lang, Lang::Js | Lang::Python | Lang::Rust);
+    let prompt = unit.ctx == Ctx::Doc && unit.lang == Lang::Shell;
     let mut acc: Vec<usize> = Vec::new();
+    // Regions of the accumulated lines: (index into `acc`, start, end), line-relative.
+    let mut acc_regions: Vec<(usize, usize, usize)> = Vec::new();
+    let mut line_regions: Vec<(usize, usize)> = Vec::new();
     let mut depth: i32 = 0;
+    let mut carry = Carry::Code;
     for i in unit.start..unit.end {
-        let line = doc.lower_line(i);
-        if acc.is_empty() && line.trim().is_empty() {
+        let line = piece(doc.lower_line(i), prompt);
+        if acc.is_empty() && carry == Carry::Code && line.trim().is_empty() {
             continue;
         }
-        let (delta, cont) = bracket_delta(line, unit.lang);
+        line_regions.clear();
+        let lexed = lexer::lex(line, unit.lang, carry, 0, &mut line_regions);
+        carry = lexed.carry;
+        let cont = continues(line, &line_regions);
+        let k = acc.len();
         acc.push(i);
+        acc_regions.extend(line_regions.iter().map(|&(a, z)| (k, a, z)));
         if brackets {
-            depth = depth.saturating_add(delta).max(0);
+            depth = depth.saturating_add(lexed.delta).max(0);
         }
         if (depth == 0 && !cont) || acc.len() >= MAX_STMT_LINES {
-            emit_stmt(doc, unit, &acc, &mut f);
+            emit_stmt(doc, unit, &acc, &acc_regions, &mut f);
             acc.clear();
+            acc_regions.clear();
             depth = 0;
         }
     }
     if !acc.is_empty() {
-        emit_stmt(doc, unit, &acc, &mut f);
+        emit_stmt(doc, unit, &acc, &acc_regions, &mut f);
     }
+}
+
+/// The line continues into the next one: a trailing `\`, `|` or `&&` in code.
+fn continues(line: &str, regions: &[(usize, usize)]) -> bool {
+    let trimmed = line.trim_end();
+    let end = match regions.last() {
+        Some(&(start, stop)) if stop >= trimmed.len() => start,
+        _ => trimmed.len(),
+    };
+    let tail = line[..end].trim_end();
+    tail.ends_with('\\') || tail.ends_with('|') || tail.ends_with("&&")
 }
 
 /// Every Markdown prose line and inline code span, as one-line `doc` statements.
@@ -570,36 +631,38 @@ pub(crate) fn for_each_prose_stmt<'d>(doc: &'d Document<'d>, mut f: impl FnMut(&
         }
         let lower = doc.lower_line(i);
         let orig = doc.line(i);
-        f(&Stmt {
-            lower: Cow::Borrowed(lower),
-            orig: Cow::Borrowed(orig),
-            first_line: line_no(i),
-            breaks: Vec::new(),
-            lang: Lang::Other,
-            ctx: Ctx::Doc,
+        f(&Stmt::borrowed(
+            lower,
+            orig,
+            line_no(i),
+            Lang::Other,
+            Ctx::Doc,
             bits,
-        });
+        ));
         if !orig.contains('`') {
             continue;
         }
         for (s, e) in inline_spans(orig) {
             let bits = line_bits(&lower[s..e], &orig[s..e]);
             if bits != 0 {
-                f(&Stmt {
-                    lower: Cow::Borrowed(&lower[s..e]),
-                    orig: Cow::Borrowed(&orig[s..e]),
-                    first_line: line_no(i),
-                    breaks: Vec::new(),
-                    lang: Lang::Shell,
-                    ctx: Ctx::Doc,
+                f(&Stmt::borrowed(
+                    &lower[s..e],
+                    &orig[s..e],
+                    line_no(i),
+                    Lang::Shell,
+                    Ctx::Doc,
                     bits,
-                });
+                ));
             }
         }
     }
 }
 
-fn strip_prompt(line: &str) -> &str {
+/// `line` without a leading `$ `/`% ` shell prompt when `prompt` is set.
+fn piece(line: &str, prompt: bool) -> &str {
+    if !prompt {
+        return line;
+    }
     let t = line.trim_start();
     t.strip_prefix("$ ")
         .or_else(|| t.strip_prefix("% "))
@@ -610,22 +673,21 @@ fn emit_stmt<'d>(
     doc: &'d Document<'d>,
     unit: &Unit,
     lines: &[usize],
+    regions: &[(usize, usize, usize)],
     f: &mut impl FnMut(&Stmt<'d>),
 ) {
     let prompt = unit.ctx == Ctx::Doc && unit.lang == Lang::Shell;
-    let piece = |text: &'d str| if prompt { strip_prompt(text) } else { text };
     let bits = lines.iter().fold(0, |acc, &i| acc | doc.bits(i));
     if bits == 0 {
         return;
     }
     if let [i] = lines {
-        let lower = piece(doc.lower_line(*i));
-        let orig = piece(doc.line(*i));
         f(&Stmt {
-            lower: Cow::Borrowed(lower),
-            orig: Cow::Borrowed(orig),
+            lower: Cow::Borrowed(piece(doc.lower_line(*i), prompt)),
+            orig: Cow::Borrowed(piece(doc.line(*i), prompt)),
             first_line: line_no(*i),
             breaks: Vec::new(),
+            regions: regions.iter().map(|&(_, a, z)| (a, z)).collect(),
             lang: unit.lang,
             ctx: unit.ctx,
             bits,
@@ -635,76 +697,41 @@ fn emit_stmt<'d>(
     let mut lower = String::new();
     let mut orig = String::new();
     let mut breaks = Vec::new();
+    let mut starts = Vec::with_capacity(lines.len());
     for (k, &i) in lines.iter().enumerate() {
         if k > 0 {
             lower.push('\n');
             orig.push('\n');
             breaks.push((lower.len(), line_no(i)));
         }
-        lower.push_str(piece(doc.lower_line(i)));
-        orig.push_str(piece(doc.line(i)));
+        starts.push(lower.len());
+        lower.push_str(piece(doc.lower_line(i), prompt));
+        orig.push_str(piece(doc.line(i), prompt));
     }
     f(&Stmt {
         lower: Cow::Owned(lower),
         orig: Cow::Owned(orig),
         first_line: line_no(lines[0]),
         breaks,
+        regions: regions
+            .iter()
+            .map(|&(k, a, z)| (starts[k] + a, starts[k] + z))
+            .collect(),
         lang: unit.lang,
         ctx: unit.ctx,
         bits,
     });
 }
 
-/// Net bracket depth change of a line (outside quotes and comments) and whether it continues.
-fn bracket_delta(line: &str, lang: Lang) -> (i32, bool) {
-    let b = line.as_bytes();
-    let hash_comment = matches!(lang, Lang::Shell | Lang::Python | Lang::Other);
-    let slash_comment = matches!(lang, Lang::Js | Lang::Rust);
-    let mut depth = 0i32;
-    let mut quote = 0u8;
-    let mut end = b.len();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if quote != 0 {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == quote {
-                quote = 0;
-            }
-        } else {
-            match c {
-                b'\'' | b'"' | b'`' => quote = c,
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                b'#' if hash_comment && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') => {
-                    end = i;
-                    break;
-                }
-                b'/' if slash_comment && b.get(i + 1) == Some(&b'/') => {
-                    end = i;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    let tail = line[..end].trim_end();
-    let cont = tail.ends_with('\\') || tail.ends_with('|') || tail.ends_with("&&");
-    (depth, cont)
-}
-
-/// Byte ranges of the commands in `s`: split on top-level `;`, `&&`, `||`, respecting quotes.
-pub(crate) fn split_commands(s: &str) -> Commands<'_> {
-    Commands { s, at: 0 }
+/// Byte ranges of the commands in `s`: split on `;`, `&&` and `||` outside `regions`.
+pub(crate) fn split_commands<'a>(s: &'a str, regions: &'a [(usize, usize)]) -> Commands<'a> {
+    Commands { s, regions, at: 0 }
 }
 
 /// Iterator over the command ranges of a statement (see [`split_commands`]).
 pub(crate) struct Commands<'a> {
     s: &'a str,
+    regions: &'a [(usize, usize)],
     at: usize,
 }
 
@@ -715,35 +742,31 @@ impl Iterator for Commands<'_> {
         let b = self.s.as_bytes();
         while self.at < b.len() {
             let start = self.at;
-            let mut quote = 0u8;
             let mut i = start;
             let mut end = b.len();
             let mut next = b.len();
+            let mut r = self.regions.partition_point(|&(_, stop)| stop <= i);
             while i < b.len() {
-                let c = b[i];
-                if quote != 0 {
-                    if c == b'\\' {
-                        i += 2;
+                if let Some(&(rs, re)) = self.regions.get(r) {
+                    if i >= rs {
+                        i = re.max(i + 1);
+                        r += 1;
                         continue;
                     }
-                    if c == quote {
-                        quote = 0;
+                }
+                let c = b[i];
+                match c {
+                    b';' => {
+                        end = i;
+                        next = i + 1;
+                        break;
                     }
-                } else {
-                    match c {
-                        b'\'' | b'"' | b'`' => quote = c,
-                        b';' => {
-                            end = i;
-                            next = i + 1;
-                            break;
-                        }
-                        b'&' | b'|' if b.get(i + 1) == Some(&c) => {
-                            end = i;
-                            next = i + 2;
-                            break;
-                        }
-                        _ => {}
+                    b'&' | b'|' if b.get(i + 1) == Some(&c) => {
+                        end = i;
+                        next = i + 2;
+                        break;
                     }
+                    _ => {}
                 }
                 i += 1;
             }
@@ -1198,43 +1221,6 @@ pub(crate) fn find_call(hay: &str, name: &str, member: bool) -> Option<usize> {
     None
 }
 
-/// True when byte `off` of `s` sits inside a quoted string or a comment on its line, i.e. the
-/// text there is data or prose, not a call. Block-comment lines (`*`, `/*`) count as comments.
-pub(crate) fn in_literal_or_comment(s: &str, off: usize, lang: Lang) -> bool {
-    let b = s.as_bytes();
-    let off = off.min(b.len());
-    let start = s[..off].rfind('\n').map_or(0, |p| p + 1);
-    let slash = matches!(lang, Lang::Js | Lang::Rust | Lang::Other);
-    let hash = matches!(lang, Lang::Shell | Lang::Python | Lang::Other);
-    let head = s[start..].trim_start();
-    if slash && (head.starts_with('*') || head.starts_with("/*")) {
-        return true;
-    }
-    let mut quote = 0u8;
-    let mut i = start;
-    while i < off {
-        let c = b[i];
-        if quote != 0 {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == quote {
-                quote = 0;
-            }
-        } else {
-            match c {
-                b'\'' | b'"' | b'`' => quote = c,
-                b'#' if hash && (i == start || b[i - 1].is_ascii_whitespace()) => return true,
-                b'/' if slash && b.get(i + 1) == Some(&b'/') => return true,
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    quote != 0
-}
-
 /// Largest char boundary of `s` at or below byte `i`.
 pub(crate) fn floor_char_boundary(s: &str, i: usize) -> usize {
     let mut i = i.min(s.len());
@@ -1538,7 +1524,9 @@ mod tests {
     #[test]
     fn split_commands_respects_quotes() {
         let s = "echo \"a;b && c\" ; curl x && wget y || z";
-        let parts: Vec<&str> = split_commands(s).map(|(a, b)| &s[a..b]).collect();
+        let mut regions = Vec::new();
+        lexer::lex(s, Lang::Shell, Carry::Code, 0, &mut regions);
+        let parts: Vec<&str> = split_commands(s, &regions).map(|(a, b)| &s[a..b]).collect();
         assert_eq!(parts, vec!["echo \"a;b && c\"", "curl x", "wget y", "z"]);
     }
 

@@ -52,7 +52,7 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
     let line = |off: usize| Some(cmd.line_at(off));
     // A language-level sink inside a string or comment is code-as-data (a help text, a rule
     // table, a command built for a remote host): it warns and never feeds a combo.
-    let quoted = |off: usize| context::in_literal_or_comment(lower, off, lang);
+    let quoted = |off: usize| cmd.quoted(off);
     let mut sink: Option<(usize, bool)> = None;
 
     if bits & T_NET != 0 {
@@ -119,11 +119,11 @@ pub(super) fn scan_cmd(cmd: &Cmd<'_>, out: &mut FileOut) {
         if decoder.is_some() {
             out.emit("exec_decode", grade_sink(q), line(off), ctx);
         }
+        // A real base64 payload next to a sink is the payload itself, quoted sink or not
+        // (Google's `'{encoded_script}'` placeholder is no literal and stays a warning).
         if b64_payload(cmd.orig(), decoder.is_some()) {
-            out.emit("exec_b64_literal", grade_sink(q), line(off), ctx);
-            if !q {
-                out.signal(Signal::ExecB64(cmd.line_at(off)), ctx);
-            }
+            out.emit("exec_b64_literal", Severity::High, line(off), ctx);
+            out.signal(Signal::ExecB64(cmd.line_at(off)), ctx);
         }
     }
 }
