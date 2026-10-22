@@ -107,11 +107,21 @@ CI (`verify-plugin-bin`) and publish run `sh scripts/stamp-shim.sh --check plugi
 To try a local engine build through the plugin, copy it into `bin/` and stamp it:
 `sh scripts/stamp-shim.sh plugins/safe-ai-skill/bin`. Don't commit that.
 
-The shim hashes with `sha256sum`, else `shasum -a 256`. With neither installed it can't verify the
-binary and fails open with a notice, like any other environment failure (`SAFE_AI_SKILL_STRICT=1`
-blocks). Both tools come from `PATH`, which a repo's committed `.claude/settings.json` `env` can
-set; such a repo can equally fake `uname`, so the check guards against a swapped binary, not a
-hostile settings file.
+The shim hashes with `sha256sum`, else `shasum -a 256`, looked up at fixed system paths first
+(`/usr/bin/sha256sum`, `/bin/sha256sum`, `/sbin/sha256sum`, `/usr/bin/shasum`), then on `PATH`. With
+no tool it can't verify the binary and fails open with a notice, like any other environment failure
+(`SAFE_AI_SKILL_STRICT=1` blocks). The `PATH` fallback can be steered by a repo's committed
+`.claude/settings.json` `env`, but such a repo can equally fake `uname`; see `SECURITY.md`. The test
+harness skips the fixed paths with a `.sha-tools-from-path` file beside its copy of the shim;
+writing there needs the same access as rewriting the shim.
+
+**The shim is the trust anchor.** The pins are only as good as the shim that holds them, and
+anything that can write the plugin's `bin/` can rewrite the shim (and its constants) as easily as
+the binary. The shim's own integrity rests on the H5 write tripwire, which denies the agent's
+writes under `~/.claude/plugins`, and on the user's file permissions. Two residuals are equivalent
+to a shim rewrite and are accepted: replacing the binary between the hash and the exec (a TOCTOU
+window of a few milliseconds), and editing the shim itself. Both need write access to the
+plugin directory, which the pin does not try to defend.
 
 ## Not done yet
 

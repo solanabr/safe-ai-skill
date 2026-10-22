@@ -18,9 +18,8 @@
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
 #     project settings mention it (a repo can't disable the firewall); SessionStart
 #     reports either way.
-# Hooks run the engine as a background child with its output in a private temp dir, so a
-# SIGTERM (Claude Code's hook timeout) is forwarded to it; without a usable temp dir the
-# output is captured in memory and the signal is not forwarded.
+# Hooks capture the engine's output in memory, through pipes: no engine output ever
+# touches a file, where another process of the same user could rewrite a verdict.
 # CLI subcommands run the engine with live output and keep its exit status; an
 # environment failure exits 1. Nothing outside this directory is ever executed (no cargo
 # build, no $CLAUDE_PLUGIN_DATA binary), and nothing is cached, so a failed probe never
@@ -149,15 +148,31 @@ tampered() {
 }
 
 # sha256_ok <file>: whether <file> hashes to $want_sha. Returns 1 on a mismatch; an
-# environment failure when neither sha256sum nor shasum exists or the tool fails.
+# environment failure when no sha256 tool exists or the tool fails. The tool is taken from
+# fixed system paths first, so a repo-set PATH can't stand in for it there; PATH is the
+# fallback (NixOS and the like). A `.sha-tools-from-path` file beside the shim (the test
+# harness's own plugin layout) skips the fixed paths; writing there is as good as rewriting
+# the shim, so it grants nothing new.
 sha256_ok() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    got=$(sha256sum <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run'
-  elif command -v shasum >/dev/null 2>&1; then
-    got=$(shasum -a 256 <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run'
-  else
-    env_failure 'no sha256sum or shasum to verify the engine binary'
+  sha_tool=
+  if [ ! -e "$self_dir/.sha-tools-from-path" ]; then
+    for t in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/bin/shasum; do
+      if [ -z "$sha_tool" ] && [ -f "$t" ] && [ -x "$t" ]; then sha_tool=$t; fi
+    done
   fi
+  if [ -z "$sha_tool" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha_tool=sha256sum
+    elif command -v shasum >/dev/null 2>&1; then
+      sha_tool=shasum
+    else
+      env_failure 'no sha256sum or shasum to verify the engine binary'
+    fi
+  fi
+  case $sha_tool in
+    *shasum) got=$("$sha_tool" -a 256 <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run' ;;
+    *) got=$("$sha_tool" <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run' ;;
+  esac
   got=${got%%[!0-9a-f]*}
   if [ "${#got}" -ne 64 ]; then env_failure 'sha256 check failed to run'; fi
   [ "$got" = "$want_sha" ]
@@ -234,46 +249,6 @@ with_repo_note() {
 }
 note_repo=
 if [ -n "$repo_disable" ] && [ "$kind" = session ]; then note_repo=1; fi
-
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/safe-ai-skill.XXXXXX" 2>/dev/null) || tmp=
-if [ -n "$tmp" ] && [ -d "$tmp" ]; then
-  trap 'rm -rf "$tmp"' EXIT
-  child=
-  term=
-  trap 'term=1; if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; fi' HUP INT TERM
-  # An asynchronous command's stdin is /dev/null unless redirected, so hand it ours on fd 3.
-  exec 3<&0
-  "$bin" "$@" <&3 3<&- >"$tmp/out" 2>"$tmp/err" &
-  child=$!
-  exec 3<&-
-  if [ -n "$term" ]; then kill -TERM "$child" 2>/dev/null; fi
-  status=0
-  wait "$child" || status=$?
-  if [ -n "$term" ]; then
-    wait "$child" 2>/dev/null
-    exit 143
-  fi
-  case $status in
-    126 | 127)
-      line=
-      IFS= read -r line <"$tmp/err" || :
-      env_failure "engine could not start (exit $status)" "$line"
-      ;;
-  esac
-  # The engine's stderr is held back until it exits, so a failed start adds no lines.
-  if [ -s "$tmp/err" ]; then cat "$tmp/err" >&2; fi
-  case $status in
-    0 | 2 | 3)
-      if [ -n "$note_repo" ]; then
-        with_repo_note "$(cat "$tmp/out")"
-      elif [ -s "$tmp/out" ]; then
-        cat "$tmp/out"
-      fi
-      exit "$status"
-      ;;
-  esac
-  crashed "$status"
-fi
 
 # run_engine <args...>: run the engine. Its stdout goes to ours, followed by "." (so
 # trailing newlines survive capture), or on 126/127 by a newline and the first line of

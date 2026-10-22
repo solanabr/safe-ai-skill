@@ -33,7 +33,9 @@
 # runner (free for public repositories).
 #
 # Windows (1.1.0 tier: Git Bash only, spec D5.3) links the C runtime statically
-# (+crt-static), so the .exe needs no VC++ redistributable.
+# (+crt-static), so the .exe needs no VC++ redistributable, and links with
+# /Brepro (no timestamp) so it can rebuild byte-identically. The release smoke
+# checks the hard guards (scripts/gate-smoke.sh).
 #
 # Only the attest job can sign attestations (id-token + attestations write). It
 # checks out nothing and runs two actions, pinned by commit SHA: download the
@@ -162,7 +164,8 @@ jobs:
             os: windows-2025
             target: x86_64-pc-windows-msvc
             exe: .exe
-            rustflags: -C target-feature=+crt-static
+            # /Brepro: no link timestamp, so the clean rebuild can be byte-identical.
+            rustflags: -C target-feature=+crt-static -C link-arg=/Brepro
             repro: true
 
     env:
@@ -258,6 +261,10 @@ jobs:
           fi
           echo "$got"
 
+      - name: Gate smoke — hard guards hold (Windows)
+        if: runner.os == 'Windows'
+        run: sh scripts/gate-smoke.sh "./$ARTIFACT"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -310,7 +317,7 @@ jobs:
     steps:
       # The same commit the binaries were built from, not the branch head.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
@@ -318,7 +325,7 @@ jobs:
       # merge-multiple flattens every artifact into dist/ directly (no per-artifact
       # subdirs), so the binary filenames don't collide with directory names.
       - name: Download built binaries (from this run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist/
           merge-multiple: true

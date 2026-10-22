@@ -12,7 +12,9 @@
 //!   failed hook as non-blocking. The version comes from `CLAUDE_CODE_VERSION`, else from a
 //!   `X.Y.Z` component of `CLAUDE_CODE_EXECPATH` (the executable's path, which carries the
 //!   version in the Homebrew and native-installer layouts). When neither gives one, nothing
-//!   is said: running `claude --version` on every session start costs too much.
+//!   is said: running `claude --version` on every session start costs too much. Both
+//!   variables can be set by a repo's committed `.claude/settings.json` `env`, so the
+//!   notice is advisory: a repo can hide it (or fake it), and nothing relies on it.
 //! - **Windows.** The shell gates match the `Bash` tool (Git Bash) only; `PowerShell` tool
 //!   calls are not gated in 1.1.0.
 

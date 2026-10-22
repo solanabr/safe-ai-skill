@@ -317,11 +317,10 @@ jobs:
         run: sh scripts/test-shim.sh
 
   # ── Windows (1.1.0 tier: Git Bash) — build + engine tests ────────────────
-  # release.yml ships safe-ai-skill-windows-x64.exe built with +crt-static; this
-  # builds the same way and runs the engine suite. The platform notices and the
-  # Windows trust-path tests must pass. The full suite is not yet Windows-clean (fixtures assume
-  # unix paths, symlinks, FIFOs and modes), so it reports without failing the
-  # run until it is.
+  # release.yml ships safe-ai-skill-windows-x64.exe built with +crt-static and
+  # /Brepro; this builds the same way, checks the hard guards with a gate smoke,
+  # and runs the whole engine suite. Any failing test not listed in
+  # crates/engine/tests/windows-known-failures.txt fails the job.
   windows:
     name: Windows / x86_64-pc-windows-msvc
     needs: lint
@@ -330,7 +329,7 @@ jobs:
       run:
         shell: bash
     env:
-      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static -C link-arg=/Brepro
     steps:
       - uses: actions/checkout@v4
 
@@ -356,15 +355,11 @@ jobs:
       - name: --version runs
         run: crates/engine/target/release/safe-ai-skill.exe --version
 
-      - name: Platform notices and case-insensitive trust paths
-        run: |
-          cargo test --manifest-path "$MANIFEST" --lib platform::
-          cargo test --manifest-path "$MANIFEST" --lib datadir::tests::windows_
-          cargo test --manifest-path "$MANIFEST" --lib datadir::tests::lowercase_
+      - name: Gate smoke (mainnet --final deploy, .env read)
+        run: sh scripts/gate-smoke.sh crates/engine/target/release/safe-ai-skill.exe
 
-      - name: Full engine suite (not yet required on Windows)
-        continue-on-error: true
-        run: cargo test --manifest-path "$MANIFEST"
+      - name: Engine suite (fails on any failure not in the known-failures list)
+        run: python -I scripts/windows-test-gate.py
 
   # ── latency budget (spec D5, cold gate < 50 ms, sweep <= 2x baseline) ─────
   # The cold gate-read goes through the real shim with the static musl build;
@@ -411,7 +406,7 @@ jobs:
           node --check npm/scripts/postinstall.js
 
       - name: shellcheck (install.sh + scripts)
-        run: shellcheck install.sh scripts/check-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh
+        run: shellcheck install.sh scripts/check-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh
 
       - name: sh -n (install.sh + scripts)
         run: |
@@ -420,7 +415,8 @@ jobs:
           sh -n scripts/smoke-static-linux.sh
           sh -n scripts/test-smoke-static-linux.sh
           sh -n scripts/stamp-shim.sh
-          python3 -I -m py_compile scripts/latency-budget.py
+          sh -n scripts/gate-smoke.sh
+          python3 -I -m py_compile scripts/latency-budget.py scripts/windows-test-gate.py
 
       - name: smoke-static-linux.sh logic (stubbed readelf + docker)
         run: sh scripts/test-smoke-static-linux.sh

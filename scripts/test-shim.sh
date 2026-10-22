@@ -37,6 +37,7 @@ for d in /usr/bin /bin; do
 done
 
 ALLOW='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
+DENY='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"mainnet deploy"}}'
 SESSION='{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
@@ -116,10 +117,7 @@ engine() {
     garbage) printf '\001\002\003\004\necho %s\n' "'$ALLOW'" >"$1" && chmod +x "$1" ;;
     empty) : >"$1" && chmod +x "$1" ;;
     noexec) mk "$1" 'echo ran' && chmod -x "$1" ;;
-    # Runs until SIGTERM, which it records.
-    sleepy) mk "$1" 'trap '"'"': >"$FAKE_MARKS/termed"; kill $! 2>/dev/null; exit 0'"'"' TERM
-sleep 10 &
-wait $!' ;;
+    deny) mk "$1" "printf '%s' '$DENY'" ;;
     # An ELF header, elf:<EI_CLASS>:<e_machine lo>:<e_machine hi> in octal, whose body, if a
     # shell ever ran the file as a script, would leave a mark.
     elf:*)
@@ -199,13 +197,6 @@ run() {
     exit $?
   ) 2>/dev/null
   rc=$?
-}
-
-# start <args...>: like run, in the background; sets bgpid to the shim's pid.
-start() {
-  if [ -n "$stale" ] && [ -z "$no_stamp" ]; then stamp; fi
-  (launch "$@") <"$payload_f" >"$case_dir/out" 2>"$case_dir/err" &
-  bgpid=$!
 }
 
 checks=0
@@ -697,6 +688,7 @@ matrix() {
 
   fresh
   engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  : >"$bin_dir/.sha-tools-from-path"
   e_path=$shasum_dir:$minbin
   t "shasum -a 256 verifies the prebuilt when sha256sum is missing"
   run gate-read
@@ -714,6 +706,7 @@ matrix() {
   for tools in none broken; do
     fresh
     engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    : >"$bin_dir/.sha-tools-from-path"
     case $tools in
       none) e_path=$minbin ;;
       broken) e_path=$broken_sha_dir:$minbin ;;
@@ -760,61 +753,50 @@ matrix() {
     expect_not_ran "safe-ai-skill-$target"
   done
 
-  # Claude Code's hook timeout sends SIGTERM to the shim; the engine child must get it too.
-  fresh
-  engine "$bin_dir/safe-ai-skill-linux-x64" sleepy
-  t "SIGTERM to the shim is forwarded to the engine"
-  start gate-bash
-  i=0
-  while [ ! -e "$marks/safe-ai-skill-linux-x64" ] && [ "$i" -lt 100 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  sleep 0.3
-  kill -TERM "$bgpid" 2>/dev/null
-  rc=0
-  wait "$bgpid" || rc=$?
-  expect_rc 143
-  i=0
-  while [ ! -e "$marks/termed" ] && [ "$i" -lt 20 ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  expect_ran termed
+  # Without the test seam the shim takes its sha256 tool from fixed system paths, so a PATH
+  # without one still verifies the prebuilt.
+  if [ -x /usr/bin/sha256sum ] || [ -x /bin/sha256sum ] || [ -x /sbin/sha256sum ] ||
+    [ -x /usr/bin/shasum ]; then
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    e_path=$minbin
+    t "the sha256 tool comes from a fixed system path, not PATH"
+    run gate-read
+    expect_rc 0
+    expect_ran safe-ai-skill-linux-x64
+  fi
 
-  # Without a usable temp dir the shim captures in memory, with the same contract.
+  # Engine output never touches a file: a same-user process rewriting
+  # $TMPDIR/safe-ai-skill.*/out can't turn a deny into an allow, and the shim creates no
+  # temp files at all.
   fresh
-  engine "$bin_dir/safe-ai-skill-linux-x64" bytes
-  e_tmpdir=$case_dir/no/such/dir
-  t "no temp dir: exit 0 passes stdout through byte for byte"
-  run gate-read
-  expect_rc 0
+  engine "$bin_dir/safe-ai-skill-linux-x64" deny
+  e_tmpdir=$case_dir/tmp
+  mkdir "$e_tmpdir"
+  (
+    while :; do
+      for d in "$e_tmpdir"/safe-ai-skill.*; do
+        if [ -d "$d" ]; then printf '%s' "$ALLOW" >"$d/out" 2>/dev/null; fi
+      done
+    done
+  ) &
+  writer=$!
+  t "a background writer on \$TMPDIR/safe-ai-skill.*/out can't change the verdict"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    run gate-bash
+    expect_rc 0
+    expect_out "$DENY"
+  done
+  kill "$writer" 2>/dev/null
+  wait "$writer" 2>/dev/null
+  t "the shim creates no temp files"
+  for args in gate-read gate-mcp redact 'verify session'; do
+    # shellcheck disable=SC2086 # 'verify session' is two arguments
+    run $args
+  done
   check
-  printf 'line1\n\nline3\n\n' | cmp -s - "$case_dir/out" ||
-    fail "stdout <$(snippet "$case_dir/out")> is not byte-identical"
-  fresh
-  engine "$bin_dir/safe-ai-skill-linux-x64" exit:2
-  e_tmpdir=$case_dir/no/such/dir
-  t "no temp dir: exit 2 passes through"
-  run gate-bash
-  expect_rc 2
-  expect_out "$ALLOW"
-  expect_err_has 'engine stderr'
-  fresh
-  engine "$bin_dir/safe-ai-skill-linux-x64" exit:127
-  e_tmpdir=$case_dir/no/such/dir
-  t "no temp dir: exit 127 is an environment failure"
-  run gate-bash
-  expect_rc 0
-  expect_ask
-  expect_err_lines 1
-  fresh
-  engine "$bin_dir/safe-ai-skill-linux-x64" kill
-  e_tmpdir=$case_dir/no/such/dir
-  t "no temp dir: a crash blocks gate-bash"
-  run gate-bash
-  expect_rc 2
-  expect_no_out
+  leftovers=$(find "$e_tmpdir" -mindepth 1 | tr '\n' ' ')
+  [ -z "$leftovers" ] || fail "temp files: $leftovers"
 
   # The ignored repo DISABLE is reported whatever the session check's exit code.
   fresh
