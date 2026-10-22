@@ -163,6 +163,67 @@ fn schema_with_private_key_block_denies() {
 }
 
 #[test]
+fn schema_with_api_key_and_credential_values_denies() {
+    for body in [
+        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+        "STRIPE_KEY=sk_\x6cive_abcdefghijklmnop1234\n",
+        "T=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij\n",
+        "HELIUS_API_KEY=0a1b2c3d-4e5f-6789-abcd-ef0123456789\n",
+        "DB_PASSWORD=hunter2\n",
+        "GH_TOKEN=ghp_abc123\n",
+        "APP_SECRET=\"s3cr3t\"\n",
+        "SIGNER_PRIVATE_KEY=abc\n",
+    ] {
+        let proj = project();
+        write(&proj, ".env.schema", body);
+        let (label, reason) = read(proj.path(), proj.join(".env.schema"));
+        assert_eq!(label, "deny", "{body:?}");
+        assert!(reason.contains("contains a secret value"), "{reason}");
+    }
+}
+
+#[test]
+fn schema_with_non_literal_values_has_no_opinion() {
+    let proj = project();
+    write(
+        &proj,
+        ".env.schema",
+        concat!(
+            "# OPENAI_API_KEY=hunter2\nHELIUS_API_KEY=\nA_API_KEY=varlock(\"local:x\")\n",
+            "B_API_KEY=exec(`op read x`)\nDB_PASSWORD=$DB_PASSWORD\nC_TOKEN=${C_TOKEN}\n",
+            "D_SECRET=<paste here>\nE_TOKEN=xxx\nF_TOKEN=changeme\nG_TOKEN=your-token\n",
+        ),
+    );
+    assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_env_named_schema_denies() {
+    let proj = project();
+    write(
+        &proj,
+        ".env",
+        "HELIUS_API_KEY=0a1b2c3d-4e5f-6789-abcd-ef0123456789\nDB_PASSWORD=hunter2\n",
+    );
+    std::fs::hard_link(proj.join(".env"), proj.join(".env.schema")).unwrap();
+    assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "deny");
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_named_schema_denies_without_hanging() {
+    let proj = project();
+    let fifo = proj.join(".env.schema");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    assert_eq!(read(proj.path(), &fifo).0, "deny");
+}
+
+#[test]
 fn upper_case_schema_with_secret_denies() {
     let proj = project();
     let key = bs58::encode(vec![7u8; 64]).into_string();

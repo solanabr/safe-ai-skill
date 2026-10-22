@@ -96,7 +96,7 @@ The npm and standalone paths download the binary matching their release tag and 
 
 - CLI commands: any `solana`, `spl-token`, `anchor`, or arbitrary shell command matching policy
 - MCP calls: value-moving and authority-changing verbs (`send*`, `stake*`, `delegate*`, `mint*`, `bridge*`, `lend*`, `borrow*`) across any connected MCP
-- Secret reads: `.env`, keypair files, credential paths. `.env.example` and a [varlock](https://varlock.dev) `.env.schema` stay readable; the schema is denied if it contains a keypair array, a base58 secret key or a private-key block, or if it is over 64 KiB. A repo's `.safe-ai-skill/policy.yaml` can remove either allow (allow-lists only shrink), for example by listing only `**/.env.example`. safe-ai-skill never runs `varlock`.
+- Secret reads: `.env`, keypair files, credential paths. `.env.example` and a [varlock](https://varlock.dev) `.env.schema` stay readable; a Read (or Grep with a file path) of the schema is denied if it contains key material (a keypair array, a base58 secret key, a private-key block, an `sk-`/JWT token, or a literal value on a `*_API_KEY`/`*_SECRET`/`*_TOKEN`/`*PASSWORD*`/`*PRIVATE_KEY` line), if it is over 64 KiB, or if it is not a regular `.env.schema` file. Bash `cat` and Grep with a directory plus glob are not content-checked (output redaction still applies). A repo's `.safe-ai-skill/policy.yaml` can remove either allow (allow-lists only shrink), for example by listing only `**/.env.example`. safe-ai-skill never runs `varlock`.
 - Interactive gate breakage: replaces broken `read -r` prompts (no TTY in hook context) with a functioning `ask` decision
 
 **Supply-chain (SessionStart verifier)**

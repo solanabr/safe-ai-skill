@@ -71,13 +71,13 @@ pub fn guard_env_schema(path: &str, cwd: &Path) -> Decision {
     if !real.to_str().map(is_env_schema).unwrap_or(false) {
         return schema_denied("resolves to a different file");
     }
+    // Check the type before opening: opening a FIFO blocks the gate until a writer appears.
+    if !std::fs::metadata(&real).is_ok_and(|m| m.is_file()) {
+        return schema_denied("could not be read as a regular file");
+    }
     let mut buf = Vec::new();
-    let read = std::fs::File::open(&real).and_then(|f| {
-        if !f.metadata()?.is_file() {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        }
-        f.take(MAX_SCHEMA_BYTES + 1).read_to_end(&mut buf)
-    });
+    let read =
+        std::fs::File::open(&real).and_then(|f| f.take(MAX_SCHEMA_BYTES + 1).read_to_end(&mut buf));
     if read.is_err() {
         return schema_denied("could not be read as a regular file");
     }
