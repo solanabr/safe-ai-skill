@@ -13,10 +13,12 @@
 //!   spend.
 //!
 //! `spend.json` is a [`crate::statefile`] envelope. A ledger that fails authentication, or
-//! one missing once the state key exists (it was deleted), means **today's budget is
-//! exhausted**: [`SpendLedger::load`] replaces it with an exhausted ledger dated today, so
-//! the next UTC day starts fresh. Only a first run (no key yet) starts at zero. The data
-//! dir's trust does not matter here: a ledger can only tighten.
+//! one missing once the state key or the audit log exists (it was deleted, or this is a 1.0
+//! upgrade), means **today's budget is exhausted**: [`SpendLedger::load`] replaces it with an
+//! exhausted ledger dated today, so the next UTC day starts fresh. Only a brand-new install
+//! (no key, no audit log) starts at zero. [`on_key_created`] applies the same rule when any
+//! other state file creates the key first, so the ledger always exists once the key does. The
+//! data dir's trust does not matter here: a ledger can only tighten.
 //!
 //! All arithmetic is guarded against `NaN`, negative, and non-finite inputs, and the
 //! running total is accumulated with saturating semantics so a corrupt or adversarial
@@ -49,9 +51,9 @@ pub const EXHAUSTED_SOL: f64 = f64::MAX;
 pub enum LedgerState {
     /// An authenticated ledger.
     Valid,
-    /// No ledger and no state key: a first run.
+    /// No ledger, no state key, no audit log: a brand-new install.
     Fresh,
-    /// No ledger although the state key exists: it was deleted.
+    /// No ledger although the state key or the audit log exists: deleted, or a 1.0 upgrade.
     Deleted,
     /// The ledger failed authentication.
     Tampered,
@@ -69,9 +71,9 @@ pub struct SpendLedger {
 impl SpendLedger {
     /// Load the authenticated ledger from `${plugin_data}/spend.json`, rolling the day over.
     ///
-    /// A first run (no ledger, no state key) stores and returns a fresh ledger. A ledger that
-    /// was deleted or fails authentication is replaced by one exhausted for today (audited),
-    /// and that is returned: no further spend fits today, and the next day rolls it over.
+    /// A brand-new install stores and returns a fresh ledger. A ledger that is missing
+    /// otherwise or fails authentication is replaced by one exhausted for today (audited), and
+    /// that is returned: no further spend fits today, and the next day rolls it over.
     pub fn load(plugin_data: &Path) -> SpendLedger {
         let today = current_epoch_day();
         let dir = state_dir(plugin_data);
@@ -293,13 +295,51 @@ fn read_ledger(dir: &DataDir) -> (LedgerState, Option<SpendLedger>) {
         Loaded::Missing if dir.is_unresolved() => (LedgerState::Tampered, None),
         Loaded::Missing => {
             let key = dir.path.join(statefile::KEY_FILE);
-            if std::fs::symlink_metadata(key).is_ok() {
+            if std::fs::symlink_metadata(key).is_ok() || has_audit_log(&dir.path) {
                 (LedgerState::Deleted, None)
             } else {
                 (LedgerState::Fresh, None)
             }
         }
     }
+}
+
+/// Whether the data dir has an audit log (any version wrote it).
+fn has_audit_log(plugin_data: &Path) -> bool {
+    std::fs::symlink_metadata(plugin_data.join("audit.jsonl")).is_ok()
+}
+
+/// Called by [`statefile::store`] when storing `name` just created the state key: start the
+/// ledger now, fresh on a brand-new install (no audit log), exhausted for today otherwise, so
+/// a ledger missing later always means deleted.
+pub fn on_key_created(dir: &DataDir, name: &str) {
+    if name == SPEND_FILE
+        || !matches!(
+            statefile::load::<SpendLedger>(dir, SPEND_FILE),
+            Loaded::Missing
+        )
+    {
+        return;
+    }
+    let total_sol = if has_audit_log(&dir.path) {
+        EXHAUSTED_SOL
+    } else {
+        0.0
+    };
+    let ledger = SpendLedger {
+        day: current_epoch_day(),
+        total_sol,
+    };
+    let _ = statefile::store(dir, SPEND_FILE, &ledger);
+}
+
+/// Store an exhausted ledger dated today (used for a 1.0 ledger at migration).
+pub fn store_exhausted(plugin_data: &Path) -> std::io::Result<()> {
+    SpendLedger {
+        day: current_epoch_day(),
+        total_sol: EXHAUSTED_SOL,
+    }
+    .save(plugin_data)
 }
 
 #[cfg(test)]

@@ -18,10 +18,13 @@ use serde::{Deserialize, Serialize};
 use crate::datadir::DataDir;
 use crate::error::{EngineError, Error};
 use crate::gate::{GateMeta, Scope};
-use crate::statefile::{self, Loaded};
+use crate::statefile::{self, FileLock, Loaded};
 
 /// State file holding the grants.
 pub const GRANTS_FILE: &str = "grants.json";
+
+/// Lock serializing read-modify-writes of [`GRANTS_FILE`] (parallel hooks must not overspend).
+const GRANTS_LOCK: &str = "grants.lock";
 
 /// Longest a grant may run (30 days).
 const MAX_GRANT_SECS: u64 = 30 * 86_400;
@@ -285,14 +288,21 @@ pub fn live(dir: &DataDir) -> Grants {
     }
 }
 
-/// Persist grants as an authenticated envelope.
+/// Persist grants as an authenticated envelope (under the grants lock).
 pub fn save(dir: &DataDir, grants: &Grants) -> Result<(), EngineError> {
+    let _lock = lock(dir)?;
     statefile::store(dir, GRANTS_FILE, grants)
+}
+
+fn lock(dir: &DataDir) -> Result<FileLock, EngineError> {
+    statefile::create_dir_private(&dir.path)?;
+    FileLock::acquire(&dir.path, GRANTS_LOCK)
 }
 
 /// Add a confirmed grant: expired grants are dropped first. A tampered file is replaced
 /// (none of its grants could apply); returns whether that happened.
 pub fn add(dir: &DataDir, grant: Grant, now: u64) -> Result<bool, EngineError> {
+    let _lock = lock(dir)?;
     let (mut grants, replaced) = match load(dir) {
         Loaded::Valid(g) => (g, false),
         Loaded::Missing => (Grants::default(), false),
@@ -300,7 +310,7 @@ pub fn add(dir: &DataDir, grant: Grant, now: u64) -> Result<bool, EngineError> {
     };
     grants.grants.retain(|g| !g.is_expired(now));
     grants.grants.push(grant);
-    save(dir, &grants)?;
+    statefile::store(dir, GRANTS_FILE, &grants)?;
     Ok(replaced)
 }
 
@@ -341,22 +351,31 @@ pub fn find_match_at<'a>(grants: &'a Grants, meta: &GateMeta, now: u64) -> Optio
 
 /// Debit `sol_amount` from the grant with `grant_id`, persisting the result.
 ///
-/// A non-finite or negative `sol_amount` is rejected, and the running `spent_sol` is clamped
-/// so it never exceeds the budget. A missing grant id is a no-op (returns `Ok`). Only an
-/// authenticated file is debited.
+/// Under the grants lock the grant is re-read and must still exist, be unexpired, and cover
+/// the amount (per-tx cap and remaining budget); otherwise it is an error and nothing is
+/// charged, so two parallel hooks cannot both spend the last of a budget. A non-finite or
+/// negative `sol_amount` is rejected. Only an authenticated file is debited.
 pub fn debit(dir: &DataDir, grant_id: &str, sol_amount: f64) -> Result<(), EngineError> {
     if !sol_amount.is_finite() || sol_amount < 0.0 {
         return Err(Error::Other(
             "debit amount must be a finite, non-negative SOL value".to_string(),
         ));
     }
+    let _lock = lock(dir)?;
     let Loaded::Valid(mut grants) = load(dir) else {
         return Err(Error::Other(
             "grants.json is missing or failed authentication".to_string(),
         ));
     };
-    let Some(g) = grants.grants.iter_mut().find(|g| g.id == grant_id) else {
-        return Ok(());
+    let now = now_secs();
+    let Some(g) = grants
+        .grants
+        .iter_mut()
+        .find(|g| g.id == grant_id && !g.is_expired(now) && g.permits_amount(Some(sol_amount)))
+    else {
+        return Err(Error::Other(format!(
+            "grant {grant_id} no longer covers {sol_amount} SOL"
+        )));
     };
     let prior = if g.spent_sol.is_finite() && g.spent_sol >= 0.0 {
         g.spent_sol
@@ -371,11 +390,14 @@ pub fn debit(dir: &DataDir, grant_id: &str, sol_amount: f64) -> Result<(), Engin
     } else {
         next
     };
-    save(dir, &grants)
+    statefile::store(dir, GRANTS_FILE, &grants)
 }
 
 /// Drop expired grants from an authenticated file and persist; returns the number removed.
 pub fn cleanup_expired(dir: &DataDir) -> usize {
+    let Ok(_lock) = lock(dir) else {
+        return 0;
+    };
     let now = now_secs();
     let Loaded::Valid(mut grants) = load(dir) else {
         return 0;
@@ -384,7 +406,7 @@ pub fn cleanup_expired(dir: &DataDir) -> usize {
     grants.grants.retain(|g| !g.is_expired(now));
     let removed = before - grants.grants.len();
     if removed > 0 {
-        let _ = save(dir, &grants);
+        let _ = statefile::store(dir, GRANTS_FILE, &grants);
     }
     removed
 }
@@ -601,16 +623,20 @@ pub(crate) mod tests {
         save(
             &dir,
             &Grants {
-                grants: vec![transfer_grant("g1", 10_000)],
+                grants: vec![transfer_grant("g1", u64::MAX)],
             },
         )
         .unwrap();
 
-        debit(&dir, "g1", 2.0).unwrap();
-        assert_eq!(live(&dir).grants[0].spent_sol, 2.0);
-
-        // Debiting past the budget clamps to budget_sol, never overshoots.
-        debit(&dir, "g1", 100.0).unwrap();
+        // max_tx 1.0, budget 5.0.
+        debit(&dir, "g1", 1.0).unwrap();
+        assert_eq!(live(&dir).grants[0].spent_sol, 1.0);
+        // Over the per-tx cap, or past the remaining budget: refused, nothing charged.
+        assert!(debit(&dir, "g1", 2.0).is_err());
+        for _ in 0..4 {
+            debit(&dir, "g1", 1.0).unwrap();
+        }
+        assert!(debit(&dir, "g1", 0.5).is_err());
         assert_eq!(live(&dir).grants[0].spent_sol, 5.0);
 
         assert!(debit(&dir, "g1", -1.0).is_err());
@@ -619,10 +645,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn debit_missing_grant_is_noop() {
+    fn debit_missing_grant_is_an_error() {
         let dir = tmp_data("debit_missing");
         save(&dir, &Grants::default()).unwrap();
-        assert!(debit(&dir, "nope", 1.0).is_ok());
+        assert!(debit(&dir, "nope", 1.0).is_err());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn parallel_debits_never_overspend() {
+        let dir = tmp_data("parallel");
+        save(
+            &dir,
+            &Grants {
+                grants: vec![transfer_grant("g1", u64::MAX)],
+            },
+        )
+        .unwrap();
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || loop {
+                    match debit(&dir, "g1", 1.0) {
+                        Err(e) if e.to_string().contains("busy") => continue,
+                        other => break other.is_ok(),
+                    }
+                })
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(ok, 5, "budget 5 at 1 SOL each");
+        assert_eq!(live(&dir).grants[0].spent_sol, 5.0);
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

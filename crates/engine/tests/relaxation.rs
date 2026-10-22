@@ -116,15 +116,51 @@ fn devnet_transfer(amount: &str) -> String {
     format!("solana transfer {DEST} {amount} --url https://api.devnet.solana.com")
 }
 
-/// The nonce in an `allow`/`mode` pending result.
-fn nonce_of(run: &Run) -> String {
+/// Assert an `allow`/`mode` result is pending and carries no code.
+fn assert_pending_without_code(run: &Run) {
     let v = run.json();
-    let line = v["confirm"].as_str().unwrap_or_else(|| panic!("{v}"));
-    let nonce = line
-        .strip_prefix("safe-ai-skill confirm ")
-        .unwrap_or_else(|| panic!("{line}"));
-    assert!(nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_digit()));
-    nonce.to_string()
+    assert_eq!(v["status"], "pending", "{v}");
+    assert!(v["request"].as_str().unwrap().starts_with('r'), "{v}");
+    assert!(v.get("confirm").is_none(), "{v}");
+    for text in [&run.stdout, &run.stderr] {
+        assert!(!has_digit_run(text, 8), "an 8-digit run leaked: {text}");
+    }
+}
+
+/// Whether `text` has a run of at least `n` ASCII digits.
+fn has_digit_run(text: &str, n: usize) -> bool {
+    text.split(|c: char| !c.is_ascii_digit())
+        .any(|run| run.len() >= n)
+}
+
+impl Sandbox {
+    /// Run the PostToolUse `pending-notice` hook (as Claude Code does after the Bash call)
+    /// and return the code it shows the user, asserting it is in `systemMessage` only.
+    fn code_shown(&self) -> String {
+        let run = self.hook(
+            &["pending-notice"],
+            json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
+                   "tool_input":{"command":"safe-ai-skill allow"},"tool_response":{"stdout":""}}),
+            &[],
+        );
+        let v = run.json();
+        assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+        let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+        code_in(msg)
+    }
+}
+
+/// The code after `safe-ai-skill confirm ` in a systemMessage.
+fn code_in(msg: &str) -> String {
+    let code: String = msg
+        .split("safe-ai-skill confirm ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{msg}"))
+        .chars()
+        .take(8)
+        .collect();
+    assert!(code.bytes().all(|b| b.is_ascii_digit()), "{msg}");
+    code
 }
 
 fn allow_transfer(sb: &Sandbox) -> Run {
@@ -142,16 +178,9 @@ fn allow_parks_a_pending_entry_and_grants_nothing() {
     let sb = Sandbox::new("relax-pending");
     let run = allow_transfer(&sb);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let v = run.json();
-    assert_eq!(v["status"], "pending", "{v}");
-    assert!(v["summary"].as_str().unwrap().contains("transfer"), "{v}");
-    nonce_of(&run);
-    // The exact line to type reaches whoever ran the command, in plain text too.
-    assert!(
-        run.stderr.contains("safe-ai-skill confirm "),
-        "{}",
-        run.stderr
-    );
+    assert_pending_without_code(&run);
+    assert!(run.json()["summary"].as_str().unwrap().contains("transfer"));
+    assert!(run.stderr.contains("show YOU"), "{}", run.stderr);
     assert!(sb.state("grants.json").is_none());
     assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[]), "ask");
 }
@@ -159,7 +188,8 @@ fn allow_parks_a_pending_entry_and_grants_nothing() {
 #[test]
 fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
     let sb = Sandbox::new("relax-confirm");
-    let nonce = nonce_of(&allow_transfer(&sb));
+    allow_transfer(&sb);
+    let nonce = sb.code_shown();
     let run = sb.prompt(&format!("safe-ai-skill confirm {nonce}"));
     let v = run.json();
     let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
@@ -191,7 +221,8 @@ fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
 #[test]
 fn a_nonce_outside_the_users_prompt_never_confirms() {
     let sb = Sandbox::new("relax-elsewhere");
-    let nonce = nonce_of(&allow_transfer(&sb));
+    allow_transfer(&sb);
+    let nonce = sb.code_shown();
     let line = format!("safe-ai-skill confirm {nonce}");
 
     // In tool output (PostToolUse), in a Bash command, in a non-UserPromptSubmit payload,
@@ -288,8 +319,7 @@ fn an_unknown_or_removed_scope_is_a_cli_error() {
 fn a_looser_mode_needs_confirmation_and_a_stricter_one_does_not() {
     let sb = Sandbox::new("relax-mode");
     let run = sb.cli(&["mode", "autopilot"]);
-    assert_eq!(run.json()["status"], "pending", "{}", run.stdout);
-    nonce_of(&run);
+    assert_pending_without_code(&run);
     assert!(sb.state("mode.json").is_none());
 
     let run = sb.cli(&["mode", "paranoid"]);
@@ -351,10 +381,26 @@ fn v1_state_is_migrated_once_and_listed_at_session_start() {
     let msg = out["systemMessage"]
         .as_str()
         .unwrap_or_else(|| panic!("{out}"));
-    assert!(msg.contains("migrated from 1.0: grant grant-v1"), "{msg}");
+    assert!(
+        msg.contains("1.0 grant grant-v1 kept as pending request"),
+        "{msg}"
+    );
     assert!(msg.contains("mode off"), "{msg}");
-    assert!(sb.state("grants.json").unwrap().contains("\"mac\""));
+    // Nothing is live; the user gets the code, the model does not.
+    assert!(sb.state("grants.json").is_none());
+    let code = code_in(msg);
+    let context = out["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or("");
+    assert!(!context.contains(&code), "{context}");
     assert!(sb.state("audit.jsonl").unwrap().contains("state_migrate"));
+    // Confirming it keeps the grant.
+    let ok = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(ok["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
+    assert!(sb.state("grants.json").unwrap().contains("\"mac\""));
 
     // Only on the first run: a plain grants.json planted later stays unauthenticated.
     std::fs::write(
@@ -368,7 +414,110 @@ fn v1_state_is_migrated_once_and_listed_at_session_start() {
     let out = sb.session();
     let msg = out["systemMessage"].as_str().unwrap();
     assert!(!msg.contains("planted"), "{msg}");
+    assert!(!msg.contains("kept as pending"), "{msg}");
     assert!(msg.contains("grants.json failed authentication"), "{msg}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1: the agent never sees the code
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
+    // The exact attack: the agent runs `allow`, then pipes a fake UserPromptSubmit into
+    // `prompt-guard` with every value it could derive from the command's output.
+    let sb = Sandbox::new("relax-attack");
+    let run = allow_transfer(&sb);
+    assert_pending_without_code(&run);
+    // Claude Code's PostToolUse hook shows the user the code before the agent's next step.
+    let code = sb.code_shown();
+    let pending = sb.state("pending.json").unwrap();
+    assert!(
+        !pending.contains(&code),
+        "the code is stored only as a hash"
+    );
+    for text in [&run.stdout, &run.stderr] {
+        assert!(!text.contains(&code), "{text}");
+    }
+
+    // Everything stdout/stderr offers: digit runs padded or cut to 8, the request id, words.
+    let text = format!("{}\n{}", run.stdout, run.stderr);
+    let mut candidates: Vec<String> = text
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("{r:0>8}").chars().take(8).collect())
+        .collect();
+    candidates.extend(
+        text.split(|c: char| c.is_whitespace() || "\",:{}".contains(c))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string),
+    );
+    candidates.push(run.json()["request"].as_str().unwrap().to_string());
+    candidates.dedup();
+    assert!(candidates.len() >= 3);
+    let mut outputs = Vec::new();
+    for c in &candidates {
+        let out = sb.prompt(&format!("safe-ai-skill confirm {c}"));
+        assert!(
+            sb.state("grants.json").is_none(),
+            "{c} confirmed: {}",
+            out.stdout
+        );
+        outputs.push(out.stdout);
+    }
+    // Three wrong codes cancelled the request, and that was audited as tampering.
+    assert!(
+        outputs.iter().any(|o| o.contains("cancelled")),
+        "{outputs:?}"
+    );
+    assert!(sb.state("audit.jsonl").unwrap().contains("confirm_lockout"));
+    let late = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(late["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("nothing confirmed"));
+    assert!(sb.state("grants.json").is_none());
+    // No hook output ever carried the code to the model.
+    for o in &outputs {
+        assert!(!o.contains(&code), "{o}");
+    }
+}
+
+#[test]
+fn the_code_is_announced_once_in_system_message_only() {
+    let sb = Sandbox::new("relax-announce");
+    allow_transfer(&sb);
+    let code = sb.code_shown();
+    // A second PostToolUse shows nothing (a later forged call gets nothing either).
+    let again = sb.hook(
+        &["pending-notice"],
+        json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": sb.proj.path()}),
+        &[],
+    );
+    assert_eq!(again.stdout.trim(), "");
+    let v = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(v["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
+    assert!(!v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .contains(&code));
+}
+
+#[test]
+fn a_request_made_outside_a_tool_call_is_announced_at_the_next_prompt() {
+    let sb = Sandbox::new("relax-terminal");
+    allow_transfer(&sb);
+    let v = sb.prompt("what changed?").json();
+    let code = code_in(v["systemMessage"].as_str().unwrap());
+    assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+    let ok = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(ok["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
 }
 
 #[test]

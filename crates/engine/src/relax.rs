@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 
 use crate::audit::{self, AuditEntry};
-use crate::confirm::{self, PendingKind};
+use crate::confirm::{self, Attempt, PendingKind};
 use crate::datadir::DataDir;
 use crate::gate::{AllowReason, GateMeta, GrantId, Verdict};
 use crate::grants::{self, GrantRequest};
@@ -37,9 +37,6 @@ use crate::policy::Policy;
 /// The reason an allow becomes an ask under `paranoid`.
 pub const ASK_ALL_REASON: &str =
     "safe-ai-skill paranoid profile: every Solana action asks — approve to proceed";
-
-/// The prefix of a confirmation prompt.
-const CONFIRM_PREFIX: &str = "safe-ai-skill confirm";
 
 /// Apply the relaxation layer to a gate's natural decision; see [`apply_verdict`].
 pub fn apply(natural: Decision, meta: &GateMeta, policy: &Policy, dir: &DataDir) -> Decision {
@@ -126,35 +123,45 @@ impl ConfirmOutcome {
 /// `prompt` MUST come from [`confirm::user_prompt`] (the `UserPromptSubmit` payload); nothing
 /// else is ever passed. `None` when the prompt is not a confirmation attempt (no output).
 ///
-/// The whole prompt, trimmed, must be the single line `safe-ai-skill confirm <nonce>`: a
-/// confirm line inside pasted text (a file, a log, tool output the user copied) is refused,
-/// so a nonce the model planted somewhere cannot ride along in a bigger paste.
+/// The whole prompt, trimmed, must be the single line `safe-ai-skill confirm <code>`
+/// ([`confirm::classify`]): a confirm line inside pasted text is refused without consuming
+/// anything. Wrong codes count toward the lockout ([`confirm::MAX_FAILURES`]), which cancels
+/// every pending request and is audited as a tamper event. The outcome never contains a code.
 pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome> {
-    let trimmed = prompt.trim();
-    let mentions = trimmed.lines().any(|l| {
-        let l = l.trim();
-        l == CONFIRM_PREFIX
-            || l.strip_prefix(CONFIRM_PREFIX)
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-    });
-    if !mentions {
-        return None;
-    }
-    if trimmed.lines().count() != 1 {
-        return Some(ConfirmOutcome::note(
-            "safe-ai-skill: nothing confirmed. Type `safe-ai-skill confirm <nonce>` as the whole \
+    match confirm::confirm_attempt(dir, prompt, now) {
+        Attempt::NotAnAttempt => None,
+        Attempt::Embedded => Some(ConfirmOutcome::note(
+            "safe-ai-skill: nothing confirmed. Type `safe-ai-skill confirm <code>` as the whole \
              prompt, on its own."
                 .to_string(),
-        ));
+        )),
+        Attempt::Wrong { remaining } => Some(ConfirmOutcome::note(format!(
+            "safe-ai-skill: nothing confirmed. No pending request matches that code; it may have \
+             expired (10 minutes) or been used already. {remaining} more wrong code(s) cancel \
+             every pending request."
+        ))),
+        Attempt::LockedOut => {
+            audit_event(
+                dir,
+                "state_tamper",
+                "confirm_lockout",
+                "too many wrong confirmation codes; every pending request was cancelled",
+            );
+            Some(ConfirmOutcome::note(
+                "safe-ai-skill: too many wrong confirmation codes, so every pending request was \
+                 cancelled. Run the command again to get a new code."
+                    .to_string(),
+            ))
+        }
+        Attempt::Confirmed(confirmed) => {
+            Some(activate(dir, confirmed.kind, &confirmed.payload, now))
+        }
     }
-    let Some(confirmed) = confirm::confirm_from_prompt(dir, trimmed, now) else {
-        return Some(ConfirmOutcome::note(
-            "safe-ai-skill: nothing confirmed. No pending request matches that nonce; it may \
-             have expired (10 minutes) or been used already."
-                .to_string(),
-        ));
-    };
-    Some(activate(dir, confirmed.kind, &confirmed.payload, now))
+}
+
+/// The `systemMessage` announcing new confirmation codes, if any (user only).
+pub fn announce(dir: &DataDir, now: u64) -> Option<String> {
+    confirm::announcement_message(&confirm::announce_pending(dir, now))
 }
 
 /// Perform a confirmed pending entry and describe the result.
@@ -454,15 +461,73 @@ mod tests {
     // Prompt-nonce confirmation
     // -----------------------------------------------------------------------------------
 
+    /// Create and announce an entry; the code is what the user's systemMessage would show.
+    fn pending(dir: &DataDir, kind: PendingKind, payload: Value) -> confirm::Nonce {
+        confirm::create_pending(dir, kind, "summary", payload).unwrap();
+        let shown = confirm::announce_pending(dir, now());
+        assert_eq!(shown.len(), 1);
+        shown[0].code.clone()
+    }
+
     fn pending_grant(dir: &DataDir) -> confirm::Nonce {
         let req = GrantRequest::from_args("transfer", "30m", 1.0, 5.0, "", ADDR, false).unwrap();
+        pending(dir, PendingKind::Grant, serde_json::to_value(&req).unwrap())
+    }
+
+    #[test]
+    fn wrong_codes_lock_out_and_audit_a_tamper_event() {
+        let dir = tmp_data("confirm_lockout");
+        let code = pending_grant(&dir);
+        let wrong = if code.as_str() == "11111111" {
+            "22222222"
+        } else {
+            "11111111"
+        };
+        for _ in 0..2 {
+            let out =
+                confirm_prompt(&dir, &format!("safe-ai-skill confirm {wrong}"), now()).unwrap();
+            assert!(out.system_message.contains("nothing confirmed"));
+        }
+        let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {wrong}"), now()).unwrap();
+        assert!(
+            out.system_message.contains("cancelled"),
+            "{}",
+            out.system_message
+        );
+        let audit = std::fs::read_to_string(dir.path.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("confirm_lockout"), "{audit}");
+        let late = confirm_prompt(&dir, &format!("safe-ai-skill confirm {code}"), now()).unwrap();
+        assert!(late.system_message.contains("nothing confirmed"));
+        assert!(grants::live(&dir).grants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn announce_shows_the_code_once_and_never_in_model_context() {
+        let dir = tmp_data("confirm_announce");
+        let req = GrantRequest::from_args("swap", "1h", 1.0, 2.0, "", "", false).unwrap();
         confirm::create_pending(
-            dir,
+            &dir,
             PendingKind::Grant,
             &req.summary(),
             serde_json::to_value(&req).unwrap(),
         )
-        .unwrap()
+        .unwrap();
+        let msg = announce(&dir, now()).expect("an announcement");
+        let code: String = msg
+            .split("safe-ai-skill confirm ")
+            .nth(1)
+            .unwrap()
+            .chars()
+            .take(8)
+            .collect();
+        assert!(msg.contains("swap"), "{msg}");
+        assert_eq!(announce(&dir, now()), None);
+        let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {code}"), now()).unwrap();
+        assert!(out.system_message.contains("you confirmed"));
+        assert!(!out.additional_context.contains(&code));
+        assert!(!out.system_message.contains(&code));
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
@@ -571,14 +636,12 @@ mod tests {
     #[test]
     fn a_forged_pending_grant_payload_is_refused() {
         let dir = tmp_data("confirm_forged");
-        let nonce = confirm::create_pending(
+        let nonce = pending(
             &dir,
             PendingKind::Grant,
-            "harmless",
             json!({"scope":"other","for_secs":60,"max_tx_sol":1e9,"budget_sol":1e9,
                    "programs":[],"to":[],"danger":false}),
-        )
-        .unwrap();
+        );
         let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {nonce}"), now()).unwrap();
         assert!(
             out.system_message.contains("failed"),
@@ -592,13 +655,7 @@ mod tests {
     #[test]
     fn the_confirm_prompt_activates_a_mode_change() {
         let dir = tmp_data("confirm_mode");
-        let nonce = confirm::create_pending(
-            &dir,
-            PendingKind::Mode,
-            "mode autopilot",
-            json!({"profile":"autopilot"}),
-        )
-        .unwrap();
+        let nonce = pending(&dir, PendingKind::Mode, json!({"profile":"autopilot"}));
         assert_eq!(mode::persisted(&dir), None);
         let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {nonce}"), now()).unwrap();
         assert!(out.system_message.contains("mode autopilot"));

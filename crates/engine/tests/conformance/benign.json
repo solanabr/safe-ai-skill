@@ -451,6 +451,28 @@
         "exit": 0,
         "stdout": ""
       }
+    },
+    {
+      "name": "pending-notice: nothing pending",
+      "args": [
+        "pending-notice"
+      ],
+      "stdin": {
+        "hook_event_name": "PostToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ls"
+        },
+        "tool_response": {
+          "stdout": "README.md"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
     }
   ]
 }

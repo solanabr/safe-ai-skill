@@ -31,7 +31,7 @@ sub=${1:-}
 case $sub in
   gate-bash) kind=solana ;;
   gate-mcp) kind=mcp ;;
-  gate-* | redact | prompt-guard) kind=broad ;;
+  gate-* | redact | prompt-guard | pending-notice) kind=broad ;;
   verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
   *) kind=cli ;;
 esac

@@ -1,60 +1,69 @@
-//! One-time migration of 1.0 relaxation state into authenticated envelopes (spec D4.2).
+//! One-time conversion of 1.0 relaxation state (spec D4.2, WS-B fix round 1).
 //!
 //! 1.0 wrote `grants.json`, `mode.json` and `spend.json` as plain JSON. 1.1.0 reads only
-//! [`crate::statefile`] envelopes, so a plain file is "tampered". [`run`] converts valid 1.0
-//! files once, at the first 1.1.0 SessionStart, and returns a line per migrated item for the
-//! SessionStart notice; each is also audited.
+//! [`crate::statefile`] envelopes, so a plain file is "tampered". [`run`] converts 1.0 files
+//! once, at the first 1.1.0 SessionStart, and **never into live relaxation**:
 //!
-//! "First run" means the state key does not exist yet and no file in the data dir is an
-//! envelope. The SessionStart that migrates also creates the key (via the spend ledger), so a
-//! plain file written later is never migrated: it stays tampered and relaxes nothing.
+//! - each unexpired 1.0 grant in a grantable scope with valid addresses becomes a *pending*
+//!   grant request for its remaining time and budget; a 1.0 `autopilot` mode becomes a pending
+//!   mode request. The user sees their confirmation codes in that SessionStart's
+//!   `systemMessage` and keeps what they confirm. `paranoid` (stricter) is applied as is;
+//! - a 1.0 spend ledger becomes an exhausted ledger for today (fresh tomorrow);
+//! - an unreadable file, and the removed `off` mode, are renamed to `<name>.v1-unmigrated`.
 //!
-//! **Trade-off:** 1.0 state was unauthenticated, so migrating it trusts whatever was on disk
-//! at upgrade time, including anything the agent wrote there under 1.0. The alternative,
-//! dropping it, costs users their live grants and mode. The risk is bounded: only unexpired
-//! grants in a grantable scope with valid addresses carry over, `off` is not carried over,
-//! and every migrated item is shown to the user at that SessionStart. An agent that deletes
-//! the key *and* every envelope to stage a second migration is a same-user write the threat
-//! model already concedes; the notice still shows the user what was migrated.
+//! Each converted file is renamed to `<name>.v1-migrated`, each item is audited and listed in
+//! the SessionStart notice, and an authenticated marker [`MIGRATED_FILE`] is written.
 //!
-//! A 1.0 file that cannot be migrated is renamed to `<name>.v1-unmigrated` so it does not
-//! show up as an authentication failure every session.
+//! "First run" means no state key, no marker, and no envelope in the data dir. Staging a
+//! second run (delete the key, the marker and every envelope, plant plain files) therefore
+//! yields only pending requests the user must confirm with a code they alone see, and an
+//! exhausted ledger. The audit log is not part of the test: every 1.0 install has one, so
+//! requiring its absence would never migrate anything.
 
 use std::path::Path;
 
 use crate::audit::{self, AuditEntry};
-use crate::confirm::PENDING_FILE;
+use crate::confirm::{self, PendingKind, PENDING_FILE};
 use crate::datadir::DataDir;
-use crate::grants::{self, Grants, GRANTABLE_SCOPES, GRANTS_FILE};
+use crate::grants::{self, GrantRequest, Grants, GRANTABLE_SCOPES, GRANTS_FILE};
 use crate::mode::{self, ModeRecord, MODE_FILE};
 use crate::session::SESSIONS_FILE;
-use crate::spend::{SpendLedger, SPEND_FILE};
+use crate::spend::{self, SPEND_FILE};
 use crate::statefile::{self, KEY_FILE};
 
 /// Largest 1.0 state file read.
 const MAX_V1_BYTES: u64 = 1024 * 1024;
 
+/// The authenticated marker written after a migration.
+pub const MIGRATED_FILE: &str = "migrated.json";
+
+/// Longest a converted grant request may run (the grant limit).
+const MAX_GRANT_SECS: u64 = 30 * 86_400;
+
 /// State files 1.1.0 writes as envelopes: one of them existing means 1.1.0 has run.
-const ENVELOPE_FILES: [&str; 7] = [
+const ENVELOPE_FILES: [&str; 8] = [
     GRANTS_FILE,
     MODE_FILE,
     SPEND_FILE,
     PENDING_FILE,
     SESSIONS_FILE,
+    MIGRATED_FILE,
     "trust.json",
     "state.json",
 ];
 
-/// Migrate valid 1.0 state in `dir`, once. Returns one human line per migrated or dropped
-/// item (empty when there was nothing to do or this is not a first run).
+/// Convert 1.0 state in `dir`, once. Returns one human line per item (empty when there was
+/// nothing to do or this is not a first run).
 pub fn run(dir: &DataDir, now: u64) -> Vec<String> {
     if dir.is_unresolved() || !is_first_run(&dir.path) {
         return Vec::new();
     }
     let mut lines = Vec::new();
+    migrate_spend(dir, &mut lines);
     migrate_grants(dir, now, &mut lines);
     migrate_mode(dir, now, &mut lines);
-    migrate_spend(dir, &mut lines);
+    let marker = serde_json::json!({ "at": now, "items": lines });
+    let _ = statefile::store(dir, MIGRATED_FILE, &marker);
     for line in &lines {
         let entry = AuditEntry::new(
             "",
@@ -69,9 +78,10 @@ pub fn run(dir: &DataDir, now: u64) -> Vec<String> {
     lines
 }
 
-/// No state key and no envelope: 1.1.0 has never written here.
+/// No state key, no marker, no envelope: 1.1.0 has never written here.
 fn is_first_run(path: &Path) -> bool {
-    if std::fs::symlink_metadata(path.join(KEY_FILE)).is_ok() {
+    let exists = |name: &str| std::fs::symlink_metadata(path.join(name)).is_ok();
+    if exists(KEY_FILE) || exists(MIGRATED_FILE) {
         return false;
     }
     !ENVELOPE_FILES.iter().any(|name| {
@@ -81,49 +91,48 @@ fn is_first_run(path: &Path) -> bool {
     })
 }
 
+fn migrate_spend(dir: &DataDir, lines: &mut Vec<String>) {
+    let path = dir.path.join(SPEND_FILE);
+    if read_v1(&path).is_none() {
+        return;
+    }
+    rename_to(&path, "v1-migrated");
+    if spend::store_exhausted(&dir.path).is_ok() {
+        lines.push(
+            "1.0 spend ledger: today's spend budget is treated as exhausted (fresh tomorrow)"
+                .to_string(),
+        );
+    }
+}
+
 fn migrate_grants(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
     let path = dir.path.join(GRANTS_FILE);
     let Some(bytes) = read_v1(&path) else {
         return;
     };
     let Ok(old) = serde_json::from_slice::<Grants>(&bytes) else {
-        set_aside(
-            &path,
-            lines,
-            "grants.json from 1.0 could not be read; not migrated",
-        );
+        rename_to(&path, "v1-unmigrated");
+        lines.push("grants.json from 1.0 could not be read; not migrated".to_string());
         return;
     };
-    let total = old.grants.len();
-    let kept: Vec<grants::Grant> = old
-        .grants
-        .into_iter()
-        .filter(|g| migratable(g, now))
-        .map(|mut g| {
-            if !g.spent_sol.is_finite() || g.spent_sol < 0.0 {
-                g.spent_sol = g.budget_sol;
-            }
-            g
-        })
-        .collect();
-    let dropped = total - kept.len();
-    if kept.is_empty() {
-        set_aside(
-            &path,
-            lines,
-            &format!("grants.json from 1.0: {dropped} grant(s) expired or invalid; not migrated"),
-        );
-        return;
+    rename_to(&path, "v1-migrated");
+    let mut dropped = 0usize;
+    for g in &old.grants {
+        let Some(request) = as_request(g, now) else {
+            dropped += 1;
+            continue;
+        };
+        let Ok(payload) = serde_json::to_value(&request) else {
+            continue;
+        };
+        let summary = format!("{} (kept from 1.0)", request.summary());
+        if let Ok(id) = confirm::create_pending(dir, PendingKind::Grant, &summary, payload) {
+            lines.push(format!(
+                "1.0 grant {} kept as pending request {id}; confirm it with the code shown to you",
+                g.id
+            ));
+        }
     }
-    let described: Vec<String> = kept.iter().map(|g| g.describe(now)).collect();
-    if grants::save(dir, &Grants { grants: kept }).is_err() {
-        return;
-    }
-    lines.extend(
-        described
-            .into_iter()
-            .map(|d| format!("migrated from 1.0: {d}")),
-    );
     if dropped > 0 {
         lines.push(format!(
             "grants.json from 1.0: {dropped} expired or invalid grant(s) dropped"
@@ -131,9 +140,10 @@ fn migrate_grants(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
     }
 }
 
-/// An unexpired 1.0 grant in a grantable scope, with sane numbers and addresses.
-fn migratable(g: &grants::Grant, now: u64) -> bool {
-    !g.is_expired(now)
+/// The pending request a 1.0 grant becomes: its remaining time and budget. `None` when it is
+/// expired, outside the grantable scopes, or carries bad numbers or addresses.
+fn as_request(g: &grants::Grant, now: u64) -> Option<GrantRequest> {
+    let valid = !g.is_expired(now)
         && GRANTABLE_SCOPES.contains(&g.scope)
         && g.max_tx_sol.is_finite()
         && g.max_tx_sol >= 0.0
@@ -142,7 +152,19 @@ fn migratable(g: &grants::Grant, now: u64) -> bool {
         && g.programs
             .iter()
             .chain(&g.to)
-            .all(|a| grants::is_address(a))
+            .all(|a| grants::is_address(a));
+    if !valid {
+        return None;
+    }
+    Some(GrantRequest {
+        scope: g.scope,
+        for_secs: g.expires_at.saturating_sub(now).clamp(1, MAX_GRANT_SECS),
+        max_tx_sol: g.max_tx_sol,
+        budget_sol: g.remaining_sol(),
+        programs: g.programs.clone(),
+        to: g.to.clone(),
+        danger: g.danger,
+    })
 }
 
 fn migrate_mode(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
@@ -150,64 +172,44 @@ fn migrate_mode(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
     let Some(bytes) = read_v1(&path) else {
         return;
     };
-    match serde_json::from_slice::<ModeRecord>(&bytes) {
-        Ok(r) if mode::is_known_profile(&r.profile) => {
-            let set_at = if r.set_at == 0 { now } else { r.set_at };
-            if mode::set(dir, &r.profile, set_at).is_ok() {
-                lines.push(format!("migrated from 1.0: mode {}", r.profile));
+    let record = serde_json::from_slice::<ModeRecord>(&bytes).ok();
+    match record.as_ref().map(|r| r.profile.as_str()) {
+        Some(p) if mode::is_known_profile(p) => {
+            rename_to(&path, "v1-migrated");
+            if mode::is_looser(p, mode::DEFAULT_PROFILE) {
+                let payload = serde_json::json!({ "profile": p });
+                let summary = format!("mode {p} (kept from 1.0)");
+                if let Ok(id) = confirm::create_pending(dir, PendingKind::Mode, &summary, payload) {
+                    lines.push(format!(
+                        "1.0 mode {p} kept as pending request {id}; confirm it with the code \
+                         shown to you"
+                    ));
+                }
+            } else if p != mode::DEFAULT_PROFILE && mode::set(dir, p, now).is_ok() {
+                lines.push(format!("1.0 mode {p} applied"));
             }
         }
-        Ok(r) if r.profile == "off" => set_aside(
-            &path,
-            lines,
-            "mode off from 1.0 was removed; not migrated (strict applies; to turn the hooks \
-             off use SAFE_AI_SKILL_DISABLE)",
-        ),
-        _ => set_aside(
-            &path,
-            lines,
-            "mode.json from 1.0 could not be read; not migrated",
-        ),
+        Some("off") => {
+            rename_to(&path, "v1-unmigrated");
+            lines.push(
+                "mode off from 1.0 was removed; not migrated (strict applies; to turn the hooks \
+                 off use SAFE_AI_SKILL_DISABLE)"
+                    .to_string(),
+            );
+        }
+        _ => {
+            rename_to(&path, "v1-unmigrated");
+            lines.push("mode.json from 1.0 could not be read; not migrated".to_string());
+        }
     }
 }
 
-fn migrate_spend(dir: &DataDir, lines: &mut Vec<String>) {
-    let path = dir.path.join(SPEND_FILE);
-    let Some(bytes) = read_v1(&path) else {
-        return;
-    };
-    let Ok(old) = serde_json::from_slice::<SpendLedger>(&bytes) else {
-        set_aside(
-            &path,
-            lines,
-            "spend.json from 1.0 could not be read; not migrated",
-        );
-        return;
-    };
-    // A fresh ledger at the 1.0 totals; the day rolls over as usual.
-    let total = if old.total_sol.is_finite() && old.total_sol >= 0.0 {
-        old.total_sol
-    } else {
-        f64::MAX
-    };
-    let ledger = SpendLedger {
-        day: old.day,
-        total_sol: total,
-    };
-    if statefile::store(dir, SPEND_FILE, &ledger).is_ok() {
-        lines.push(format!(
-            "migrated from 1.0: spend ledger ({total} SOL on day {})",
-            old.day
-        ));
-    }
-}
-
-/// Rename an unmigratable 1.0 file aside and note it.
-fn set_aside(path: &Path, lines: &mut Vec<String>, note: &str) {
+/// Rename a 1.0 file to `<name>.<suffix>`.
+fn rename_to(path: &Path, suffix: &str) {
     let mut aside = path.as_os_str().to_owned();
-    aside.push(".v1-unmigrated");
+    aside.push(".");
+    aside.push(suffix);
     let _ = std::fs::rename(path, aside);
-    lines.push(note.to_string());
 }
 
 /// The bytes of a regular (non-symlink, non-FIFO) file of at most [`MAX_V1_BYTES`].
@@ -223,9 +225,17 @@ fn read_v1(path: &Path) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::grants::tests::{tmp_data, transfer_grant, ADDR};
+    use crate::spend::SpendLedger;
     use crate::statefile::Loaded;
 
     const NOW: u64 = 1_000_000;
+
+    fn real_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 
     fn write(dir: &DataDir, name: &str, body: &str) {
         std::fs::create_dir_all(&dir.path).unwrap();
@@ -235,6 +245,7 @@ mod tests {
     fn v1_grants() -> String {
         let mut to_dest = transfer_grant("live", NOW + 3_600);
         to_dest.to = vec![ADDR.into()];
+        to_dest.spent_sol = 2.0;
         let mut other = transfer_grant("other", NOW + 3_600);
         other.scope = crate::gate::Scope::Other;
         serde_json::to_string(&Grants {
@@ -244,64 +255,84 @@ mod tests {
     }
 
     #[test]
-    fn valid_v1_state_is_migrated_once_and_re_maced() {
+    fn v1_state_becomes_pending_requests_and_an_exhausted_ledger() {
         let dir = tmp_data("migrate_ok");
         write(&dir, GRANTS_FILE, &v1_grants());
         write(&dir, MODE_FILE, r#"{"profile":"autopilot","set_at":5}"#);
-        write(&dir, SPEND_FILE, r#"{"day":11,"total_sol":2.5}"#);
+        write(&dir, SPEND_FILE, r#"{"day":11,"total_sol":0.0}"#);
 
         let lines = run(&dir, NOW);
-        assert!(lines.iter().any(|l| l.contains("grant live")), "{lines:?}");
         assert!(
-            lines.iter().any(|l| l.contains("mode autopilot")),
+            lines
+                .iter()
+                .any(|l| l.contains("1.0 grant live kept as pending")),
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("spend ledger")),
+            lines.iter().any(|l| l.contains("1.0 mode autopilot kept")),
             "{lines:?}"
         );
+        assert!(lines.iter().any(|l| l.contains("exhausted")), "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("2 expired or invalid")),
             "{lines:?}"
         );
 
-        let migrated = grants::live(&dir);
-        assert_eq!(migrated.grants.len(), 1);
-        assert_eq!(migrated.grants[0].id, "live");
-        assert_eq!(mode::persisted(&dir), Some("autopilot".into()));
+        // Nothing is live: no grant, no autopilot.
+        assert!(grants::live(&dir).grants.is_empty());
+        assert_eq!(mode::persisted(&dir), None);
         match statefile::load::<SpendLedger>(&dir, SPEND_FILE) {
-            Loaded::Valid(l) => assert_eq!((l.day, l.total_sol), (11, 2.5)),
+            Loaded::Valid(l) => assert!(l.is_exhausted()),
             other => panic!("{other:?}"),
         }
-        let audit = std::fs::read_to_string(dir.path.join("audit.jsonl")).unwrap();
-        assert!(audit.contains("state_migrate"));
-
-        // Once: a plain grants.json written afterwards is never migrated.
-        write(&dir, GRANTS_FILE, &v1_grants());
-        assert!(run(&dir, NOW).is_empty());
-        assert!(grants::live(&dir).grants.is_empty());
+        // The requests carry the remaining time and budget; the user confirms them.
+        let shown = confirm::announce_pending(&dir, real_now());
+        assert_eq!(shown.len(), 2);
+        let grant = shown.iter().find(|a| a.kind == PendingKind::Grant).unwrap();
+        assert!(grant.summary.contains("3 SOL budget") && grant.summary.contains("1h"));
+        assert!(dir.path.join("grants.json.v1-migrated").exists());
+        assert!(std::fs::read_to_string(dir.path.join("audit.jsonl"))
+            .unwrap()
+            .contains("state_migrate"));
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
-    fn no_migration_when_the_key_exists() {
-        let dir = tmp_data("migrate_keyed");
-        // Any 1.1.0 store creates the key.
-        mode::set(&dir, "strict", 0).unwrap();
+    fn staged_rerun_is_refused_while_the_marker_or_key_exists() {
+        let dir = tmp_data("migrate_once");
         write(&dir, GRANTS_FILE, &v1_grants());
-        assert!(run(&dir, NOW).is_empty());
-        assert!(grants::live(&dir).grants.is_empty());
-        let _ = std::fs::remove_dir_all(&dir.path);
-    }
-
-    #[test]
-    fn no_migration_when_an_envelope_survives_a_deleted_key() {
-        let dir = tmp_data("migrate_nokey");
-        mode::set(&dir, "strict", 0).unwrap();
+        assert!(!run(&dir, NOW).is_empty());
+        // Delete the key and every envelope but the marker, plant again: refused.
         std::fs::remove_file(dir.path.join(KEY_FILE)).unwrap();
+        for name in [PENDING_FILE, SPEND_FILE, statefile::GEN_INDEX] {
+            let _ = std::fs::remove_file(dir.path.join(name));
+        }
         write(&dir, GRANTS_FILE, &v1_grants());
         assert!(run(&dir, NOW).is_empty());
-        assert!(grants::live(&dir).grants.is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn no_migration_when_the_key_or_an_envelope_exists() {
+        let dir = tmp_data("migrate_keyed");
+        mode::set(&dir, "strict", 0).unwrap();
+        write(&dir, GRANTS_FILE, &v1_grants());
+        assert!(run(&dir, NOW).is_empty());
+        std::fs::remove_file(dir.path.join(KEY_FILE)).unwrap();
+        assert!(run(&dir, NOW).is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn even_a_fully_staged_rerun_relaxes_nothing() {
+        // Key, marker and every envelope deleted: the plant converts again, but only into
+        // pending requests (codes go to the user) and an exhausted ledger.
+        let dir = tmp_data("migrate_staged");
+        write(&dir, MODE_FILE, r#"{"profile":"autopilot","set_at":5}"#);
+        write(&dir, SPEND_FILE, r#"{"day":11,"total_sol":0.0}"#);
+        assert!(!run(&dir, NOW).is_empty());
+        assert_eq!(mode::persisted(&dir), None);
+        assert!(spend::SpendLedger::load(&dir.path).is_exhausted());
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
@@ -315,7 +346,6 @@ mod tests {
             .iter()
             .any(|l| l.contains("grants.json from 1.0 could not be read")));
         assert!(lines.iter().any(|l| l.contains("mode off")));
-        assert!(!dir.path.join(GRANTS_FILE).exists());
         assert!(dir.path.join("grants.json.v1-unmigrated").exists());
         assert!(dir.path.join("mode.json.v1-unmigrated").exists());
         assert_eq!(mode::persisted(&dir), None);
@@ -323,8 +353,21 @@ mod tests {
     }
 
     #[test]
+    fn paranoid_is_applied_directly() {
+        let dir = tmp_data("migrate_paranoid");
+        write(&dir, MODE_FILE, r#"{"profile":"paranoid","set_at":5}"#);
+        let lines = run(&dir, NOW);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("1.0 mode paranoid applied")));
+        assert_eq!(mode::persisted(&dir), Some("paranoid".into()));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
     fn nothing_to_migrate_is_silent() {
         let dir = tmp_data("migrate_none");
         assert!(run(&dir, NOW).is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 }

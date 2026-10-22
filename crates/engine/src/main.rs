@@ -53,6 +53,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-prompt-expansion", |_| cmd_no_opinion()),
     ("redact", |_| cmd_redact()),
     ("prompt-guard", |_| cmd_prompt_guard()),
+    ("pending-notice", |_| cmd_pending_notice()),
     ("verify", cmd_verify),
     ("add", cmd_add),
     ("install", cmd_install),
@@ -389,8 +390,35 @@ fn cmd_prompt_guard() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let dir = state_dir(&cwd_of(&input));
-    if let Some(outcome) = relax::confirm_prompt(&dir, user_prompt, now_secs()) {
-        print_json(&outcome.hook_output());
+    let now = now_secs();
+    let outcome = relax::confirm_prompt(&dir, user_prompt, now);
+    // Codes for requests made outside a Bash tool call (a terminal, `!` mode): shown to the
+    // user only, in the systemMessage.
+    let codes = relax::announce(&dir, now);
+    let mut out = match (outcome, &codes) {
+        (Some(o), _) => o.hook_output(),
+        (None, Some(_)) => serde_json::json!({}),
+        (None, None) => return ExitCode::SUCCESS,
+    };
+    if let (Some(codes), Some(map)) = (codes, out.as_object_mut()) {
+        let msg = match map.get("systemMessage").and_then(|m| m.as_str()) {
+            Some(prev) => format!("{prev}\n{codes}"),
+            None => codes,
+        };
+        map.insert("systemMessage".to_string(), serde_json::Value::String(msg));
+    }
+    print_json(&out);
+    ExitCode::SUCCESS
+}
+
+/// `pending-notice` — the PostToolUse (Bash) hook that shows the user the confirmation code
+/// of a request the tool call just made. The code goes in `systemMessage` only (never
+/// `additionalContext`), and each request is announced once. Nothing pending → no output.
+fn cmd_pending_notice() -> ExitCode {
+    let input = read_input().1.unwrap_or_default();
+    let dir = state_dir(&cwd_of(&input));
+    if let Some(codes) = relax::announce(&dir, now_secs()) {
+        print_json(&serde_json::json!({ "systemMessage": codes }));
     }
     ExitCode::SUCCESS
 }
@@ -466,6 +494,14 @@ fn cmd_verify_session() -> ExitCode {
             }
             field.push_str(&text);
         }
+    }
+    // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
+    // user's systemMessage only.
+    if let Some(codes) = relax::announce(&dir, now) {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&codes);
     }
 
     if let Some(out) = res.hook_output() {
@@ -1190,9 +1226,9 @@ fn cli_error(command: &str, error: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Park a relaxing action for prompt-nonce confirmation (spec D4.1) and tell whoever ran
-/// the command exactly what to type: JSON on stdout, plain text on stderr. Nothing takes
-/// effect until the user's own next prompt is `safe-ai-skill confirm <nonce>`.
+/// Park a relaxing action for confirmation (spec D4.1). The output names the request but
+/// carries **no code**: safe-ai-skill shows the code to the user alone, in a `systemMessage`
+/// (the PostToolUse `pending-notice` hook, or the next prompt or session start).
 fn park_pending(
     command: &str,
     dir: &DataDir,
@@ -1200,25 +1236,20 @@ fn park_pending(
     summary: &str,
     payload: serde_json::Value,
 ) -> ExitCode {
-    // Start the spend ledger first: creating the state key without it would make the ledger
-    // look deleted (budget exhausted) at the next session.
-    let _ = SpendLedger::load(&dir.path);
-    let nonce = match confirm::create_pending(dir, kind, summary, payload) {
-        Ok(n) => n,
+    let id = match confirm::create_pending(dir, kind, summary, payload) {
+        Ok(id) => id,
         Err(e) => return cli_error(command, &format!("could not record the request: {e}")),
     };
-    let line = format!("safe-ai-skill confirm {nonce}");
     let minutes = confirm::TTL_SECS / 60;
-    let untrusted = !dir.trusted;
     let mut message = format!(
-        "Nothing has changed yet. Requested: {summary}.\n\
-         To approve it, type this line as your entire next prompt in Claude Code \
-         (valid {minutes} minutes, single use):\n\n    {line}\n"
+        "Pending request {id} created: {summary}. Nothing has changed yet. safe-ai-skill will \
+         show YOU (not the agent) a confirmation code; type it as your entire next prompt in \
+         Claude Code to approve (valid {minutes} minutes after it is shown)."
     );
-    if untrusted {
+    if !dir.trusted {
         message.push_str(
-            "\nWarning: the plugin data dir is not in a trusted location, so this will not \
-             take effect even once confirmed.\n",
+            " Warning: the plugin data dir is not in a trusted location, so this will not take \
+             effect even once confirmed.",
         );
     }
     let _ = writeln!(std::io::stderr(), "{message}");
@@ -1226,10 +1257,9 @@ fn park_pending(
     print_json(&serde_json::json!({
         "command": command,
         "status": "pending",
+        "request": id.as_str(),
         "summary": summary,
-        "confirm": line,
-        "expires_in_secs": confirm::TTL_SECS,
-        "data_dir_trusted": !untrusted,
+        "data_dir_trusted": dir.trusted,
         "message": message,
     }));
     ExitCode::SUCCESS
@@ -1310,7 +1340,6 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
             serde_json::json!({ "profile": profile }),
         );
     }
-    let _ = SpendLedger::load(&dir.path);
     match mode::set(&dir, profile, now_secs()) {
         Ok(()) => {
             audit_event(
@@ -1337,7 +1366,6 @@ fn cmd_revoke() -> ExitCode {
         Loaded::Valid(g) => g.grants.len(),
         _ => 0,
     };
-    let _ = SpendLedger::load(&dir.path);
     if let Err(e) = grants::save(&dir, &grants::Grants::default()) {
         return cli_error("revoke", &e.to_string());
     }
