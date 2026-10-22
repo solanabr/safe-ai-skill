@@ -4,26 +4,29 @@
 //! - `shared_corpus_schema` (always on): every row parses against the schema, ids are unique,
 //!   verdict strings are well formed, `combined` equals `combine(plugin, kit)`, and the contract
 //!   invariants 1 to 3 hold on the file itself.
-//! - `shared_corpus_plugin_column` (`#[ignore]`d until F8 merges the gate work of F1 to F5):
-//!   drives the built binary through the hook entry the plugin wires for the row's tool, once per
+//! - `shared_corpus_plugin_column`: drives the built binary through the hook entry the plugin wires for the row's tool, once per
 //!   tier, and asserts the `plugin` column. It also asserts invariants 1 to 3 on the actual
 //!   verdicts combined with the row's `kit` column, and that no-opinion cells print nothing.
 //!   Rows that need an authenticated `tier.json`, a grant or a sandbox override need
 //!   `--features test-hooks`: without it the run fails (naming the feature), unless
 //!   `SHARED_CORPUS_ALLOW_SKIP=1` accepts the skipped cells. A filter matching nothing fails.
-//!   It assumes `gate-bash` is wired unconditionally (no `hooks.json` `if` filter).
+//!   It assumes `gate-bash` is wired unconditionally (no `hooks.json` `if` filter). A row whose
+//!   `interim.plugin` is set (the shipped engine differs from the end state, with a reason) is
+//!   held to that interim verdict, unless the build has its `interim.until_feature`.
 //! - `conformance_diff_fails_on_bad_input` (always on, unix): `scripts/conformance-diff.sh` exits
 //!   non-zero on empty, garbage, partial and duplicate input.
 //! - `runner_plumbing_smoke` (always on): four rows the 1.1.0 gates already satisfy, so a broken
 //!   materialiser shows up in a plain `cargo test`.
 //!
-//! Run the full matrix: `cargo test --features test-hooks --test shared_corpus -- --ignored`.
+//! Run the full matrix: `cargo test --features test-hooks --test shared_corpus` (add
+//! `env-read-opt-in` for the opt-in rows' end state).
 //! `SHARED_CORPUS_FILTER=<id substring>[,..]` narrows it; `SHARED_CORPUS_RESULTS=<path>` writes
 //! one `{"id","plugin"}` line per row for `scripts/conformance-diff.sh` (`?` marks a tier that was
 //! skipped or errored).
 //!
 //! Nothing here touches the real HOME: every run gets a temporary root with `home/`, the project
-//! dir, a plugin-data dir and an empty `PATH` (no `solana` to shell out to). No network.
+//! dir, a plugin-data dir and a `PATH` holding nothing, or only a stub `solana` that answers
+//! `config get` from the temp HOME's CLI config file when the row writes one. No network.
 
 mod common;
 
@@ -112,6 +115,11 @@ struct Interim {
     plugin: Option<Verdicts>,
     kit: Option<Verdicts>,
     combined: Verdicts,
+    /// Why the plugin's shipped verdict differs from its end state (required with `plugin`).
+    reason: Option<String>,
+    /// A cargo feature that already gives the end state: built with it, the runner asserts
+    /// `expect.plugin` instead of `interim.plugin`.
+    until_feature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,9 +419,28 @@ fn parse_expect(v: &Value, what: &str) -> Result<Expect, String> {
         Some(Value::Object(io)) => {
             check_keys(
                 io,
-                &["plugin", "kit", "combined"],
+                &["plugin", "kit", "combined", "reason", "until_feature"],
                 &format!("{what} interim"),
             )?;
+            let text = |key: &str| -> Result<Option<String>, String> {
+                match io.get(key) {
+                    None => Ok(None),
+                    Some(Value::String(t)) if !t.is_empty() => Ok(Some(t.clone())),
+                    Some(_) => Err(format!("{what}: interim.{key} must be a non-empty string")),
+                }
+            };
+            if io.contains_key("plugin") && !io.contains_key("reason") {
+                return Err(format!("{what}: interim.plugin needs interim.reason"));
+            }
+            let until_feature = text("until_feature")?;
+            if until_feature
+                .as_deref()
+                .is_some_and(|f| !KNOWN_FEATURES.contains(&f))
+            {
+                return Err(format!(
+                    "{what}: interim.until_feature names an unknown feature"
+                ));
+            }
             let opt = |key: &str, unknown: bool| -> Result<Option<Verdicts>, String> {
                 io.get(key)
                     .map(|x| verdicts(x, &format!("{what} interim.{key}"), unknown))
@@ -427,6 +454,8 @@ fn parse_expect(v: &Value, what: &str) -> Result<Expect, String> {
                     &format!("{what} interim.combined"),
                     true,
                 )?,
+                reason: text("reason")?,
+                until_feature,
             })
         }
         Some(_) => return Err(format!("{what}: expect.interim must be an object")),
@@ -871,6 +900,28 @@ fn materialise(row: &Row) -> Result<Paths, String> {
                 .map_err(|e| format!("write {}: {e}", path.display()))?;
         }
     }
+    // A row writing the CLI config gets a stub `solana` answering `config get` from it, as
+    // the real CLI would (the engine reads the default cluster only through the CLI).
+    #[cfg(unix)]
+    {
+        let config = paths.home.join(".config/solana/cli/config.yml");
+        if config.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let stub = paths.tools.join("solana");
+            std::fs::write(
+                &stub,
+                "#!/bin/sh\n[ \"$1\" = config ] && [ \"$2\" = get ] || exit 1\n\
+                 url=\nwhile IFS= read -r line; do\n  case \"$line\" in\n    \
+                 json_rpc_url:*) url=${line#json_rpc_url:} ;;\n  esac\ndone \
+                 < \"$HOME/.config/solana/cli/config.yml\"\nurl=${url# }\n\
+                 echo \"Config File: $HOME/.config/solana/cli/config.yml\"\n\
+                 echo \"RPC URL: $url\"\n",
+            )
+            .map_err(|e| format!("write solana stub: {e}"))?;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("chmod solana stub: {e}"))?;
+        }
+    }
     if !is_empty_object(&row.ctx.repo_policy) {
         let dir = paths.proj.join(".safe-ai-skill");
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
@@ -1117,12 +1168,34 @@ fn work_for(rows: &[Row], filter: &[String]) -> Vec<(usize, usize)> {
     work
 }
 
+/// Cargo features an interim row may name in `until_feature`, and whether this build has them.
+const KNOWN_FEATURES: [&str; 1] = ["env-read-opt-in"];
+
+fn built_with(feature: &str) -> bool {
+    match feature {
+        "env-read-opt-in" => cfg!(feature = "env-read-opt-in"),
+        _ => false,
+    }
+}
+
+/// The plugin verdict this build must give: the interim one while the row says the shipped
+/// engine differs from the end state (unless the named feature is built), else the end state.
 fn expected_at(row: &Row, tier: usize) -> char {
-    row.expect.plugin[tier]
+    match &row.expect.interim {
+        Some(Interim {
+            plugin: Some(p),
+            until_feature,
+            ..
+        }) if !until_feature.as_deref().is_some_and(built_with) => p[tier],
+        _ => row.expect.plugin[tier],
+    }
 }
 
 #[test]
-#[ignore = "red until F8 merges the F1-F5 gate work; run with --features test-hooks"]
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    ignore = "needs --features test-hooks (Off, opt-ins, grants and sandbox states)"
+)]
 fn shared_corpus_plugin_column() {
     let rows = load_rows().unwrap_or_else(|e| panic!("corpus does not parse:\n{}", e.join("\n")));
     let filter: Vec<String> = std::env::var("SHARED_CORPUS_FILTER")
@@ -1228,6 +1301,23 @@ fn shared_corpus_plugin_column() {
     );
     for (file, (cells, bad)) in &by_file {
         eprintln!("  {file:<13} {cells:>4} cells, {bad:>4} red");
+    }
+    let mut interim: BTreeMap<&str, usize> = BTreeMap::new();
+    for idx in per_row.keys() {
+        if let Some(Interim {
+            plugin: Some(p),
+            reason: Some(why),
+            until_feature,
+            ..
+        }) = &rows[*idx].expect.interim
+        {
+            if *p != rows[*idx].expect.plugin && !until_feature.as_deref().is_some_and(built_with) {
+                *interim.entry(why.as_str()).or_default() += 1;
+            }
+        }
+    }
+    for (why, n) in &interim {
+        eprintln!("  interim (held to the shipped verdict): {n:>3} rows: {why}");
     }
     assert!(
         red.is_empty(),

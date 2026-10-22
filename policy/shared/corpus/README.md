@@ -34,8 +34,10 @@ One JSON object per line, eight topic files. The plugin's engine runner
 - `cwd`: project directory name under the runner's temp root. `files`: path (relative to that root, or
   `~/...` = temp HOME) to content. A content starting `@symlink:<path>` creates a symlink to that
   path instead. No network: cluster comes from files and flags only.
-- `env`: process environment for the hook. Runners own `HOME`, `PATH` (empty, so no `solana`),
-  `CLAUDE_PLUGIN_*` and `CLAUDE_CONFIG_DIR`; a row cannot set them.
+- `env`: process environment for the hook. Runners own `HOME`, `PATH`, `CLAUDE_PLUGIN_*` and
+  `CLAUDE_CONFIG_DIR`; a row cannot set them. `PATH` holds nothing, except, when the row writes
+  `~/.config/solana/cli/config.yml`, a stub `solana` that answers `solana config get` from that file
+  (as the real CLI does). Nothing else runs.
 - `ctx`:
   - `sandbox`: `on | off | unset` (declared Claude Code sandbox).
   - `headless`: contract section 3.3; a headless row has no `A` anywhere.
@@ -53,9 +55,15 @@ One JSON object per line, eight topic files. The plugin's engine runner
 - `expect`: four characters for Off Relaxed Medium High: `D` deny, `A` ask, `L` allow, `-` no opinion.
   - `plugin` is the end state this engine must give; `kit` the end state of the kit's own layers;
     `combined = max(plugin, kit)` with `D > A > L > -`; `owner` the engine whose reason text shows.
-  - `interim` (optional): the state before the kit's M5. May carry `kit` and, rarely, `plugin`; the
-    other side defaults to the end state; `combined` is recomputed. End-state invariants are not
-    checked on a row that has `interim`'s kit value, only on the end state.
+  - `interim` (optional): the state before the end state. May carry `kit` (before the kit's M5) and
+    `plugin` (the shipped engine differs from its end state); the other side defaults to the end
+    state; `combined` is recomputed. End-state invariants are not checked on a row that has
+    `interim`'s kit value, only on the end state.
+    - Additive: `reason` (required with `interim.plugin`): why the shipped engine differs, for
+      example `exfil tripwire deferred (#19)`. The engine runner asserts `interim.plugin` on such a
+      row.
+    - Additive: `until_feature`: a cargo feature (`env-read-opt-in`) that already gives the end
+      state; a build with it is held to `plugin`, a build without it to `interim.plugin`.
   - Additive: `updated_input: true` (the gate must emit `updatedInput`, no decision), `note`.
 - **`?` (kit and interim columns only, additive):** the kit's verdict at that tier is not asserted
   (unknown from reading its source, or dependent on a kit choice not made yet). `combined` is then
@@ -92,11 +100,11 @@ checks them again on its actual verdicts for rows without `interim`.
 
 ## Known limits
 
-- **Hook wiring.** The runner calls `gate-bash` for every Bash row. Claude Code only starts it when
-  `hooks.json`'s `if` filters match (`Bash(solana *)`, `Bash(spl-token *)`, `Bash(anchor *)`), so the
-  wrapper rows (`env`, `bash -c`, `$S`, quoted binaries, `sudo`, path-qualified binaries) are only
-  meaningful if `gate-bash` is wired unconditionally. The runner assumes that wiring (F3 makes it one
-  unconditional `gate-bash` entry); it does not evaluate the `if` globs.
+- **Hook wiring.** The runner calls `gate-bash` for every Bash row, matching `hooks.json`'s single
+  unconditional `gate-bash` entry.
+- **Interim rows.** The exfil tripwire is deferred (#19): its host-list and quiet JSON-RPC rows hold
+  the shipped verdicts in `interim.plugin`. Raw env-read opt-in rows hold `DDDD` until the
+  `env-read-opt-in` feature is built (it ships disabled).
 - **Sandbox.** `sandbox: unset` and `off` both map to the engine's "off" override under `test-hooks`,
   so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by F2's tests.
 - **Not in the corpus:** supply chain (needs pack fixtures) and PostToolUse redaction.
@@ -107,14 +115,15 @@ checks them again on its actual verdicts for rows without `interim`.
 ```sh
 cd crates/engine
 cargo test --test shared_corpus                      # schema test + runner smoke test
-cargo test --features test-hooks --test shared_corpus -- --ignored   # the full plugin-column run
+cargo test --features test-hooks --test shared_corpus                  # the full plugin-column run
+cargo test --features test-hooks,env-read-opt-in --test shared_corpus  # opt-in rows at their end state
 SHARED_CORPUS_FILTER=U01,CL- SHARED_CORPUS_RESULTS=/tmp/plugin.jsonl \
-  cargo test --features test-hooks --test shared_corpus -- --ignored
+  cargo test --features test-hooks --test shared_corpus
 sh scripts/conformance-diff.sh --column plugin /tmp/plugin.jsonl
 sh scripts/conformance-diff.sh <kit-results.jsonl>   # kit runner output, compared to expect.kit
 ```
 
-The full plugin run **fails** unless built with `--features test-hooks`, because it would otherwise
+The full plugin run is ignored without `--features test-hooks`, and **fails** when forced (`-- --ignored`), because it would otherwise
 skip every Off column, `env_read` opt-in, grant and `pre_cli` row. `SHARED_CORPUS_ALLOW_SKIP=1` accepts
 that gap explicitly. A filter that matches no cell also fails. `conformance-diff.sh` exits 1 on empty or
 garbage input, rows missing from the results (`--allow-missing` for a partial run), duplicate or
@@ -122,6 +131,6 @@ value-less ids and unknown ids, so a crashed runner cannot pass.
 
 The runner drives each row through the hook entry the plugin wires for the tool (`gate-bash` and
 `gate-bash-secrets`, `gate-read`, `gate-tamper`, `gate-mcp`) and takes the strictest verdict, like
-Claude Code's merge. It calls `gate-bash` for every Bash row (see Known limits). Rows needing Off, an `env_read` opt-in, a
+Claude Code's merge. Rows needing Off, an `env_read` opt-in, a
 grant or `pre_cli` need the `test-hooks` build (an authenticated tier.json in a trusted data dir). A
 no-opinion cell must print nothing (or, at most, a decision-less `systemMessage`/`updatedInput`).
