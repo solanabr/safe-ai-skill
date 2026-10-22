@@ -281,7 +281,7 @@ mod tests {
             line.starts_with("safe-ai-skill tier: relaxed (hooks only) (default); sandbox: off"),
             "{line}"
         );
-        assert!(line.contains("lists: contract 1.0.0 "), "{line}");
+        assert!(line.contains("lists: contract 1.1.0 "), "{line}");
         ctx.sandbox = SandboxState::On;
         assert!(tier_line(&resolution, &ctx).contains("tier: relaxed (default); sandbox: on"));
     }

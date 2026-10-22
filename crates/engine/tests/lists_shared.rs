@@ -24,9 +24,9 @@ fn lists_embedded_equal_policy_shared_byte_for_byte() {
 #[test]
 fn lists_every_file_parses_and_the_manifest_matches() {
     let all = lists::lists().expect("embedded lists parse and match MANIFEST");
-    assert_eq!(all.contract, "1.0.0");
+    assert_eq!(all.contract, "1.1.0");
     assert_eq!(all.manifest_sha256.len(), 64);
-    assert_eq!(all.credentials.len(), 57);
+    assert_eq!(all.credentials.len(), 63);
     assert_eq!(all.exfil_hosts.len(), 84);
     assert_eq!(all.verbs.len(), 43);
 }
@@ -72,7 +72,7 @@ fn lists_kit_derived_credentials_are_pinned() {
     assert_eq!(in_section("kit:SB_CREDENTIALS"), 13);
     assert_eq!(in_section("kit:SB_HOST_CREDENTIALS"), 10);
     assert_eq!(in_section("kit:SB_BROWSER_STORES"), 22);
-    assert_eq!(in_section("plugin"), 12);
+    assert_eq!(in_section("plugin"), 18);
     let find = |g: &str| {
         creds
             .iter()
@@ -85,6 +85,18 @@ fn lists_kit_derived_credentials_are_pinned() {
     assert_eq!(find("~/.npmrc").class, CredClass::HostToken);
     assert_eq!(find("~/.npmrc").sb, SbTier::Medium);
     assert_eq!(find("~/.kube/config").class, CredClass::KeyMaterial);
+    // Contract 1.1.0: cloud and infrastructure CLI token stores.
+    for g in [
+        "~/.config/gcloud/",
+        "~/.azure/",
+        "~/.config/doctl/",
+        "~/.terraform.d/credentials.tfrc.json",
+        "~/.config/helm/",
+        "~/.vault-token",
+    ] {
+        let c = find(g);
+        assert_eq!((c.class, c.sb, c.exception), (CredClass::HostToken, SbTier::Medium, false), "{g}");
+    }
     let chrome = find("~/AppData/Local/Google/Chrome/User Data/");
     assert_eq!(
         (chrome.class, chrome.os),
