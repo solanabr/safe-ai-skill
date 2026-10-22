@@ -9,15 +9,19 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
-/// Globs recommended for `sandbox.filesystem.denyRead`: the hard-deny and env classes.
-/// `~/.config/solana/*.json` (not `**`) keeps `cli/config.yml` readable for the Solana CLI;
-/// `**/.env.*` also hides `.env.example` from sandboxed commands (the Read tool still sees it).
-/// Claude Code transcripts and the data dir's state key are listed because transcripts record
-/// the hook messages that carry confirmation codes, and the key signs safe-ai-skill's state.
-pub const RECOMMENDED_DENY_READ: &[&str] = &[
+use crate::gates::credpaths;
+
+/// Globs recommended for `sandbox.filesystem.denyRead` beyond the credential stores: the
+/// hard-deny and env classes. `~/.config/solana/*.json` (not `**`) keeps `cli/config.yml`
+/// readable for the Solana CLI; `**/.env.*` also hides `.env.example` from sandboxed commands
+/// (the Read tool still sees it). Claude Code transcripts and the data dir's state key are
+/// listed because transcripts record the hook messages that carry confirmation codes, and the
+/// key signs safe-ai-skill's state.
+const BASE_DENY_READ: &[&str] = &[
     "~/.claude/projects/**",
     "~/.claude/plugins/data/safe-ai-skill-*/key",
     "**/*-keypair.json",
@@ -34,6 +38,20 @@ pub const RECOMMENDED_DENY_READ: &[&str] = &[
     "**/.dev.vars.*",
     "**/.varlock-frozen-env",
 ];
+
+/// The recommended `denyRead` globs: [`BASE_DENY_READ`] plus one per shared-list credential
+/// record that a sandboxed subprocess may be denied (`credentials.list` `sb` column not
+/// `never`; the kit's sandbox carries the same entries), generated from
+/// [`crate::lists::credentials`] for this OS.
+pub static RECOMMENDED_DENY_READ: LazyLock<Vec<String>> = LazyLock::new(|| {
+    let mut all: Vec<String> = BASE_DENY_READ.iter().map(|g| g.to_string()).collect();
+    for glob in credpaths::sandbox_deny_read() {
+        if !all.contains(&glob) {
+            all.push(glob);
+        }
+    }
+    all
+});
 
 /// Settings files read, in Claude Code's precedence order (lowest first).
 fn settings_files(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
@@ -94,7 +112,7 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
     }
     let missing: Vec<&str> = RECOMMENDED_DENY_READ
         .iter()
-        .copied()
+        .map(String::as_str)
         .filter(|g| !state.deny_read.iter().any(|d| d == g))
         .collect();
     if missing.is_empty() {
@@ -112,7 +130,7 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
         let snippet = serde_json::json!({
             "sandbox": {
                 "enabled": true,
-                "filesystem": { "denyRead": RECOMMENDED_DENY_READ },
+                "filesystem": { "denyRead": &*RECOMMENDED_DENY_READ },
             }
         });
         out.push_str(
@@ -122,7 +140,10 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
         out.push('\n');
     }
     out.push_str(
-        "\nenv files: use `safe-ai-skill env keys|set|unset` instead of raw reads; `secrets.env_read: ask` in the plugin policy restores prompted raw reads.\n",
+        "\nenv files: use `safe-ai-skill env keys|set|unset` instead of raw reads; `safe-ai-skill tier --env-read ask` (user scope, needs the sandbox on) restores prompted raw reads.\n",
+    );
+    out.push_str(
+        "\ncredential stores: the hooks deny the agent's reads of home credential stores (~/.ssh keys, ~/.aws, ~/.npmrc and other host tokens, keychains, browser profiles, wallet extension data) and command-form readers (gh auth token, git credential fill, security find-generic-password -w, pass show, op read, bw get, ...) at every tier. Residual: a subprocess, compiled or encoded read of the same files is not seen; only the sandbox denyRead list above closes it.\n",
     );
     out
 }
@@ -147,9 +168,31 @@ mod tests {
             "~/.claude/projects/**",
             "~/.claude/plugins/data/safe-ai-skill-*/key",
         ] {
-            assert!(RECOMMENDED_DENY_READ.contains(&glob), "{glob}");
+            assert!(RECOMMENDED_DENY_READ.iter().any(|g| g == glob), "{glob}");
             assert!(out.contains(glob), "{out}");
         }
+    }
+
+    #[test]
+    fn the_snippet_is_generated_from_the_credential_list() {
+        let out = report(None, std::path::Path::new("/nonexistent"));
+        for glob in [
+            "~/.aws/**",
+            "~/.gnupg/**",
+            "~/.npmrc",
+            "~/.docker/config.json",
+        ] {
+            assert!(RECOMMENDED_DENY_READ.iter().any(|g| g == glob), "{glob}");
+            assert!(out.contains(glob), "{glob}: {out}");
+        }
+        // sb=never entries (the Solana CLI must read them) stay out of the generated part.
+        assert!(!RECOMMENDED_DENY_READ
+            .iter()
+            .any(|g| g == "~/.config/solana/**"));
+        assert!(
+            out.contains("Residual: a subprocess, compiled or encoded read"),
+            "{out}"
+        );
     }
 
     #[test]

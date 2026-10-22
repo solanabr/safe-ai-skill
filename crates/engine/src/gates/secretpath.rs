@@ -30,7 +30,7 @@ pub enum Class {
     HardDeny(&'static str),
     /// Name alone does not decide: [`sniff`] it (and deny when it cannot be read).
     Suspect(Suspect),
-    /// Env class: raw reads denied (or asked, `secrets.env_read: ask`), served by `env`.
+    /// Env class: raw reads denied (asked only under the user's `safe-ai-skill tier --env-read ask`), served by `env`.
     Env,
     /// A varlock `.env.schema`: readable when allow-listed, after the content guard.
     Schema,

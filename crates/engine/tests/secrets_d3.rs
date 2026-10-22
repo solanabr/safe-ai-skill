@@ -863,12 +863,36 @@ fn redact_never_prints_values_on_stderr() {
 // Fix round 1
 // ---------------------------------------------------------------------------------------
 
+/// `**/.ssh/**` as `rg --glob` sees it: every letter a two-case class.
+fn two_case(glob: &str) -> String {
+    glob.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase())
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// D8 v2 spec §4: a Grep at or above `$HOME` is no longer denied; it runs with every
+/// credential glob excluded (the key trees included).
 #[test]
-fn grep_over_an_ancestor_of_a_key_tree_denies() {
+fn grep_over_an_ancestor_of_a_key_tree_excludes_every_credential_glob() {
     let sb = Sandbox::new();
     std::fs::create_dir_all(sb.home.join(".ssh")).unwrap();
     std::fs::create_dir_all(sb.home.join(".config/solana")).unwrap();
     let home = sb.home.path().to_str().unwrap().to_string();
+    let check = |run: Run, what: &str| {
+        let v = run.json();
+        let out = &v["hookSpecificOutput"];
+        assert!(out.get("permissionDecision").is_none(), "{what}: {v}");
+        let glob = out["updatedInput"]["glob"].as_str().unwrap();
+        for want in ["**/.ssh/**", "**/.config/solana/**", "**/.aws/**"] {
+            assert!(glob.contains(&two_case(want)), "{what}: {want} in {glob}");
+        }
+    };
     for path in [
         home.clone(),
         format!("{home}/.config"),
@@ -876,7 +900,7 @@ fn grep_over_an_ancestor_of_a_key_tree_denies() {
         "/".into(),
     ] {
         let run = sb.pre("gate-read", "Grep", json!({ "pattern": "x", "path": path }));
-        assert_eq!(decision_label(&run), "deny", "{path}");
+        check(run, &path);
     }
     // cwd = $HOME and no path.
     let run = sb.run(
@@ -888,7 +912,7 @@ fn grep_over_an_ancestor_of_a_key_tree_denies() {
             "tool_input": { "pattern": "x" },
         }),
     );
-    assert_eq!(decision_label(&run), "deny");
+    check(run, "cwd = $HOME");
 }
 
 #[test]

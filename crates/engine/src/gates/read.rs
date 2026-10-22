@@ -8,7 +8,7 @@
 //! 1. hard-deny class or key-material content: `deny`, never relaxed by any glob or setting;
 //! 2. `allow_read_globs` match: readable (a `.env.schema` still passes its content guard);
 //! 3. env class (`.env`, `.env.*`, templates and schemas not allow-listed, …): `deny` with the
-//!    `safe-ai-skill env` commands, or `ask` under `secrets.env_read: ask`;
+//!    `safe-ai-skill env` commands, or `ask` under the user's `safe-ai-skill tier --env-read ask`;
 //! 4. `deny_read_globs` match: `deny`;
 //! 5. `id.json` / `*.pem` / `*.key` that cannot be read (or a `*.pem`/`*.key` too large to scan):
 //!    `deny`;
