@@ -6,8 +6,10 @@
 # contract (spec D6.1):
 #   - Environment failure (no prebuilt for this platform, not an executable for this
 #     machine, no sha256 tool to verify it, exit 126/127): fail open with a notice.
-#     gate-bash keeps the Solana CLI surface at `ask` (gate-skill asks too), SessionStart reports the firewall
-#     INACTIVE, every other hook exits 0 with one stderr line.
+#     gate-bash keeps the Solana CLI surface at `ask` (a payload naming solana, spl-token,
+#     anchor or keygen, or holding $'…'; any other Bash call gets no opinion), gate-skill asks
+#     too, SessionStart reports the firewall INACTIVE, every other hook exits 0 with one
+#     stderr line.
 #   - Tamper (the prebuilt's sha256 differs from the constant stamped below at release):
 #     the prebuilt never runs. gate-bash, gate-mcp and gate-skill exit 2, the other PreToolUse gates
 #     ask, SessionStart reports the firewall TAMPERED, the remaining hooks exit 0 with a
@@ -128,7 +130,14 @@ env_failure() {
   printf 'safe-ai-skill: firewall inactive on %s: %s%s\n' "$label" "$1" "${2:+: $2}" >&2
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
-    solana) ask_json "safe-ai-skill inactive on $label: $1; review this command manually" ;;
+    solana)
+      # gate-bash runs for every Bash call: keep the ask to the Solana surface. A payload
+      # grep can't read (exit 2, no grep) still asks.
+      grep -qiE "solana|spl-token|anchor|keygen|[$]'" 2>/dev/null
+      if [ $? -ne 1 ]; then
+        ask_json "safe-ai-skill inactive on $label: $1; review this command manually"
+      fi
+      ;;
     skill) ask_json "safe-ai-skill inactive on $label: $1; review this skill call manually" ;;
     session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
     cli) exit 1 ;;

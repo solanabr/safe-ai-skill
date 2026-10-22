@@ -43,6 +43,8 @@ SESSION_MSG='{"systemMessage":"engine notice","hookSpecificOutput":{"hookEventNa
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
 payload_text=$(cat "$payload")
+solana_payload=$work/solana-payload
+printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"solana transfer X 1 -um"}}' >"$solana_payload"
 big_in=$work/big-in
 dd if=/dev/zero bs=1024 count=200 2>/dev/null | tr '\000' x >"$big_in"
 nul_in=$work/nul-in
@@ -199,6 +201,14 @@ run() {
     exit $?
   ) 2>/dev/null
   rc=$?
+}
+
+# run_solana <args...>: run with a Bash payload naming solana (the Solana surface).
+run_solana() {
+  saved_payload=$payload_f
+  payload_f=$solana_payload
+  run "$@"
+  payload_f=$saved_payload
 }
 
 checks=0
@@ -420,10 +430,15 @@ matrix() {
     expect_rc 0
     expect_no_out
     expect_err_lines 1
-    t "$sc: gate-bash answers ask"
-    run gate-bash
+    t "$sc: gate-bash answers ask for a Solana command"
+    run_solana gate-bash
     expect_rc 0
     expect_ask
+    expect_err_lines 1
+    t "$sc: gate-bash fails open for any other call"
+    run gate-bash
+    expect_rc 0
+    expect_no_out
     expect_err_lines 1
     t "$sc: gate-skill answers ask"
     run gate-skill
@@ -631,7 +646,7 @@ matrix() {
   u_s='Evil"OS'\\
   u_m='x"86'\\
   t "a hostile uname still yields valid JSON"
-  run gate-bash
+  run_solana gate-bash
   expect_rc 0
   expect_ask
   run verify session
@@ -764,7 +779,7 @@ matrix() {
     expect_err_lines 1
     expect_err_has sha256
     t "sha256 tool $tools: gate-bash answers ask"
-    run gate-bash
+    run_solana gate-bash
     expect_rc 0
     expect_ask
     t "sha256 tool $tools: SessionStart reports the firewall INACTIVE"
@@ -790,7 +805,7 @@ matrix() {
     target=${rest%%/*}
     engine "$bin_dir/safe-ai-skill-$target" "${rest#*/}"
     t "$u_m: an ELF prebuilt with ${rest#*/} is an environment failure"
-    run gate-bash
+    run_solana gate-bash
     expect_rc 0
     expect_ask
     run gate-read
@@ -874,7 +889,7 @@ matrix() {
     u_s=SunOS
     t "hooks.json '$args' takes its hook contract on an unsupported platform"
     # shellcheck disable=SC2086 # 'verify session' is two arguments
-    run $args
+    run_solana $args
     expect_rc 0
     case $args in
       gate-bash | gate-skill) expect_ask ;;
@@ -971,7 +986,7 @@ expect_ran safe-ai-skill-linux-x64
 fresh
 u_s=SunOS
 t "the shebang path fails open with ask too"
-run gate-bash
+run_solana gate-bash
 expect_rc 0
 expect_ask
 
