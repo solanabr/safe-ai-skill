@@ -10,20 +10,26 @@
 //!   protected state, checked as given and with symlinks resolved.
 //!
 //! Protected state:
-//! - the plugin data dir: `$CLAUDE_PLUGIN_DATA`, any path component that is its basename or a
-//!   `safe-ai-skill-<marketplace>` name (wherever it appears, so relative paths count), any glob
-//!   that spells such a name out (`[s]afe-ai-skill-stbr`), and any glob right after
-//!   `plugins/data/` whose literal prefix does not rule safe-ai-skill out (`*-stbr`, `plugins/d*/*`);
+//! - the plugin data dir. Anywhere: `$CLAUDE_PLUGIN_DATA` (its path, or the variable itself) and
+//!   `…/plugins/data/` followed by a component whose literal prefix does not rule safe-ai-skill out
+//!   (`safe-ai-skill-stbr`, `*-stbr`, `plugins/d*/[s]afe…`). An absolute path also matches by the
+//!   live data dir's basename (`/tmp/link/safe-ai-skill-stbr`). A relative path matches by any
+//!   data dir name (`safe-ai-skill-<marketplace>`, the live basename, or a glob spelling one) only
+//!   when the command also `cd`s into a `plugins` or `plugins/data` dir or the live data dir's
+//!   parent, and after a `cd` into `plugins/data` (or that parent) any glob or brace word is
+//!   denied (`rm -rf sa*`, `safe-ai-skill-{stbr,x}`);
 //! - the `~/.safe-ai-skill` fallback data dir (also `~user/`, `$HOME/` and globs such as `~/.s*`);
 //! - the installed plugin, `…/plugins/cache/<marketplace>/safe-ai-skill/…`;
 //! - the live plugin's `hooks/hooks.json` (`$CLAUDE_PLUGIN_ROOT`);
 //! - the state files of a project `.safe-ai-skill/` dir. Its `policy.yaml` stays editable because
 //!   the repo overlay can only tighten (D1.10).
 //!
-//! Read-only use of the binary (`status`, `verify check`, `env …`, `--version`, bare `mode`) is
-//! never blocked, even through the plugin's cache path. Matching is deliberately loose
-//! (case-insensitive, blind to quotes and escapes, `$IFS` read as a space, `~`/`$HOME` expanded,
-//! globs honoured) so that it errs towards a false deny. The Bash path does no filesystem I/O.
+//! A checkout named like the plugin (`safe-ai-skill-fork`) is not protected state: a component
+//! of the project root (`$CLAUDE_PROJECT_DIR` or the hook's working directory) never counts as a
+//! data dir name. Read-only use of the binary (`status`, `verify check`, `env …`, `--version`,
+//! bare `mode`) is never blocked, even through the plugin's cache path. Matching is deliberately
+//! loose (case-insensitive, blind to quotes and escapes, `$IFS` read as a space, `~`/`$HOME`
+//! expanded, globs honoured) so that it errs towards a false deny. The Bash path reads no files.
 //!
 //! This is a tripwire against a careless or prompt-injected model, **not a sandbox**: any
 //! same-UID process can rewrite user-space state, the Claude Code sandbox is the hard boundary,
@@ -37,11 +43,15 @@
 //! - a script written with Write and run later;
 //! - removing or renaming an ancestor (`rm -rf ~/.claude/plugins`), or the marketplace dir that
 //!   hosts the plugin (`rm -rf ~/.claude/plugins/cache/stbr`);
-//! - relative paths from a shell already inside a protected dir (`rm grants.json` after an
-//!   earlier `cd`), and a custom `$CLAUDE_PLUGIN_DATA` reached through a glob of its own name;
+//! - relative paths from a shell left inside a protected dir by an earlier call (`rm grants.json`,
+//!   `rm -rf safe-ai-skill-stbr` after a separate `cd`), unless the hook itself runs there, and a
+//!   custom `$CLAUDE_PLUGIN_DATA` reached through a glob of its own name;
+//! - an absolute path to another installed copy's data dir through a link
+//!   (`/tmp/link/safe-ai-skill-safe-ai-skill` when the live one is `safe-ai-skill-stbr`);
 //! - `find <broad root> -delete` or `-exec`;
 //! - symlinks for Bash (the Write path resolves them), and Windows spellings other than `\`
-//!   separators (8.3 short names, `%USERPROFILE%`).
+//!   separators: a relative name with a trailing dot or space (`safe-ai-skill-stbr.`), 8.3 short
+//!   names, `%USERPROFILE%`.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +65,9 @@ const BINARY: &str = "safe-ai-skill";
 
 /// Characters that make a path component a glob.
 const GLOB: [char; 3] = ['*', '?', '['];
+
+/// Glob and brace-expansion characters: after a `cd` into `plugins/data`, any of them denies.
+const EXPANSION: [char; 5] = ['*', '?', '[', '{', '}'];
 
 /// Shell globbing: a leading `*`, `?` or `[…]` never matches a leading dot.
 const GLOB_OPTIONS: glob::MatchOptions = glob::MatchOptions {
@@ -130,6 +143,17 @@ impl Kind {
     }
 }
 
+/// How far the data dir name rule reaches for one word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Names {
+    /// A relative word in a command that never enters a `plugins` dir: no name rule.
+    Off,
+    /// An absolute word: only the live data dir's basename, outside the project root.
+    Live,
+    /// A relative word in a command that `cd`s into `plugins`/`plugins/data`: any data dir name.
+    All,
+}
+
 /// Locations taken from the hook environment, on top of the fixed patterns.
 #[derive(Debug, Clone)]
 pub struct Protected {
@@ -139,6 +163,12 @@ pub struct Protected {
     data: Option<PathBuf>,
     /// `$CLAUDE_PLUGIN_ROOT` as given (only its `hooks/hooks.json` is protected).
     root: Option<PathBuf>,
+    /// Project roots as given (`$CLAUDE_PROJECT_DIR`, the hook's working directory).
+    projects: Vec<PathBuf>,
+    /// Normalised spellings of `projects`: their components never count as data dir names.
+    project_roots: Vec<String>,
+    /// The hook's working directory (normalised), where a command's `cd`s start from.
+    start_dir: Option<String>,
     /// Normalised spellings of `home` (as given, plus symlink-resolved for file tools); the
     /// first one expands `~` and `$HOME`.
     homes: Vec<String>,
@@ -154,14 +184,36 @@ pub struct Protected {
 }
 
 impl Protected {
-    /// Read `HOME`, `CLAUDE_PLUGIN_DATA` and `CLAUDE_PLUGIN_ROOT` (no filesystem I/O).
+    /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PROJECT_DIR`, and take
+    /// the process's working directory (Claude Code starts hooks in the session's) as both a
+    /// project root and the place a command's `cd`s start from. No file is read.
     pub fn from_env() -> Self {
         let var = |key: &str| std::env::var(key).ok();
-        Protected::new(
+        let mut protected = Protected::new(
             var("HOME").as_deref(),
             var("CLAUDE_PLUGIN_DATA").as_deref(),
             var("CLAUDE_PLUGIN_ROOT").as_deref(),
-        )
+        );
+        if let Some(dir) = var("CLAUDE_PROJECT_DIR") {
+            protected = protected.with_project_root(Path::new(&dir));
+        }
+        if let Ok(dir) = std::env::current_dir() {
+            protected.start_dir = Some(normalize_path(&dir.to_string_lossy()));
+            protected = protected.with_project_root(&dir);
+        }
+        protected
+    }
+
+    /// Add a project root: its components never count as a data dir name.
+    fn with_project_root(mut self, dir: &Path) -> Self {
+        if dir.is_absolute() && dir.parent().is_some() && !self.projects.iter().any(|p| p == dir) {
+            push_new(
+                &mut self.project_roots,
+                normalize_path(&dir.to_string_lossy()),
+            );
+            self.projects.push(dir.to_path_buf());
+        }
+        self
     }
 
     /// Build from explicit values. Relative paths are ignored, and so is a data dir that is
@@ -179,6 +231,9 @@ impl Protected {
             home,
             data,
             root,
+            projects: Vec::new(),
+            project_roots: Vec::new(),
+            start_dir: None,
             homes: Vec::new(),
             home_prefixes: ["~/", "$home/", "${home}/"].map(String::from).to_vec(),
             data_dirs: Vec::new(),
@@ -203,25 +258,31 @@ impl Protected {
     }
 
     fn add_spellings(&mut self, spell: impl Fn(&Path) -> Option<String>) {
-        let norm = |p: &Option<PathBuf>| {
-            p.as_deref()
-                .and_then(&spell)
-                .map(|s| lexical(&s.to_lowercase().replace('\\', "/")))
-        };
-        if let Some(home) = norm(&self.home) {
+        let norm = |p: &Path| spell(p).map(|s| normalize_path(&s));
+        if let Some(home) = self.home.as_deref().and_then(norm) {
             push_new(&mut self.home_prefixes, format!("{home}/"));
             push_new(&mut self.homes, home);
         }
-        if let Some(data) = norm(&self.data) {
+        if let Some(data) = self.data.as_deref().and_then(norm) {
             if let Some(name) = data.rsplit('/').next().filter(|n| !n.is_empty()) {
                 push_new(&mut self.data_names, name.to_string());
             }
             push_new(&mut self.data_dirs, data);
         }
-        if let Some(root) = norm(&self.root) {
+        if let Some(root) = self.root.as_deref().and_then(norm) {
             push_new(&mut self.hooks_files, format!("{root}/hooks/hooks.json"));
         }
+        for project in &self.projects {
+            if let Some(spelling) = norm(project) {
+                push_new(&mut self.project_roots, spelling);
+            }
+        }
     }
+}
+
+/// A path as the matcher compares it: lowercase, `/`-separated, `.`/`..` resolved.
+fn normalize_path(path: &str) -> String {
+    lexical(&path.to_lowercase().replace('\\', "/"))
 }
 
 fn push_new(list: &mut Vec<String>, item: String) {
@@ -261,13 +322,19 @@ pub fn decide_file(tool_input: Option<&Value>, cwd: &Path, protected: &Protected
     let Some(input) = tool_input else {
         return Decision::Defer;
     };
-    let resolved = protected.resolved();
+    let resolved = protected.clone().with_project_root(cwd).resolved();
     for key in ["file_path", "notebook_path"] {
         let Some(target) = input.get(key).and_then(Value::as_str) else {
             continue;
         };
         for candidate in path_candidates(target, cwd, &resolved) {
-            if let Some(kind) = protected_kind(&normalize_word(&candidate, &resolved), &resolved) {
+            let word = normalize_word(&candidate, &resolved);
+            let names = if is_absolute(&word) {
+                Names::Live
+            } else {
+                Names::Off
+            };
+            if let Some(kind) = protected_kind(&word, &resolved, names) {
                 return Decision::Deny {
                     reason: path_reason(target, kind),
                 };
@@ -305,6 +372,7 @@ fn ifs_as_space(text: &str) -> String {
 /// Scan one reading of a command. `Some(reason)` means deny.
 fn check_text(text: &str, protected: &Protected) -> Option<String> {
     let toks = tokenize(text);
+    let cds = scan_cds(&toks, protected);
     // `cd .safe-ai-skill && echo {} > grants.json`: a `cd`/`pushd` into the dir plus a bare state
     // file name in the same command.
     let mut cd_into_state_dir = false;
@@ -313,6 +381,10 @@ fn check_text(text: &str, protected: &Protected) -> Option<String> {
         let Tok::Word(raw) = *tok else {
             continue;
         };
+        // Inside `plugins/data`, any glob or brace word may expand to a data dir.
+        if cds.in_data_parent[i] && raw.contains(EXPANSION) {
+            return Some(path_reason(raw, Kind::DataDir));
+        }
         if state_file.is_none() {
             state_file = bare_state_file(raw);
         }
@@ -341,7 +413,14 @@ fn check_text(text: &str, protected: &Protected) -> Option<String> {
             run_by_name =
                 matches!(args(&toks[i + 1..]).next(), Some(s) if SUBCOMMANDS.contains(&s));
         }
-        match protected_kind(&word, protected) {
+        let names = if is_absolute(&word) {
+            Names::Live
+        } else if cds.enters_plugins {
+            Names::All
+        } else {
+            Names::Off
+        };
+        match protected_kind(&word, protected, names) {
             // Running the plugin's own binary by its cache path is not a write to it.
             Some(Kind::Plugin) if run_by_name => {}
             Some(kind) => return Some(path_reason(&word, kind)),
@@ -353,6 +432,102 @@ fn check_text(text: &str, protected: &Protected) -> Option<String> {
         &format!(".safe-ai-skill/{file}"),
         Kind::ProjectState,
     ))
+}
+
+/// Where a command's `cd`/`pushd`s lead, starting from the hook's working directory.
+struct CdScan {
+    /// The command enters a `plugins` or `plugins/data` dir, or the live data dir's parent.
+    enters_plugins: bool,
+    /// Per token: it runs inside a `plugins/data` dir or the live data dir's parent.
+    in_data_parent: Vec<bool>,
+}
+
+fn scan_cds(toks: &[Tok], protected: &Protected) -> CdScan {
+    // Longer than PATH_MAX cannot be a real directory; it reads as unknown (and keeps a chain
+    // of relative `cd`s from growing without bound).
+    const MAX_DIR: usize = 4096;
+    let entered = |dir: &str| is_plugins_dir(dir) || is_data_parent(dir, protected);
+    let in_parent =
+        |dir: &Option<String>| dir.as_deref().is_some_and(|d| is_data_parent(d, protected));
+    let mut dir = protected.start_dir.clone();
+    let mut inside = in_parent(&dir);
+    let mut enters_plugins = dir.as_deref().is_some_and(entered);
+    // A `cd` takes effect after its operand: `(last operand index, new dir)`.
+    let mut pending: Option<(usize, Option<String>)> = None;
+    let mut in_data_parent = Vec::with_capacity(toks.len());
+    for (i, tok) in toks.iter().enumerate() {
+        if pending.as_ref().is_some_and(|(after, _)| i > *after) {
+            dir = pending.take().and_then(|(_, next)| next);
+            inside = in_parent(&dir);
+        }
+        in_data_parent.push(inside);
+        if !matches!(tok, Tok::Word("cd" | "pushd")) {
+            continue;
+        }
+        // The operand is the first word that is not a flag (`cd -P dir`); `cd -` stays unknown.
+        let mut end = i;
+        let mut operand = None;
+        while let Some(Tok::Word(w)) = toks.get(end + 1) {
+            end += 1;
+            if !w.starts_with('-') {
+                operand = Some(normalize_word(w, protected));
+                break;
+            }
+        }
+        let next = operand
+            .map(|w| match &dir {
+                Some(d) if !is_absolute(&w) => lexical(&format!("{d}/{w}")),
+                _ => w,
+            })
+            .filter(|d| d.len() <= MAX_DIR);
+        enters_plugins |= next.as_deref().is_some_and(entered);
+        pending = Some((end, next));
+    }
+    CdScan {
+        enters_plugins,
+        in_data_parent,
+    }
+}
+
+/// Whether a normalised word is rooted (`/…`, `~…`, `$VAR/…`, `C:/…`, curl's `@/…`) rather
+/// than relative to the shell's working directory.
+fn is_absolute(word: &str) -> bool {
+    let word = word.strip_prefix('@').unwrap_or(word);
+    let bytes = word.as_bytes();
+    word.starts_with(['/', '~', '$'])
+        || (bytes.get(1) == Some(&b':') && bytes.first().is_some_and(u8::is_ascii_alphabetic))
+}
+
+/// Whether a normalised directory is a `plugins` dir.
+fn is_plugins_dir(dir: &str) -> bool {
+    dir.rsplit('/')
+        .next()
+        .is_some_and(|c| !is_wildcard(c) && could_be(unbrace(c), "plugins"))
+}
+
+/// Whether a normalised directory is a `…/plugins/data` dir or the live data dir's parent.
+fn is_data_parent(dir: &str, protected: &Protected) -> bool {
+    let mut tail = dir.rsplit('/').map(unbrace);
+    let (last, parent) = (tail.next(), tail.next());
+    matches!((parent, last), (Some(p), Some(l)) if is_pair(p, l, "plugins", "data"))
+        || protected
+            .data_dirs
+            .iter()
+            .any(|d| d.rsplit_once('/').is_some_and(|(parent, _)| parent == dir))
+}
+
+/// How many leading components of `word` belong to a project root (0 when none contains it).
+fn project_prefix_len(word: &str, protected: &Protected) -> usize {
+    protected
+        .project_roots
+        .iter()
+        .filter(|root| {
+            word.strip_prefix(root.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+        .map(|root| root.split('/').count())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Cheap pre-check (the Bash gate sees every command): a word can only hit a rule if it holds
@@ -573,11 +748,19 @@ fn is_build_suffix(suffix: &str) -> bool {
         .any(|os| suffix.starts_with(os))
 }
 
-/// Which protected location a normalised word points into, if any.
-fn protected_kind(word: &str, protected: &Protected) -> Option<Kind> {
+/// Which protected location a normalised word points into, if any. `names` scopes the data dir
+/// name rule; components of a project root never count for it.
+fn protected_kind(word: &str, protected: &Protected, names: Names) -> Option<Kind> {
     let comps: Vec<&str> = word.split('/').map(unbrace).collect();
+    let outside_root = comps
+        .get(project_prefix_len(word, protected)..)
+        .unwrap_or_default();
+    let named = names != Names::Off
+        && outside_root
+            .iter()
+            .any(|c| is_data_dir_name(c, protected, names == Names::All));
     let data_dir = word.contains("claude_plugin_data")
-        || comps.iter().any(|c| is_data_dir_name(c, protected))
+        || named
         || after_pair(&comps, "plugins", "data")
             .into_iter()
             .any(|i| could_name(comps[i], BINARY))
@@ -600,27 +783,34 @@ fn protected_kind(word: &str, protected: &Protected) -> Option<Kind> {
     project_state.then_some(Kind::ProjectState)
 }
 
-/// Whether component `c` names a plugin data dir wherever it appears: the live one's basename,
-/// any `safe-ai-skill-<marketplace>` (not a release binary or a dotted file or version name), or
-/// a glob that spells such a name out (`[s]afe-ai-skill-stbr`, `safe-ai-skill-*`).
-fn is_data_dir_name(c: &str, protected: &Protected) -> bool {
+/// Whether component `c` names a plugin data dir: the live one's basename and, with
+/// `any_marketplace`, any `safe-ai-skill-<marketplace>` (not a release binary or a dotted file or
+/// version name), or a glob that spells such a name out (`[s]afe-ai-skill-stbr`,
+/// `safe-ai-skill-*`).
+fn is_data_dir_name(c: &str, protected: &Protected, any_marketplace: bool) -> bool {
+    let probes: &[&str] = if any_marketplace {
+        DATA_DIR_PROBES
+    } else {
+        &[]
+    };
     if c.contains(GLOB) {
         return skeleton(c).contains("ai-skill")
             && protected
                 .data_names
                 .iter()
                 .map(String::as_str)
-                .chain(DATA_DIR_PROBES.iter().copied())
+                .chain(probes.iter().copied())
                 .any(|name| could_be(c, name));
     }
     protected.data_names.iter().any(|n| n == c)
-        || c.strip_prefix("safe-ai-skill-").is_some_and(|marketplace| {
-            !marketplace.is_empty()
-                && marketplace
-                    .chars()
-                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
-                && !is_build_suffix(marketplace)
-        })
+        || any_marketplace
+            && c.strip_prefix("safe-ai-skill-").is_some_and(|marketplace| {
+                !marketplace.is_empty()
+                    && marketplace
+                        .chars()
+                        .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+                    && !is_build_suffix(marketplace)
+            })
 }
 
 /// `~/.safe-ai-skill` (also `~user/`, `$HOME/` and the absolute home), including globs a shell
@@ -671,16 +861,22 @@ fn bare_state_file(word: &str) -> Option<&str> {
     is_state.then_some(base)
 }
 
-/// Indices of the component right after each `a/b` pair in `comps`. Glob-aware, so
-/// `plugins/d*/` counts, but a pair of bare wildcards (`*/*/`) does not.
+/// Indices of the component right after each `a/b` pair in `comps`.
 fn after_pair(comps: &[&str], a: &str, b: &str) -> Vec<usize> {
-    let wildcard = |c: &str| !c.is_empty() && c.chars().all(|ch| matches!(ch, '*' | '?'));
     (2..comps.len())
-        .filter(|&i| {
-            let (x, y) = (comps[i - 2], comps[i - 1]);
-            could_be(x, a) && could_be(y, b) && !(wildcard(x) && wildcard(y))
-        })
+        .filter(|&i| is_pair(comps[i - 2], comps[i - 1], a, b))
         .collect()
+}
+
+/// Whether components `x/y` could be `a/b`. Glob-aware, so `plugins/d*` counts, but a pair of
+/// bare wildcards (`*/*`) does not.
+fn is_pair(x: &str, y: &str, a: &str, b: &str) -> bool {
+    could_be(x, a) && could_be(y, b) && !(is_wildcard(x) && is_wildcard(y))
+}
+
+/// A component made only of `*`/`?`: it could be anything.
+fn is_wildcard(c: &str) -> bool {
+    !c.is_empty() && c.chars().all(|ch| matches!(ch, '*' | '?'))
 }
 
 /// Whether component `c` is `target`, or is a glob that matches it.
@@ -1017,7 +1213,6 @@ mod tests {
             "cd ~/.claude/plugins/data && echo '{\"profile\":\"autopilot\"}' > safe-ai-skill-stbr/mode.json",
             "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-*",
             "cd ~/.claude/plugins && rm -rf data/safe-ai-skill-stbr",
-            "ln -s ~/.claude/plugins/data /tmp/d && echo '{}' > /tmp/d/safe-ai-skill-stbr/mode.json",
             "rm -rf ~/.claude/plugins/data/*-stbr",
             "cat ~/.claude/plugins/data/*stbr/grants.json",
             "cat ~/.claude/plugins/d*/safe-ai-skill-stbr/grants.json",
@@ -1030,6 +1225,111 @@ mod tests {
         ] {
             assert_deny(cmd);
         }
+    }
+
+    #[test]
+    fn cd_into_data_parent_then_glob_or_brace_denies() {
+        for cmd in [
+            "cd ~/.claude/plugins/data && rm -rf saf*stbr",
+            "cd ~/.claude/plugins/data && rm -rf *-skill-stbr",
+            "cd ~/.claude/plugins/data && rm -rf sa*",
+            "cd ~/.claude/plugins/data && rm -rf ./*",
+            "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-{stbr,x}",
+            "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-st{b,}r",
+            "pushd $CLAUDE_CONFIG_DIR/plugins/data >/dev/null; cat */grants.json",
+            "cd ~/.claude/plugins && cd data && rm -rf *",
+            "cd ~/.claude\ncd plugins/data\nrm -rf ?afe*",
+            "cd /srv && rm -rf *",
+        ] {
+            assert_deny(cmd);
+        }
+        for cmd in [
+            "cd ~/.claude/plugins/data && ls",
+            "cd ~/.claude/plugins && ls -la",
+            "cd ~/.claude/plugins/data && cd ~/code && rm -rf build/*",
+            "rm -rf *.o && cd ~/.claude/plugins/data",
+        ] {
+            assert_defer(cmd);
+        }
+    }
+
+    #[test]
+    fn checkouts_named_like_the_plugin_are_not_data_dirs() {
+        for cmd in [
+            "cd ~/code/safe-ai-skill-fork && cargo test",
+            "git clone https://github.com/solanabr/safe-ai-skill safe-ai-skill-dev",
+            "ls safe-ai-skill-dev/src && cat safe-ai-skill-v2/Cargo.toml",
+            "cargo test --manifest-path /work/safe-ai-skill-v2/Cargo.toml",
+            "cp -r /work/safe-ai-skill-fork/src /tmp/backup",
+        ] {
+            assert_defer(cmd);
+        }
+    }
+
+    #[test]
+    fn live_data_dir_basename_counts_on_absolute_paths() {
+        let live = Protected::new(
+            Some("/home/u"),
+            Some("/home/u/.claude/plugins/data/safe-ai-skill-stbr"),
+            None,
+        );
+        for cmd in [
+            "ln -s ~/.claude/plugins/data /tmp/d && echo '{}' > /tmp/d/safe-ai-skill-stbr/mode.json",
+            "rm -rf /tmp/d/[s]afe-ai-skill-stbr",
+            "cd ~/.claude/plugins && rm -rf data/safe-ai-skill-stbr",
+        ] {
+            let d = decide_bash(cmd, &live);
+            assert!(matches!(d, Decision::Deny { .. }), "{cmd}: {d:?}");
+        }
+        // Another marketplace's name on an absolute path is not structure.
+        assert_eq!(
+            decide_bash("ls /tmp/d/safe-ai-skill-fork", &live),
+            Decision::Defer
+        );
+    }
+
+    #[test]
+    fn project_root_components_never_count_as_data_dir_names() {
+        let live = Protected::new(
+            Some("/home/u"),
+            Some("/home/u/.claude/plugins/data/safe-ai-skill-stbr"),
+            None,
+        );
+        let in_checkout = live
+            .clone()
+            .with_project_root(Path::new("/work/safe-ai-skill-stbr"));
+        assert_eq!(
+            decide_bash("cat /work/safe-ai-skill-stbr/README.md", &in_checkout),
+            Decision::Defer
+        );
+        assert!(matches!(
+            decide_bash("cat /work/safe-ai-skill-stbr/README.md", &live),
+            Decision::Deny { .. }
+        ));
+        // Structure still applies inside the root.
+        assert!(matches!(
+            decide_bash(
+                "cat /work/safe-ai-skill-stbr/.safe-ai-skill/grants.json",
+                &in_checkout
+            ),
+            Decision::Deny { .. }
+        ));
+        let write = |path: &str| {
+            decide_file(
+                Some(&serde_json::json!({ "file_path": path })),
+                Path::new("/work/safe-ai-skill-stbr"),
+                &live,
+            )
+        };
+        assert_eq!(write("src/main.rs"), Decision::Defer);
+        assert_eq!(
+            write("/work/safe-ai-skill-stbr/src/main.rs"),
+            Decision::Defer
+        );
+        assert!(matches!(
+            write("/tmp/d/safe-ai-skill-stbr/grants.json"),
+            Decision::Deny { .. }
+        ));
     }
 
     #[test]
@@ -1202,6 +1502,9 @@ mod tests {
             "/work/proj/.safe-ai-skill/policy.yaml",
             "/work/proj/src/main.rs",
             "/work/proj/docs/safe-ai-skill-notes.md",
+            "/work/safe-ai-skill-fork/src/main.rs",
+            "/work/safe-ai-skill-v2/Cargo.toml",
+            "safe-ai-skill-dev/README.md",
             "/opt/sas-plugin/bin/safe-ai-skill",
             "/home/u/.claude/settings.json",
         ] {

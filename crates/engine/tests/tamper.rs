@@ -48,16 +48,20 @@ impl Drop for Scratch {
 /// Isolated HOME, plugin data dir, plugin root and project dir for one test.
 struct Sandbox {
     home: Scratch,
-    data: Scratch,
+    /// `$CLAUDE_PLUGIN_DATA`, laid out as Claude Code does: `~/.claude/plugins/data/<plugin>-<mkt>`.
+    data: PathBuf,
     root: Scratch,
     project: Scratch,
 }
 
 impl Sandbox {
     fn new(tag: &str) -> Self {
+        let home = Scratch::new(&format!("{tag}-home"));
+        let data = home.join(".claude/plugins/data/safe-ai-skill-stbr");
+        std::fs::create_dir_all(&data).expect("create plugin data dir");
         Sandbox {
-            home: Scratch::new(&format!("{tag}-home")),
-            data: Scratch::new(&format!("{tag}-data")),
+            home,
+            data,
             root: Scratch::new(&format!("{tag}-root")),
             project: Scratch::new(&format!("{tag}-proj")),
         }
@@ -68,7 +72,7 @@ impl Sandbox {
     }
 
     fn data(&self) -> String {
-        self.data.path().display().to_string()
+        self.data.display().to_string()
     }
 
     fn root(&self) -> String {
@@ -80,22 +84,32 @@ impl Sandbox {
     }
 
     fn run(&self, sub: &str, tool: &str, tool_input: Value) -> Run {
+        self.run_at(&self.project(), sub, tool, tool_input)
+    }
+
+    /// Run with the session (hook `cwd` and `$CLAUDE_PROJECT_DIR`) at `cwd`.
+    fn run_at(&self, cwd: &str, sub: &str, tool: &str, tool_input: Value) -> Run {
         let payload = json!({
             "session_id": "it-tamper",
-            "cwd": self.project(),
+            "cwd": cwd,
             "hook_event_name": "PreToolUse",
             "tool_name": tool,
             "tool_input": tool_input,
         });
-        self.raw(sub, payload.to_string())
+        self.invoke(sub, payload.to_string(), cwd)
     }
 
     /// Run `sub` on a raw (possibly unreadable) stdin body.
     fn raw(&self, sub: &str, body: String) -> Run {
+        self.invoke(sub, body, &self.project())
+    }
+
+    fn invoke(&self, sub: &str, body: String, project_dir: &str) -> Run {
         Invocation::new(&[sub])
-            .plugin_data(self.data.path())
+            .plugin_data(&self.data)
             .home(self.home.path())
             .env("CLAUDE_PLUGIN_ROOT", &self.root())
+            .env("CLAUDE_PROJECT_DIR", project_dir)
             .stdin(body)
             .run()
     }
@@ -329,6 +343,87 @@ fn bash_computed_or_split_binary_with_mutating_subcommand_denies() {
     ] {
         assert_deny(&sb.bash(cmd), cmd);
     }
+}
+
+#[test]
+fn bash_cd_into_data_dir_then_glob_or_brace_denies() {
+    let sb = Sandbox::new("tw-cdglob");
+    for cmd in [
+        "cd ~/.claude/plugins/data && rm -rf saf*stbr",
+        "cd ~/.claude/plugins/data && rm -rf *-skill-stbr",
+        "cd ~/.claude/plugins/data && rm -rf sa*",
+        "cd ~/.claude/plugins/data && rm -rf ./*",
+        "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-{stbr,x}",
+        "cd ~/.claude/plugins/data && rm -rf safe-ai-skill-st{b,}r",
+        "cd ~/.claude/plugins && cd data && cat */grants.json",
+    ] {
+        assert_deny(&sb.bash(cmd), cmd);
+    }
+    for cmd in [
+        "cd ~/.claude/plugins/data && ls",
+        "cd ~/.claude/plugins && ls -la",
+    ] {
+        assert_no_opinion(&sb.bash(cmd), cmd);
+    }
+}
+
+#[test]
+fn checkout_named_like_the_plugin_has_no_opinion() {
+    let sb = Sandbox::new("tw-fork");
+    let fork = sb.project.join("safe-ai-skill-fork");
+    std::fs::create_dir_all(fork.join("src")).expect("create checkout");
+    let fork = fork.display().to_string();
+    for cmd in [
+        format!("cd {fork} && cargo test"),
+        "git clone https://github.com/solanabr/safe-ai-skill safe-ai-skill-dev".to_string(),
+        "ls safe-ai-skill-dev/src && cat safe-ai-skill-v2/Cargo.toml".to_string(),
+    ] {
+        assert_no_opinion(&sb.bash(&cmd), &cmd);
+    }
+    // Inside the checkout: the hook cwd and $CLAUDE_PROJECT_DIR are the checkout.
+    let bash = sb.run_at(
+        &fork,
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": format!("cargo test && cat {fork}/README.md") }),
+    );
+    assert_no_opinion(&bash, "bash inside the checkout");
+    for path in ["src/main.rs".to_string(), format!("{fork}/src/main.rs")] {
+        let run = sb.run_at(
+            &fork,
+            "gate-tamper",
+            "Write",
+            json!({ "file_path": path, "content": "fn main() {}" }),
+        );
+        assert_no_opinion(&run, &path);
+    }
+}
+
+#[test]
+fn project_root_named_like_the_live_data_dir_has_no_opinion() {
+    // A checkout named exactly like the live data dir (`safe-ai-skill-stbr`): its own components
+    // never count, but the same name elsewhere on an absolute path still does.
+    let sb = Sandbox::new("tw-root");
+    let checkout = sb.project.join("safe-ai-skill-stbr");
+    std::fs::create_dir_all(checkout.join("src")).expect("create checkout");
+    let checkout = checkout.display().to_string();
+    let bash = sb.run_at(
+        &checkout,
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": format!("cat {checkout}/README.md") }),
+    );
+    assert_no_opinion(&bash, "bash in the project root");
+    let write = sb.run_at(
+        &checkout,
+        "gate-tamper",
+        "Write",
+        json!({ "file_path": format!("{checkout}/src/main.rs"), "content": "" }),
+    );
+    assert_no_opinion(&write, "write in the project root");
+    let cmd =
+        "ln -s ~/.claude/plugins/data /tmp/d && echo '{}' > /tmp/d/safe-ai-skill-stbr/mode.json";
+    assert_deny(&sb.bash(cmd), cmd);
 }
 
 #[test]
