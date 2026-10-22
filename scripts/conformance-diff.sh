@@ -2,8 +2,8 @@
 # Compare a runner's results file against the shared conformance corpus and print the per-row
 # divergences. It only reads files: it never executes the kit (or any other) code.
 #
-#   sh scripts/conformance-diff.sh [--column kit|plugin|combined] [--interim] [--show-missing] \
-#                                  <results.jsonl>
+#   sh scripts/conformance-diff.sh [--column kit|plugin|combined] [--interim] [--allow-missing] \
+#                                  [--show-missing] <results.jsonl>
 #
 # <results.jsonl> has one JSON object per line: {"id": "CL-2", "<column>": "----"} where the value
 # is four verdict characters for Off Relaxed Medium High (D deny, A ask, L allow, - no opinion;
@@ -13,10 +13,14 @@
 #   --column      which corpus column to compare (default kit)
 #   --interim     compare against expect.interim.<column> where a row has one (the state before
 #                 the kit's M5), else the end-state column
-#   --show-missing  also list corpus rows the results file does not cover
+#   --allow-missing  accept corpus rows the results file does not cover (a partial run); without
+#                   it every uncovered row is a failure and is listed as MISSING
+#   --show-missing  with --allow-missing, still list the uncovered rows
 #
-# CORPUS_DIR overrides policy/shared/corpus. A `?` on either side skips that tier. Exit 0: no
-# divergence and no unknown id. Exit 1: at least one DIVERGE or UNKNOWN line. Exit 2: usage.
+# CORPUS_DIR overrides policy/shared/corpus. A `?` on either side skips that tier.
+# Exit 0: every corpus row compared, no divergence. Exit 1: any DIVERGE, UNKNOWN, MISSING (unless
+# --allow-missing) or MALFORMED line (a line with no id, an id with no value for the column, a
+# duplicate id), or no row compared at all (empty or garbage input). Exit 2: usage.
 #
 # The corpus is parsed with awk from its one-object-per-line, "expect" before "interim" layout
 # (the generator and the kit runner both keep it); it is not a general JSON parser.
@@ -25,6 +29,7 @@ set -eu
 column=kit
 interim=0
 show_missing=0
+allow_missing=0
 results=
 
 while [ $# -gt 0 ]; do
@@ -42,8 +47,12 @@ while [ $# -gt 0 ]; do
       show_missing=1
       shift
       ;;
+    --allow-missing)
+      allow_missing=1
+      shift
+      ;;
     -h | --help)
-      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     -*)
@@ -62,7 +71,7 @@ case $column in
   kit | plugin | combined) ;;
   *) echo "conformance-diff: --column must be kit, plugin or combined" >&2; exit 2 ;;
 esac
-[ -n "$results" ] || { echo "usage: conformance-diff.sh [--column C] [--interim] [--show-missing] <results.jsonl>" >&2; exit 2; }
+[ -n "$results" ] || { echo "usage: conformance-diff.sh [--column C] [--interim] [--allow-missing] [--show-missing] <results.jsonl>" >&2; exit 2; }
 [ -f "$results" ] || { echo "conformance-diff: no such file: $results" >&2; exit 2; }
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -101,8 +110,8 @@ awk -v column="$column" -v interim="$interim" '
   }
 ' "$corpus"/*.jsonl >"$tmp/corpus.tsv"
 
-# results -> id <TAB> got
-awk -v column="$column" '
+# results -> id <TAB> got; malformed lines go to malformed.txt
+awk -v column="$column" -v bad="$tmp/malformed.txt" '
   function field(s, key,    t) {
     if (match(s, "\"" key "\"[ \t]*:[ \t]*\"[^\"]*\"")) {
       t = substr(s, RSTART, RLENGTH)
@@ -112,14 +121,21 @@ awk -v column="$column" '
     }
     return ""
   }
+  /^[ \t\r]*$/ { next }
   {
     id = field($0, "id")
-    if (id == "") next
-    printf "%s\t%s\n", id, field($0, column)
+    if (id == "") { printf "MALFORMED line %d: no id\n", NR >> bad; next }
+    if (id in seen) { printf "MALFORMED %s: duplicate id (line %d)\n", id, NR >> bad; next }
+    seen[id] = 1
+    v = field($0, column)
+    if (v == "") { printf "MALFORMED %s: no %s value (line %d)\n", id, column, NR >> bad; next }
+    printf "%s\t%s\n", id, v
   }
 ' "$results" >"$tmp/results.tsv"
+: >>"$tmp/malformed.txt"
 
-awk -F '\t' -v column="$column" -v show_missing="$show_missing" '
+rc=0
+awk -F '\t' -v column="$column" -v show_missing="$show_missing" -v allow_missing="$allow_missing" '
   FNR == NR {
     want[$1] = $2
     owner[$1] = $3
@@ -140,9 +156,9 @@ awk -F '\t' -v column="$column" -v show_missing="$show_missing" '
     }
     for (i = 1; i <= n; i++) {
       id = order[i]
-      if (!(id in seen) || got[id] == "") {
+      if (!(id in seen)) {
         missing++
-        if (show_missing == 1) printf "MISSING %s\n", id
+        if (allow_missing == 0 || show_missing == 1) printf "MISSING %s\n", id
         continue
       }
       w = want[id]; g = got[id]
@@ -169,6 +185,16 @@ awk -F '\t' -v column="$column" -v show_missing="$show_missing" '
     }
     printf "conformance-diff (%s): %d rows match, %d diverge, %d unknown, %d not asserted, %d missing from results\n", \
       column, matched, diverge, unknown, skipped, missing
-    exit (diverge > 0 || unknown > 0) ? 1 : 0
+    if (matched + diverge == 0) {
+      print "conformance-diff: no corpus row was compared (empty or unusable results)"
+      exit 1
+    }
+    exit (diverge > 0 || unknown > 0 || (missing > 0 && allow_missing == 0)) ? 1 : 0
   }
-' "$tmp/corpus.tsv" "$tmp/results.tsv"
+' "$tmp/corpus.tsv" "$tmp/results.tsv" || rc=$?
+
+if [ -s "$tmp/malformed.txt" ]; then
+  cat "$tmp/malformed.txt"
+  rc=1
+fi
+exit "$rc"

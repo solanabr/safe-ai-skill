@@ -7,9 +7,13 @@
 //! - `shared_corpus_plugin_column` (`#[ignore]`d until F8 merges the gate work of F1 to F5):
 //!   drives the built binary through the hook entry the plugin wires for the row's tool, once per
 //!   tier, and asserts the `plugin` column. It also asserts invariants 1 to 3 on the actual
-//!   verdicts combined with the row's `kit` column. Rows that need an authenticated `tier.json`,
-//!   a grant or a sandbox override need `--features test-hooks`; without it they are reported
-//!   as skipped.
+//!   verdicts combined with the row's `kit` column, and that no-opinion cells print nothing.
+//!   Rows that need an authenticated `tier.json`, a grant or a sandbox override need
+//!   `--features test-hooks`: without it the run fails (naming the feature), unless
+//!   `SHARED_CORPUS_ALLOW_SKIP=1` accepts the skipped cells. A filter matching nothing fails.
+//!   It assumes `gate-bash` is wired unconditionally (no `hooks.json` `if` filter).
+//! - `conformance_diff_fails_on_bad_input` (always on, unix): `scripts/conformance-diff.sh` exits
+//!   non-zero on empty, garbage, partial and duplicate input.
 //! - `runner_plumbing_smoke` (always on): four rows the 1.1.0 gates already satisfy, so a broken
 //!   materialiser shows up in a plain `cargo test`.
 //!
@@ -48,6 +52,17 @@ const FILES: [&str; 8] = [
 ];
 
 const MIN_ROWS: usize = 120;
+
+/// The contract 3.3 headless signal variables.
+const HEADLESS_SIGNALS: [&str; 7] = [
+    "SAFE_AI_SKILL_HEADLESS",
+    "KIT_FIREWALL_HEADLESS",
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "BUILDKITE",
+    "JENKINS_URL",
+];
 
 /// Env names the runner owns; a row may not set them.
 const RESERVED_ENV: [&str; 7] = [
@@ -205,6 +220,9 @@ fn text_of(v: Verdicts) -> String {
 
 /// Contract §2.2 invariants 1 to 3 for one tier: `Some(message)` on a violation.
 fn invariant(plugin: char, kit: char, headless: bool) -> Option<String> {
+    if headless && (plugin == 'A' || kit == 'A') {
+        return Some("invariant 3: an ask in a headless row".into());
+    }
     if kit == '?' {
         return None;
     }
@@ -213,9 +231,6 @@ fn invariant(plugin: char, kit: char, headless: bool) -> Option<String> {
     }
     if plugin == 'L' && kit == 'A' {
         return Some("invariant 2: plugin allow neutralised by a kit ask".into());
-    }
-    if headless && (plugin == 'A' || kit == 'A') {
-        return Some("invariant 3: an ask in a headless row".into());
     }
     None
 }
@@ -919,8 +934,17 @@ fn invocation<'a>(args: &[&str], row: &Row, tier: Tier, paths: &'a Paths) -> Inv
         .home(&paths.home)
         .cwd(&paths.proj)
         .sandbox(row.ctx.sandbox)
-        .headless(row.ctx.headless)
         .env("PATH", &paths.tools.display().to_string());
+    // A row that names a contract 3.3 signal in its env is testing that signal alone; do not
+    // add the blanket SAFE_AI_SKILL_HEADLESS on top of it.
+    if row.ctx.headless
+        && !row
+            .env
+            .iter()
+            .any(|(k, _)| HEADLESS_SIGNALS.contains(&k.as_str()))
+    {
+        inv = inv.headless(true);
+    }
     match row.ctx.user_tier {
         UserTier::Column => inv = inv.tier(tier),
         UserTier::Fixed(t) => inv = inv.tier(t),
@@ -964,6 +988,24 @@ fn parse_stdout(hook: &str, stdout: &str) -> Result<(char, bool), String> {
         None => '-',
         Some(other) => return Err(format!("{hook}: unexpected permissionDecision `{other}`")),
     };
+    if verdict == '-' {
+        // No opinion is empty stdout; the only other accepted shapes carry no decision at all.
+        let top_ok = v.as_object().is_some_and(|o| {
+            o.keys()
+                .all(|k| k == "systemMessage" || k == "hookSpecificOutput")
+        });
+        let inner_ok = out.as_object().is_none_or(|o| {
+            o.keys().all(|k| {
+                ["hookEventName", "updatedInput", "additionalContext"].contains(&k.as_str())
+            })
+        });
+        if !top_ok || !inner_ok {
+            return Err(format!(
+                "{hook}: no-opinion must be empty stdout, got {}",
+                stdout.trim()
+            ));
+        }
+    }
     Ok((verdict, updated))
 }
 
@@ -1018,9 +1060,10 @@ struct Cell {
     result: Result<Outcome, String>,
 }
 
-fn run_cells(rows: &[Row], work: Vec<(usize, usize)>) -> (Vec<Cell>, usize) {
+/// Cells run, cells skipped for the OS, cells skipped for a missing build feature.
+fn run_cells(rows: &[Row], work: Vec<(usize, usize)>) -> (Vec<Cell>, usize, usize) {
     let cells = Mutex::new(Vec::new());
-    let skipped = Mutex::new(0usize);
+    let skipped = Mutex::new((0usize, 0usize));
     let next = Mutex::new(work.into_iter());
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().min(8));
     std::thread::scope(|scope| {
@@ -1032,9 +1075,13 @@ fn run_cells(rows: &[Row], work: Vec<(usize, usize)>) -> (Vec<Cell>, usize) {
                 };
                 let Some((r, t)) = item else { break };
                 let row = &rows[r];
-                if skip_reason(row, TIERS[t]).is_some() {
+                if let Some(why) = skip_reason(row, TIERS[t]) {
                     if let Ok(mut n) = skipped.lock() {
-                        *n += 1;
+                        if why == "os" {
+                            n.0 += 1;
+                        } else {
+                            n.1 += 1;
+                        }
                     }
                     continue;
                 }
@@ -1050,8 +1097,8 @@ fn run_cells(rows: &[Row], work: Vec<(usize, usize)>) -> (Vec<Cell>, usize) {
         }
     });
     let cells = cells.into_inner().unwrap_or_default();
-    let skipped = skipped.into_inner().unwrap_or(0);
-    (cells, skipped)
+    let (os_skipped, feature_skipped) = skipped.into_inner().unwrap_or((0, 0));
+    (cells, os_skipped, feature_skipped)
 }
 
 /// Fixed-tier rows ignore the column: run one column and reuse it for the other three.
@@ -1086,7 +1133,23 @@ fn shared_corpus_plugin_column() {
                 .collect()
         })
         .unwrap_or_default();
-    let (cells, skipped) = run_cells(&rows, work_for(&rows, &filter));
+    let allow_skip = std::env::var("SHARED_CORPUS_ALLOW_SKIP").is_ok_and(|v| v == "1");
+    assert!(
+        TEST_HOOKS || allow_skip,
+        "the full corpus run needs the trusted-data-dir and sandbox overrides: run with \
+         `--features test-hooks` (or set SHARED_CORPUS_ALLOW_SKIP=1 to run the subset that \
+         works without them; skipped cells are then reported, not hidden)"
+    );
+    let (cells, os_skipped, feature_skipped) = run_cells(&rows, work_for(&rows, &filter));
+    assert!(
+        !cells.is_empty(),
+        "no cell ran (SHARED_CORPUS_FILTER={filter:?} matched nothing, or every cell was skipped)"
+    );
+    assert!(
+        feature_skipped == 0 || allow_skip,
+        "{feature_skipped} cells were skipped for a missing build feature; run with \
+         `--features test-hooks`, or set SHARED_CORPUS_ALLOW_SKIP=1 to accept the gap"
+    );
 
     let mut red: Vec<String> = Vec::new();
     let mut by_file: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -1120,6 +1183,12 @@ fn shared_corpus_plugin_column() {
                         "RED {:<12} {:<8} want updatedInput, none emitted",
                         row.id, word
                     ));
+                } else if out.updated_input && !row.expect.updated_input {
+                    entry.1 += 1;
+                    red.push(format!(
+                        "RED {:<12} {:<8} unexpected updatedInput",
+                        row.id, word
+                    ));
                 } else if row.expect.interim.is_none() {
                     if let Some(why) =
                         invariant(out.verdict, row.expect.kit[cell.tier], row.ctx.headless)
@@ -1151,17 +1220,14 @@ fn shared_corpus_plugin_column() {
         std::fs::write(&path, out).unwrap_or_else(|e| panic!("write {path}: {e}"));
     }
 
-    println!(
-        "shared corpus: {} rows, {} cells run, {} skipped",
+    eprintln!(
+        "shared corpus: {} rows, {} cells run, {os_skipped} skipped for the OS, \
+         {feature_skipped} skipped for a missing feature",
         rows.len(),
         cells.len(),
-        skipped
     );
     for (file, (cells, bad)) in &by_file {
-        println!("  {file:<13} {cells:>4} cells, {bad:>4} red");
-    }
-    if skipped > 0 {
-        println!("  {skipped} cells skipped (need --features test-hooks, or another OS)");
+        eprintln!("  {file:<13} {cells:>4} cells, {bad:>4} red");
     }
     assert!(
         red.is_empty(),
@@ -1182,4 +1248,98 @@ fn runner_plumbing_smoke() {
         let out = execute(row, Tier::Relaxed).unwrap_or_else(|e| panic!("{id}: {e}"));
         assert_eq!(out.verdict, expected_at(row, 1), "{id} at relaxed");
     }
+}
+
+// ------------------------------------------------------------------ conformance-diff.sh
+
+#[cfg(unix)]
+fn diff_script(results: &str, args: &[&str]) -> (Option<i32>, String) {
+    let dir = TempDir::new("conformance-diff");
+    let corpus = dir.join("corpus");
+    std::fs::create_dir_all(&corpus).expect("mkdir corpus");
+    let row = |id: &str, kit: &str| {
+        format!(
+            r#"{{"id":"{id}","expect":{{"plugin":"----","kit":"{kit}","combined":"{kit}","owner":"plugin"}}}}"#
+        )
+    };
+    std::fs::write(
+        corpus.join("x.jsonl"),
+        format!("{}\n{}\n", row("A-1", "DDDD"), row("A-2", "-AAD")),
+    )
+    .expect("write corpus");
+    let file = dir.join("results.jsonl");
+    std::fs::write(&file, results).expect("write results");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/conformance-diff.sh");
+    let out = std::process::Command::new("sh")
+        .arg(script)
+        .args(args)
+        .arg(&file)
+        .env("CORPUS_DIR", &corpus)
+        .output()
+        .expect("run conformance-diff.sh");
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn conformance_diff_fails_on_bad_input() {
+    let full = "{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n{\"id\":\"A-2\",\"kit\":\"-AAD\"}\n";
+    let (code, out) = diff_script(full, &[]);
+    assert_eq!(code, Some(0), "{out}");
+
+    let (code, out) = diff_script(
+        "{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n{\"id\":\"A-2\",\"kit\":\"-A?D\"}\n",
+        &[],
+    );
+    assert_eq!(code, Some(0), "a `?` tier is skipped: {out}");
+
+    let (code, out) = diff_script(
+        "{\"id\":\"A-1\",\"kit\":\"----\"}\n{\"id\":\"A-2\",\"kit\":\"-AAD\"}\n",
+        &[],
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("DIVERGE A-1"), "{out}");
+
+    for (what, input, needle) in [
+        ("empty file", "", "no corpus row was compared"),
+        ("garbage", "not json\n\u{1}\u{2}\n", "MALFORMED"),
+        ("truncated line", "{\"id\":\"A-1\"\n", "MALFORMED"),
+        (
+            "partial results",
+            "{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n",
+            "MISSING A-2",
+        ),
+        (
+            "duplicate id",
+            "{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n{\"id\":\"A-2\",\"kit\":\"-AAD\"}\n",
+            "duplicate id",
+        ),
+        (
+            "unknown id",
+            "{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n{\"id\":\"A-2\",\"kit\":\"-AAD\"}\n{\"id\":\"Z-9\",\"kit\":\"----\"}\n",
+            "UNKNOWN Z-9",
+        ),
+        (
+            "all tiers unasserted",
+            "{\"id\":\"A-1\",\"kit\":\"????\"}\n{\"id\":\"A-2\",\"kit\":\"????\"}\n",
+            "no corpus row was compared",
+        ),
+    ] {
+        let (code, out) = diff_script(input, &[]);
+        assert_eq!(code, Some(1), "{what}: {out}");
+        assert!(out.contains(needle), "{what}: {out}");
+    }
+
+    let (code, out) = diff_script("{\"id\":\"A-1\",\"kit\":\"DDDD\"}\n", &["--allow-missing"]);
+    assert_eq!(code, Some(0), "a partial run is accepted on request: {out}");
+
+    let (code, _) = diff_script(full, &["--column", "bogus"]);
+    assert_eq!(code, Some(2));
 }

@@ -72,10 +72,16 @@ checks them again on its actual verdicts for rows without `interim`.
   contract's section 2.4 seed. Class U denies on mainnet, testnet and Unknown, asks on identified
   localnet/devnet, and is never grantable.
 - `kit`: read from solanabr/solana-ai-kit `42755ab` (`onchain-guard.sh`, `secrets-guard.awk`,
-  `egress-guard.sh`, `firewall.sh` deny lists), nothing executed. The end-state kit value assumes M3 to
-  M7 as the contract describes them: its `onchain-guard` no longer resolves clusters, so Class U and
-  Class C rows are `----` and the plugin carries them; `interim` records what the kit does today. Rows
-  where a wrapper might defeat a kit deny glob are `?`. A kit owner should review the whole column.
+  `egress-guard.sh`, `firewall.sh` deny lists), nothing executed. The pin is `42755ab`; the permanent
+  wrapper denies below were re-checked at kit HEAD `edf0cb5` (same entries, different line numbers).
+  The end-state kit value assumes M3 to M7 as the contract describes them: its `onchain-guard` no
+  longer resolves clusters, so Class U and Class C rows are `----` and the plugin carries them;
+  `interim` records what the kit does today. **Exception:** the kit keeps `Bash(env *)`,
+  `Bash(sh -c *)`, `Bash(bash -c *)` and `Bash(sudo *)` in its unconditional deny list (M5 only removes
+  `DENY_IRREVERSIBLE_ONCHAIN` entries), so every `env`, `sh -c`, `bash -c` (also behind `timeout`) and
+  `sudo` row has kit `DDDD` at every tier in the end state, and its `combined` is `DDDD`; those rows
+  only verify the engine. Rows where a wrapper might defeat a kit deny glob are `?`. A kit owner should
+  review the whole column.
 - Seed ambiguities, resolved here: IR-1 and the other `--final` rows give the kit an end-state `----`
   (the contract's "both layers" is read as the interim state); DEV-3 uses 5 SOL, because the contract's
   50 SOL exceeds `hard_tx_sol_max` and denies (kept as DEV-3B); MN-3 and MN-4 get interim kit values.
@@ -83,6 +89,18 @@ checks them again on its actual verdicts for rows without `interim`.
   `anchor *`; CL-3, CL-3B and CL-8 cover only the `solana`-side and flag cases.
 - Not covered here: supply chain (F5, needs pack fixtures) and PostToolUse redaction, which are not
   PreToolUse verdicts.
+
+## Known limits
+
+- **Hook wiring.** The runner calls `gate-bash` for every Bash row. Claude Code only starts it when
+  `hooks.json`'s `if` filters match (`Bash(solana *)`, `Bash(spl-token *)`, `Bash(anchor *)`), so the
+  wrapper rows (`env`, `bash -c`, `$S`, quoted binaries, `sudo`, path-qualified binaries) are only
+  meaningful if `gate-bash` is wired unconditionally. The runner assumes that wiring (F3 makes it one
+  unconditional `gate-bash` entry); it does not evaluate the `if` globs.
+- **Sandbox.** `sandbox: unset` and `off` both map to the engine's "off" override under `test-hooks`,
+  so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by F2's tests.
+- **Not in the corpus:** supply chain (needs pack fixtures) and PostToolUse redaction.
+- **MANIFEST.** The corpus is not hash-pinned in `../MANIFEST`; versioning follows the contract.
 
 ## Running
 
@@ -96,8 +114,14 @@ sh scripts/conformance-diff.sh --column plugin /tmp/plugin.jsonl
 sh scripts/conformance-diff.sh <kit-results.jsonl>   # kit runner output, compared to expect.kit
 ```
 
+The full plugin run **fails** unless built with `--features test-hooks`, because it would otherwise
+skip every Off column, `env_read` opt-in, grant and `pre_cli` row. `SHARED_CORPUS_ALLOW_SKIP=1` accepts
+that gap explicitly. A filter that matches no cell also fails. `conformance-diff.sh` exits 1 on empty or
+garbage input, rows missing from the results (`--allow-missing` for a partial run), duplicate or
+value-less ids and unknown ids, so a crashed runner cannot pass.
+
 The runner drives each row through the hook entry the plugin wires for the tool (`gate-bash` and
 `gate-bash-secrets`, `gate-read`, `gate-tamper`, `gate-mcp`) and takes the strictest verdict, like
-Claude Code's merge. It calls `gate-bash` for every Bash row, whether or not `hooks.json`'s `if`
-filter would have started it. Rows needing Off, an `env_read` opt-in, a grant or `pre_cli` need the
-`test-hooks` build (an authenticated tier.json in a trusted data dir) and are skipped without it.
+Claude Code's merge. It calls `gate-bash` for every Bash row (see Known limits). Rows needing Off, an `env_read` opt-in, a
+grant or `pre_cli` need the `test-hooks` build (an authenticated tier.json in a trusted data dir). A
+no-opinion cell must print nothing (or, at most, a decision-less `systemMessage`/`updatedInput`).
