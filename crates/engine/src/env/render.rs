@@ -712,7 +712,8 @@ mod tests {
              L1   CLUSTER   devnet   (duplicate; overridden by L4)\n\
              L2   #OLD      commented\n\
              L3   SHORT     set len=7\n\
-             L4   CLUSTER   testnet   (duplicate; this line wins)\n"
+             L4   CLUSTER   testnet   (duplicate; this line wins)\n\
+             # duplicates: dotenv loaders and `source` use the last assignment; dotenvy (Rust) keeps the first\n"
         );
     }
 
