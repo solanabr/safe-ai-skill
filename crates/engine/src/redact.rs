@@ -631,6 +631,7 @@ mod tests {
             "PRIVATE_SIGNING_KEY=abc123",
             "API_KEY=abc123 # note",
             "API_KEY=\"abc123\" # note",
+            "API_KEY=\"abc#def\"",
         ] {
             assert!(contains_key_material(text), "{text}");
         }
