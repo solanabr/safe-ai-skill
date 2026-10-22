@@ -8,13 +8,19 @@
 //! decision (`Deny` > `Ask` > `Allow` > `Defer`). The returned [`GateMeta`] describes the most
 //! significant gated command so the relaxation layer and grants can reason about it.
 //!
-//! `Allow` comes only from a within-cap transfer on a positively identified
-//! devnet/testnet/localnet, and only when every command is a direct solana-family command: an
-//! allow vouches for the whole tool call. Read-only commands and deploys to such a network get
-//! no opinion, so the normal permission flow applies. Irreversible actions (`--final`,
-//! authority changes, closes) are hard-guard asks on every cluster, and `--final` on mainnet
-//! is denied. A command naming a solana-family program that cannot be parsed, or that runs
-//! code the command line does not spell out, asks as a hard guard.
+//! D8 v2 (spec §2, §3) splits on-chain actions by recoverability:
+//!
+//! - **Class U** (the shared list's `irreversible net` rows, [`lists::irreversible`]): denied
+//!   with the command echoed on mainnet, testnet and any cluster not positively identified
+//!   (Unknown), a hard-guard ask on identified localnet/devnet; at every tier, never granted.
+//! - **Class C** (transfers, deploys, buffer closes, authority changes, withdraws): on mainnet
+//!   or Unknown an ask below High (a grantable one unless it is an authority change, an
+//!   account close or an unbudgetable amount) and a deny at High. `Allow` comes only from a
+//!   within-cap transfer on a positively identified devnet/testnet/localnet, and only when
+//!   every command is a direct solana-family command; deploys there get no opinion.
+//! - A command naming a solana-family program that cannot be parsed, runs code the command
+//!   line does not spell out, or runs an expansion as its program asks as a hard guard, and
+//!   is denied at High.
 //!
 //! A command that names its own cluster (`-um`, `--url …`, `-C file`) is judged on it;
 //! otherwise `solana`/`spl-token` use [`Context::network`] and `anchor`
@@ -27,10 +33,12 @@
 
 use std::path::Path;
 
-use crate::context::shell::{self, Parsed};
+use crate::context::shell::{self, Parsed, SimpleCommand};
 use crate::context::{self, Argv, Context, Network};
 use crate::gate::{GateMeta, Scope};
 use crate::io::Decision;
+use crate::lists::{self, Verb, VerbCluster};
+use crate::policy::tier::Tier;
 use crate::policy::Policy;
 use crate::spend::{self, SpendLedger};
 
@@ -131,12 +139,13 @@ fn decide_parsed(
     ctx: &Context,
     policy: &Policy,
 ) -> (Decision, GateMeta) {
+    let tier = policy.tier();
     // A solana-family program named where the parser cannot follow: unparseable text, or an
     // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
     // one. It could be any command at all: a hard-guard ask, whatever its words.
     let named = shell::mentions_family(command);
     if (parsed.unparseable && named) || parsed.opaque_mention {
-        return ask_unparseable();
+        return unreadable_at(ask_unparseable(), tier);
     }
 
     let mut best: Option<(Decision, GateMeta)> = None;
@@ -145,27 +154,9 @@ fn decide_parsed(
 
     for cmd in &parsed.commands {
         let candidate = if cmd.is_family() {
-            let program = cmd.program();
-            let argv = Argv::from_shell(&cmd.words);
-            let segment_ctx = Context {
-                network: command_network(&argv, &program, ctx, parsed),
-                ..ctx.clone()
-            };
-            let (decision, meta) = classify(&program, &argv, &segment_ctx, policy);
-            let decision = if cmd.writes_file && decision == Decision::Allow {
-                // A redirection writes a file: never part of an allowed transfer.
-                unvetted = true;
-                Decision::Ask {
-                    reason: format!(
-                        "{program} command redirects output to a file — approve to proceed"
-                    ),
-                }
-            } else {
-                decision
-            };
-            (mainnet_policy(decision, segment_ctx.network, policy), meta)
-        } else if shell::dynamic_family_program(cmd, parsed) {
-            ask_dynamic_program()
+            family_decision(command, cmd, parsed, ctx, policy, &mut unvetted)
+        } else if let Some(verdict) = dynamic_decision(command, cmd, parsed, ctx, tier) {
+            verdict
         } else {
             unvetted = true;
             continue;
@@ -182,7 +173,7 @@ fn decide_parsed(
 
     // Solana text written to a file, then a file or stdin run as code.
     if parsed.write_then_run {
-        let unaccounted = ask_unaccounted();
+        let unaccounted = unreadable_at(ask_unaccounted(), tier);
         let keep = best
             .as_ref()
             .is_some_and(|(d, _)| severity(d) >= severity(&unaccounted.0));
@@ -209,25 +200,429 @@ fn decide_parsed(
     }
 }
 
-/// The cluster one solana-family command runs on: its own flags, else the default for its
-/// program — unknown when the command changes directory (for `anchor`, and for a relative
-/// `-C`) or the variables the CLIs read their config through.
-fn command_network(argv: &Argv, program: &str, ctx: &Context, parsed: &Parsed) -> Network {
-    let base = (!parsed.cwd_changed).then_some(ctx.project_dir.as_path());
-    if let Some(net) = context::explicit_network(argv, base) {
-        return net;
+/// Decide one solana-family command: Class U first, then the Class C / read-only
+/// classification, then the policy and tier rules.
+fn family_decision(
+    command: &str,
+    cmd: &SimpleCommand,
+    parsed: &Parsed,
+    ctx: &Context,
+    policy: &Policy,
+    unvetted: &mut bool,
+) -> (Decision, GateMeta) {
+    let tier = policy.tier();
+    let program = cmd.program();
+    let (words, extra) = split_extra_bools(&cmd.words);
+    let argv = Argv::from_shell(&words);
+    let cluster = command_cluster(cmd, &argv, &program, ctx, parsed);
+    let irreversible = match irreversible_match(&program, &argv, &extra) {
+        Ok(found) => found,
+        Err(_) => return unreadable_at(ask_lists_unavailable(&program), tier),
+    };
+    if let Some(row) = irreversible {
+        return class_u(&row, &cluster, command, ctx);
     }
-    if parsed.env_changed {
-        return Network::Unknown;
-    }
-    if program == "anchor" {
-        if parsed.cwd_changed {
-            Network::Unknown
-        } else {
-            ctx.anchor_network
+    let segment_ctx = Context {
+        network: cluster.network,
+        ..ctx.clone()
+    };
+    let (decision, meta) = classify(&program, &argv, &segment_ctx, policy);
+    let decision = if cmd.writes_file && decision == Decision::Allow {
+        // A redirection writes a file: never part of an allowed transfer.
+        *unvetted = true;
+        Decision::Ask {
+            reason: format!("{program} command redirects output to a file — approve to proceed"),
         }
     } else {
-        ctx.network
+        decision
+    };
+    let decision = mainnet_policy(decision, cluster.network, policy);
+    if is_unreadable_meta(&meta) {
+        return unreadable_at((decision, meta), tier);
+    }
+    let decision = class_c_at(decision, &meta, &cluster, command, ctx, tier);
+    (decision, meta)
+}
+
+/// A command whose program is an expansion. `None` when it cannot be a solana-family command.
+///
+/// It may be one when [`shell::dynamic_family_program`] says so, or when its words have the
+/// shape of a Class U command for some family program (`$S program-v4 finalize P`): then the
+/// Class U verdict for the riskiest reading joins the expansion's own hard-guard ask.
+fn dynamic_decision(
+    command: &str,
+    cmd: &SimpleCommand,
+    parsed: &Parsed,
+    ctx: &Context,
+    tier: Tier,
+) -> Option<(Decision, GateMeta)> {
+    if !cmd.words.first().is_some_and(|w| w.dynamic) {
+        return None;
+    }
+    let (words, extra) = split_extra_bools(&cmd.words);
+    let argv = Argv::from_shell(&words);
+    let irreversible = shell::FAMILY
+        .iter()
+        .find_map(|program| irreversible_match(program, &argv, &extra).ok().flatten());
+    let dynamic = shell::dynamic_family_program(cmd, parsed);
+    if !dynamic && irreversible.is_none() {
+        return None;
+    }
+    let expansion = unreadable_at(ask_dynamic_program(), tier);
+    let Some(row) = irreversible else {
+        return Some(expansion);
+    };
+    let base = (!parsed.cwd_changed).then_some(ctx.project_dir.as_path());
+    let cluster = match context::explicit_network(&argv, base) {
+        Some(network) => Cluster {
+            network,
+            source: Source::Flags(flag_words(cmd)),
+        },
+        None => Cluster {
+            network: Network::Unknown,
+            source: Source::Expansion,
+        },
+    };
+    let class_u = class_u(&row, &cluster, command, ctx);
+    Some(if severity(&expansion.0) > severity(&class_u.0) {
+        expansion
+    } else {
+        class_u
+    })
+}
+
+/// A cluster and where it came from (named in deny reasons).
+struct Cluster {
+    network: Network,
+    source: Source,
+}
+
+/// Where a command's cluster came from.
+enum Source {
+    /// The command's own `-u/--url/--cluster/--provider.cluster/-C` words.
+    Flags(String),
+    /// The command line sets a variable the CLIs read their config through.
+    EnvChanged,
+    /// The command line changes directory before an `anchor` command.
+    CwdChanged,
+    /// `anchor` without a cluster flag: `Anchor.toml`, else the CLI config.
+    AnchorDefault,
+    /// `solana`/`spl-token` without a cluster flag: the CLI config.
+    CliDefault,
+    /// An expansion runs as the program: nothing names a cluster.
+    Expansion,
+}
+
+impl Source {
+    fn describe(&self, ctx: &Context) -> String {
+        match self {
+            Source::Flags(words) if words.is_empty() => "the command's own flags".to_string(),
+            Source::Flags(words) => format!("the command's `{words}`"),
+            Source::EnvChanged => {
+                "the CLI config, after the command line changes the variables it is read \
+                 through"
+                    .to_string()
+            }
+            Source::CwdChanged => "Anchor.toml, after the command line changes directory".into(),
+            Source::AnchorDefault => {
+                let toml = ctx
+                    .project_dir
+                    .ancestors()
+                    .any(|d| d.join("Anchor.toml").exists());
+                let base = if toml {
+                    "Anchor.toml"
+                } else {
+                    "the CLI config (`solana config get`)"
+                };
+                let env = std::env::var("ANCHOR_PROVIDER_URL").is_ok_and(|v| !v.trim().is_empty());
+                if env {
+                    format!("{base} and ANCHOR_PROVIDER_URL")
+                } else {
+                    base.to_string()
+                }
+            }
+            Source::CliDefault => "the CLI config (`solana config get`)".to_string(),
+            Source::Expansion => "nothing: an expansion runs as the program".to_string(),
+        }
+    }
+}
+
+/// The words of `cmd` that name its cluster (`-um`, `--url x`, `-C file`), as written.
+fn flag_words(cmd: &SimpleCommand) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut words = cmd.words.iter().skip(1).map(|w| w.text.as_str());
+    while let Some(word) = words.next() {
+        let long = ["--url", "--cluster", "--provider.cluster", "--config"]
+            .iter()
+            .find(|f| word == **f || word.starts_with(&format!("{f}=")));
+        let short = !word.starts_with("--")
+            && word.starts_with('-')
+            && word
+                .trim_start_matches('-')
+                .trim_start_matches(['v', 'h', 'V'])
+                .starts_with(['u', 'C']);
+        if long.is_none() && !short {
+            continue;
+        }
+        out.push(word);
+        let bare = long.is_some_and(|f| word == *f)
+            || (short
+                && word
+                    .trim_start_matches('-')
+                    .trim_start_matches(['v', 'h', 'V'])
+                    .len()
+                    == 1);
+        if bare {
+            if let Some(value) = words.next() {
+                out.push(value);
+            }
+        }
+    }
+    out.join(" ")
+}
+
+/// The cluster one solana-family command runs on, with its source: its own flags, else the
+/// default for its program — unknown when the command changes directory (for `anchor`, and
+/// for a relative `-C`) or the variables the CLIs read their config through.
+fn command_cluster(
+    cmd: &SimpleCommand,
+    argv: &Argv,
+    program: &str,
+    ctx: &Context,
+    parsed: &Parsed,
+) -> Cluster {
+    let base = (!parsed.cwd_changed).then_some(ctx.project_dir.as_path());
+    if let Some(network) = context::explicit_network(argv, base) {
+        return Cluster {
+            network,
+            source: Source::Flags(flag_words(cmd)),
+        };
+    }
+    let (network, source) = if parsed.env_changed {
+        (Network::Unknown, Source::EnvChanged)
+    } else if program == "anchor" && parsed.cwd_changed {
+        (Network::Unknown, Source::CwdChanged)
+    } else if program == "anchor" {
+        (ctx.anchor_network, Source::AnchorDefault)
+    } else {
+        (ctx.network, Source::CliDefault)
+    };
+    Cluster { network, source }
+}
+
+/// Boolean flags of Class U rows that the shared flag model ([`Argv`]) does not list: read
+/// as unknown, they would make the next word (`--bypass-warning -ud`) a possible value.
+const EXTRA_BOOL_FLAGS: &[&str] = &["--bypass-warning"];
+
+/// `words` without the [`EXTRA_BOOL_FLAGS`], and the ones present.
+fn split_extra_bools(words: &[shell::Word]) -> (Vec<shell::Word>, Vec<&'static str>) {
+    let mut found: Vec<&'static str> = Vec::new();
+    let kept = words
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| {
+            let extra = (*i > 0)
+                .then(|| EXTRA_BOOL_FLAGS.iter().find(|f| w.text == **f))
+                .flatten();
+            if let Some(flag) = extra {
+                found.push(flag);
+            }
+            extra.is_none()
+        })
+        .map(|(_, w)| w.clone())
+        .collect();
+    (kept, found)
+}
+
+/// Class U rows the shared list does not spell but this gate also treats as Class U (same
+/// argv grammar): `anchor program close` of a program, and `--final` on the other deploy
+/// commands. `anchor legacy-idl …` is read as `anchor idl …`.
+const EXTRA_IRREVERSIBLE: &[&[&str]] = &[
+    &["anchor", "program", "close", "[--bypass-warning]"],
+    &["anchor", "upgrade", "[--final]"],
+    &["anchor", "migrate", "[--final]"],
+];
+
+/// The Class U row `program` + `argv` matches, written out (`solana program deploy --final`);
+/// `None` when none does. Positional words are matched as parsed, even past an uncertain
+/// position: a literal Class U spelling is judged as one.
+fn irreversible_match(
+    program: &str,
+    argv: &Argv,
+    extra: &[&str],
+) -> Result<Option<String>, lists::ListsUnavailable> {
+    let mut tokens: Vec<String> = Vec::with_capacity(argv.positionals.len() + 1);
+    tokens.push(program.to_ascii_lowercase());
+    tokens.extend(argv.positionals.iter().map(|w| w.to_ascii_lowercase()));
+    if program == "anchor" && tokens.get(1).is_some_and(|t| t == "legacy-idl") {
+        tokens[1] = "idl".to_string();
+    }
+    let rows = lists::irreversible()?;
+    let listed = rows
+        .iter()
+        .filter(|v| v.cluster == VerbCluster::Net)
+        .map(|v: &&Verb| v.argv.iter().map(String::as_str).collect::<Vec<_>>());
+    let built_in = EXTRA_IRREVERSIBLE.iter().map(|r| r.to_vec());
+    Ok(listed
+        .chain(built_in)
+        .find(|row| row_matches(row, &tokens, |f| argv.has_flag(f) || extra.contains(&f)))
+        .map(|row| describe_row(&row, &tokens)))
+}
+
+/// Whether `row` (literals, `*`, `[--flag]`) matches `tokens` (program + positionals) and
+/// the flags `has_flag` reports.
+fn row_matches(row: &[&str], tokens: &[String], has_flag: impl Fn(&str) -> bool) -> bool {
+    let mut at = 0usize;
+    for part in row {
+        if let Some(flag) = part.strip_prefix('[').and_then(|p| p.strip_suffix(']')) {
+            if !has_flag(flag) {
+                return false;
+            }
+            continue;
+        }
+        let Some(token) = tokens.get(at) else {
+            return false;
+        };
+        if *part != "*" && !token.eq_ignore_ascii_case(part) {
+            return false;
+        }
+        at = match at.checked_add(1) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+    true
+}
+
+/// A matched row as words: `*` replaced by the command's word, brackets dropped.
+fn describe_row(row: &[&str], tokens: &[String]) -> String {
+    let mut at = 0usize;
+    let mut out: Vec<&str> = Vec::with_capacity(row.len());
+    for part in row {
+        if let Some(flag) = part.strip_prefix('[').and_then(|p| p.strip_suffix(']')) {
+            out.push(flag);
+            continue;
+        }
+        out.push(if *part == "*" {
+            tokens.get(at).map_or("*", String::as_str)
+        } else {
+            part
+        });
+        at = at.saturating_add(1);
+    }
+    out.join(" ")
+}
+
+/// Longest command echoed in a reason.
+const MAX_ECHO_CHARS: usize = 400;
+
+/// `command` for a reason: whole, or its first [`MAX_ECHO_CHARS`] characters and `…`.
+fn echo(command: &str) -> String {
+    let command = command.trim();
+    match command.char_indices().nth(MAX_ECHO_CHARS) {
+        Some((cut, _)) => format!("{}…", &command[..cut]),
+        None => command.to_string(),
+    }
+}
+
+/// How a reason names a cluster.
+fn cluster_label(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "mainnet",
+        Network::Devnet => "devnet",
+        Network::Testnet => "testnet",
+        Network::Localnet => "localnet",
+        Network::Unknown => "an unidentified cluster",
+    }
+}
+
+/// The Class U decision for `row` on `cluster` (spec §3.1): a hard-guard ask on positively
+/// identified localnet/devnet, a deny everywhere else. Never granted: the meta is a hard
+/// guard, and the deny echoes `command` for the user to run themselves.
+fn class_u(row: &str, cluster: &Cluster, command: &str, ctx: &Context) -> (Decision, GateMeta) {
+    let scope = if ["authority", "authorize"].iter().any(|w| row.contains(w)) {
+        Scope::Authority
+    } else if ["deploy", "upgrade", "write-buffer", "finalize", "--final"]
+        .iter()
+        .any(|w| row.contains(w))
+    {
+        Scope::Deploy
+    } else {
+        Scope::Destructive
+    };
+    let mut meta = GateMeta::new(scope, true);
+    meta.program = row.split(' ').next().map(str::to_string);
+    let net = cluster_label(cluster.network);
+    let source = cluster.source.describe(ctx);
+    let decision = match cluster.network {
+        Network::Localnet | Network::Devnet => Decision::Ask {
+            reason: format!(
+                "Irreversible on-chain action `{row}` on {net} (cluster from {source}): it \
+                 destroys the capability even for its owner — approve to proceed (no grant \
+                 covers it)"
+            ),
+        },
+        Network::Mainnet | Network::Testnet | Network::Unknown => Decision::Deny {
+            reason: format!(
+                "Irreversible on-chain action `{row}` on {net} (cluster from {source}): it \
+                 destroys the capability even for its owner and runs through the agent only \
+                 on a positively identified localnet or devnet. Run it yourself outside the \
+                 agent if you intend it: `{}`",
+                echo(command)
+            ),
+        },
+    };
+    (decision, meta)
+}
+
+/// Class C at High (spec §2): on mainnet or an unidentified cluster, an ask for a transfer,
+/// deploy, authority change or close is a deny, whatever grant exists. Other tiers keep it.
+fn class_c_at(
+    decision: Decision,
+    meta: &GateMeta,
+    cluster: &Cluster,
+    command: &str,
+    ctx: &Context,
+    tier: Tier,
+) -> Decision {
+    let counterparty = matches!(
+        meta.scope,
+        Scope::Transfer | Scope::Deploy | Scope::Authority | Scope::Destructive
+    );
+    let risky = matches!(cluster.network, Network::Mainnet | Network::Unknown);
+    match decision {
+        Decision::Ask { reason } if tier == Tier::High && counterparty && risky => Decision::Deny {
+            reason: format!(
+                "{reason} — denied at tier high: a counterparty action on {} (cluster \
+                     from {}). Run it yourself outside the agent if you intend it: `{}`",
+                cluster_label(cluster.network),
+                cluster.source.describe(ctx),
+                echo(command)
+            ),
+        },
+        other => other,
+    }
+}
+
+/// Whether `meta` marks a command the gate cannot read (unparseable, opaque, an expansion
+/// program, ambiguous words, lists unavailable): a hard guard of no particular scope.
+fn is_unreadable_meta(meta: &GateMeta) -> bool {
+    meta.scope == Scope::Other && meta.hard_guard
+}
+
+/// An unreadable solana-family command (spec §2, WS-A row): its hard-guard ask is a deny at
+/// High.
+fn unreadable_at((decision, meta): (Decision, GateMeta), tier: Tier) -> (Decision, GateMeta) {
+    match decision {
+        Decision::Ask { reason } if tier == Tier::High => (
+            Decision::Deny {
+                reason: format!(
+                    "{reason} — denied at tier high: the gate cannot tell what this runs"
+                ),
+            },
+            meta,
+        ),
+        other => (other, meta),
     }
 }
 
@@ -269,6 +664,14 @@ fn classify_solana(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, Ga
             Err(verdict) => verdict,
         },
         "close" => destructive_decision("solana", ctx, true),
+        "program-v4" => match word_or_ask(argv, 1, "solana") {
+            Ok(action) if action == "deploy" => deploy_decision("solana", ctx, argv),
+            Ok(_) => ask_unknown("solana"),
+            Err(verdict) => verdict,
+        },
+        "withdraw-stake" | "withdraw-from-vote-account" | "withdraw-from-nonce-account" => {
+            withdraw_decision(&sub, ctx)
+        }
         "close-vote-account" => irreversible_decision(
             "solana",
             ctx,
@@ -288,7 +691,7 @@ fn classify_program(argv: &Argv, program: &str, ctx: &Context) -> (Decision, Gat
         Err(verdict) => return verdict,
     };
     match action.as_str() {
-        "deploy" | "write-buffer" | "upgrade" => deploy_decision(program, ctx, argv),
+        "deploy" | "write-buffer" | "upgrade" | "extend" => deploy_decision(program, ctx, argv),
         "set-upgrade-authority" => irreversible_decision(
             program,
             ctx,
@@ -297,7 +700,9 @@ fn classify_program(argv: &Argv, program: &str, ctx: &Context) -> (Decision, Gat
             "upgrade-authority change",
         ),
         "set-buffer-authority" => authority_decision(program, ctx, argv),
-        "close" => irreversible_decision(program, ctx, argv, Scope::Destructive, "program close"),
+        // `close --bypass-warning` (a program) is Class U, decided before this. Without it the
+        // CLI closes buffers only: lamports go to the recipient.
+        "close" => buffer_close_decision(program, ctx),
         // Read-only program subcommands.
         "show" | "dump" => readonly(program),
         _ => ask_unknown(program),
@@ -417,10 +822,12 @@ fn transfer_decision(
     (decision, meta)
 }
 
-/// Build a deploy decision (`program deploy|write-buffer|upgrade`, `anchor deploy|upgrade|migrate`).
+/// Build a deploy decision (`program deploy|write-buffer|upgrade|extend`, `program-v4 deploy`,
+/// `anchor deploy|upgrade|migrate`).
 ///
-/// `--final` makes the program immutable: irreversible. Otherwise mainnet → ask (+ hard guard),
-/// an unidentified network → ask, a positively identified devnet/testnet/localnet → no opinion.
+/// `--final` makes the program immutable: irreversible (Class U, normally decided before
+/// this). Otherwise mainnet or an unidentified network → a grantable ask, a positively
+/// identified devnet/testnet/localnet → no opinion.
 fn deploy_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, GateMeta) {
     if argv.has_flag("--final") {
         return irreversible_decision(
@@ -432,8 +839,8 @@ fn deploy_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, Gate
         );
     }
 
-    let mainnet = matches!(ctx.network, Network::Mainnet);
-    let mut meta = GateMeta::new(Scope::Deploy, mainnet);
+    // Grantable on any cluster (spec §2: a covering confirmed grant allows below High).
+    let mut meta = GateMeta::new(Scope::Deploy, false);
     meta.program = Some(program.to_string());
 
     let decision = match ctx.network {
@@ -448,8 +855,9 @@ fn deploy_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, Gate
     (decision, meta)
 }
 
-/// Build an irreversible-action decision: a hard-guard ask on every cluster, and a deny for
-/// `--final` on mainnet — that one the user runs themselves.
+/// Build an irreversible-action decision for a command the Class U rows did not match (an
+/// authority change to a new key, an IDL authority change) or, should a list row go, the
+/// 1.1.0 fallback: a hard-guard ask on every cluster, and a deny for `--final` on mainnet.
 fn irreversible_decision(
     program: &str,
     ctx: &Context,
@@ -490,6 +898,45 @@ fn authority_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, G
     (
         Decision::Ask {
             reason: reason.to_string(),
+        },
+        meta,
+    )
+}
+
+/// A program buffer close (`program close` without `--bypass-warning`): Class C, a grantable
+/// ask on every cluster (spec §2: recoverable close asks; a covering grant allows below High).
+fn buffer_close_decision(program: &str, ctx: &Context) -> (Decision, GateMeta) {
+    let mut meta = GateMeta::new(Scope::Destructive, false);
+    meta.program = Some(program.to_string());
+    let net = if matches!(ctx.network, Network::Mainnet) {
+        "mainnet "
+    } else {
+        ""
+    };
+    (
+        Decision::Ask {
+            reason: format!(
+                "{program} {net}buffer close (recoverable: lamports go to the recipient) — \
+                 approve to proceed"
+            ),
+        },
+        meta,
+    )
+}
+
+/// A stake, vote or nonce withdraw (Class C): it moves lamports to a recipient by an amount
+/// this gate does not budget, so a hard-guard ask on every cluster.
+fn withdraw_decision(sub: &str, ctx: &Context) -> (Decision, GateMeta) {
+    let mut meta = GateMeta::new(Scope::Transfer, true);
+    meta.program = Some("solana".to_string());
+    let net = if matches!(ctx.network, Network::Mainnet) {
+        "mainnet "
+    } else {
+        ""
+    };
+    (
+        Decision::Ask {
+            reason: format!("solana {net}{sub} moves lamports to a recipient — approve to proceed"),
         },
         meta,
     )
@@ -544,6 +991,22 @@ fn ask_unknown(program: &str) -> (Decision, GateMeta) {
     (
         Decision::Ask {
             reason: format!("Unrecognized {program} command — approve to proceed"),
+        },
+        meta,
+    )
+}
+
+/// The shared on-chain list failed to load: the gate cannot tell Class U from anything else, so
+/// every solana-family command is a hard-guard ask (fail closed).
+fn ask_lists_unavailable(program: &str) -> (Decision, GateMeta) {
+    let mut meta = GateMeta::unreadable();
+    meta.program = Some(program.to_string());
+    (
+        Decision::Ask {
+            reason: format!(
+                "The shared on-chain action list is unavailable, so this {program} command \
+                 cannot be classified — approve to proceed"
+            ),
         },
         meta,
     )
@@ -833,11 +1296,12 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_deploy_asks_and_is_hard_guard() {
+    fn mainnet_deploy_asks_and_is_grantable() {
+        // Class C (spec §2): a covering confirmed grant may allow it below High.
         let ctx = ctx_with(Network::Mainnet, "mainnet_deploy");
         let (d, meta) = decide("solana program deploy ./prog.so", &ctx, &policy());
         assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
-        assert!(meta.hard_guard);
+        assert!(!meta.hard_guard);
         assert_eq!(meta.scope, Scope::Deploy);
     }
 
@@ -909,12 +1373,16 @@ mod tests {
     }
 
     #[test]
-    fn spl_burn_asks_not_hard_guard() {
+    fn spl_burn_is_class_u() {
+        // Class U (spec §3.1): a hard-guard ask on devnet, a deny on mainnet.
         let ctx = ctx_with(Network::Devnet, "burn");
         let (d, meta) = decide(&format!("spl-token burn {DEST} 100"), &ctx, &policy());
         assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
-        assert!(!meta.hard_guard, "burn is destructive but not a hard guard");
+        assert!(meta.hard_guard, "Class U is never granted");
         assert_eq!(meta.scope, Scope::Destructive);
+        let ctx = ctx_with(Network::Mainnet, "burn_main");
+        let (d, _) = decide(&format!("spl-token burn {DEST} 100"), &ctx, &policy());
+        assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
     }
 
     #[test]
@@ -1019,6 +1487,45 @@ mod tests {
             &policy(),
         );
         assert_eq!(meta.program.as_deref(), Some("solana"));
+        assert!(!meta.hard_guard, "a mainnet deploy is grantable Class C");
+    }
+
+    #[test]
+    fn rows_match_literals_wildcards_and_flags() {
+        let parsed = shell::parse("solana -um program-v4 retract P --final");
+        let argv = Argv::from_shell(&parsed.commands[0].words);
+        let tokens: Vec<String> = std::iter::once("solana".to_string())
+            .chain(argv.positionals.iter().map(|w| w.to_string()))
+            .collect();
+        let has = |f: &str| argv.has_flag(f);
+        assert!(row_matches(
+            &["solana", "program-v4", "*", "[--final]"],
+            &tokens,
+            has
+        ));
+        assert!(!row_matches(
+            &["solana", "program-v4", "finalize"],
+            &tokens,
+            has
+        ));
+        assert!(!row_matches(
+            &["solana", "program-v4", "*", "[--nope]"],
+            &tokens,
+            has
+        ));
+        assert_eq!(
+            describe_row(&["solana", "program-v4", "*", "[--final]"], &tokens),
+            "solana program-v4 retract --final"
+        );
+    }
+
+    #[test]
+    fn class_u_at_high_is_still_an_ask_on_devnet() {
+        let ctx = ctx_with(Network::Devnet, "u_high");
+        let mut p = policy();
+        p.runtime.tier = Tier::High;
+        let (d, meta) = decide("spl-token close-mint M", &ctx, &p);
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
         assert!(meta.hard_guard);
     }
 }
