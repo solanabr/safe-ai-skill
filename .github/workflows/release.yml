@@ -45,7 +45,8 @@
 #
 # Only the attest job can sign attestations (id-token + attestations write). It
 # checks out nothing and runs two actions, pinned by commit SHA: download the
-# build artifacts, attest them. The build job runs no third-party action and
+# build artifacts, attest them. Every action in this workflow is pinned by commit
+# SHA. The build job runs no third-party action and
 # restores no cache either: rustup is preinstalled on GitHub's runners, and the
 # toolchain is pinned below.
 #
@@ -118,7 +119,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Check version and tags
         env:
@@ -188,7 +189,7 @@ jobs:
       VERSION: ${{ inputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         run: |
@@ -278,7 +279,7 @@ jobs:
         run: sh scripts/gate-smoke.sh "./$ARTIFACT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
@@ -387,7 +388,7 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Check the tagged commit
         env:
@@ -404,6 +405,10 @@ jobs:
           fi
           sh scripts/check-binary-versions.sh plugins/safe-ai-skill/bin "$version"
           sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin
+          if [ -e plugins/safe-ai-skill/bin/.sha-tools-from-path ]; then
+            echo "::error::plugins/safe-ai-skill/bin/.sha-tools-from-path must not ship"
+            exit 1
+          fi
           cd plugins/safe-ai-skill/bin
           sha256sum -c SHA256SUMS
           # The binary users get must be the version being tagged, not a stale vendor.

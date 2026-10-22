@@ -291,6 +291,15 @@ jobs:
       - name: Shim sha256 constants match the committed binaries
         run: sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin
 
+      # A `.sha-tools-from-path` beside the shim makes it take sha256sum from PATH (the test
+      # harness's layout); a shipped plugin must never carry it.
+      - name: No test-only shim markers are committed
+        run: |
+          if [ -e plugins/safe-ai-skill/bin/.sha-tools-from-path ]; then
+            echo "::error::plugins/safe-ai-skill/bin/.sha-tools-from-path must not be committed"
+            exit 1
+          fi
+
   # ── shim failure contract (fake uname + fake engines, no build) ─────────
   # /bin/sh is dash on Ubuntu and bash 3.2 on macOS; the script also runs dash and
   # bash --posix wherever they exist.
