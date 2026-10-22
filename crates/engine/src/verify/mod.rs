@@ -179,17 +179,12 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Discover each `ext/<name>` git submodule directory under a skills root.
 ///
-/// The kit lays third-party code out as 18 git submodules under `.claude/skills/ext/`
-/// (trailofbits, ghostsecurity, …). [`run_session`] currently treats `ext/` as a
-/// single child unit; per the round-2 contract these should each be verified/pinned as their
-/// OWN unit (pin/drift on the submodule git SHA). This is the discovery primitive Round-2
-/// Agent B iterates over.
+/// The kit lays third-party code out as git submodules under `.claude/skills/ext/`
+/// (trailofbits, ghostsecurity, …). Each submodule is verified and pinned as its own unit.
 ///
 /// `skills_dir` is a skills root (e.g. an entry from
 /// [`crate::policy::SupplyChainPolicy::verify_skills_dirs`]); the `ext/` subdir name is taken
-/// from `policy.supply_chain.ext_dir`'s final component. Returns each immediate child
-/// directory of that `ext/` dir (the individual submodules), or an empty vec when ext
-/// verification is disabled, the root is missing, or `ext/` does not exist.
+/// from `policy.supply_chain.ext_dir`'s final component.
 ///
 /// Returns each immediate child directory of `<skills_dir>/<ext>` (the individual submodules),
 /// or an empty vec when ext verification is disabled, the root is missing, or `ext/` does not
@@ -333,23 +328,7 @@ pub fn neutralize_telemetry(skill_md: &str) -> (String, bool) {
     (out.join("\n"), changed)
 }
 
-/// Extract `@latest`/unpinned MCP server entries from a `.mcp.json` body (pure).
-///
-/// Returns one [`Finding`] per server whose command/args carry `@latest` or an unpinned
-/// `npx` spec, located at the line of the server's key. These are emitted at
-/// [`Severity::Low`] (informational): per the roadmap, MCPs are intentionally kept `@latest`,
-/// so an unpinned spec is surfaced but never escalated to a blocking/ask Warn. Hermetic; used
-/// by the `verify session` sweep.
-pub fn scan_mcp_json(body: &str) -> Report {
-    Report {
-        findings: unpinned_mcp_servers(body)
-            .into_iter()
-            .map(|m| m.finding)
-            .collect(),
-    }
-}
-
-/// One MCP server [`scan_mcp_json`] reports.
+/// One unpinned MCP server found in a `.mcp.json` body.
 struct UnpinnedMcp {
     /// Server name: its key in the servers object.
     server: String,
@@ -359,7 +338,12 @@ struct UnpinnedMcp {
     finding: Finding,
 }
 
-/// Each server [`scan_mcp_json`] reports, with its name and command line.
+/// Extract `@latest`/unpinned MCP server entries from a `.mcp.json` body (pure).
+///
+/// Returns one entry per server whose command/args carry `@latest` or an unpinned `npx` spec,
+/// with a [`Severity::Low`] (informational) finding located at the line of the server's key.
+/// MCPs are intentionally kept `@latest`, so an unpinned spec is surfaced but never escalated
+/// to a blocking/ask Warn.
 fn unpinned_mcp_servers(body: &str) -> Vec<UnpinnedMcp> {
     let value: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -1286,6 +1270,15 @@ pub fn severity_label(s: Severity) -> &'static str {
 mod orchestration_tests {
     use super::*;
     use std::fs;
+
+    fn scan_mcp_json(body: &str) -> Report {
+        Report {
+            findings: unpinned_mcp_servers(body)
+                .into_iter()
+                .map(|m| m.finding)
+                .collect(),
+        }
+    }
 
     fn tempdir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(

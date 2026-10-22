@@ -7,14 +7,12 @@
 //!
 //! This module owns ONLY the grant/profile *name* persistence. The profile's *effect* (cap
 //! overrides, `relax_transfer`/`relax_swap` flags) lives in [`crate::policy::Policy::effective`]
-//! — `mode::get` supplies the active name, `policy.effective()` applies the overlay. The two
+//! — `mode::persisted` supplies the active name, `policy.effective()` applies the overlay. The two
 //! never overlap.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-
-use crate::policy::PROFILE_ENV;
 
 /// The known profile names. Any other value is rejected by [`set`].
 pub const KNOWN_PROFILES: [&str; 4] = ["strict", "autopilot", "paranoid", "off"];
@@ -33,30 +31,9 @@ pub fn is_known_profile(profile: &str) -> bool {
     KNOWN_PROFILES.contains(&profile)
 }
 
-/// Read the requested profile.
-///
-/// Precedence: the [`PROFILE_ENV`] env var (when set to a known profile) overrides the
-/// persisted file; otherwise the value in `mode.json` is returned. `None` when neither a
-/// valid env override nor a persisted record exists, so the caller may fall back to the
-/// policy default. Not the profile gates use: there the env var may only tighten
-/// [`persisted`] (see [`crate::policy::Policy::load_with_mode`]).
-pub fn get(plugin_data: &Path) -> Option<String> {
-    get_with(plugin_data, std::env::var(PROFILE_ENV).ok().as_deref())
-}
-
-/// [`get`] with the [`PROFILE_ENV`] value passed in (tests never touch the process env).
-fn get_with(plugin_data: &Path, env_profile: Option<&str>) -> Option<String> {
-    if let Some(env_profile) = env_profile {
-        let trimmed = env_profile.trim();
-        if is_known_profile(trimmed) {
-            return Some(trimmed.to_string());
-        }
-    }
-    persisted(plugin_data)
-}
-
-/// Read the profile persisted in `mode.json` alone, ignoring the env override. `None` when
-/// absent or not a known profile.
+/// Read the profile persisted in `mode.json`. The [`crate::policy::PROFILE_ENV`] override is
+/// applied separately, in [`crate::policy::Policy::load_with_mode`]. `None` when absent or not
+/// a known profile.
 pub fn persisted(plugin_data: &Path) -> Option<String> {
     let path = plugin_data.join("mode.json");
     let text = std::fs::read_to_string(path).ok()?;
@@ -118,17 +95,17 @@ mod tests {
     }
 
     #[test]
-    fn set_then_get_roundtrip() {
+    fn set_then_persisted_roundtrip() {
         let dir = tmp_dir("roundtrip");
         set(&dir, "autopilot").unwrap();
-        assert_eq!(get_with(&dir, None), Some("autopilot".to_string()));
+        assert_eq!(persisted(&dir), Some("autopilot".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn get_none_when_unset() {
+    fn persisted_none_when_unset() {
         let dir = tmp_dir("unset");
-        assert_eq!(get_with(&dir, None), None);
+        assert_eq!(persisted(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -136,19 +113,6 @@ mod tests {
     fn invalid_profile_rejected() {
         let dir = tmp_dir("invalid");
         assert!(set(&dir, "turbo").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_overrides_file() {
-        let dir = tmp_dir("env");
-        set(&dir, "strict").unwrap();
-        assert_eq!(
-            get_with(&dir, Some("paranoid")),
-            Some("paranoid".to_string())
-        );
-        // Garbage env value is ignored; file value wins.
-        assert_eq!(get_with(&dir, Some("garbage")), Some("strict".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

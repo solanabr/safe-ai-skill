@@ -1,4 +1,4 @@
-//! TOFU lockfile: sha256 dir-tree hashing, pin/diff, and quarantine.
+//! TOFU lockfile: sha256 dir-tree hashing, and pin/diff.
 //!
 //! The lockfile lives at `${CLAUDE_PLUGIN_DATA}/lockfile.json` and records, per skill /
 //! MCP, the content hash pinned on first use (trust-on-first-use). A later content change

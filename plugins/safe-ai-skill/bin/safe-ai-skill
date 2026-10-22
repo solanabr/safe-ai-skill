@@ -154,7 +154,7 @@ if [ -z "$plat" ]; then env_failure 'unsupported platform'; fi
 bin=$self_dir/safe-ai-skill-$plat$ext
 if [ ! -f "$bin" ]; then env_failure 'no engine binary for this platform'; fi
 if [ ! -x "$bin" ]; then env_failure 'engine binary is not executable'; fi
-# The prebuilt's sha256 check against a release-stamped constant (D6.1) goes here.
+# Note: in 1.0.1 the engine binary is not hash-pinned; only its platform and executable format are checked.
 if ! exec_format_ok "$bin"; then env_failure "engine binary is not a $family executable"; fi
 
 if [ "$kind" = cli ]; then

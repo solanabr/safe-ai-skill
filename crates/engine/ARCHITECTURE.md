@@ -191,7 +191,6 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 impl HookInput {
-    pub fn from_stdin() -> Self;                 // bounded; unreadable → default
     pub fn parse(raw: &str) -> Self;
     pub fn bash_command(&self) -> Option<&str>;
     pub fn read_path(&self) -> Option<&str>;
@@ -332,7 +331,7 @@ pub struct Context { pub network: Network, pub plugin_data: PathBuf, pub project
 impl Context { pub fn build(command: &str, cwd: &Path) -> Context; }
 
 pub fn resolve_network(command: &str, cwd: &Path) -> Network;  // flag>env>Anchor.toml>cached solana config
-pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA} | ~/.safe-ai-skill
+pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA}
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
 Fully implemented (not a stub). Never panics; `Unknown` on failure.
@@ -414,7 +413,6 @@ pub fn grants::debit(plugin_data: &Path, grant_id: &str, sol_amount: f64) -> std
 pub fn grants::cleanup_expired(plugin_data: &Path) -> usize;
 
 // mode
-pub fn mode::get(plugin_data: &Path) -> Option<String>;        // env-if-known, else mode.json (raw read)
 pub fn mode::persisted(plugin_data: &Path) -> Option<String>;  // mode.json only; what load_with_mode takes
 pub fn mode::set(plugin_data: &Path, profile: &str) -> std::io::Result<()>;
 
