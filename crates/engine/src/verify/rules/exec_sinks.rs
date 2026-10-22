@@ -312,8 +312,19 @@ fn new_function(orig: &str) -> Option<usize> {
     None
 }
 
-/// Indirect or obfuscated execution: computed eval, `constructor.constructor`, `data:` imports,
-/// string timers, the `vm` module; Python `exec`, `marshal`/`pickle` loads, `__import__`.
+/// Decoder calls whose result, handed to a timer, is a string of code.
+const DECODED_ARGS: &[&str] = &[
+    "atob(",
+    "buffer.from(",
+    "decodeuricomponent(",
+    "unescape(",
+    "string.fromcharcode(",
+];
+
+/// Indirect or obfuscated execution: computed eval, the `Function` constructor reached through
+/// `constructor` (`constructor.constructor`, `Function.prototype.constructor`, a function
+/// expression's `.constructor(`), `data:` imports, timers given a string or a decoded string, the
+/// `vm` module; Python `exec`, `marshal`/`pickle` loads, `__import__`.
 fn obfuscated(s: &str, lang: Lang) -> Option<usize> {
     let mut found: Vec<Option<usize>> = Vec::new();
     if matches!(lang, Lang::Js | Lang::Other) {
@@ -321,6 +332,9 @@ fn obfuscated(s: &str, lang: Lang) -> Option<usize> {
             s,
             &[
                 "constructor.constructor",
+                "function.prototype.constructor",
+                "}).constructor(",
+                "} ).constructor(",
                 "['constructor']",
                 "[\"constructor\"]",
                 "import('data:",
@@ -338,7 +352,9 @@ fn obfuscated(s: &str, lang: Lang) -> Option<usize> {
             if let Some(p) = find_call(s, timer, true) {
                 let arg = s[p + timer.len()..].trim_start();
                 let arg = arg.strip_prefix('(').unwrap_or(arg).trim_start();
-                if arg.starts_with(['\'', '"', '`']) {
+                if arg.starts_with(['\'', '"', '`'])
+                    || DECODED_ARGS.iter().any(|d| arg.starts_with(d))
+                {
                     found.push(Some(p));
                 }
             }
@@ -412,21 +428,29 @@ fn joins_literals(body: &str) -> bool {
     false
 }
 
-/// Process spawning per language (inventory, and a sink for combos).
+/// `child_process` methods, also reached as bracket members (`cp['exec'](…)`).
+const SPAWN_METHODS: &[&str] = &[
+    "exec",
+    "execsync",
+    "execfile",
+    "execfilesync",
+    "spawn",
+    "spawnsync",
+    "fork",
+];
+
+/// Process spawning per language (inventory, and a sink for combos). A module name in
+/// `require('child_process')` / `import('node:child_process')` / `from '…'` counts at the
+/// `require` / `import` / `from` keyword, so the quotes around it do not make it data.
 fn spawn(s: &str, lang: Lang) -> Option<usize> {
     let mut found: Vec<Option<usize>> = Vec::new();
     if matches!(lang, Lang::Js | Lang::Other) {
         found.push(find_any(
             s,
-            &[
-                "child_process",
-                "execsync",
-                "spawnsync",
-                "execfilesync",
-                "shelljs",
-                "execa(",
-            ],
+            &["execsync", "spawnsync", "execfilesync", "shelljs", "execa("],
         ));
+        found.push(module_import(s, "child_process"));
+        found.push(bracket_call(s, SPAWN_METHODS));
         found.push(find_call(s, "execfile", true));
         found.push(find_call(s, "spawn", false));
         found.push(find_call(s, "fork", false));
@@ -464,6 +488,56 @@ fn spawn(s: &str, lang: Lang) -> Option<usize> {
         ));
     }
     found.into_iter().flatten().min()
+}
+
+/// Offset of `module` (`child_process`, also `node:child_process`): the `require` / `import` /
+/// `from` keyword when it names the module, else the name itself.
+fn module_import(s: &str, module: &str) -> Option<usize> {
+    let p = s.find(module)?;
+    let lead = s[..p].strip_suffix("node:").unwrap_or(&s[..p]);
+    let Some(before) = lead.strip_suffix(['\'', '"', '`']) else {
+        return Some(p);
+    };
+    let before = before.trim_end();
+    let keyword = before
+        .strip_suffix('(')
+        .map(str::trim_end)
+        .and_then(|b| {
+            ["require", "import"]
+                .iter()
+                .find(|k| b.ends_with(*k))
+                .map(|k| b.len() - k.len())
+        })
+        .or_else(|| before.ends_with("from").then(|| before.len() - 4));
+    Some(keyword.unwrap_or(p))
+}
+
+/// Offset of a bracket member call to one of `names`: `x['exec'](`, `x["spawn"] (`.
+fn bracket_call(s: &str, names: &[&str]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(p) = s.get(from..).and_then(|r| r.find('[')).map(|p| p + from) {
+        from = p + 1;
+        let rest = &s[p + 1..];
+        let Some(q) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))
+        else {
+            continue;
+        };
+        let body = &rest[1..];
+        let Some(end) = body.find(q) else {
+            continue;
+        };
+        let after = body[end + 1..].trim_start();
+        let called = after
+            .strip_prefix(']')
+            .is_some_and(|a| a.trim_start().starts_with('('));
+        if called && names.contains(&&body[..end]) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Base64 / hex / char-code decoding.

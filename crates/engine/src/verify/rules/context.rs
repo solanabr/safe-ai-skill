@@ -1203,7 +1203,9 @@ pub(crate) fn line_bits(lower: &str, orig: &str) -> u32 {
     if both(P_IMPORT, P_DATA)
         || (bits & P_FUNCTION != 0 && orig.contains("Function"))
         || (bits & P_MEMBER != 0
-            && (quoted_member(lower) || lower.contains("constructor.constructor")))
+            && (quoted_member(lower)
+                || lower.contains("constructor.constructor")
+                || lower.contains(".constructor(")))
     {
         out |= T_EVAL;
     }
