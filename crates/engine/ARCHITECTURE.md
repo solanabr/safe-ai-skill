@@ -46,10 +46,12 @@ For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-m
 
 ```
 stdin → io::read_payload                           # bytes (≤ 1 MiB + 1) + parse or Unreadable
-      → Policy::load(cwd) → .effective()           # active-profile overlay applied
+      → Policy::load(cwd) → .effective()           # policy overlays applied
+      → policy::tier::resolve(root, dir, env)      # (tier, env_read, notes): max(user tier.json, raise-only hints)
       → Context::build(command, cwd)               # network resolution
       → gate::decide(...) -> (Decision, GateMeta)  # PURE
-      → relax::apply(decision, meta, effective, plugin_data)  # may upgrade Ask→Allow
+      → relax::apply(decision, meta, effective, plugin_data)  # may upgrade Ask→Allow (never at High)
+      → headless post-processor                      # Ask→Deny when headless (grants confirmed earlier still allow)
       → audit::append(...)                          # when policy.audit.enabled
       → io::emit_pretooluse(final_decision)         # authoritative JSON; exit 0
 ```
@@ -136,7 +138,7 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | `netcache.json` | `context` | cached `solana config get` RPC URL (60s TTL, authenticated state file, bound to the CLI config's size+mtime; future `ts` ignored) |
 | `spend.json` | `spend` | daily spend ledger (authenticated; missing after the key exists, or tampered → today exhausted) |
 | `grants.json` | `grants` | scoped grants (authenticated; created only by a confirmed prompt nonce) |
-| `mode.json` | `mode` | runtime active-profile override (authenticated; looser profiles need a confirmed nonce) |
+| `tier.json` | `tierstate` | user-scope tier `{global?, projects[root]}` with optional `env_read` (authenticated; a lowering or an `env_read` loosening needs a confirmed nonce). Replaces the pre-tier `mode.json`, which `migrate` converts once |
 | `sessions.json` | `session` | session-key metadata and the active-session pointer (authenticated) |
 | `lockfile.json` | `verify::lockfile` | v1 name-keyed pins; read for the state-v2 carry-over, still written by `add`/`install` |
 | `state.json` | `verify::state` | state v2: per-pack pin, grade, findings, names, fingerprint (authenticated) |
@@ -148,6 +150,27 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 | `pending.json` | `confirm` | pending requests: id, payload, code **hash** once announced, failure count (authenticated) |
 | `migrated.json` | `migrate` | authenticated marker: 1.0 state was converted |
 | `*.lock` | `statefile::FileLock` | `state.lock` (stores), `pending.lock`, `grants.lock` |
+
+---
+
+## Tiers, sandbox state, headless and shared lists (D8 v2)
+
+The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permission rules and tier selection UX. User-facing behaviour is in `docs/tiers.md` and the README table; this section maps the modules. Signatures are in the source (rustdoc).
+
+| Module | Role |
+|---|---|
+| `policy/tier.rs` | `Tier {Off, Relaxed, Medium, High}` (`Ord`; aliases `strict`, `paranoid`, `autopilot`), `TierSource`, and `resolve(root, &DataDir, env) -> (Tier, EnvRead, Vec<Note>)`: `base` (`relaxed`), then the user value from `tier.json` (`projects[root]`, else `global`), then `max()` with the raise-only hints (kit `.claude/security.json` `tier`/`declared.tier`/`enforced.tier`, repo `policy.yaml` `tier`, env `SAFE_AI_SKILL_TIER`). A lower hint is ignored with a note. The table in the README is checked against the table in this file. |
+| `tierstate.rs` | The authenticated `tier.json` v1 under the statefile MAC and generation index; the writer behind `safe-ai-skill tier`. A raise applies at once; a lowering or an `env_read` loosening (`deny` < `ask` < `tier`) becomes a `confirm::PendingKind::Tier` request. `mode.rs` stays as a deprecated alias. |
+| `sandbox.rs` | `state(root) -> {On, Off, Unknown}` from the first `sandbox.enabled` in managed, project-local, project, then user settings (passwd home, never env `HOME`; `$CLAUDE_CONFIG_DIR`). `On` also needs macOS or Linux with `bwrap` on a fixed path, never native Windows. Declared configuration, not a runtime proof. A test override exists only under `test-hooks`. |
+| `headless.rs` | `is_headless(env)`: any of `SAFE_AI_SKILL_HEADLESS`/`KIT_FIREWALL_HEADLESS` (`1`/`true`), a CI variable not `0`/`false`, or no readable `/dev/tty`. Any signal turns it on, nothing turns it off. `main.rs` post-processes every PreToolUse verdict: `ask` becomes `deny`; a grant confirmed earlier still allows below High. |
+| `lists.rs` | Parses the embedded `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!`, `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
+| `gates/credpaths.rs`, `gates/creddump.rs` | Credential path classification and directory-Grep exclusion globs from `credentials.list`; the command-form readers (`gh auth token`, `git credential fill`, `security … -w`, `op read`, …). Deny at every tier. |
+| `gates/envread.rs`, `gates/envwrite.rs` | The raw project-env read verdict from `(tier, env_read, sandbox)`; the Write/Edit/MultiEdit and agent `env set\|unset` verdict (deny from Medium). The opt-in applies only with the sandbox `On`. |
+| `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); Class U (`irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and Class C (caps, grants, mainnet/Unknown ask, High deny). |
+| `gates/exfil.rs` | The naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`: secret operand to a network-capable command, or a listed host, per the tier's list size. |
+| `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
+
+**Invariants the tests pin:** every `deny` row holds at Off; no repo file, kit file or env variable lowers a tier or loosens `env_read`; a lowering is pending until a whole-prompt confirm; raising never prompts; High emits no `allow`; no tier emits `defer`; nothing moves by default; the exfil lists never shrink below the shared file; the embedded lists equal `policy/shared/*` byte for byte; headless never yields `ask`; the kit's `.safe-ai-skill/policy.yaml` loads unchanged. The conformance corpus is `policy/shared/corpus/*.jsonl`, run by `tests/shared_corpus.rs`.
 
 ---
 
@@ -270,15 +293,7 @@ safe direction stay fixed: `catalog`, `swap.rugcheck_timeout_ms`, `supply_chain.
 change lands in `ignored_overrides`, which `verify session` appends to the SessionStart
 `additionalContext`; the notes never echo repo text.
 
-**Profiles (D1.11):** `strict` (default, no-op), `paranoid` (`ask_all`: `relax` turns every
-allow into an ask and skips grants; `gate-bash` asks for every Solana CLI command), `autopilot`
-(per-tx cap 2.0). The active profile is the authenticated `mode.json` (trusted data dir only)
-if set, else the plugin default's; `autopilot` applies only from `mode.json` (a base-policy
-`autopilot` is strict, noted); `PROFILE_ENV` may then only pick a stricter one (`autopilot` <
-`strict` < `paranoid`). Removed in 1.1.0 and listed as ignored where an old policy still has
-them: the `off` profile, `relax_transfer`, `relax_swap`, `disabled`, and the never-read
-`gates`/`hard_guards` lists. Hard guards are set by the gates (`GateMeta::hard_guard`) and
-never relaxed.
+**Profiles are gone (D8 v2).** `strict`, `paranoid` and `autopilot` are input aliases for the tiers `relaxed`, `high` and `relaxed` (`migrate.rs`, `policy::tier`); `profiles:`, `ask_all`, the autopilot cap, `KNOWN_PROFILES`, the `off` profile, `relax_transfer`, `relax_swap`, `disabled` and the never-read `gates`/`hard_guards` lists load as ignored notes. See "Tiers, sandbox state, headless and shared lists" below. Hard guards are set by the gates (`GateMeta::hard_guard`) and never relaxed.
 
 **On-disk ⇄ embedded equivalence (invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
@@ -412,11 +427,8 @@ pub fn grants::add(dir: &DataDir, grant: Grant, now: u64) -> Result<bool, Engine
 pub fn grants::find_match<'a>(grants: &'a Grants, meta: &GateMeta) -> Option<&'a Grant>;
 pub fn grants::debit(dir: &DataDir, grant_id: &str, sol_amount: f64) -> Result<(), EngineError>;
 
-// mode — mode.json is a statefile envelope
-pub const mode::KNOWN_PROFILES: [&str; 3];          // loosest first: autopilot strict paranoid
-pub fn mode::persisted(dir: &DataDir) -> Option<String>;  // Valid AND dir.trusted AND known
-pub fn mode::set(dir: &DataDir, profile: &str, now: u64) -> Result<(), EngineError>;
-pub fn mode::is_looser(target: &str, current: &str) -> bool;
+// tierstate — tier.json is a statefile envelope (see "Tiers, sandbox state, headless and shared lists");
+// `mode` is a deprecated alias shim over it, and the pre-tier mode.json is converted once by migrate
 
 // relax — called by main.rs after every gate, and by prompt-guard
 pub fn relax::apply(natural: Decision, meta: &GateMeta, policy: &Policy, dir: &DataDir) -> Decision;
@@ -429,9 +441,9 @@ pub fn spend::ledger_state(plugin_data: &Path) -> LedgerState;  // Valid | Fresh
 pub fn migrate::run(dir: &DataDir, now: u64) -> Vec<String>;      // 1.0 → envelopes, once
 pub fn notice::loosenings(inputs: &notice::Inputs) -> Option<String>;
 ```
-`relax::apply` contract: under the effective policy's `ask_all` every `Allow` becomes `Ask`
-and no grant is consulted; otherwise if `natural` is not `Ask`, or `meta.hard_guard` is
-true, return it unchanged; otherwise the first live grant matching within budget/`max_tx_sol`
+`relax::apply` contract: at the tier High the engine never emits `Allow` (no grant is consulted,
+and a within-cap allow falls back to no opinion, so Claude Code's own flow decides); otherwise if
+`natural` is not `Ask`, or `meta.hard_guard` is true, return it unchanged; otherwise the first live grant matching within budget/`max_tx_sol`
 is debited (a failed debit keeps the ask) and the result is `Allow`.
 
 **Confirmation flow (D4.1, fix round 1).** `allow` and `mode <looser>` call
@@ -527,7 +539,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`mode [<profile>]` · `revoke` · `status` · `--version`. `allow`, `mode autopilot` and
+`tier [<name>] [--project] [--env-read deny|ask|tier] | --clear` (`mode` is a deprecated alias) · `revoke` · `status` · `--version`. `allow`, a tier lowering and
 `verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
 an argument error exits 1.
 
