@@ -1193,10 +1193,14 @@ fn e2e_wallet_directories_globs_and_cd() {
         "rm -rf build",
         "mv build/x /tmp",
         "cd /tmp && rm id.json",
-        "rm ~/.config/solana/cli/*.bak",
     ] {
         assert_eq!(w.bash(cmd, Tier::Relaxed), "", "{cmd}");
     }
+    // Not the wallet, so gate-bash has no opinion; but `~/.config/solana/` is a credential
+    // store (credentials.list), so gate-bash-secrets denies and the strictest verdict wins.
+    let cmd = "rm ~/.config/solana/cli/*.bak";
+    assert_eq!(decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[])), "", "{cmd}");
+    assert_eq!(w.bash(cmd, Tier::Relaxed), "deny", "{cmd}");
 }
 
 // ---------------------------------------------------------------------------------------
