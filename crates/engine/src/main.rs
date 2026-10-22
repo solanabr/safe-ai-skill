@@ -60,13 +60,13 @@ fn main() -> ExitCode {
     }
 }
 
+/// What `--version` prints. One literal, so the release's binary version check
+/// (`scripts/check-binary-versions.sh`) can also find it in a binary it can't run.
+const VERSION_LINE: &str = concat!("safe-ai-skill ", env!("CARGO_PKG_VERSION"));
+
 /// `--version` — one plain line, never hook JSON.
 fn cmd_version() -> ExitCode {
-    let _ = writeln!(
-        std::io::stdout(),
-        "safe-ai-skill {}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let _ = writeln!(std::io::stdout(), "{VERSION_LINE}");
     ExitCode::SUCCESS
 }
 
