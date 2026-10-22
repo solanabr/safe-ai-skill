@@ -144,7 +144,7 @@ safe-ai-skill registry list          # list catalog entries with risk classifica
 safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
-safe-ai-skill verify                 # on-demand sweep of installed skills and MCPs (what SessionStart runs)
+safe-ai-skill verify                 # sweep installed skills and MCPs and pin new packs (what SessionStart runs)
 safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
 safe-ai-skill status                 # active profile, live grants, spend, recent decisions
@@ -155,7 +155,7 @@ safe-ai-skill revoke                 # cancel grants early
 safe-ai-skill session                # show session keypair state
 ```
 
-`allow`, `revoke`, `mode <profile>`, `verify approve` and `install` change what the firewall permits or pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing.
+`allow`, `revoke`, `mode <profile>`, `verify approve` and `install` change what the firewall permits or pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 

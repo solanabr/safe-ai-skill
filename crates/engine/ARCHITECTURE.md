@@ -152,7 +152,12 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
 
 ---
 
-## State files (under `${CLAUDE_PLUGIN_DATA}`, fallback `~/.safe-ai-skill`)
+## State files (under `${CLAUDE_PLUGIN_DATA}`)
+
+From a terminal where `CLAUDE_PLUGIN_DATA` is unset, the CLI resolves the hooks' dir: under
+`$CLAUDE_CONFIG_DIR/plugins/data/` (or `~/.claude/plugins/data/`) `safe-ai-skill-safe-ai-skill`,
+then `safe-ai-skill-stbr`, else the only `safe-ai-skill-*` dir; otherwise it exits 1 asking for
+`CLAUDE_PLUGIN_DATA`. State is never written to `~/.safe-ai-skill` or the cwd.
 
 | File | Producer | Purpose |
 |---|---|---|

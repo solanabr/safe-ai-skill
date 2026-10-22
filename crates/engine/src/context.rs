@@ -41,7 +41,7 @@ impl Network {
 pub struct Context {
     /// Resolved network for the action.
     pub network: Network,
-    /// `${CLAUDE_PLUGIN_DATA}` (or `~/.safe-ai-skill`) — where state lives.
+    /// The plugin data dir ([`plugin_data_dir`]) — where state lives.
     pub plugin_data: PathBuf,
     /// Project root for the session.
     pub project_dir: PathBuf,
@@ -542,19 +542,84 @@ fn solana_config_rpc_url() -> Option<String> {
     None
 }
 
-/// `${CLAUDE_PLUGIN_DATA}` if set, else `~/.safe-ai-skill`, else `./.safe-ai-skill`.
+/// Data dir names Claude Code gives this plugin, most likely first:
+/// `<plugin>-<marketplace>` for the `safe-ai-skill` and `stbr` marketplaces.
+const DATA_DIR_NAMES: &[&str] = &["safe-ai-skill-safe-ai-skill", "safe-ai-skill-stbr"];
+
+/// Where state goes when [`resolve_plugin_data_dir`] finds none: a path no directory can be
+/// created under, so state is neither read nor written (never the cwd).
+#[cfg(not(windows))]
+const UNRESOLVED_DATA_DIR: &str = "/dev/null/safe-ai-skill";
+#[cfg(windows)]
+const UNRESOLVED_DATA_DIR: &str = "NUL\\safe-ai-skill";
+
+/// The plugin data dir, resolved as [`resolve_plugin_data_dir`] does. Hooks always get
+/// `$CLAUDE_PLUGIN_DATA`; when nothing resolves, a path where no state can exist.
 pub fn plugin_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_PLUGIN_DATA") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    resolve_plugin_data_dir().unwrap_or_else(|_| PathBuf::from(UNRESOLVED_DATA_DIR))
+}
+
+/// The plugin data dir the hooks use, also from a terminal where `$CLAUDE_PLUGIN_DATA` is unset:
+/// `$CLAUDE_PLUGIN_DATA`; else under `$CLAUDE_CONFIG_DIR/plugins/data/` (or
+/// `~/.claude/plugins/data/`) the first existing dir of [`DATA_DIR_NAMES`], or the only
+/// `safe-ai-skill-*` dir. Anything else is an error that says to set `CLAUDE_PLUGIN_DATA`.
+pub fn resolve_plugin_data_dir() -> Result<PathBuf, String> {
+    let var = |k: &str| std::env::var(k).ok();
+    data_dir_from(
+        var("CLAUDE_PLUGIN_DATA").as_deref(),
+        var("CLAUDE_CONFIG_DIR").as_deref(),
+        var("HOME").or_else(|| var("USERPROFILE")).as_deref(),
+    )
+}
+
+/// [`resolve_plugin_data_dir`] over explicit values (empty counts as unset).
+fn data_dir_from(
+    plugin_data: Option<&str>,
+    config_dir: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    let set = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(PathBuf::from);
+    if let Some(dir) = set(plugin_data) {
+        return Ok(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".safe-ai-skill");
+    let guidance = "set CLAUDE_PLUGIN_DATA to the plugin's data dir, usually \
+                    ~/.claude/plugins/data/safe-ai-skill-<marketplace>";
+    let base = match set(config_dir).or_else(|| set(home).map(|h| h.join(".claude"))) {
+        Some(config) => config.join("plugins").join("data"),
+        None => {
+            return Err(format!(
+                "safe-ai-skill: no plugin data dir: HOME is unset; {guidance}"
+            ))
         }
+    };
+    if let Some(name) = DATA_DIR_NAMES.iter().find(|n| base.join(n).is_dir()) {
+        return Ok(base.join(name));
     }
-    PathBuf::from(".safe-ai-skill")
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("safe-ai-skill-")
+                })
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!(
+            "safe-ai-skill: no plugin data dir under {} (is the plugin installed?); {guidance}",
+            base.display()
+        )),
+        n => Err(format!(
+            "safe-ai-skill: {n} safe-ai-skill-* data dirs under {}; {guidance}",
+            base.display()
+        )),
+    }
 }
 
 /// Project root for a session. Currently the cwd itself (reserved for a future git-root walk).
@@ -825,6 +890,72 @@ mod tests {
         // real network or Unknown, but the call must not panic.
         let _ = resolve_network("echo hi", &dir);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sas-ddir-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn data_dir_env_wins() {
+        let home = tmp_home("env");
+        assert_eq!(
+            data_dir_from(Some("/x/pd"), None, Some(home.to_str().unwrap())),
+            Ok(PathBuf::from("/x/pd"))
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn data_dir_prefers_marketplace_names_under_home_claude() {
+        let home = tmp_home("pref");
+        let data = home.join(".claude/plugins/data");
+        fs::create_dir_all(data.join("safe-ai-skill-stbr")).unwrap();
+        fs::create_dir_all(data.join("safe-ai-skill-other")).unwrap();
+        let h = home.to_str().unwrap();
+        assert_eq!(
+            data_dir_from(None, None, Some(h)),
+            Ok(data.join("safe-ai-skill-stbr"))
+        );
+        fs::create_dir_all(data.join("safe-ai-skill-safe-ai-skill")).unwrap();
+        assert_eq!(
+            data_dir_from(Some(""), Some(""), Some(h)),
+            Ok(data.join("safe-ai-skill-safe-ai-skill"))
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn data_dir_single_other_marketplace_or_error() {
+        let home = tmp_home("single");
+        let cfg = home.join("cfg");
+        let data = cfg.join("plugins/data");
+        fs::create_dir_all(data.join("unrelated-mkt")).unwrap();
+        let (h, c) = (home.to_str().unwrap(), cfg.to_str().unwrap());
+        // None at all: an error naming CLAUDE_PLUGIN_DATA, never a cwd or ~/.safe-ai-skill dir.
+        let err = data_dir_from(None, Some(c), Some(h)).unwrap_err();
+        assert!(err.contains("CLAUDE_PLUGIN_DATA"), "{err}");
+        fs::create_dir_all(data.join("safe-ai-skill-fork")).unwrap();
+        assert_eq!(
+            data_dir_from(None, Some(c), Some(h)),
+            Ok(data.join("safe-ai-skill-fork"))
+        );
+        // Two candidates and no preferred name: ambiguous.
+        fs::create_dir_all(data.join("safe-ai-skill-mine")).unwrap();
+        assert!(data_dir_from(None, Some(c), Some(h)).is_err());
+        // `$CLAUDE_CONFIG_DIR` replaces `~/.claude`, which is not consulted.
+        fs::create_dir_all(home.join(".claude/plugins/data/safe-ai-skill-stbr")).unwrap();
+        assert!(data_dir_from(None, Some(c), Some(h)).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn data_dir_without_home_or_config_is_an_error() {
+        assert!(data_dir_from(None, None, None).is_err());
+        assert!(data_dir_from(None, None, Some("")).is_err());
     }
 
     #[test]

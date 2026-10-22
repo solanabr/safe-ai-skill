@@ -70,6 +70,24 @@ fn cmd_version() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The plugin data dir for a CLI command run from the user's terminal: the hooks' dir
+/// ([`context::resolve_plugin_data_dir`]). When it can't be found, prints the guidance (JSON
+/// on stdout, a line on stderr) and returns `None`; state is never put anywhere else.
+fn cli_data_dir(command: &str) -> Option<PathBuf> {
+    match context::resolve_plugin_data_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "{e}");
+            print_json(&serde_json::json!({
+                "command": command,
+                "status": "error",
+                "error": e,
+            }));
+            None
+        }
+    }
+}
+
 /// Unknown or missing subcommand: nothing on stdout (a mis-wired hook has no opinion), the
 /// error on stderr, and exit 3 so the shim and CI can tell it from a verdict.
 fn cmd_unknown(sub: &str) -> ExitCode {
@@ -437,7 +455,9 @@ fn cmd_verify_approve(name: &str) -> ExitCode {
         }));
         return ExitCode::SUCCESS;
     }
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("verify approve") else {
+        return ExitCode::FAILURE;
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
     let project = verify::project_root(&cwd);
@@ -502,7 +522,9 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("add") else {
+        return ExitCode::FAILURE;
+    };
 
     // Catalog high-risk gate (runs BEFORE the verify/install pipeline). If the target resolves
     // to a known high-risk registry entry (`phantom-mcp` wallet signing, `x402-proxy-mcp` key
@@ -708,7 +730,9 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 /// Never widens `settings.json`. A skill with a High finding is held unless `--yes`.
 fn cmd_install(rest: &[String]) -> ExitCode {
     let force = rest.iter().any(|a| a == "--yes" || a == "--force");
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("install") else {
+        return ExitCode::FAILURE;
+    };
 
     // Optional local source (`--from`) and test home override (`--home` / env).
     let from = flag_value(rest, "--from");
@@ -1011,7 +1035,9 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
 fn cmd_registry(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("list");
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("registry") else {
+        return ExitCode::FAILURE;
+    };
     let policy = load_effective_policy(&cwd, &plugin_data);
     let reg_path = cwd.join(&policy.catalog.registry_path);
 
@@ -1116,7 +1142,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn cmd_session(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("status");
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("session") else {
+        return ExitCode::FAILURE;
+    };
     let result = match action {
         "init" => {
             let cap = rest
@@ -1148,7 +1176,9 @@ fn cmd_allow(rest: &[String]) -> ExitCode {
     let to = flag_value(rest, "--to").unwrap_or_default();
     let danger = rest.iter().any(|a| a == "--danger");
 
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("allow") else {
+        return ExitCode::FAILURE;
+    };
     let now = now_secs();
 
     let grant = match grants::Grant::from_args(
@@ -1199,7 +1229,9 @@ fn cmd_allow(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_mode(rest: &[String]) -> ExitCode {
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("mode") else {
+        return ExitCode::FAILURE;
+    };
     match rest.first() {
         Some(profile) => match mode::set(&plugin_data, profile) {
             Ok(()) => {
@@ -1233,7 +1265,9 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
 }
 
 fn cmd_revoke() -> ExitCode {
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("revoke") else {
+        return ExitCode::FAILURE;
+    };
     let cleared = grants::load(&plugin_data).grants.len();
     let _ = grants::save(&plugin_data, &grants::Grants::default());
     audit_event(
@@ -1252,7 +1286,9 @@ fn cmd_revoke() -> ExitCode {
 
 fn cmd_status() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let plugin_data = context::plugin_data_dir();
+    let Some(plugin_data) = cli_data_dir("status") else {
+        return ExitCode::FAILURE;
+    };
     let effective = load_effective_policy(&cwd, &plugin_data);
 
     // Live grants with derived remaining-budget / time-left.
@@ -1287,6 +1323,7 @@ fn cmd_status() -> ExitCode {
 
     print_json(&serde_json::json!({
         "command": "status",
+        "plugin_data": plugin_data.display().to_string(),
         "active_profile": effective.active_profile,
         "grants": grants_view,
         "spend": spend_view,

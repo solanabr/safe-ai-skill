@@ -27,7 +27,7 @@
 //!   data/*` after `cd ~/.claude/plugins`, or `echo x > grants.json` from inside the data dir,
 //!   counts. Brace groups expand (`plugins/{data,x}/…`); past 8 groups, 64 alternatives or a
 //!   4096-byte word, each group reads as `*`;
-//! - the `~/.safe-ai-skill` fallback data dir (also `~user/`, `$HOME/` and globs such as `~/.s*`);
+//! - the legacy `~/.safe-ai-skill` data dir, the CLI fallback before 1.0.1 (also `~user/`, `$HOME/` and globs such as `~/.s*`);
 //! - the installed plugin, `…/plugins/cache/<marketplace>/safe-ai-skill/…`;
 //! - the live plugin's `hooks/hooks.json` (`$CLAUDE_PLUGIN_ROOT`);
 //! - the state files of a project `.safe-ai-skill/` dir. Its `policy.yaml` stays editable because
@@ -267,7 +267,7 @@ pub struct Protected {
     /// first one expands `~` and `$HOME`.
     homes: Vec<String>,
     /// `<home>/` prefixes (including `~/` and `$HOME/`) under which `.safe-ai-skill` is the
-    /// fallback data dir.
+    /// legacy (pre-1.0.1) fallback data dir.
     home_prefixes: Vec<String>,
     /// Normalised spellings of `data`.
     data_dirs: Vec<String>,
