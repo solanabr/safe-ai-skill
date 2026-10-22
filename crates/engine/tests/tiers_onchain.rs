@@ -946,7 +946,7 @@ fn gate_bash_fast_path_is_silent_and_touches_nothing() {
         "ls -la",
         "cargo build --release",
         "git status && npm test",
-        "rm -rf build",
+        "make test",
     ] {
         let run = w.invocation("gate-bash", w.bash_payload(cmd)).run();
         assert_eq!(decision_label(&run), "", "{cmd}");
@@ -972,12 +972,229 @@ fn fast_path_lets_every_solana_shape_through() {
     ] {
         assert!(bash::may_concern(cmd), "{cmd}");
     }
-    for cmd in [
-        "ls -la",
-        "cargo test",
-        "rm -rf build",
-        "git push origin main",
-    ] {
+    for cmd in ["ls -la", "cargo test", "make test", "git push origin main"] {
         assert!(!bash::may_concern(cmd), "{cmd}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review F3): compounds, in-line cluster changes, unresolved programs, wallet
+// directories and globs, fast path, work cap.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_grant_never_lifts_a_compound_holding_class_u_or_a_hard_guard() {
+    let rows = [
+        format!("solana transfer {D} 0.5 -um && spl-token burn A 1 -ud"),
+        format!("solana transfer {D} 0.5 -um && solana program close P --bypass-warning -ul"),
+        "solana program deploy x.so -um && anchor idl close P --provider.cluster devnet".to_string(),
+        "solana program close BUF -um; spl-token close A -ud".to_string(),
+        format!(
+            "solana transfer {D} 0.5 -um && solana program set-upgrade-authority P --new-upgrade-authority {Q} -um"
+        ),
+        format!("solana transfer {D} 0.5 -um && spl-token authorize {D} owner {Q} -ud"),
+        // Two grantable actions: one grant covers one action.
+        format!("solana transfer {D} 0.5 -um && solana transfer {D} 0.6 -um"),
+    ];
+    for cmd in &rows {
+        let at = |t| Setup::at(t).default_net(Network::Devnet);
+        assert_eq!(x4(cmd, at), ["ask", "ask", "ask", "deny"], "{cmd}");
+        assert_eq!(
+            x4(cmd, |t| at(t).grant()),
+            ["ask", "ask", "ask", "deny"],
+            "{cmd} grant"
+        );
+        assert_eq!(
+            x4(cmd, |t| at(t).grant().headless()),
+            ["deny"; 4],
+            "{cmd} headless"
+        );
+    }
+    // The order does not matter.
+    let reversed = format!("spl-token burn A 1 -ud && solana transfer {D} 0.5 -um");
+    assert_eq!(
+        x4(&reversed, |t| Setup::at(t).grant()),
+        ["ask", "ask", "ask", "deny"]
+    );
+    // Two within-cap devnet transfers are not one allow.
+    let two = format!("solana transfer {D} 0.5 -ud && solana transfer {D} 0.5 -ud");
+    assert_eq!(x4(&two, Setup::at)[1], "ask");
+    // A single grantable action is still lifted by its grant.
+    assert_eq!(
+        x4(
+            &format!("solana transfer {D} 0.5 -um && solana balance"),
+            |t| Setup::at(t).grant()
+        ),
+        ["allow", "allow", "allow", "deny"]
+    );
+}
+
+#[test]
+fn a_cluster_change_earlier_in_the_line_moves_later_commands() {
+    let dev = |t| Setup::at(t).default_net(Network::Devnet);
+    for cmd in [
+        "solana config set --url mainnet-beta && solana program close P --bypass-warning",
+        "solana config set -um; spl-token burn A 1",
+        "solana config set --url $RPC && spl-token close A",
+        "cp main.yml ~/.config/solana/cli/config.yml && spl-token burn A 1",
+        "echo 'json_rpc_url: https://api.mainnet-beta.solana.com' > ~/.config/solana/cli/config.yml; spl-token burn A 1",
+        "sed -i s/devnet/mainnet-beta/ ~/.config/solana/cli/config.yml && anchor idl close P",
+        "export ANCHOR_PROVIDER_URL=https://api.mainnet-beta.solana.com; anchor idl close P",
+        "ANCHOR_PROVIDER_URL=https://api.mainnet-beta.solana.com anchor idl close P",
+    ] {
+        assert_eq!(x4(cmd, dev), ["deny"; 4], "{cmd}");
+    }
+    let d = run_lib(
+        "solana config set -um && spl-token close-mint M",
+        dev(Tier::Relaxed),
+    );
+    assert!(d.reason().contains("solana config set"), "{d:?}");
+    // At High a Class C action after a mainnet config set denies.
+    assert_eq!(
+        lib(
+            &format!("solana config set -um && solana transfer {D} 5"),
+            dev(Tier::High)
+        ),
+        "deny"
+    );
+    assert_eq!(
+        lib(
+            "solana config set -um && solana program deploy x.so",
+            dev(Tier::High)
+        ),
+        "deny"
+    );
+    // A change to devnet is the new value; an explicit flag still wins.
+    let main = |t| Setup::at(t).default_net(Network::Mainnet);
+    assert_eq!(
+        x4("solana config set -ud && spl-token burn A 1", main),
+        ["ask"; 4]
+    );
+    assert_eq!(
+        x4("solana config set -ud && spl-token burn A 1 -um", main),
+        ["deny"; 4]
+    );
+}
+
+#[test]
+fn unresolved_programs_get_the_full_gate() {
+    for cmd in [
+        "/usr/local/bin/sol*a program close P --bypass-warning -um",
+        "/opt/bin/s[o]lana program close P --bypass-warning -um",
+        "~/.local/share/solana/install/active_release/bin/sol?na program close P --bypass-warning -um",
+        "printf 'so%sna' la | xargs -I@ @ program close P --bypass-warning -um",
+        "printf solana | xargs -I {} {} program-v4 finalize P -um",
+    ] {
+        assert_eq!(x4(cmd, Setup::at), ["deny"; 4], "{cmd}");
+        assert!(bash::may_concern(cmd), "{cmd}");
+    }
+    assert_eq!(
+        x4(&format!("/opt/bin/s[o]lana transfer {D} 1"), Setup::at),
+        ["ask", "ask", "ask", "deny"]
+    );
+    assert_eq!(
+        x4("printf x | xargs -I@ @ --version", Setup::at),
+        ["ask", "ask", "ask", "deny"]
+    );
+    // A glob naming no family program, as an argument or a program, has no opinion.
+    assert_eq!(x4("ls /tmp/*.log", Setup::at), ["", "", "", ""]);
+    assert_eq!(x4("./build/run-*.sh --fast", Setup::at), ["", "", "", ""]);
+}
+
+#[test]
+fn class_c_high_reason_does_not_ask() {
+    let d = run_lib(
+        &format!("solana transfer {D} 0.5 -um"),
+        Setup::at(Tier::High),
+    );
+    assert!(!d.reason().contains("approve to proceed"), "{d:?}");
+}
+
+#[test]
+fn fast_path_follows_line_continuations() {
+    for cmd in [
+        "sol\\\nana program close P --bypass-warning -um",
+        "spl-\\\ntoken burn A 1 -um",
+        "\"sol\\\nana\" program close P --bypass-warning -um",
+    ] {
+        assert!(bash::may_concern(cmd), "{cmd:?}");
+        assert_eq!(x4(cmd, Setup::at), ["deny"; 4], "{cmd:?}");
+    }
+    let w = World::new("onchain-continuation");
+    let run = w.run(
+        "gate-bash",
+        "sol\\\nana program close P --bypass-warning -um",
+        Tier::Relaxed,
+        &[],
+    );
+    assert_eq!(decision_label(&run), "deny");
+}
+
+#[test]
+fn oversized_or_deeply_nested_commands_ask_without_parsing() {
+    let big = format!("echo {}", "a".repeat(bash::MAX_PARSE_BYTES));
+    let nested = format!("echo {}x{}", "$(".repeat(3000), ")".repeat(3000));
+    for cmd in [&big, &nested] {
+        assert!(bash::over_work_cap(cmd));
+        assert!(bash::may_concern(cmd));
+        assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"]);
+        assert_eq!(
+            x4(cmd, |t| Setup::at(t).grant()),
+            ["ask", "ask", "ask", "deny"]
+        );
+    }
+    let w = World::new("onchain-cap");
+    let started = std::time::Instant::now();
+    let run = w.run("gate-bash", &nested, Tier::Relaxed, &[]);
+    assert_eq!(decision_label(&run), "ask");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!bash::over_work_cap("echo $(date) ${HOME} `id`"));
+}
+
+#[test]
+fn e2e_wallet_directories_globs_and_cd() {
+    let w = World::new("onchain-wallet-dirs");
+    let cli = w.home.join(".config/solana/cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let custom = w.home.join("keys/main-wallet.json");
+    std::fs::write(
+        cli.join("config.yml"),
+        format!("keypair_path: {}\n", custom.display()),
+    )
+    .unwrap();
+    let deny = [
+        "rm -rf ~/.config/solana".to_string(),
+        "rm -rf ~/.config".to_string(),
+        "rm -rf ~".to_string(),
+        "cd ~/.config && rm -r solana".to_string(),
+        "cd ~ && rm -rf .config/solana/".to_string(),
+        "rm ~/.config/solana/*.json".to_string(),
+        "rm ~/.config/solana/id.*".to_string(),
+        "rm ~/.config/s*/id.json".to_string(),
+        "rm -rf ~/.config/s*".to_string(),
+        "mv ~/.config/solana /tmp/old-solana".to_string(),
+        "cd ~/.config/solana && solana-keygen new -o id.json --force".to_string(),
+        "cd ~/.config/solana; solana-keygen new --force --outfile ./id.json".to_string(),
+        "cd $SOMEWHERE && rm -rf solana".to_string(),
+        "(cd ~/.config/solana && rm id.json)".to_string(),
+        format!("rm -rf {}", w.home.join("keys").display()),
+        format!("rm {}", custom.display()),
+        "echo x >& ~/.config/solana/id.json".to_string(),
+    ];
+    for cmd in &deny {
+        assert_eq!(w.bash(cmd, Tier::Relaxed), "deny", "{cmd}");
+        // gate-bash alone (the blocking entry) denies too.
+        let run = w.run("gate-bash", cmd, Tier::Relaxed, &[]);
+        assert_eq!(decision_label(&run), "deny", "gate-bash: {cmd}");
+    }
+    for cmd in [
+        "solana-keygen new --no-outfile --force",
+        "rm -rf ~/.config/other",
+        "rm -rf build",
+        "mv build/x /tmp",
+        "cd /tmp && rm id.json",
+        "rm ~/.config/solana/cli/*.bak",
+    ] {
+        assert_eq!(w.bash(cmd, Tier::Relaxed), "", "{cmd}");
     }
 }

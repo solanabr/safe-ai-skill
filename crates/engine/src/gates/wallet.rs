@@ -1,17 +1,22 @@
 //! Default-wallet destruction (D8 v2 spec §3.1; owned by F3): `solana-keygen new|recover` with
-//! `--force/-f` and no `-o` or an outfile naming `~/.config/solana/id.json` or the CLI config's
-//! `keypair_path`; Bash `rm|mv|cp|tee|dd of=|>` onto that file; Write/Edit/NotebookEdit to it.
-//! Denied on every cluster at every tier, headless or not; no grant, repo or env relaxes it.
+//! `--force/-f` and no `-o` (and no `--no-outfile`) or an outfile naming `~/.config/solana/id.json`
+//! or the CLI config's `keypair_path`; Bash `rm|mv|cp|tee|dd of=|>` onto that file, and
+//! `rm`/`mv` of a directory holding it; Write/Edit/NotebookEdit to it. Denied on every cluster
+//! at every tier, headless or not; no grant, repo or env relaxes it.
 //!
 //! The keygen verbs come from the shared list's `irreversible any` rows
 //! ([`crate::lists::irreversible`]). The protected files are `~/.config/solana/id.json` under
 //! `$HOME` and under the account's passwd home (a repo-set `HOME` cannot move the real one out
 //! of reach), and the `keypair_path` of `$HOME/.config/solana/cli/config.yml`. Paths compare
 //! lexically (case-insensitively: macOS volumes usually are) and, when the file exists, by
-//! its canonical path, so a symlink onto the wallet counts.
+//! its canonical path, so a symlink onto the wallet counts. An unquoted glob is matched
+//! against the protected paths (and, for a delete or move, their ancestors). A relative path
+//! is resolved against the payload cwd and every directory an earlier `cd`/`pushd` in the
+//! command line names; after a directory change the gate cannot place, a relative name equal
+//! to a protected file's (or, for a delete or move, an ancestor's) name counts.
 //!
-//! Call lines: `main::cmd_gate_bash_secrets` ([`decide_bash`]; `solana-keygen` is not matched
-//! by the bash gate's `if`) and `main::cmd_gate_tamper` ([`decide_file`]).
+//! Call lines: `main::cmd_gate_bash` and `main::cmd_gate_bash_secrets` ([`decide_bash`]) and
+//! `main::cmd_gate_tamper` ([`decide_file`]).
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -20,6 +25,7 @@ use serde_json::Value;
 
 use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
+use crate::gates::bash::glob_match;
 use crate::lists::{self, VerbCluster};
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -33,11 +39,23 @@ const CLI_CONFIG: &str = ".config/solana/cli/config.yml";
 /// Largest CLI config read for its `keypair_path`.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
-/// Programs that delete, move or overwrite every path argument they name.
-const CLOBBER_ALL: &[&str] = &["rm", "unlink", "shred", "truncate", "tee", "mv", "srm"];
+/// Programs that delete or move every path argument they name, a directory holding the wallet
+/// included.
+const DELETE_OR_MOVE: &[&str] = &["rm", "srm", "shred", "mv"];
+
+/// Programs that overwrite or remove exactly the files they name.
+const OVERWRITE: &[&str] = &["unlink", "truncate", "tee"];
 
 /// Programs whose last path argument (or `-t DIR`) is a destination they overwrite.
 const CLOBBER_DEST: &[&str] = &["cp", "install", "ln", "rsync", "ditto", "scp"];
+
+/// Whether `program` (a base name) may delete, move or overwrite a file this gate protects.
+pub(crate) fn is_file_clobber(program: &str) -> bool {
+    program == "dd"
+        || DELETE_OR_MOVE.contains(&program)
+        || OVERWRITE.contains(&program)
+        || CLOBBER_DEST.contains(&program)
+}
 
 /// The verdict for a Bash `command` run in `cwd`; `None` is no opinion.
 pub fn decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
@@ -46,10 +64,7 @@ pub fn decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Op
     let redirects = command.contains('>');
     let relevant = |c: &SimpleCommand| {
         let p = c.program();
-        p == "solana-keygen"
-            || p == "dd"
-            || CLOBBER_ALL.contains(&p.as_str())
-            || CLOBBER_DEST.contains(&p.as_str())
+        p == "solana-keygen" || is_file_clobber(&p)
     };
     if !redirects && !parsed.commands.iter().any(relevant) {
         return None;
@@ -57,19 +72,104 @@ pub fn decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Op
     let homes = Homes::from_env();
     let wallets = Wallets::load(&homes);
     let keygen_rows = keygen_rows();
-    for cmd in parsed.commands.iter().filter(|c| relevant(c)) {
-        if let Some(reason) = keygen(cmd, cwd, &homes, &wallets, &keygen_rows) {
+    let mut dirs = Dirs::new(cwd, &parsed);
+    for cmd in &parsed.commands {
+        dirs.step(cmd, &homes);
+        if !relevant(cmd) {
+            continue;
+        }
+        if let Some(reason) = keygen(cmd, &dirs, &homes, &wallets, &keygen_rows) {
             return Some(deny(reason, command));
         }
-        if let Some(reason) = clobber(cmd, cwd, parsed.cwd_changed, &homes, &wallets) {
+        if let Some(reason) = clobber(cmd, &dirs, &homes, &wallets) {
             return Some(deny(reason, command));
         }
     }
     if !redirects {
         return None;
     }
-    redirect_target(command, cwd, &homes, &wallets)
+    redirect_target(command, &dirs, &homes, &wallets)
         .map(|target| deny(format!("a redirection overwrites {target}"), command))
+}
+
+/// The directories a relative path may resolve against, as the command line goes.
+struct Dirs {
+    /// The payload cwd and every directory a `cd`/`pushd` so far named (a subshell's `cd` may
+    /// or may not still apply, so all are kept).
+    known: Vec<PathBuf>,
+    /// A directory change happened that the gate cannot place.
+    unknown: bool,
+}
+
+impl Dirs {
+    fn new(cwd: &Path, parsed: &shell::Parsed) -> Dirs {
+        let has_cd = parsed
+            .commands
+            .iter()
+            .any(|c| matches!(c.program().as_str(), "cd" | "pushd"));
+        Dirs {
+            known: vec![normalise(cwd)],
+            // `env -C`, `popd` and the like change directory without a `cd` the gate reads.
+            unknown: parsed.cwd_changed && !has_cd,
+        }
+    }
+
+    /// Account for `cmd` if it changes directory.
+    fn step(&mut self, cmd: &SimpleCommand, homes: &Homes) {
+        match cmd.program().as_str() {
+            "cd" | "pushd" => {}
+            "popd" => {
+                self.unknown = true;
+                return;
+            }
+            _ => return,
+        }
+        let target = cmd
+            .words
+            .iter()
+            .skip(1)
+            .find(|w| !w.text.starts_with('-') || w.text == "-");
+        let Some(target) = target else {
+            match homes.expand_base() {
+                Some(home) => self.known.push(normalise(home)),
+                None => self.unknown = true,
+            }
+            return;
+        };
+        if target.text == "-" || target.dynamic || target.splits {
+            self.unknown = true;
+            return;
+        }
+        let next: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter_map(|base| resolve(&target.text, base, homes))
+            .collect();
+        if next.is_empty() {
+            self.unknown = true;
+        }
+        for dir in next {
+            if !self.known.contains(&dir) {
+                self.known.push(dir);
+            }
+        }
+    }
+
+    /// Every resolution of `raw` against the known directories.
+    fn resolve_all(&self, raw: &str, homes: &Homes) -> Vec<PathBuf> {
+        if is_absolute_word(raw) {
+            return resolve(raw, Path::new("/"), homes).into_iter().collect();
+        }
+        self.known
+            .iter()
+            .filter_map(|base| resolve(raw, base, homes))
+            .collect()
+    }
+}
+
+/// Whether a path word does not depend on the cwd.
+fn is_absolute_word(raw: &str) -> bool {
+    raw.starts_with(['/', '~']) || raw.starts_with("$HOME") || raw.starts_with("${HOME}")
 }
 
 /// The verdict for a Write|Edit|MultiEdit|NotebookEdit `tool_input`; `None` is no opinion.
@@ -171,12 +271,58 @@ impl Wallets {
             .then(|| real.display().to_string())
     }
 
-    /// Whether some wallet's file name is `name` (for paths after a directory change).
-    fn has_file_name(&self, name: &str) -> bool {
-        let name = name.to_ascii_lowercase();
-        self.paths
+    /// The wallet `path` names or (with `ancestors`) holds below it, if any.
+    fn hit_or_holds(&self, path: &Path, ancestors: bool) -> Option<String> {
+        if let Some(t) = self.hit(path) {
+            return Some(t);
+        }
+        if !ancestors {
+            return None;
+        }
+        let k = key(path);
+        let prefix = format!("{k}/");
+        if let Some((_, shown)) = self.paths.iter().find(|(p, _)| p.starts_with(&prefix)) {
+            return Some(format!("{shown} (inside {})", path.display()));
+        }
+        let real = std::fs::canonicalize(path).ok()?;
+        self.canonical
             .iter()
-            .any(|(p, _)| p.rsplit('/').next() == Some(name.as_str()))
+            .find(|c| c.starts_with(&real) && **c != real)
+            .map(|c| format!("{} (inside {})", c.display(), real.display()))
+    }
+
+    /// The wallet an unquoted glob `pattern` (resolved, lowercased key) matches, or (with
+    /// `ancestors`) a directory holding it.
+    fn glob_hit(&self, pattern: &str, ancestors: bool) -> Option<String> {
+        self.paths.iter().find_map(|(p, shown)| {
+            if glob_match(pattern, p) {
+                return Some(shown.clone());
+            }
+            if !ancestors {
+                return None;
+            }
+            let mut at = p.as_str();
+            while let Some((parent, _)) = at.rsplit_once('/') {
+                if glob_match(pattern, parent) || (parent.is_empty() && glob_match(pattern, "/")) {
+                    return Some(format!("{shown} (inside `{pattern}`)"));
+                }
+                at = parent;
+            }
+            None
+        })
+    }
+
+    /// Whether some wallet's file name (or, with `ancestors`, a directory name above it) is
+    /// `name` (for relative paths after a directory change the gate cannot place).
+    fn has_name(&self, name: &str, ancestors: bool) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.paths.iter().any(|(p, _)| {
+            let mut parts = p.rsplit('/');
+            if parts.next() == Some(name.as_str()) {
+                return true;
+            }
+            ancestors && parts.any(|part| part == name)
+        })
     }
 
     /// The wallet a copy of `source` into directory `dir` would overwrite.
@@ -358,7 +504,7 @@ fn outfile_text(word: &Word) -> &str {
 /// Why a `solana-keygen` command destroys the default wallet, if it does.
 fn keygen(
     cmd: &SimpleCommand,
-    cwd: &Path,
+    dirs: &Dirs,
     homes: &Homes,
     wallets: &Wallets,
     rows: &[(String, String)],
@@ -371,7 +517,7 @@ fn keygen(
     let forced = rows
         .iter()
         .any(|(v, flag)| *v == verb && args.flags.iter().any(|f| f == flag));
-    if !forced {
+    if !forced || args.flags.iter().any(|f| f == "--no-outfile") {
         return None;
     }
     let Some(word) = args.outfile else {
@@ -382,83 +528,156 @@ fn keygen(
         });
     };
     let text = outfile_text(word);
-    match resolve(text, cwd, homes) {
-        Some(path) => wallets
-            .hit(&path)
-            .map(|target| format!("`solana-keygen {verb} --force` overwrites {target}")),
-        // An outfile the gate cannot resolve may be the wallet.
-        None => Some(format!(
+    match path_hit(text, word.splits, dirs, homes, wallets, false) {
+        Some(Hit::Wallet(target)) => Some(format!(
+            "`solana-keygen {verb} --force` overwrites {target}"
+        )),
+        Some(Hit::Unresolved) => Some(format!(
             "`solana-keygen {verb} --force` writes `{text}`, which may be the default wallet"
         )),
+        None => None,
     }
 }
 
-/// Why a file command deletes, moves or overwrites a wallet, if it does.
-fn clobber(
-    cmd: &SimpleCommand,
-    cwd: &Path,
-    cwd_changed: bool,
+/// What a path word names.
+enum Hit {
+    /// A protected wallet (display form).
+    Wallet(String),
+    /// A word the gate cannot resolve (an expansion).
+    Unresolved,
+}
+
+/// Whether path word `raw` names a protected wallet (or, with `ancestors`, a directory holding
+/// one): every resolution against the known directories, an unquoted glob matched, and after
+/// an unplaceable directory change a relative name equal to a protected one.
+fn path_hit(
+    raw: &str,
+    globs: bool,
+    dirs: &Dirs,
     homes: &Homes,
     wallets: &Wallets,
-) -> Option<String> {
-    let program = cmd.program();
-    let args: Vec<&str> = cmd.words.iter().skip(1).map(|w| w.text.as_str()).collect();
-    let hit = |raw: &str| -> Option<String> {
-        if let Some(path) = resolve(raw, cwd, homes) {
-            if let Some(target) = wallets.hit(&path) {
-                return Some(target);
-            }
-            // After `cd`, a relative path may be anywhere: a wallet file name counts.
-            let relative = !raw.starts_with(['/', '~', '$']);
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if cwd_changed && relative && wallets.has_file_name(name) {
-                return Some(format!("`{raw}` (after a directory change)"));
-            }
+    ancestors: bool,
+) -> Option<Hit> {
+    let resolved = dirs.resolve_all(raw, homes);
+    if resolved.is_empty() {
+        return Some(Hit::Unresolved);
+    }
+    let globbed = globs && raw.contains(['*', '?', '[']);
+    for path in &resolved {
+        let found = if globbed {
+            wallets.glob_hit(&key(path), ancestors)
+        } else {
+            wallets.hit_or_holds(path, ancestors)
+        };
+        if let Some(t) = found {
+            return Some(Hit::Wallet(t));
         }
-        None
+    }
+    if dirs.unknown && !is_absolute_word(raw) {
+        let name = resolved
+            .first()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if globbed || wallets.has_name(name, ancestors) {
+            return Some(Hit::Wallet(format!("`{raw}` (after a directory change)")));
+        }
+    }
+    None
+}
+
+/// Why a file command deletes, moves or overwrites a wallet, if it does.
+fn clobber(cmd: &SimpleCommand, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -> Option<String> {
+    let program = cmd.program();
+    let words: Vec<&Word> = cmd.words.iter().skip(1).collect();
+    // An unresolvable operand of a file command is not assumed to be the wallet.
+    let hit = |w: &Word, ancestors: bool| match path_hit(
+        &w.text, w.splits, dirs, homes, wallets, ancestors,
+    ) {
+        Some(Hit::Wallet(t)) => Some(t),
+        _ => None,
     };
     if program == "dd" {
-        return args
+        return words
             .iter()
-            .filter_map(|a| a.strip_prefix("of="))
-            .find_map(hit)
+            .filter_map(|w| {
+                w.text.strip_prefix("of=").map(|rest| Word {
+                    text: rest.to_string(),
+                    ..(*w).clone()
+                })
+            })
+            .find_map(|w| hit(&w, false))
             .map(|t| format!("`dd` writes {t}"));
     }
-    let paths: Vec<&str> = args
+    let paths: Vec<&Word> = words
         .iter()
         .copied()
-        .filter(|a| !a.starts_with('-') || *a == "-")
+        .filter(|w| !w.text.starts_with('-') || w.text == "-")
         .collect();
-    if CLOBBER_ALL.contains(&program.as_str()) {
+    if DELETE_OR_MOVE.contains(&program.as_str()) {
+        // `mv`'s destination overwrites; every other operand of these is deleted or moved away.
+        let found = if program == "mv" {
+            paths.split_last().and_then(|(dest, sources)| {
+                hit(dest, false).or_else(|| sources.iter().find_map(|w| hit(w, true)))
+            })
+        } else {
+            paths.iter().find_map(|w| hit(w, true))
+        };
+        return found.map(|t| format!("`{program}` removes or overwrites {t}"));
+    }
+    if OVERWRITE.contains(&program.as_str()) {
         return paths
             .iter()
-            .find_map(|a| hit(a))
+            .find_map(|w| hit(w, false))
             .map(|t| format!("`{program}` removes or overwrites {t}"));
     }
     if CLOBBER_DEST.contains(&program.as_str()) {
-        let target_dir = args
+        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        let target_dir = texts
             .iter()
             .position(|a| *a == "-t" || *a == "--target-directory")
-            .and_then(|i| args.get(i + 1))
+            .and_then(|i| words.get(i + 1))
             .copied()
             .or_else(|| {
-                args.iter()
-                    .find_map(|a| a.strip_prefix("--target-directory="))
+                words
+                    .iter()
+                    .copied()
+                    .find(|w| w.text.starts_with("--target-directory="))
             });
-        let (dest, sources): (&str, Vec<&str>) = match target_dir {
-            Some(dir) => (dir, paths.iter().copied().filter(|p| *p != dir).collect()),
+        let owned_dir;
+        let (dest, sources): (&Word, Vec<&Word>) = match target_dir {
+            Some(dir) => {
+                owned_dir = Word {
+                    text: dir
+                        .text
+                        .strip_prefix("--target-directory=")
+                        .unwrap_or(&dir.text)
+                        .to_string(),
+                    ..dir.clone()
+                };
+                let sources = paths
+                    .iter()
+                    .copied()
+                    .filter(|p| p.text != dir.text)
+                    .collect();
+                (&owned_dir, sources)
+            }
             None => {
                 let (last, rest) = paths.split_last()?;
                 (*last, rest.to_vec())
             }
         };
-        if let Some(t) = hit(dest) {
+        if let Some(t) = hit(dest, false) {
             return Some(format!("`{program}` overwrites {t}"));
         }
-        let dir = resolve(dest, cwd, homes)?;
-        return sources
+        return dirs
+            .resolve_all(&dest.text, homes)
             .iter()
-            .find_map(|s| wallets.hit_in_dir(&dir, s))
+            .find_map(|dir| {
+                sources
+                    .iter()
+                    .find_map(|s| wallets.hit_in_dir(dir, &s.text))
+            })
             .map(|t| format!("`{program}` overwrites {t}"));
     }
     None
@@ -466,7 +685,7 @@ fn clobber(
 
 /// The wallet a `>`/`>>`/`>|`/`&>` redirection in `command` writes, if any. The parser drops
 /// redirections, so the raw text is scanned (nested `-c` scripts included).
-fn redirect_target(command: &str, cwd: &Path, homes: &Homes, wallets: &Wallets) -> Option<String> {
+fn redirect_target(command: &str, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -> Option<String> {
     let chars: Vec<char> = command.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
@@ -475,31 +694,35 @@ fn redirect_target(command: &str, cwd: &Path, homes: &Homes, wallets: &Wallets) 
             continue;
         }
         i += 1;
-        while i < chars.len() && matches!(chars[i], '>' | '|' | '&') {
-            if chars[i] == '&' {
-                // `>&2` duplicates a descriptor.
-                break;
-            }
+        while i < chars.len() && matches!(chars[i], '>' | '|') {
+            i += 1;
+        }
+        // `>&2` duplicates a descriptor; `>& file` writes the file.
+        let ampersand = chars.get(i) == Some(&'&');
+        if ampersand {
             i += 1;
         }
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
         }
         let mut word = String::new();
+        let mut quoted = false;
         while i < chars.len() {
             let c = chars[i];
             if c.is_whitespace() || matches!(c, ';' | '|' | '&' | ')' | '<' | '>') {
                 break;
             }
-            if !matches!(c, '"' | '\'' | '\\') {
+            if matches!(c, '"' | '\'' | '\\') {
+                quoted = true;
+            } else {
                 word.push(c);
             }
             i += 1;
         }
-        if word.is_empty() {
+        if word.is_empty() || (ampersand && word.chars().all(|c| c.is_ascii_digit() || c == '-')) {
             continue;
         }
-        if let Some(target) = resolve(&word, cwd, homes).and_then(|p| wallets.hit(&p)) {
+        if let Some(Hit::Wallet(target)) = path_hit(&word, !quoted, dirs, homes, wallets, false) {
             return Some(target);
         }
     }
@@ -572,7 +795,11 @@ mod tests {
             )],
             canonical: Vec::new(),
         };
-        let cwd = Path::new("/p");
+        let cwd = Dirs {
+            known: vec![PathBuf::from("/p")],
+            unknown: false,
+        };
+        let cwd = &cwd;
         assert!(redirect_target("echo [] > ~/.config/solana/id.json", cwd, &h, &w).is_some());
         assert!(
             redirect_target("echo x >>\"$HOME/.config/solana/id.json\"", cwd, &h, &w).is_some()
@@ -580,6 +807,9 @@ mod tests {
         assert!(
             redirect_target("bash -c 'cat k >| ~/.config/solana/id.json'", cwd, &h, &w).is_some()
         );
+        assert!(redirect_target("echo x >& ~/.config/solana/id.json", cwd, &h, &w).is_some());
+        assert!(redirect_target("echo x > ~/.config/solana/*.json", cwd, &h, &w).is_some());
         assert!(redirect_target("echo x > out.json 2>&1", cwd, &h, &w).is_none());
+        assert!(redirect_target("echo x >&2", cwd, &h, &w).is_none());
     }
 }

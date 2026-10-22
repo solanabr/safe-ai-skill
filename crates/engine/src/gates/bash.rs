@@ -47,6 +47,9 @@ use crate::spend::{self, SpendLedger};
 /// Returns the natural decision (before relaxation) and a [`GateMeta`] describing the
 /// action. The caller (`main.rs`) applies the relaxation layer to the result.
 pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
+    if over_work_cap(command) {
+        return over_cap(policy);
+    }
     let parsed = shell::parse(command);
     match decide_parsed(command, &parsed, ctx, policy) {
         // An allow vouches for the whole tool call: only for direct (canonical) commands, never
@@ -63,34 +66,226 @@ pub fn decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateM
     }
 }
 
-/// Whether `command` could concern this gate or the wallet gate: some reading of it names a
-/// solana-family program or `solana-keygen` (any path, quoted, escaped, inside wrappers, `-c`
-/// strings or substitutions: the raw text is searched), holds ANSI-C quoting, runs an
-/// expansion as a program, or cannot be read. `false` lets `gate-bash`, wired for every Bash
-/// call, answer no opinion before loading anything. Pure and allocation-light.
-pub fn may_concern(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    if lower.contains("$'") {
+/// Longest command the gate parses; longer is a hard-guard ask (deny at High) without parsing.
+pub const MAX_PARSE_BYTES: usize = 256 * 1024;
+
+/// Most expansion openers (`$(`, `${`, `<(`, `>(`, backquote) the gate parses; more is a
+/// hard-guard ask (deny at High). Nesting costs the parser more than its length.
+pub const MAX_EXPANSIONS: usize = 2048;
+
+/// Whether `command` is too large or too nested to parse within the hook's budget.
+pub fn over_work_cap(command: &str) -> bool {
+    if command.len() > MAX_PARSE_BYTES {
         return true;
     }
-    let plain: String = lower
+    let bytes = command.as_bytes();
+    let mut count = 0usize;
+    for (i, b) in bytes.iter().enumerate() {
+        let opener = match b {
+            b'`' => true,
+            b'(' | b'{' => i > 0 && matches!(bytes[i - 1], b'$' | b'<' | b'>'),
+            _ => false,
+        };
+        if opener {
+            count = count.saturating_add(1);
+            if count > MAX_EXPANSIONS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The verdict for a command over the work cap ([`over_work_cap`]).
+pub fn over_cap(policy: &Policy) -> (Decision, GateMeta) {
+    unreadable_at(
+        (
+            Decision::Ask {
+                reason: "This command is too large or too deeply nested to check — approve to \
+                         proceed"
+                    .to_string(),
+            },
+            GateMeta::unreadable(),
+        ),
+        policy.tier(),
+    )
+}
+
+/// Substrings that send a command to the full gate (after line continuations, quotes and
+/// backslashes are removed): the family programs, `solana-keygen`, and `xargs` (whose
+/// replacement string can become the program).
+const TRIGGERS: &[&str] = &["solana", "spl-token", "anchor", "keygen", "xargs"];
+
+/// Whether `command` could concern this gate or the wallet gate. Conservative: when in doubt,
+/// the full gate runs. It does when the command is over the work cap; holds ANSI-C quoting or
+/// a redirection; contains a [`TRIGGERS`] word once `\`+newline, quotes and backslashes are
+/// removed; or its parse is unreadable, opaque, writes or runs script text, or has a command
+/// whose program is a family program, `solana-keygen`, a file-clobbering program (the wallet
+/// gate's), an expansion or an unquoted glob. `false` lets `gate-bash`, wired for every Bash
+/// call, answer no opinion before loading policy, lists or state. It parses the command once.
+pub fn may_concern(command: &str) -> bool {
+    if over_work_cap(command) {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("$'") || lower.contains('>') {
+        return true;
+    }
+    let joined = lower.replace("\\\r\n", "").replace("\\\n", "");
+    let plain: String = joined
         .chars()
         .filter(|c| !matches!(c, '"' | '\'' | '\\'))
         .collect();
-    if ["solana", "spl-token", "anchor", "keygen"]
-        .iter()
-        .any(|w| plain.contains(w))
-    {
+    if TRIGGERS.iter().any(|w| plain.contains(w)) {
         return true;
     }
     let parsed = shell::parse(command);
     parsed.unparseable
         || parsed.opaque
         || parsed.write_then_run
-        || parsed
-            .commands
-            .iter()
-            .any(|c| c.words.first().is_some_and(|w| w.dynamic))
+        || parsed.writes_family_text
+        || parsed.commands.iter().any(|c| {
+            let program = c.program();
+            c.is_family()
+                || program == "solana-keygen"
+                || crate::gates::wallet::is_file_clobber(&program)
+                || c.words.first().is_some_and(unresolved_program_word)
+        })
+}
+
+/// Whether a program word names no fixed program: an expansion, or an unquoted glob.
+fn unresolved_program_word(word: &shell::Word) -> bool {
+    word.dynamic || (word.splits && word.text.contains(['*', '?', '[']))
+}
+
+/// Shell glob match of `text` against `pattern` (`*`, `?`, `[…]` with ranges and `!`/`^`
+/// negation; everything else literal). Iterative, O(len(pattern) × len(text)).
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // reach[j]: the pattern so far matches text[..j].
+    let mut reach = vec![false; t.len() + 1];
+    reach[0] = true;
+    let mut i = 0usize;
+    while let Some(&pc) = p.get(i) {
+        let mut next = vec![false; t.len() + 1];
+        match pc {
+            '*' => {
+                let mut on = false;
+                for (j, slot) in next.iter_mut().enumerate() {
+                    on |= reach[j];
+                    *slot = on;
+                }
+                i += 1;
+            }
+            '[' => {
+                let (class, len) = char_class(p.get(i..).unwrap_or_default());
+                for (j, &tc) in t.iter().enumerate() {
+                    if reach[j] && class.as_ref().map_or(tc == '[', |c| c.matches(tc)) {
+                        next[j + 1] = true;
+                    }
+                }
+                i += len;
+            }
+            c => {
+                for (j, &tc) in t.iter().enumerate() {
+                    if reach[j] && (c == '?' || tc == c) {
+                        next[j + 1] = true;
+                    }
+                }
+                i += 1;
+            }
+        }
+        reach = next;
+    }
+    reach[t.len()]
+}
+
+/// A `[…]` bracket expression.
+struct CharClass {
+    negated: bool,
+    items: Vec<(char, char)>,
+}
+
+impl CharClass {
+    fn matches(&self, c: char) -> bool {
+        self.items.iter().any(|&(lo, hi)| lo <= c && c <= hi) != self.negated
+    }
+}
+
+/// Parse the bracket expression at the start of `p` (`p[0] == '['`): the class and the pattern
+/// characters it spans. No closing `]` → `None` and a literal `[` of length 1.
+fn char_class(p: &[char]) -> (Option<CharClass>, usize) {
+    let mut k = 1;
+    let negated = matches!(p.get(k), Some('!' | '^'));
+    if negated {
+        k += 1;
+    }
+    let mut items = Vec::new();
+    let mut first = true;
+    while let Some(&c) = p.get(k) {
+        if c == ']' && !first {
+            return (Some(CharClass { negated, items }), k + 1);
+        }
+        first = false;
+        match (p.get(k + 1), p.get(k + 2)) {
+            (Some('-'), Some(&hi)) if hi != ']' => {
+                items.push((c, hi));
+                k += 3;
+            }
+            _ => {
+                items.push((c, c));
+                k += 1;
+            }
+        }
+    }
+    (None, 1)
+}
+
+/// The replacement strings of `xargs -I R` / `-J R` / `--replace=R` / `-iR` in `command`: a
+/// program word containing one is whatever stdin holds.
+fn xargs_placeholders(command: &str) -> Vec<String> {
+    if !command.contains("xargs") {
+        return Vec::new();
+    }
+    let tokens = context::tokenize(command);
+    let mut out = Vec::new();
+    let mut in_xargs = false;
+    let mut i = 0usize;
+    while let Some(tok) = tokens.get(i) {
+        i += 1;
+        if shell::base_name(tok) == "xargs" {
+            in_xargs = true;
+            continue;
+        }
+        if !in_xargs {
+            continue;
+        }
+        let value = if tok == "-I" || tok == "-J" {
+            let v = tokens.get(i).cloned();
+            i += 1;
+            v
+        } else if let Some(v) = tok.strip_prefix("--replace=") {
+            Some(v.to_string())
+        } else if tok == "--replace" || tok == "-i" {
+            Some("{}".to_string())
+        } else if let Some(v) = tok
+            .strip_prefix("-I")
+            .or_else(|| tok.strip_prefix("-J"))
+            .or_else(|| tok.strip_prefix("-i"))
+        {
+            Some(v.to_string())
+        } else {
+            if !tok.starts_with('-') {
+                in_xargs = false;
+            }
+            None
+        };
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 /// The indirection prefilter of the unconditional Bash hook (spec D6.3, default-route).
@@ -194,23 +389,76 @@ fn decide_parsed(
     let mut best: Option<(Decision, GateMeta)> = None;
     // Command or process substitution runs code the gate never sees, quoted or not.
     let mut unvetted = parsed.substitution;
+    // Gated (non-defer) commands, and whether any ask among them is a hard guard.
+    let mut gated = 0usize;
+    let mut allows = 0usize;
+    let mut hard_ask = false;
+    // A cluster change earlier in the line (`solana config set --url …`, a write onto the CLI
+    // config): the default for the commands after it.
+    let mut config: Option<(Network, String)> = None;
+    let placeholders = xargs_placeholders(command);
 
     for cmd in &parsed.commands {
         let candidate = if cmd.is_family() {
-            family_decision(command, cmd, parsed, ctx, policy, &mut unvetted)
-        } else if let Some(verdict) = dynamic_decision(command, cmd, parsed, ctx, tier) {
+            family_decision(
+                command,
+                cmd,
+                parsed,
+                ctx,
+                policy,
+                config.as_ref(),
+                &mut unvetted,
+            )
+        } else if let Some(verdict) =
+            dynamic_decision(command, cmd, parsed, ctx, tier, &placeholders)
+        {
             verdict
         } else {
             unvetted = true;
+            if let Some(change) = config_write(command, cmd) {
+                config = Some(change);
+            }
             continue;
         };
-        // Keep the most restrictive command; on a tie the first one wins.
+        if let Some(change) = config_set(cmd) {
+            config = Some(change);
+        }
+        if candidate.0 != Decision::Defer {
+            gated = gated.saturating_add(1);
+        }
+        if candidate.0 == Decision::Allow {
+            allows = allows.saturating_add(1);
+        }
+        if matches!(candidate.0, Decision::Ask { .. }) && candidate.1.hard_guard {
+            hard_ask = true;
+        }
+        // Keep the most restrictive command; on a tie a hard guard beats a grantable one, else
+        // the first one wins.
         let replace = match &best {
             None => true,
-            Some((cur, _)) => severity(&candidate.0) > severity(cur),
+            Some((cur, cur_meta)) => {
+                severity(&candidate.0) > severity(cur)
+                    || (severity(&candidate.0) == severity(cur)
+                        && candidate.1.hard_guard
+                        && !cur_meta.hard_guard)
+            }
         };
         if replace {
             best = Some(candidate);
+        }
+    }
+
+    // A grant covers one counterparty action of its own scope: an ask joined from several
+    // gated commands, or with a hard-guard ask among them, is never relaxed. Several allowed
+    // transfers in one call are budgeted one by one: ask.
+    if let Some((decision, meta)) = best.as_mut() {
+        if allows > 1 && *decision == Decision::Allow {
+            *decision = Decision::Ask {
+                reason: "Several transfers in one call — approve to proceed".to_string(),
+            };
+        }
+        if matches!(decision, Decision::Ask { .. }) && (gated > 1 || hard_ask) {
+            meta.hard_guard = true;
         }
     }
 
@@ -251,12 +499,13 @@ fn family_decision(
     parsed: &Parsed,
     ctx: &Context,
     policy: &Policy,
+    config: Option<&(Network, String)>,
     unvetted: &mut bool,
 ) -> (Decision, GateMeta) {
     let tier = policy.tier();
     let program = cmd.program();
     let argv = Argv::from_shell(&cmd.words);
-    let cluster = command_cluster(cmd, &argv, &program, ctx, parsed);
+    let cluster = command_cluster(cmd, &argv, &program, ctx, parsed, config);
     let irreversible = match irreversible_match(&program, &argv) {
         Ok(found) => found,
         Err(_) => return unreadable_at(ask_lists_unavailable(&program), tier),
@@ -297,15 +546,27 @@ fn dynamic_decision(
     parsed: &Parsed,
     ctx: &Context,
     tier: Tier,
+    placeholders: &[String],
 ) -> Option<(Decision, GateMeta)> {
-    if !cmd.words.first().is_some_and(|w| w.dynamic) {
+    let first = cmd.words.first()?;
+    let placeholder = placeholders.iter().any(|p| first.text.contains(p.as_str()));
+    let glob = !first.dynamic && unresolved_program_word(first);
+    if !first.dynamic && !glob && !placeholder {
         return None;
     }
     let argv = Argv::from_shell(&cmd.words);
     let irreversible = shell::FAMILY
         .iter()
         .find_map(|program| irreversible_match(program, &argv).ok().flatten());
-    let dynamic = shell::dynamic_family_program(cmd, parsed);
+    let dynamic = if glob {
+        // A glob can be a family program when its last segment matches one's name.
+        let last = first.text.rsplit('/').next().unwrap_or(&first.text);
+        ["solana", "spl-token", "anchor", "solana-keygen"]
+            .iter()
+            .any(|name| glob_match(&last.to_ascii_lowercase(), name))
+    } else {
+        placeholder || shell::dynamic_family_program(cmd, parsed)
+    };
     if !dynamic && irreversible.is_none() {
         return None;
     }
@@ -352,6 +613,8 @@ enum Source {
     CliDefault,
     /// An expansion runs as the program: nothing names a cluster.
     Expansion,
+    /// An earlier command in the line changed the CLI config (described).
+    ConfigChanged(String),
 }
 
 impl Source {
@@ -384,6 +647,9 @@ impl Source {
             }
             Source::CliDefault => "the CLI config (`solana config get`)".to_string(),
             Source::Expansion => "nothing: an expansion runs as the program".to_string(),
+            Source::ConfigChanged(what) => {
+                format!("the CLI config as an earlier `{what}` in this command line leaves it")
+            }
         }
     }
 }
@@ -431,6 +697,7 @@ fn command_cluster(
     program: &str,
     ctx: &Context,
     parsed: &Parsed,
+    config: Option<&(Network, String)>,
 ) -> Cluster {
     let base = (!parsed.cwd_changed).then_some(ctx.project_dir.as_path());
     if let Some(network) = context::explicit_network(argv, base) {
@@ -441,6 +708,14 @@ fn command_cluster(
     }
     let (network, source) = if parsed.env_changed {
         (Network::Unknown, Source::EnvChanged)
+    } else if let Some((net, what)) = config {
+        // Anchor reads Anchor.toml first: the riskier of it and the changed CLI config.
+        let net = if program == "anchor" {
+            context::riskier(ctx.anchor_network, *net)
+        } else {
+            *net
+        };
+        (net, Source::ConfigChanged(what.clone()))
     } else if program == "anchor" && parsed.cwd_changed {
         (Network::Unknown, Source::CwdChanged)
     } else if program == "anchor" {
@@ -449,6 +724,47 @@ fn command_cluster(
         (ctx.network, Source::CliDefault)
     };
     Cluster { network, source }
+}
+
+/// The cluster a `solana config set` leaves for later commands: its `--url`/`-u` value, or
+/// unknown when the value cannot be read. `None` when `cmd` sets no URL.
+fn config_set(cmd: &SimpleCommand) -> Option<(Network, String)> {
+    if cmd.program() != "solana" {
+        return None;
+    }
+    let argv = Argv::from_shell(&cmd.words);
+    let positional = |i: usize| argv.positionals.get(i).map(|w| w.to_ascii_lowercase());
+    if positional(0).as_deref() != Some("config") || positional(1).as_deref() != Some("set") {
+        return None;
+    }
+    let sets_url = argv.has_flag("--url") || argv.has_flag("--config");
+    if !sets_url && argv.uncertain_from.is_none() {
+        return None;
+    }
+    let net = if argv.has_flag("--config") {
+        Network::Unknown
+    } else {
+        argv.network().unwrap_or(Network::Unknown)
+    };
+    Some((net, "solana config set".to_string()))
+}
+
+/// A command that writes, copies, moves or edits a solana CLI config file: later commands'
+/// default cluster is unknown.
+fn config_write(command: &str, cmd: &SimpleCommand) -> Option<(Network, String)> {
+    let names_config = |t: &str| {
+        let t = t.to_ascii_lowercase();
+        t.contains("solana/cli/") || t.ends_with("cli/config.yml")
+    };
+    let program = cmd.program();
+    let edits = crate::gates::wallet::is_file_clobber(&program)
+        || matches!(
+            program.as_str(),
+            "sed" | "perl" | "ed" | "ex" | "awk" | "python" | "python3"
+        );
+    let by_words = edits && cmd.words.iter().skip(1).any(|w| names_config(&w.text));
+    let by_redirect = cmd.writes_file && names_config(command);
+    (by_words || by_redirect).then(|| (Network::Unknown, format!("{program} onto the CLI config")))
 }
 
 /// Class U rows the shared list does not spell but this gate also treats as Class U (same
@@ -609,8 +925,9 @@ fn class_c_at(
     match decision {
         Decision::Ask { reason } if tier == Tier::High && counterparty && risky => Decision::Deny {
             reason: format!(
-                "{reason} — denied at tier high: a counterparty action on {} (cluster \
+                "{} — denied at tier high: a counterparty action on {} (cluster \
                      from {}). Run it yourself outside the agent if you intend it: `{}`",
+                reason.trim_end_matches(" — approve to proceed"),
                 cluster_label(cluster.network),
                 cluster.source.describe(ctx),
                 echo(command)

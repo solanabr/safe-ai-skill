@@ -532,17 +532,24 @@ fn cmd_gate_bash() -> ExitCode {
     let Some(command) = input.bash_command() else {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
-    // Wired unconditionally for every Bash call: nothing solana-shaped → no opinion, before
-    // any policy, list or state is loaded.
+    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen
+    // or a wallet write → no opinion, before any policy, list or state is loaded.
     if !safe_ai_skill::gates::bash::may_concern(command) {
         return ExitCode::SUCCESS;
     }
     let cwd = cwd_of(&input);
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
+    // Too large or nested to parse in budget: a hard-guard ask, never the watchdog's.
+    if safe_ai_skill::gates::bash::over_work_cap(command) {
+        let (decision, meta) = safe_ai_skill::gates::bash::over_cap(&effective);
+        return finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw);
+    }
     let ctx = Context::build(command, &cwd);
     let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
-    // Default-wallet destruction also fails closed here (this entry is `onFailure: block`).
+    // Default-wallet destruction is joined here too, so the commands the fast path passes on
+    // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
+    // entry as well as from `gate-bash-secrets`.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
     let (decision, meta) = join_tier(strictest([wallet_verdict]), decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
