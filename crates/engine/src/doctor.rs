@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use crate::gates::credpaths;
+use crate::lists::SbTier;
 
 /// Globs recommended for `sandbox.filesystem.denyRead` beyond the credential stores: the
 /// hard-deny and env classes. `~/.config/solana/*.json` (not `**`) keeps `cli/config.yml`
@@ -40,17 +41,26 @@ const BASE_DENY_READ: &[&str] = &[
 ];
 
 /// The recommended `denyRead` globs: [`BASE_DENY_READ`] plus one per shared-list credential
-/// record that a sandboxed subprocess may be denied (`credentials.list` `sb` column not
-/// `never`; the kit's sandbox carries the same entries), generated from
-/// [`crate::lists::credentials`] for this OS.
+/// record with `sb` = relaxed (the kit's Relaxed sandbox carries the same entries), generated
+/// from [`crate::lists::credentials`] for this OS. Host tokens (`~/.npmrc`, `gh/hosts.yml`,
+/// `~/.docker/config.json`, …) are sandbox-denied only from Medium, because denying them at
+/// Relaxed breaks subprocess `gh`, `npm`, `git` and `docker`: see [`MEDIUM_DENY_READ`].
 pub static RECOMMENDED_DENY_READ: LazyLock<Vec<String>> = LazyLock::new(|| {
     let mut all: Vec<String> = BASE_DENY_READ.iter().map(|g| g.to_string()).collect();
-    for glob in credpaths::sandbox_deny_read() {
+    for glob in credpaths::sandbox_deny_read(SbTier::Relaxed) {
         if !all.contains(&glob) {
             all.push(glob);
         }
     }
     all
+});
+
+/// The additional globs for a Medium or High sandbox (`sb` = medium and high records).
+pub static MEDIUM_DENY_READ: LazyLock<Vec<String>> = LazyLock::new(|| {
+    credpaths::sandbox_deny_read(SbTier::High)
+        .into_iter()
+        .filter(|g| !RECOMMENDED_DENY_READ.contains(g))
+        .collect()
 });
 
 /// Settings files read, in Claude Code's precedence order (lowest first).
@@ -127,10 +137,13 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
     }
     let enabled = matches!(state.enabled, Some((_, true)));
     if !enabled || !missing.is_empty() {
+        // A relocated `$CLAUDE_CONFIG_DIR` keeps its login file under that path.
+        let mut deny_read: Vec<String> = RECOMMENDED_DENY_READ.clone();
+        deny_read.extend(credpaths::config_dir_deny_read(SbTier::Relaxed));
         let snippet = serde_json::json!({
             "sandbox": {
                 "enabled": true,
-                "filesystem": { "denyRead": &*RECOMMENDED_DENY_READ },
+                "filesystem": { "denyRead": deny_read },
             }
         });
         out.push_str(
@@ -142,8 +155,14 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
     out.push_str(
         "\nenv files: use `safe-ai-skill env keys|set|unset` instead of raw reads; `safe-ai-skill tier --env-read ask` (user scope, needs the sandbox on) restores prompted raw reads.\n",
     );
+    if !MEDIUM_DENY_READ.is_empty() {
+        out.push_str(&format!(
+            "\nadd for a Medium or High sandbox (host tokens: denying them also stops subprocess `gh`, `npm install` from a private registry, `git push` over a credential file, `docker pull`, and cargo/pypi/gem publish from reading their own login): {}\n",
+            MEDIUM_DENY_READ.join(", ")
+        ));
+    }
     out.push_str(
-        "\ncredential stores: the hooks deny the agent's reads of home credential stores (~/.ssh keys, ~/.aws, ~/.npmrc and other host tokens, keychains, browser profiles, wallet extension data) and command-form readers (gh auth token, git credential fill, security find-generic-password -w, pass show, op read, bw get, ...) at every tier. Residual: a subprocess, compiled or encoded read of the same files is not seen; only the sandbox denyRead list above closes it.\n",
+        "\ncredential stores: the hooks deny the agent's reads of home credential stores (~/.ssh keys, ~/.aws, ~/.npmrc and other host tokens, keychains, browser profiles, wallet extension data) at every tier: Read, file Grep, MCP path arguments, any Bash command that names such a path (metadata-only commands such as `ls` excepted), a recursive search or archive rooted at or above a store, and command-form readers (gh auth token, git credential fill, security find-generic-password -w, pass show, op read, bw get, ...). Residual: the hook's analysis of a command line is incomplete (variables, eval, encodings, scripts that build the path, subprocess and compiled reads are not seen). The sandbox denyRead list above is the real control.\n",
     );
     out
 }
@@ -176,21 +195,27 @@ mod tests {
     #[test]
     fn the_snippet_is_generated_from_the_credential_list() {
         let out = report(None, std::path::Path::new("/nonexistent"));
-        for glob in [
-            "~/.aws/**",
-            "~/.gnupg/**",
-            "~/.npmrc",
-            "~/.docker/config.json",
-        ] {
+        for glob in ["~/.aws/**", "~/.gnupg/**", "~/.ssh/**"] {
             assert!(RECOMMENDED_DENY_READ.iter().any(|g| g == glob), "{glob}");
             assert!(out.contains(glob), "{glob}: {out}");
         }
+        // Host tokens are sandbox-denied from Medium: printed apart, with what they break.
+        for glob in [
+            "~/.npmrc",
+            "~/.docker/config.json",
+            "~/.config/gh/hosts.yml",
+        ] {
+            assert!(!RECOMMENDED_DENY_READ.iter().any(|g| g == glob), "{glob}");
+            assert!(MEDIUM_DENY_READ.iter().any(|g| g == glob), "{glob}");
+            assert!(out.contains(glob), "{glob}: {out}");
+        }
+        assert!(out.contains("add for a Medium or High sandbox"), "{out}");
         // sb=never entries (the Solana CLI must read them) stay out of the generated part.
         assert!(!RECOMMENDED_DENY_READ
             .iter()
             .any(|g| g == "~/.config/solana/**"));
         assert!(
-            out.contains("Residual: a subprocess, compiled or encoded read"),
+            out.contains("Residual: the hook's analysis of a command line is incomplete"),
             "{out}"
         );
     }

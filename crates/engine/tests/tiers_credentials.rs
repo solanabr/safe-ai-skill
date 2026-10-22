@@ -199,6 +199,46 @@ const BASH_DENIED: &[&str] = &[
     "TOKEN=$(gh auth token)",
     "/usr/local/bin/gh auth token",
     "timeout 5 pass show solana",
+    // fix round 1 #4, #11: npm's `get` alias, gh config, keychain export
+    "npm get //registry.npmjs.org/:_authToken",
+    "gh config get oauth_token -h github.com",
+    "security export -t privKeys",
+    // #1: shell patterns the matcher must not treat as literal text
+    "cat ~/.git-credential?",
+    "cat ~/.n?trc",
+    "cat ~/.npmr?",
+    "cat ~/.docker/config.js?n",
+    "cat ~/.config/gh/hosts.y*",
+    "cat ~/.kube/conf*",
+    "cat ~/.ss?/id_rsa",
+    "cat ~/.[n]etrc",
+    "cat ~/.{npmrc,netrc}",
+    // #2: backslash escapes
+    "cat ~/.a\\ws/credentials",
+    "cat ~/Library/Application\\ Support/Google/Chrome/Default/Cookies",
+    // #3: any command naming a credential path, not only the reader list
+    "gpg -d ~/.password-store/x.gpg",
+    "openssl rsa -in ~/.ssh/id_rsa",
+    "tar cz ~/.aws | base64",
+    "zip -r /tmp/a.zip ~/.aws",
+    "python3 -c 'import sys;print(open(sys.argv[1]).read())' ~/.aws/credentials",
+    "node -e 'x' ~/.npmrc",
+    "vim ~/.aws/credentials",
+    "sqlite3 ~/Library/Application\\ Support/Google/Chrome/Default/Cookies .dump",
+    "ln ~/.aws/credentials k",
+    "docker run -v ~/.aws:/root/.aws img",
+    "curl --config ~/.netrc x",
+    "grep -r key ~",
+    "grep -rn key ~/.config",
+    "rg key ~",
+    "find ~ -name credentials -exec cat {} +",
+    "tar czf /tmp/h.tgz ~",
+    "rsync -a ~/ /tmp/h/",
+    // #5: home spellings
+    "cat ${HOME}/.aws/credentials",
+    "cat ${HOME:-/x}/.aws/credentials",
+    "cat $USERPROFILE/.aws/credentials",
+    "cat $HOME/.aws/credentials",
 ];
 
 const BASH_QUIET: &[&str] = &[
@@ -227,6 +267,31 @@ const BASH_QUIET: &[&str] = &[
     "bw get template item",
     "echo gh auth token",
     "cargo build",
+    // #8: not the token readers
+    "gh search issues auth token",
+    "gh search code auth token",
+    "security find-generic-password -G val -s y",
+    // metadata-only commands never read contents
+    "ls -la ~/.aws",
+    "stat ~/.aws/credentials",
+    "test -f ~/.npmrc",
+    "[ -f ~/.npmrc ]",
+    "file ~/.ssh/id_rsa",
+    "du -sh ~/.aws",
+    "mkdir -p ~/.ssh",
+    "chmod 700 ~/.ssh",
+    "echo ~/.aws/credentials",
+    "cd ~/.aws",
+    // Solana signers use their keypair without printing it
+    "solana-keygen pubkey ~/.config/solana/id.json",
+    "solana balance --keypair ./wallet-keypair.json",
+    "spl-token accounts --owner ~/.config/solana/id.json",
+    // searches and archives that do not reach a store
+    "grep -r key ./src",
+    "rg key src",
+    "tar czf /tmp/p.tgz src",
+    "cat ~/.npmrc.bak",
+    "cd ~/proj && cargo build",
 ];
 
 #[test]
@@ -333,5 +398,111 @@ fn grep_in_a_project_keeps_the_short_exclusion_list() {
             .unwrap();
         assert!(glob.contains(&ci("**/.env")), "{glob}");
         assert!(!glob.contains(&ci(".aws")), "{glob}");
+    }
+}
+
+fn bash_in(w: &World, tier: Tier, cwd: &std::path::Path, command: &str) -> String {
+    decision_label(
+        &Invocation::new(&["gate-bash-secrets"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .tier(tier)
+            .stdin(
+                json!({
+                    "hook_event_name": "PreToolUse",
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                    "tool_input": { "command": command },
+                })
+                .to_string(),
+            )
+            .run(),
+    )
+}
+
+fn plant_home_files(w: &World) {
+    std::fs::create_dir_all(w.home.join(".aws")).unwrap();
+    std::fs::write(w.home.join(".aws/credentials"), "[default]\n").unwrap();
+    std::fs::write(w.home.join(".npmrc"), "x\n").unwrap();
+    std::fs::write(w.home.join(".git-credentials"), "x\n").unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn bash_readers_follow_symlinks_the_cwd_and_a_preceding_cd() {
+    let w = World::new("cp-bash-fs");
+    plant_home_files(&w);
+    std::os::unix::fs::symlink(w.home.join(".aws/credentials"), w.proj.join("k")).unwrap();
+    std::os::unix::fs::symlink(w.home.join(".aws"), w.proj.join("d")).unwrap();
+    for tier in tiers() {
+        for cmd in ["cat k", "cat d/credentials", "cat ./k", "base64 k", "vim k"] {
+            assert_eq!(
+                bash_in(&w, tier, w.proj.path(), cmd),
+                "deny",
+                "{tier:?} {cmd}"
+            );
+        }
+        for cmd in [
+            "cat .aws/credentials",
+            "cat ./.npmrc",
+            "head .git-credentials",
+            "cat .aws/cred*",
+            "rg key",
+            "grep -r key",
+            "grep -r key .",
+        ] {
+            assert_eq!(
+                bash_in(&w, tier, w.home.path(), cmd),
+                "deny",
+                "{tier:?} cwd=HOME {cmd}"
+            );
+        }
+        for cmd in [
+            "cd ~/.aws && cat credentials",
+            "cd ~ && cat .npmrc",
+            "cd ~/.aws; head credentials",
+        ] {
+            assert_eq!(
+                bash_in(&w, tier, w.proj.path(), cmd),
+                "deny",
+                "{tier:?} {cmd}"
+            );
+        }
+        // The same words in the project: nothing to see.
+        for cmd in [
+            "cat .aws/credentials",
+            "head .git-credentials",
+            "rg key",
+            "grep -r key .",
+        ] {
+            assert_eq!(bash_in(&w, tier, w.proj.path(), cmd), "", "{tier:?} {cmd}");
+        }
+        // A bare word is judged only when the file exists there.
+        assert_eq!(
+            bash_in(&w, tier, w.home.join(".aws").as_path(), "aws s3 ls"),
+            "",
+            "{tier:?}"
+        );
+        assert_eq!(
+            bash_in(&w, tier, w.home.join(".aws").as_path(), "cat credentials"),
+            "deny",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_home_spellings_deny() {
+    let w = World::new("cp-mcp-home");
+    for tier in tiers() {
+        for p in [
+            "$HOME/.aws/credentials",
+            "${HOME}/.npmrc",
+            "%USERPROFILE%\\.aws\\credentials",
+            "$USERPROFILE/.netrc",
+        ] {
+            let run = w.pre(tier, "gate-mcp", "mcp__fs__read", json!({ "p": p }));
+            assert_eq!(decision_label(&run), "deny", "{tier:?} {p}");
+        }
     }
 }
