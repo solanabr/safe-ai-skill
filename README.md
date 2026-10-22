@@ -101,7 +101,7 @@ The npm and standalone paths download the binary matching their release tag and 
 
 **Supply-chain (SessionStart verifier)**
 
-- Skill packs: sweeps the project's `.claude/skills`; `~/.claude/skills` only when `supply_chain.verify_skills_dirs` lists it, plus packs installed there with `install --from`
+- Skill packs: sweeps the project's `.claude/skills`; `~/.claude/skills` only when a project's `.safe-ai-skill/policy.yaml` adds it to `supply_chain.verify_skills_dirs` (the only dir outside the project a project may add), plus packs installed there with `install --from`
 - Per-submodule pinning: walks each `ext/` submodule independently; pins first-seen git SHA (TOFU); reports drift without moving anything. A drifted pack is reported every session until you run `safe-ai-skill verify approve <name>`, which re-pins it in place
 - Catalog gating: classifies `skill-registry.json` entries by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`); blocks installation of denied classes
 - `curl | bash` detection: flags installer-script patterns before they execute

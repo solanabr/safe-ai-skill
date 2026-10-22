@@ -568,7 +568,8 @@ impl Policy {
             persisted_profile,
             env_profile.as_deref(),
         );
-        policy.confine_project_dirs(cwd);
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+        policy.confine_project_dirs(cwd, home.as_deref().map(Path::new));
         policy
     }
 
@@ -576,8 +577,9 @@ impl Policy {
     /// checks the text only, so a committed symlink (`up -> ..`) would pass it and sweep
     /// whatever it points at. Each dir becomes its canonical path when it is a directory
     /// strictly inside the canonical `root`, so the sweep scans exactly what was checked;
-    /// otherwise it is dropped (and noted when it resolves outside).
-    fn confine_project_dirs(&mut self, root: &Path) {
+    /// otherwise it is dropped (and noted when it resolves outside). The one opt-in outside the
+    /// project, [`USER_SKILLS_DIR`], is kept as the canonical `<home>/.claude/skills`.
+    fn confine_project_dirs(&mut self, root: &Path, home: Option<&Path>) {
         let added = std::mem::take(&mut self.project_scan_dirs);
         if added.is_empty() {
             return;
@@ -585,10 +587,18 @@ impl Policy {
         let canonical_root = std::fs::canonicalize(root).ok();
         let mut outside = false;
         for dir in added {
-            let resolved = std::fs::canonicalize(root.join(&dir)).ok();
-            let within = match (&canonical_root, &resolved) {
-                (Some(r), Some(path)) => path != r && path.starts_with(r),
-                _ => false,
+            let (resolved, within) = if is_user_skills(&dir) {
+                let resolved =
+                    home.and_then(|h| std::fs::canonicalize(h.join(".claude/skills")).ok());
+                let within = resolved.is_some();
+                (resolved, within)
+            } else {
+                let resolved = std::fs::canonicalize(root.join(&dir)).ok();
+                let within = match (&canonical_root, &resolved) {
+                    (Some(r), Some(path)) => path != r && path.starts_with(r),
+                    _ => false,
+                };
+                (resolved, within)
             };
             // A dir that does not resolve has nothing to sweep: drop it quietly.
             outside |= resolved.is_some() && !within;
@@ -1070,6 +1080,7 @@ fn keep_subset(path: &str, current: &mut Vec<String>, asked: &[String], notes: &
 
 /// [`keep_union`] for skill scan dirs, except an added dir must stay inside the project:
 /// sweeping `~`, `/`, `..` or the project root itself would treat unrelated dirs as packs.
+/// The one exception is the user-scope [`USER_SKILLS_DIR`], which a project may opt in to.
 /// The project's order comes first, since `verify approve` restores into the first dir.
 /// Returns the added dirs; [`Policy::load_with_mode`] re-checks them on disk.
 fn keep_scan_dirs(
@@ -1087,7 +1098,7 @@ fn keep_scan_dirs(
         }
         if current.contains(dir) {
             dirs.push(dir.clone());
-        } else if is_inside_project(dir) {
+        } else if is_inside_project(dir) || is_user_skills(dir) {
             dirs.push(dir.clone());
             added.push(dir.clone());
         } else {
@@ -1119,6 +1130,14 @@ fn note_dropped(path: &str, current: &[String], asked: &[String], notes: &mut Ve
             dropped.join(", ")
         ));
     }
+}
+
+/// The only scan dir outside the project a project overlay may add: user-scope skills.
+const USER_SKILLS_DIR: &str = "~/.claude/skills";
+
+/// Whether `dir` spells [`USER_SKILLS_DIR`] (a trailing `/` allowed).
+fn is_user_skills(dir: &str) -> bool {
+    dir.trim_end_matches('/') == USER_SKILLS_DIR
 }
 
 /// Whether `dir` is, as text, a relative path below the project root. Symlinks are checked

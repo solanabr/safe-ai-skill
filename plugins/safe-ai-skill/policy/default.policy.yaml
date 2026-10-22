@@ -63,7 +63,7 @@ catalog:
       keywords: [ "curl | bash", "curl|bash", "| sh", "wget" ]
       ids: []
 supply_chain:
-  verify_skills_dirs: [ ".claude/skills" ]   # project skills; list "~/.claude/skills" to also sweep user-scope skills
+  verify_skills_dirs: [ ".claude/skills" ]   # project skills; a project .safe-ai-skill/policy.yaml may add "~/.claude/skills" (the only out-of-project dir allowed) to also sweep user-scope skills
   flag_unpinned_mcp: true           # @latest in .mcp.json — INFORMATIONAL/LOW (MCPs kept @latest), not blocking
   flag_telemetry_curl: true         # generic telemetry preamble detector (e.g. Convex /api/mutation)
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units

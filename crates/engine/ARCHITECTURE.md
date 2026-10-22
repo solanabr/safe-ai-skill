@@ -446,7 +446,8 @@ pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, polic
 ```
 
 **`verify session` is report-only.** `run_session` sweeps each root in `supply_chain.verify_skills_dirs`
-(project `.claude/skills`; `~/.claude/skills` only when listed, except packs `install --from`
+(project `.claude/skills`; `~/.claude/skills` only when a project overlay opts in to it, the one out-of-project dir
+`keep_scan_dirs` accepts, canonicalised by `confine_project_dirs`; except packs `install --from`
 put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
 own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
 if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, High findings
