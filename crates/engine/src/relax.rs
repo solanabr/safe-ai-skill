@@ -131,9 +131,12 @@ impl ConfirmOutcome {
 /// so a nonce the model planted somewhere cannot ride along in a bigger paste.
 pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome> {
     let trimmed = prompt.trim();
-    let mentions = trimmed
-        .lines()
-        .any(|l| l.trim_start().starts_with(CONFIRM_PREFIX));
+    let mentions = trimmed.lines().any(|l| {
+        let l = l.trim();
+        l == CONFIRM_PREFIX
+            || l.strip_prefix(CONFIRM_PREFIX)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+    });
     if !mentions {
         return None;
     }
@@ -556,6 +559,7 @@ mod tests {
         for prompt in [
             "deploy to devnet",
             "what does safe-ai-skill confirm do?",
+            "safe-ai-skill confirmation is confusing",
             "",
             "the nonce is 12345678",
         ] {

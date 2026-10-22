@@ -800,11 +800,12 @@ mod tests {
             },
             total_sol: 4.8,
         };
-        std::fs::write(
-            ctx.plugin_data.join("spend.json"),
-            serde_json::to_string(&ledger).unwrap(),
-        )
-        .unwrap();
+        // The ledger is an authenticated state file (a plain one counts as exhausted).
+        let dir = crate::datadir::DataDir {
+            path: ctx.plugin_data.clone(),
+            trusted: false,
+        };
+        crate::statefile::store(&dir, crate::spend::SPEND_FILE, &ledger).unwrap();
 
         // 0.5 is under per-tx (1.0) but pushes daily to 5.3 > 5.0.
         let (d, _) = decide(&format!("solana transfer {DEST} 0.5"), &ctx, &policy());

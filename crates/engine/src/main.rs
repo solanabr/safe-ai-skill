@@ -558,7 +558,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // custody, …), force the class decision (`ask`/`deny`) and refuse to emit the install
     // command — the verify pipeline never even runs. A `deny` blocks outright; an `ask` holds
     // unless `--yes`.
-    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(&plugin_data, source) {
+    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(source) {
         let blocked = decision == "deny" || (decision == "ask" && !force);
         if blocked {
             audit_event(
@@ -665,11 +665,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
 /// from [`registry::Registry::decision_for_kind`]. Returns `None` when there is no catalog, no
 /// matching entry, or the entry is not high-risk — in which case `add` proceeds to its normal
 /// verify pipeline. Never panics; a missing/unparseable catalog yields `None`.
-fn resolve_high_risk_target(
-    plugin_data: &Path,
-    source: &str,
-) -> Option<(String, &'static str, &'static str)> {
-    let _ = plugin_data;
+fn resolve_high_risk_target(source: &str) -> Option<(String, &'static str, &'static str)> {
     let cwd = process_cwd();
     let policy = load_effective_policy(&cwd, &state_dir(&cwd));
     let reg_path = cwd.join(&policy.catalog.registry_path);

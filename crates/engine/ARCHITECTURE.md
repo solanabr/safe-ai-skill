@@ -143,12 +143,13 @@ it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hook
 |---|---|---|
 | `audit.jsonl` | `audit::append` | append-only decision log |
 | `netcache.json` | `context` | cached `solana config get` RPC URL (60s TTL) |
-| `spend.json` | `spend` (round-2) | daily spend ledger |
-| `grants.json` | `grants` (round-2) | active scoped grants |
-| `mode.json` | `mode` (round-2) | runtime active-profile override |
+| `spend.json` | `spend` | daily spend ledger (authenticated; missing after the key exists, or tampered → today exhausted) |
+| `grants.json` | `grants` | scoped grants (authenticated; created only by a confirmed prompt nonce) |
+| `mode.json` | `mode` | runtime active-profile override (authenticated; looser profiles need a confirmed nonce) |
+| `sessions.json` | `session` | session-key metadata and the active-session pointer (authenticated) |
 | `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
 | `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
-| `session/<id>.json` | `session` (round-2) | ephemeral session keypairs (0600) |
+| `session/<id>.json` | `session` | ephemeral session keypairs (0600, Solana CLI format, plain) |
 | `key` | `statefile` | 32-byte HMAC key for authenticated state (0600) |
 | `pending.json` | `confirm` | prompt-nonce pending entries (authenticated, 600 s TTL) |
 
@@ -205,7 +206,6 @@ pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE" — may only
 pub struct Policy {
     pub version: u32, pub active_profile: String,
     pub network: NetworkPolicy, pub spend: SpendPolicy,
-    pub gates: Vec<String>, pub hard_guards: Vec<String>,
     pub mcp: McpPolicy, pub swap: SwapPolicy, pub secrets: SecretsPolicy,
     pub redact: TogglePolicy, pub audit: TogglePolicy,
     pub catalog: CatalogPolicy,             // NEW (solana-ai-kit milestone)
@@ -239,10 +239,7 @@ pub struct HighRiskClass {
     pub keywords: Vec<String>,              // case-insensitive substrings of safety/description/tags
     pub ids: Vec<String>,                   // exact entry ids that always belong to the class
 }
-pub struct ProfileOverlay {
-    pub relax_transfer: bool, pub relax_swap: bool, pub ask_all: bool,
-    pub disabled: bool, pub per_tx_sol_max: Option<f64>,
-}
+pub struct ProfileOverlay { pub ask_all: bool, pub per_tx_sol_max: Option<f64> }
 
 impl Policy {
     pub fn load(cwd: &Path) -> Policy;          // load_with_mode(cwd, None)
@@ -255,22 +252,21 @@ impl Policy {
                         persisted_profile: Option<&str>, env_profile: Option<&str>) -> Policy;
     pub fn fail_closed() -> Policy;             // conservative; every soft gate → ask
     pub fn is_fail_closed(&self) -> bool;
-    pub fn is_hard_guard(&self, scope_label: &str) -> bool;
     pub fn effective(&self) -> Policy;          // apply active profile overlay, then re-clamp project caps
     pub fn active_overlay(&self) -> ProfileOverlay;
     pub fn ignored_notice(&self) -> Option<String>; // SessionStart block listing ignored_overrides
 }
 ```
 **Fail-closed guarantee:** an unparsable plugin default returns `fail_closed()` (caps zero,
-mainnet `ask`, profile `strict`, all hard guards present). A *project override* that is not
+mainnet `ask`, profile `strict`). A *project override* that is not
 valid YAML (or not a mapping) is ignored; one with ill-typed values fails closed through the
 ratchet, so no other field ends up looser than the base. Either way it is noted.
 
 **Project ratchet (D1.10).** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
 tighten the base, field by field: caps take the lower value (and still bind under any
 profile); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
-`network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`, `gates`,
-`hard_guards`, `mcp.sensitive_name_pattern` alternatives) add entries; allow-lists
+`network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`,
+`mcp.sensitive_name_pattern` alternatives) add entries; allow-lists
 (`secrets.allow_read_globs`, `swap.trusted_mints`) drop them; toggles can only turn on;
 `verify_skills_dirs` keeps every base dir and may add dirs strictly inside the project
 (lexically in `from_sources`, then canonicalized on disk in `load_with_mode`). Fields with no
@@ -279,15 +275,19 @@ safe direction stay fixed: `catalog`, `swap.rugcheck_timeout_ms`, `supply_chain.
 change lands in `ignored_overrides`, which `verify session` appends to the SessionStart
 `additionalContext`; the notes never echo repo text.
 
-**Profiles:** `strict` (no-op), `autopilot` (relax_transfer/swap + per_tx cap 2.0),
-`paranoid` (ask_all), `off` (disabled). The active profile is the `safe-ai-skill mode` choice
-(`mode.json`) if set, else the plugin default's; `PROFILE_ENV` may then only pick a stricter
-one (`off` < `autopilot` < `strict` < `paranoid`). `effective()` applies cap overrides; the
-boolean flags are consumed by gates / `relax`. Hard guards are never relaxed.
+**Profiles (D1.11):** `strict` (default, no-op), `paranoid` (`ask_all`: `relax` turns every
+allow into an ask and skips grants; `gate-bash` asks for every Solana CLI command), `autopilot`
+(per-tx cap 2.0). The active profile is the authenticated `mode.json` (trusted data dir only)
+if set, else the plugin default's; `autopilot` applies only from `mode.json` (a base-policy
+`autopilot` is strict, noted); `PROFILE_ENV` may then only pick a stricter one (`autopilot` <
+`strict` < `paranoid`). Removed in 1.1.0 and listed as ignored where an old policy still has
+them: the `off` profile, `relax_transfer`, `relax_swap`, `disabled`, and the never-read
+`gates`/`hard_guards` lists. Hard guards are set by the gates (`GateMeta::hard_guard`) and
+never relaxed.
 
 **On-disk ⇄ embedded equivalence (FROZEN invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
-`active_profile`, `hard_guards`, `profiles`, `catalog`, and the new `supply_chain` fields) and
+`active_profile`, `profiles`, `catalog`, and the new `supply_chain` fields) and
 MUST parse to the same `Policy` as the embedded `DEFAULT_POLICY_YAML` const. The
 `policy::tests::ondisk_policy_equivalent_to_embedded` test enforces this field-by-field — edit
 both together.
@@ -371,32 +371,51 @@ pub fn spend::record_and_check(plugin_data: &Path, sol_amount: f64, policy: &Pol
 pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;                              // Defer
 ```
 
-### Relaxation trio (STUBS — one round-2 agent)
+### Relaxation (D4)
 ```rust
-// grants
-pub struct grants::Grant {
-    pub id: String, pub scope: Scope, pub programs: Vec<String>, pub to: Vec<String>,
-    pub max_tx_sol: f64, pub budget_sol: f64, pub spent_sol: f64,
-    pub expires_at: u64, pub danger: bool,
-}
+// grants — grants.json is a statefile envelope
+pub struct grants::Grant { pub id, pub scope: Scope, pub programs, pub to, pub max_tx_sol, pub budget_sol,
+                           pub spent_sol, pub expires_at: u64, pub danger: bool }
 pub struct grants::Grants { pub grants: Vec<Grant> }
-pub fn grants::load(plugin_data: &Path) -> Grants;
-pub fn grants::save(plugin_data: &Path, grants: &Grants) -> std::io::Result<()>;
+pub struct grants::GrantRequest { pub scope, pub for_secs, pub max_tx_sol, pub budget_sol, pub programs, pub to, pub danger }
+pub const grants::GRANTABLE_SCOPES: [Scope; 5];   // transfer swap deploy authority destructive
+pub fn grants::grantable_scope(label: &str) -> Result<Scope, String>;   // `other`/unknown → Err
+pub fn grants::load(dir: &DataDir) -> Loaded<Grants>;
+pub fn grants::live(dir: &DataDir) -> Grants;       // Valid AND dir.trusted, else empty
+pub fn grants::save(dir: &DataDir, grants: &Grants) -> Result<(), EngineError>;
+pub fn grants::add(dir: &DataDir, grant: Grant, now: u64) -> Result<bool, EngineError>;
 pub fn grants::find_match<'a>(grants: &'a Grants, meta: &GateMeta) -> Option<&'a Grant>;
-pub fn grants::debit(plugin_data: &Path, grant_id: &str, sol_amount: f64) -> std::io::Result<()>;
-pub fn grants::cleanup_expired(plugin_data: &Path) -> usize;
+pub fn grants::debit(dir: &DataDir, grant_id: &str, sol_amount: f64) -> Result<(), EngineError>;
 
-// mode
-pub fn mode::get(plugin_data: &Path) -> Option<String>;        // env-if-known, else mode.json (raw read)
-pub fn mode::persisted(plugin_data: &Path) -> Option<String>;  // mode.json only; what load_with_mode takes
-pub fn mode::set(plugin_data: &Path, profile: &str) -> std::io::Result<()>;
+// mode — mode.json is a statefile envelope
+pub const mode::KNOWN_PROFILES: [&str; 3];          // loosest first: autopilot strict paranoid
+pub fn mode::persisted(dir: &DataDir) -> Option<String>;  // Valid AND dir.trusted AND known
+pub fn mode::set(dir: &DataDir, profile: &str, now: u64) -> Result<(), EngineError>;
+pub fn mode::is_looser(target: &str, current: &str) -> bool;
 
-// relax  (called by main.rs after every gate)
-pub fn relax::apply(natural: Decision, meta: &GateMeta, policy: &Policy, plugin_data: &Path) -> Decision;
+// relax — called by main.rs after every gate, and by prompt-guard
+pub fn relax::apply(natural: Decision, meta: &GateMeta, policy: &Policy, dir: &DataDir) -> Decision;
+pub fn relax::confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome>;
+
+// spend — spend.json is a statefile envelope; SpendLedger::load repairs a deleted/tampered one
+pub fn spend::ledger_state(plugin_data: &Path) -> LedgerState;  // Valid | Fresh | Deleted | Tampered
+
+// migrate / notice — SessionStart
+pub fn migrate::run(dir: &DataDir, now: u64) -> Vec<String>;      // 1.0 → envelopes, once
+pub fn notice::loosenings(inputs: &notice::Inputs) -> Option<String>;
 ```
-`relax::apply` contract: if `natural` is not `Ask`, or `meta.hard_guard` is true, return it
-unchanged; otherwise consult active grants and (on a match within budget/`max_tx_sol`) debit
-and return `Allow`. `policy` is the EFFECTIVE policy (profile overlay already applied).
+`relax::apply` contract: under the effective policy's `ask_all` every `Allow` becomes `Ask`
+and no grant is consulted; otherwise if `natural` is not `Ask`, or `meta.hard_guard` is
+true, return it unchanged; otherwise the first live grant matching within budget/`max_tx_sol`
+is debited (a failed debit keeps the ask) and the result is `Allow`.
+
+**Confirmation flow (D4.1).** `allow` and `mode <looser>` call `confirm::create_pending` and
+print the summary plus the exact `safe-ai-skill confirm <nonce>` line (JSON on stdout, text on
+stderr). `prompt-guard` (UserPromptSubmit) passes `confirm::user_prompt` to
+`relax::confirm_prompt`, which acts only when the whole trimmed prompt is that one line,
+consumes the entry, re-validates its payload, stores the grant/mode, audits it, and returns a
+`systemMessage` (+ `additionalContext`) echoing what was approved. `verify trust|approve`
+pending kinds are not handled here (WS-D1).
 
 ### `verify` (`Report`/`Finding`/`Severity` FROZEN; scan fns STUBS)
 ```rust
@@ -442,8 +461,8 @@ until classified. Round-2 Agent A fills the three stub bodies + tests.
 ### `squads` / `session` (STUBS)
 ```rust
 pub fn squads::upgrade_authority_advisory(program: &str, ctx: &Context) -> Option<String>;  // None
-pub fn session::init(cap_sol: f64, plugin_data: &Path) -> error::Result<String>;            // Ok("")
-pub fn session::status(plugin_data: &Path) -> error::Result<String>;                        // Ok("no active session")
+pub fn session::init(cap_sol: f64, dir: &DataDir) -> error::Result<String>;
+pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ```
 
 ---
@@ -454,7 +473,8 @@ pub fn session::status(plugin_data: &Path) -> error::Result<String>;            
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`mode [<profile>]` · `revoke` · `status` · `--version`.
+`mode [<profile>]` · `revoke` · `status` · `--version`. `allow` and `mode autopilot` only park
+a pending request (prompt-nonce confirmation); an argument error exits 1.
 
 Gate subcommands emit the authoritative PreToolUse decision (nothing for no opinion); the rest
 print a JSON result line. Unknown or missing subcommand → empty stdout, stderr message, exit 3.

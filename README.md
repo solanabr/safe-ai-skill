@@ -134,11 +134,35 @@ safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
 safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
-safe-ai-skill status                 # pins, quarantine list, active profile, live grants, recent decisions
-safe-ai-skill mode <profile>         # switch relaxation profile (strict / standard / dev)
-safe-ai-skill allow <gate>           # grant a specific gate for the current session
+safe-ai-skill status                 # pins, active profile, live grants, spend, recent decisions
+safe-ai-skill mode <profile>         # strict (default) | paranoid | autopilot (needs confirmation)
+safe-ai-skill allow --scope transfer --for 30m --max-tx 1 --budget 5 [--to <addr>]
+                                     # request a time-boxed grant (needs confirmation)
+safe-ai-skill revoke                 # drop every grant at once
 safe-ai-skill session                # show active session state
 ```
+
+**Relaxations need your confirmation in the prompt.** `allow` and `mode autopilot` change
+nothing on their own: they print a summary and a line like `safe-ai-skill confirm 48213907`.
+The request takes effect only when your next prompt in Claude Code is exactly that line, on its
+own (within 10 minutes, once). Claude Code then shows you what you approved. The agent can't
+type your prompts, so it can't approve its own request; a confirm line inside pasted text is
+refused. A stricter `mode` and `revoke` apply at once. Grant scopes are `transfer`, `swap`,
+`deploy`, `authority` and `destructive`; anything else is an error.
+
+**Profiles.** `strict` is the default. `paranoid` asks for every Solana CLI command and
+disables every automatic allow, grants included. `autopilot` raises the per-transaction cap
+to 2 SOL and applies only through a confirmed `safe-ai-skill mode autopilot`.
+`SAFE_AI_SKILL_PROFILE` can only pick a stricter profile. To turn the hooks off, set
+`SAFE_AI_SKILL_DISABLE=1`.
+
+**State is authenticated.** Grants, the mode, the daily spend ledger and session metadata are
+signed with a per-install key in the plugin data directory. A hand-edited grant or mode is
+ignored, and a deleted or edited spend ledger counts as today's budget spent. This is
+tamper-evident, not tamper-proof: anything running as you can read the key. Valid 1.0 grants
+and mode are migrated once, at the first 1.1.0 session, and listed then. Every session start
+lists what is currently loosened: a profile env var, a non-default mode, live grants, ignored
+repo policy, state that failed authentication, and a Claude Code sandbox that is off.
 
 Each `add` command runs the intrinsic verification pipeline on the actual fetched content before executing the underlying install. `registry list` shows the full catalog with risk classes flagged. High-risk entries (`wallet_signing`, `key_custody`, `installer_script`) require explicit approval.
 
