@@ -231,10 +231,12 @@ fn script_runs_family(text: &str, depth: usize) -> bool {
         || (parsed.unparseable && mentions_family(text) && quoted_segments(text).is_empty())
         || parsed.commands.iter().any(|c| {
             (c.is_family()
-                && c.words
+                && (c
+                    .words
                     .iter()
                     .skip(1)
-                    .any(|w| w.dynamic || is_gated_word(&w.text)))
+                    .any(|w| w.dynamic || is_gated_word(&w.text))
+                    || unknown_cli_subcommand(c)))
                 || dynamic_family_program(c, &parsed)
         });
     if runs {
@@ -246,6 +248,28 @@ fn script_runs_family(text: &str, depth: usize) -> bool {
             .iter()
             .any(|s| FAMILY.contains(&base_name(s.trim()).as_str()))
             && segments.iter().any(|s| is_gated_word(s.trim())))
+}
+
+/// A `solana` / `spl-token` command in a written script whose subcommand is not a known
+/// read-only one (`solana pay …`): the top-level gate asks on those, so a script running one
+/// counts as running a gated command.
+fn unknown_cli_subcommand(cmd: &SimpleCommand) -> bool {
+    let program = cmd.program();
+    let mut subs = cmd
+        .words
+        .iter()
+        .skip(1)
+        .map(|w| w.text.to_ascii_lowercase())
+        .filter(|t| !t.starts_with('-'));
+    let Some(sub) = subs.next() else {
+        return false;
+    };
+    match program.as_str() {
+        "solana" if sub.as_str() == "config" => subs.next().as_deref() != Some("get"),
+        "solana" => !crate::gates::bash::is_solana_readonly(&sub),
+        "spl-token" => !crate::gates::bash::is_spl_readonly(&sub),
+        _ => false,
+    }
 }
 
 /// The contents of the `'…'` and `"…"` strings in `text` (interpreter code).
@@ -320,10 +344,15 @@ fn printf_text(args: &[&str]) -> String {
                 out.push('%');
                 continue;
             }
-            while format
-                .get(i)
-                .is_some_and(|c| matches!(c, '-' | '+' | ' ' | '#' | '0'..='9' | '.'))
-            {
+            while let Some(&f) = format.get(i) {
+                match f {
+                    '-' | '+' | ' ' | '#' | '0'..='9' | '.' => {}
+                    // A width or precision taken from the next argument.
+                    '*' => {
+                        values.next();
+                    }
+                    _ => break,
+                }
                 i += 1;
             }
             if !format.get(i).is_some_and(|c| c.is_ascii_alphabetic()) {
@@ -336,6 +365,73 @@ fn printf_text(args: &[&str]) -> String {
         }
         if conversions == 0 || values.len() == 0 {
             break;
+        }
+    }
+    decode_escapes(&out)
+}
+
+/// The backslash escapes `printf` (format and `%b`) and `echo -e` decode: `\n`, `\t`, `\\`,
+/// `\xHH` and octal `\NNN` / `\0NNN`, so `\x73olana` reads as `solana`. Others stay as written.
+fn decode_escapes(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '\\' || i >= chars.len() {
+            out.push(c);
+            continue;
+        }
+        let next = chars[i];
+        let digits = |from: usize, max: usize, radix: u32| -> (u32, usize) {
+            let mut value = 0u32;
+            let mut n = 0;
+            while n < max {
+                match chars.get(from + n).and_then(|d| d.to_digit(radix)) {
+                    Some(d) => value = value * radix + d,
+                    None => break,
+                }
+                n += 1;
+            }
+            (value, n)
+        };
+        match next {
+            'n' => {
+                out.push('\n');
+                i += 1;
+            }
+            't' => {
+                out.push('\t');
+                i += 1;
+            }
+            '\\' => {
+                out.push('\\');
+                i += 1;
+            }
+            'x' => {
+                let (value, n) = digits(i + 1, 2, 16);
+                match char::from_u32(value).filter(|_| n > 0) {
+                    Some(ch) => {
+                        out.push(ch);
+                        i += 1 + n;
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            '0'..='7' => {
+                // `\0NNN` (echo -e, %b) or `\NNN` (printf format).
+                let start = if next == '0' { i + 1 } else { i };
+                let (value, n) = digits(start, 3, 8);
+                match char::from_u32(value) {
+                    Some(ch) if n > 0 || next == '0' => {
+                        out.push(ch);
+                        i = start + n;
+                    }
+                    _ => out.push('\\'),
+                }
+            }
+            _ => out.push('\\'),
         }
     }
     out
@@ -2244,6 +2340,11 @@ mod tests {
             assert!(parse(command).write_then_run, "{command}");
         }
         assert!(!parse("echo 'solana balance' > notes.txt").write_then_run);
+        // An unknown subcommand counts like at top level (where it asks); read-only ones don't.
+        assert!(parse("echo 'solana pay D 1' > x.sh; bash x.sh").write_then_run);
+        assert!(parse("echo 'spl-token frobnicate' > x.sh; bash x.sh").write_then_run);
+        assert!(!parse("echo 'solana balance' > x.sh; bash x.sh").write_then_run);
+        assert!(!parse("echo 'solana config get' > x.sh; bash x.sh").write_then_run);
         // The run must come after the write.
         assert!(!parse("bash x.sh; echo 'solana transfer' > x.sh").write_then_run);
     }
@@ -2259,6 +2360,8 @@ mod tests {
             "printf 'solana transfer X 1' | tee a | tee x.sh; bash x.sh",
             "echo \"subprocess.run(['solana', 'transfer', 'X', '1'])\" > x.py; python3 x.py",
             "echo 'solana transfer X 1' > x.sh; xargs -a x.sh -I{} sh -c '{}'",
+            "printf '\\x73olana transfer X 1' > x.sh; bash x.sh",
+            "printf '%*s\\n' 0 'solana transfer X 1' > x.sh; bash x.sh",
         ] {
             assert!(parse(command).write_then_run, "{command}");
         }
@@ -2289,7 +2392,16 @@ mod tests {
             "solana transfer -um 1"
         );
         assert_eq!(printf_text(&["-v", "v", "--", "100%% %b", "x"]), "100% x");
-        assert_eq!(printf_text(&["a %*d", "transfer"]), "a %*d\ntransfer");
+        // `*` takes its width from the next argument.
+        assert_eq!(
+            printf_text(&["%*s\\n", "0", "solana transfer X 1"]),
+            "solana transfer X 1\n"
+        );
+        assert_eq!(printf_text(&["%.3s", "solana"]), "solana");
+        // Hex and octal escapes are decoded.
+        assert_eq!(printf_text(&["\\x73olana transfer"]), "solana transfer");
+        assert_eq!(printf_text(&["\\163olana"]), "solana");
+        assert_eq!(printf_text(&["%b", "\\0163olana"]), "solana");
         assert_eq!(printf_text(&["plain", "ignored"]), "plain");
     }
 

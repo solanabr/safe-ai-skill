@@ -613,7 +613,7 @@ fn severity(decision: &Decision) -> u8 {
 
 /// Read-only `solana` subcommands (no opinion). `config` is handled separately: only
 /// `config get` is read-only.
-fn is_solana_readonly(sub: &str) -> bool {
+pub(crate) fn is_solana_readonly(sub: &str) -> bool {
     matches!(
         sub,
         "balance"
@@ -644,7 +644,7 @@ fn is_solana_readonly(sub: &str) -> bool {
 }
 
 /// Read-only `spl-token` subcommands (no opinion).
-fn is_spl_readonly(sub: &str) -> bool {
+pub(crate) fn is_spl_readonly(sub: &str) -> bool {
     matches!(
         sub,
         "balance" | "accounts" | "address" | "display" | "supply" | "account-info"
