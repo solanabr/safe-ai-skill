@@ -116,7 +116,7 @@ These block unconditionally. No profile flag or explicit grant overrides them.
 
 ## Secrets and `.env`
 
-Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Keypair files, private keys, `~/.ssh/id_*` and the Solana config tree are never readable. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory has env and key files excluded from its results; Glob only lists names and is not gated. Tool output that still contains a value from a project env file is shown as `«redacted:KEY»`.
+Raw reads of env files (`.env`, `.env.*`, `*.env`, `.envrc`, `.dev.vars`, `~/.config/solana/cli/config.yml`) are denied, and the deny message gives the commands to use instead. Keypair files, private keys, `~/.ssh/id_*` and the Solana config tree are never readable. `.env.example|.sample|.template|.dist` and `.env.schema` stay readable. A Grep over a directory has env and key files excluded from its results (this also hides `.env.example` and `.env.schema` from directory searches; read them directly), and a Grep over `$HOME` or another directory containing `~/.ssh` or `~/.config/solana` is denied; Glob only lists names and is not gated. Tool output that still contains a value from a project env file is shown as `«redacted:KEY»`.
 
 Three tiers, pick the one that fits; each keeps working without the next:
 

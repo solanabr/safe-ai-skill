@@ -213,7 +213,12 @@ pub fn normalize(path: &str, home: Option<&str>) -> String {
 
 /// [`normalize`] without the lowercasing (for case-sensitive allow globs).
 pub fn fold(path: &str, home: Option<&str>) -> String {
-    let text = path.trim().replace('\\', "/");
+    // Case-insensitive filesystems fold these compatibility letters to ASCII (`.ſsh`, `.\u{212A}ey`).
+    let text = path
+        .trim()
+        .replace('\\', "/")
+        .replace('\u{17F}', "s")
+        .replace('\u{212A}', "k");
     let text = match (text.strip_prefix('~'), home) {
         (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
             format!("{}{rest}", home.replace('\\', "/").trim_end_matches('/'))
@@ -308,13 +313,23 @@ pub fn sniff(path: &Path, limit: usize) -> Sniffed {
     Sniffed::Clean
 }
 
-/// Whether `text` holds a PEM / OpenSSH private-key header.
+/// Whether `text` holds a PEM / OpenSSH private-key block: a `-----BEGIN … PRIVATE KEY-----`
+/// header line followed by a base64 body line. A header alone (detector source, docs) is not
+/// a key.
 pub fn has_private_key_block(text: &str) -> bool {
     text.match_indices("-----BEGIN").any(|(i, _)| {
-        text[i..]
-            .lines()
-            .next()
-            .is_some_and(|l| l.contains("PRIVATE KEY-----"))
+        let mut lines = text[i..].lines();
+        let header = lines.next().is_some_and(|l| l.contains("PRIVATE KEY-----"));
+        header
+            && lines
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.contains(':'))
+                .is_some_and(|body| {
+                    body.len() >= 16
+                        && body
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+                })
     })
 }
 
@@ -412,6 +427,8 @@ mod tests {
             "/root/.config/solana/id.json",
             ".config/solana/id.json",
             "/Users/x/.ssh/id_ecdsa",
+            "/home/u/.\u{17F}sh/id_rsa",
+            "wallet-\u{212A}eypair.json",
         ] {
             assert!(class(p).is_hard(), "{p}: {:?}", class(p));
         }
@@ -482,12 +499,16 @@ mod tests {
 
     #[test]
     fn private_key_headers() {
-        assert!(has_private_key_block(
-            "x\n-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
-        ));
-        assert!(has_private_key_block("-----BEGIN RSA PRIVATE KEY-----"));
-        assert!(has_private_key_block(
-            "-----BEGIN ENCRYPTED PRIVATE KEY-----"
+        let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU=";
+        assert!(has_private_key_block(&format!(
+            "x\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n"
+        )));
+        assert!(has_private_key_block(&format!(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\n{body}"
+        )));
+        assert!(!has_private_key_block("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(!has_private_key_block(
+            "const H = \"-----BEGIN PRIVATE KEY-----\";\nfn detect() {}"
         ));
         assert!(!has_private_key_block(
             "-----BEGIN CERTIFICATE-----\nPRIVATE KEY-----"
@@ -503,7 +524,11 @@ mod tests {
         std::fs::write(&kp, format!("[{}]", arr.join(","))).unwrap();
         assert_eq!(sniff(&kp, SNIFF_BYTES), Sniffed::Keypair);
         let pem = dir.join("k.pem");
-        std::fs::write(&pem, "-----BEGIN PRIVATE KEY-----\nMII\n").unwrap();
+        std::fs::write(
+            &pem,
+            "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0B\n",
+        )
+        .unwrap();
         assert_eq!(sniff(&pem, SNIFF_BYTES), Sniffed::PrivateKey);
         let cert = dir.join("c.pem");
         std::fs::write(&cert, "-----BEGIN CERTIFICATE-----\nMII\n").unwrap();

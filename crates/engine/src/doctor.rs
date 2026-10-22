@@ -21,10 +21,14 @@ pub const RECOMMENDED_DENY_READ: &[&str] = &[
     "~/.ssh/id_*",
     "~/.superstack/config.json",
     "~/.config/varlock/**",
+    "~/.varlock/**",
     "**/.env",
     "**/.env.*",
+    "**/*.env",
     "**/.envrc",
     "**/.dev.vars",
+    "**/.dev.vars.*",
+    "**/.varlock-frozen-env",
 ];
 
 /// Settings files read, in Claude Code's precedence order (lowest first).

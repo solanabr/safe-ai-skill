@@ -33,10 +33,11 @@ use crate::policy::Policy;
 const READER_COMMANDS: &[&str] = &[
     "cat", "less", "more", "head", "tail", "xxd", "od", "base64", "strings", "cp", "mv", "scp",
     "rsync", "source", ".", "grep", "egrep", "fgrep", "rg", "sed", "awk", "nl", "tac", "bat",
+    "sort", "cut", "diff", "jq",
 ];
 
 /// Readers whose first positional argument is a pattern or program, not a file.
-const PATTERN_FIRST: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk"];
+const PATTERN_FIRST: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk", "jq"];
 
 /// Wrappers that run the rest of the line as the command.
 const WRAPPERS: &[&str] = &["sudo", "env", "command", "exec", "time", "nohup", "nice"];
@@ -165,18 +166,17 @@ fn install_script_decision(policy: &Policy) -> Decision {
 /// Evaluate one command segment.
 fn decide_segment(segment: &str, policy: &Policy, cwd: Option<&Path>) -> Decision {
     let all: Vec<String> = tokenize(segment);
+    // `< .env` / `$(<.env)` / `dd if=.env` feed a secret to any command.
+    if let Some(decision) = decide_redirects(&all, policy, cwd) {
+        return decision;
+    }
     let (assignments, tokens) = strip_wrappers(&all);
     if tokens.is_empty() {
         return Decision::Defer;
     }
 
-    // `< .env` feeds a secret to any command.
-    if let Some(decision) = decide_redirects(tokens, policy, cwd) {
-        return decision;
-    }
-
     if let Some(args) = varlock_args(tokens) {
-        return decide_varlock(args, assignments, policy);
+        return decide_varlock(args, &assignments, policy);
     }
 
     let program = base_program(&tokens[0]);
@@ -205,13 +205,23 @@ fn decide_segment(segment: &str, policy: &Policy, cwd: Option<&Path>) -> Decisio
 
     // `git show REV:.env`, `git cat-file -p REV:.env`.
     if program == "git" {
-        let sub = tokens
-            .iter()
-            .skip(1)
-            .find(|t| !is_flag(t))
-            .map(String::as_str);
+        // Global options before the subcommand, skipping the values of those that take one.
+        let mut i = 1;
+        while let Some(t) = tokens.get(i) {
+            if matches!(
+                t.as_str(),
+                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+            ) {
+                i += 2;
+            } else if is_flag(t) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let sub = tokens.get(i).map(String::as_str);
         if matches!(sub, Some("show" | "cat-file")) {
-            for arg in tokens.iter().skip(2).filter(|t| !is_flag(t)) {
+            for arg in tokens.iter().skip(i + 1).filter(|t| !is_flag(t)) {
                 let Some((_, path)) = arg.split_once(':') else {
                     continue;
                 };
@@ -232,13 +242,14 @@ fn decide_segment(segment: &str, policy: &Policy, cwd: Option<&Path>) -> Decisio
 }
 
 /// Leading `NAME=VALUE` assignments and wrapper commands (`sudo`, `env -i`, `command`, …)
-/// split off the command they run.
-fn strip_wrappers(tokens: &[String]) -> (&[String], &[String]) {
+/// split off the command they run. Assignments after `env` are collected too.
+fn strip_wrappers(tokens: &[String]) -> (Vec<&String>, &[String]) {
     let mut i = 0;
+    let mut assignments = Vec::new();
     while i < tokens.len() && is_assignment(&tokens[i]) {
+        assignments.push(&tokens[i]);
         i += 1;
     }
-    let assignments = &tokens[..i];
     while let Some(tok) = tokens.get(i) {
         let prog = base_program(tok);
         if !WRAPPERS.contains(&prog.as_str()) {
@@ -256,6 +267,7 @@ fn strip_wrappers(tokens: &[String]) -> (&[String], &[String]) {
                 );
                 i += if takes_value { 2 } else { 1 };
             } else if is_assignment(t) {
+                assignments.push(t);
                 i += 1;
             } else {
                 break;
@@ -274,8 +286,29 @@ fn is_assignment(tok: &str) -> bool {
     })
 }
 
-/// The verdict for a `<` input redirection from a secret file, if any.
+/// The verdict for reading a secret through a redirection-like form, if any: `< file`,
+/// `$(<file)` (anywhere, assignments included) and `dd if=file`.
 fn decide_redirects(tokens: &[String], policy: &Policy, cwd: Option<&Path>) -> Option<Decision> {
+    for tok in tokens {
+        let mut rest = tok.as_str();
+        while let Some(i) = rest.find("$(<") {
+            let inner = &rest[i + 3..];
+            let path = inner.split(')').next().unwrap_or("").trim();
+            if let Some(decision) = secret_arg_decision(path, "$(<…)", policy, cwd) {
+                return Some(decision);
+            }
+            rest = inner;
+        }
+    }
+    if tokens.iter().any(|t| base_program(t) == "dd") {
+        for tok in tokens {
+            if let Some(path) = tok.strip_prefix("if=") {
+                if let Some(decision) = secret_arg_decision(path, "dd", policy, cwd) {
+                    return Some(decision);
+                }
+            }
+        }
+    }
     let mut iter = tokens.iter().peekable();
     while let Some(tok) = iter.next() {
         let target = if tok == "<" {
@@ -353,35 +386,58 @@ fn classify_arg(arg: &str, policy: &Policy) -> Option<ArgClass> {
 }
 
 /// The arguments after `varlock` when `tokens` runs it, directly or through a package runner
-/// (`npx`, `pnpm exec|dlx`, `yarn [dlx]`, `bunx`, `bun x`, `npm exec`).
+/// (`npx`, `pnpx`, `pnpm`, `yarn`, `bunx`, `bun`, `npm`, in any of their run/exec/dlx forms).
+/// After a runner, the first `varlock` token that is not the value of a flag (`--package`,
+/// `--filter`, …) is the binary: `npx -p varlock varlock printenv` → `printenv`.
 fn varlock_args(tokens: &[String]) -> Option<&[String]> {
     let prog = base_program(tokens.first()?);
-    let mut i = match prog.as_str() {
-        "varlock" => return Some(&tokens[1..]),
-        "npx" | "bunx" | "yarn" => 1,
-        "pnpm" | "bun" | "npm" => {
-            let sub = tokens.get(1).map(String::as_str)?;
-            if !matches!(sub, "exec" | "dlx" | "x") {
-                return None;
-            }
-            2
+    if prog == "varlock" {
+        return Some(&tokens[1..]);
+    }
+    if !matches!(
+        prog.as_str(),
+        "npx" | "pnpx" | "pnpm" | "yarn" | "bunx" | "bun" | "npm"
+    ) {
+        return None;
+    }
+    let mut i = 1;
+    while let Some(tok) = tokens.get(i) {
+        if tok == "--" {
+            i += 1;
+            continue;
         }
-        _ => return None,
-    };
-    if prog == "yarn" && tokens.get(i).map(String::as_str) == Some("dlx") {
+        if tok.starts_with('-') {
+            let takes_value = !tok.contains('=')
+                && matches!(
+                    tok.as_str(),
+                    "-p" | "--package"
+                        | "--filter"
+                        | "-F"
+                        | "-C"
+                        | "--dir"
+                        | "--cwd"
+                        | "--prefix"
+                        | "-w"
+                        | "--workspace"
+                        | "--registry"
+                        | "-c"
+                        | "--call"
+                );
+            i += if takes_value { 2 } else { 1 };
+            continue;
+        }
+        let name = tok.split('@').find(|s| !s.is_empty()).unwrap_or("");
+        if base_program(name) == "varlock" {
+            return Some(&tokens[i + 1..]);
+        }
         i += 1;
     }
-    while tokens.get(i).is_some_and(|t| t.starts_with('-')) {
-        i += 1;
-    }
-    let pkg = tokens.get(i)?;
-    let name = pkg.split('@').find(|s| !s.is_empty()).unwrap_or("");
-    (base_program(name) == "varlock").then(|| &tokens[i + 1..])
+    None
 }
 
 /// varlock subcommands that print resolved values are treated like `cat .env`; turning off
 /// `varlock run` output redaction asks (spec D3.8.5). safe-ai-skill never runs varlock itself.
-fn decide_varlock(args: &[String], assignments: &[String], policy: &Policy) -> Decision {
+fn decide_varlock(args: &[String], assignments: &[&String], policy: &Policy) -> Decision {
     let positional: Vec<&str> = args
         .iter()
         .map(String::as_str)
@@ -403,7 +459,8 @@ fn decide_varlock(args: &[String], assignments: &[String], policy: &Policy) -> D
     };
     if prints {
         let reason = format!(
-            "safe-ai-skill: `varlock {sub}` prints resolved secret values into the transcript.              Use `varlock load --agent` (redacted) to see the config, or `varlock run -- <cmd>` to run a tool with the values injected;              `safe-ai-skill env keys <file>` lists keys with values masked."
+            "safe-ai-skill: `varlock {sub}` prints resolved secret values into the transcript. {}",
+            "Use `varlock load --agent` (redacted) to see the config, or `varlock run -- <cmd>` to run a tool with the values injected; `safe-ai-skill env keys <file>` lists keys with values masked."
         );
         return if policy.secrets.env_read == "ask" {
             Decision::Ask { reason }

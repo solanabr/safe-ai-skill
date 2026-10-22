@@ -31,7 +31,11 @@ pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 /// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
 /// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
 pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
+    if is_binary_payload(response) {
+        return None;
+    }
     match response {
+        Value::String(text) if is_base64_blob(text) => None,
         Value::String(text) => {
             let after_values = scrub_values(text, values);
             let base = after_values.as_deref().unwrap_or(text);
@@ -69,9 +73,33 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
     }
 }
 
+/// Image / PDF payloads are left alone: their base64 data would trip the base58 detector
+/// (about once per 200 KB of random base64) and a changed byte corrupts the file. Read
+/// `{type:"image"|"pdf",file:{…}}`, Bash `{isImage:true,…}`, MCP `{type:"image",data:…}`.
+fn is_binary_payload(value: &Value) -> bool {
+    let Value::Object(map) = value else {
+        return false;
+    };
+    let typed = map
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| matches!(t, "image" | "pdf" | "document" | "audio"));
+    typed || map.get("isImage").and_then(Value::as_bool) == Some(true)
+}
+
+/// One unbroken base64 / base64url run longer than 1 KiB (an inline file, not text).
+fn is_base64_blob(text: &str) -> bool {
+    text.len() > 1024
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+}
+
 /// Replace each occurrence of a known env value with `«redacted:KEY»`. `values` should be
 /// longest first (as [`crate::env::values::load`] returns them) so a value containing another
 /// is replaced whole. `None` when nothing matched.
+/// Only whole tokens match: the characters on both sides of an occurrence must not be
+/// `[A-Za-z0-9_]` (so `postgres` is not replaced inside `postgresql`).
 pub fn scrub_values(text: &str, values: &[KnownValue]) -> Option<String> {
     let mut out: Option<String> = None;
     for known in values {
@@ -79,12 +107,67 @@ pub fn scrub_values(text: &str, values: &[KnownValue]) -> Option<String> {
             continue;
         }
         let current = out.as_deref().unwrap_or(text);
-        if current.contains(&known.value) {
-            let marker = format!("«redacted:{}»", known.key);
-            out = Some(current.replace(&known.value, &marker));
+        if let Some(replaced) = replace_tokens(current, &known.value, &known.key) {
+            out = Some(replaced);
         }
     }
     out
+}
+
+/// `text` with whole-token occurrences of `value` replaced, or `None` when there are none.
+fn replace_tokens(text: &str, value: &str, key: &str) -> Option<String> {
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    let mut out = String::new();
+    let mut cursor = 0;
+    let mut changed = false;
+    for (start, _) in text.match_indices(value) {
+        if start < cursor {
+            continue;
+        }
+        let end = start + value.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        if is_word(before) || is_word(after) {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&format!("«redacted:{key}»"));
+        cursor = end;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&text[cursor..]);
+    Some(out)
+}
+
+/// Key names that announce a secret (`*_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, …).
+/// Shared with the value scrub; H9's `contains_key_material` key-name set should merge here.
+pub(crate) fn is_secret_key_name(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    [
+        "KEY",
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "PWD",
+        "PRIVATE",
+        "CREDENTIAL",
+        "AUTH",
+        "SEED",
+        "MNEMONIC",
+        "JWT",
+        "SIGNATURE",
+        "COOKIE",
+        "SESSION",
+        "DSN",
+        "WEBHOOK",
+    ]
+    .iter()
+    .any(|w| k.contains(w))
 }
 
 /// A single redaction span: `[start, end)` byte range and the marker kind.
@@ -630,6 +713,38 @@ mod tests {
             Some("x «redacted:LONG» y «redacted:SHORT»")
         );
         assert_eq!(scrub_values("clean", &values), None);
+    }
+
+    #[test]
+    fn scrub_values_matches_whole_tokens_only() {
+        let values = [known("DB", "postgres-main")];
+        assert_eq!(
+            scrub_values("xpostgres-main postgres-main_1", &values),
+            None
+        );
+        assert_eq!(
+            scrub_values("(postgres-main)", &values).as_deref(),
+            Some("(«redacted:DB»)")
+        );
+        assert_eq!(
+            scrub_values("postgres-main", &values).as_deref(),
+            Some("«redacted:DB»")
+        );
+    }
+
+    #[test]
+    fn binary_payloads_are_left_alone() {
+        let arr: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let keypair = format!("[{}]", arr.join(","));
+        for v in [
+            json!({ "type": "image", "file": { "base64": keypair, "type": "image/png" } }),
+            json!({ "stdout": keypair, "isImage": true }),
+            json!([{ "type": "image", "data": keypair, "mimeType": "image/png" }]),
+        ] {
+            assert_eq!(scrub_response(&v, &[]), None, "{v}");
+        }
+        let blob = bs58::encode([9u8; 64]).into_string().repeat(20);
+        assert_eq!(scrub_response(&json!(blob), &[]), None);
     }
 
     #[test]

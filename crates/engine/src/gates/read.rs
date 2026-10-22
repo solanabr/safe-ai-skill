@@ -31,8 +31,10 @@ use crate::io::Decision;
 use crate::policy::Policy;
 use crate::redact;
 
-/// Appended to a directory Grep's `glob`: env-class names and key files, case-insensitive
-/// (`rg --glob` is case-sensitive). Template and schema files fall under `.env.*` as well.
+/// Appended to a directory Grep's `glob`: env-class names, key files and the hard-deny trees,
+/// case-insensitive (`rg --glob` is case-sensitive). Template and schema files fall under
+/// `.env.*` too, so a directory Grep never searches `.env.example` or `.env.schema` (read them
+/// directly); re-including them would turn the glob list into a whitelist.
 const GREP_EXCLUDED: &[&str] = &[
     "**/.env",
     "**/.env.*",
@@ -45,6 +47,11 @@ const GREP_EXCLUDED: &[&str] = &[
     "**/id.json",
     "**/*.pem",
     "**/*.key",
+    "**/.ssh/id_*",
+    "**/.config/solana/**",
+    "**/.superstack/**",
+    "**/.config/varlock/**",
+    "**/.varlock/**",
 ];
 
 /// Names a Grep `glob` is tried against: one that matches a secret probe and no benign probe
@@ -258,6 +265,7 @@ fn expand_home(path: &str) -> String {
 fn absolute(path: &str, cwd: &Path, homes: &[String]) -> PathBuf {
     let expanded = match (path.strip_prefix("~/"), homes.first()) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        (None, Some(home)) if path == "~" => PathBuf::from(home),
         _ => PathBuf::from(path),
     };
     if expanded.is_absolute() || is_windows_absolute(path) {
@@ -461,6 +469,16 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     if in_hard_tree {
         return ReadVerdict::Decide(hard_deny("search inside a key directory"));
     }
+    // Grep passes `--hidden`: a search from $HOME, ~/.config or any ancestor reaches ~/.ssh and
+    // ~/.config/solana, and name exclusions cannot cover every key file name there.
+    if [&target, &real]
+        .iter()
+        .any(|p| contains_hard_tree(p, &homes))
+    {
+        return ReadVerdict::Decide(hard_deny(
+            "search over a directory that contains ~/.ssh or ~/.config/solana; pass a project path",
+        ));
+    }
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
         return ReadVerdict::Decide(env_verdict(first, policy, varlock_hint(cwd, &real)));
@@ -475,6 +493,30 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     let mut updated = input.clone();
     updated.insert("glob".into(), Value::String(new_glob));
     ReadVerdict::Rewrite(Value::Object(updated))
+}
+
+/// Whether `dir` is an ancestor of (or equal to) a home hard-deny tree.
+fn contains_hard_tree(dir: &Path, homes: &[String]) -> bool {
+    let dir = PathBuf::from(secretpath::normalize(&dir.to_string_lossy(), None));
+    homes.iter().any(|home| {
+        let home = secretpath::normalize(home, None);
+        [
+            ".ssh",
+            ".config/solana",
+            ".superstack",
+            ".config/varlock",
+            ".varlock",
+        ]
+        .iter()
+        .any(|tree| Path::new(&home).join(tree).starts_with(&dir))
+    }) || std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|x| !x.is_empty())
+        .is_some_and(|x| {
+            Path::new(&secretpath::normalize(&x, None))
+                .join("varlock")
+                .starts_with(&dir)
+        })
 }
 
 /// The ` !{…}` negated brace group appended to a directory Grep's glob.

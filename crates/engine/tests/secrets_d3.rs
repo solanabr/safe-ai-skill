@@ -263,10 +263,13 @@ fn read_pem_denies_private_keys_only() {
     assert_eq!(sb.read("cert.pem"), "");
     sb.write(
         "bundle.pem",
-        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\nMHc\n",
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBkg4LVWM9nuwNSk3yByxZpYRTBnVJk5\n",
     );
     assert_eq!(sb.read("bundle.pem"), "deny");
-    sb.write("notes.md", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3Bl\n");
+    sb.write(
+        "notes.md",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAE\n",
+    );
     assert_eq!(
         sb.read("notes.md"),
         "deny",
@@ -831,4 +834,151 @@ fn redact_never_prints_values_on_stderr() {
     let run = sb.redact("Bash", json!({ "stdout": VALUE }));
     assert!(!run.stderr.contains(VALUE), "{}", run.stderr);
     assert!(!run.stdout.contains(VALUE), "{}", run.stdout);
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn grep_over_an_ancestor_of_a_key_tree_denies() {
+    let sb = Sandbox::new();
+    std::fs::create_dir_all(sb.home.join(".ssh")).unwrap();
+    std::fs::create_dir_all(sb.home.join(".config/solana")).unwrap();
+    let home = sb.home.path().to_str().unwrap().to_string();
+    for path in [
+        home.clone(),
+        format!("{home}/.config"),
+        "~".into(),
+        "/".into(),
+    ] {
+        let run = sb.pre("gate-read", "Grep", json!({ "pattern": "x", "path": path }));
+        assert_eq!(decision_label(&run), "deny", "{path}");
+    }
+    // cwd = $HOME and no path.
+    let run = sb.run(
+        "gate-read",
+        json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": sb.home.path(),
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "x" },
+        }),
+    );
+    assert_eq!(decision_label(&run), "deny");
+}
+
+#[test]
+fn grep_exclusion_covers_nested_key_trees() {
+    let sb = Sandbox::new();
+    let run = sb.pre("gate-read", "Grep", json!({ "pattern": "x" }));
+    let glob = run.json()["hookSpecificOutput"]["updatedInput"]["glob"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for part in [
+        "**/.[sS][sS][hH]/[iI][dD]_*",
+        "**/.[cC][oO][nN][fF][iI][gG]/[sS][oO][lL][aA][nN][aA]/**",
+    ] {
+        assert!(glob.contains(part), "{part}: {glob}");
+    }
+}
+
+/// Deterministic pseudo-random base64 of `n` bytes.
+fn random_base64(n: usize) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ALPHA[(x % 64) as usize] as char
+        })
+        .collect()
+}
+
+#[test]
+fn redact_leaves_images_and_blobs_unchanged() {
+    let sb = env_sandbox();
+    let data = random_base64(3 * 1024 * 1024);
+    let read_image = json!({ "type": "image", "file": { "base64": data, "type": "image/png", "originalSize": 1 } });
+    assert_silent(&sb.redact("Read", read_image), "Read image");
+    let mcp = json!([{ "type": "image", "data": data, "mimeType": "image/png" }]);
+    assert_silent(
+        &sb.redact("mcp__playwright__browser_take_screenshot", mcp),
+        "MCP image",
+    );
+    let blob = json!({ "stdout": data, "stderr": "" });
+    assert_silent(&sb.redact("Bash", blob), "base64 blob");
+}
+
+#[test]
+fn redact_value_pass_respects_token_boundaries_and_plain_identifiers() {
+    let sb = Sandbox::new();
+    sb.write(
+        ".env",
+        "DB_HOST=postgres\nREGION=us-east-1\nHOST=127.0.0.1\nAPI_TOKEN=tok_9f8e7d6c5b4a\n",
+    );
+    let out = updated(&sb.redact(
+        "Bash",
+        json!({ "stdout": "postgresql://127.0.0.1 us-east-1 xtok_9f8e7d6c5b4a tok_9f8e7d6c5b4a" }),
+    ));
+    assert_eq!(
+        out["stdout"],
+        "postgresql://127.0.0.1 us-east-1 xtok_9f8e7d6c5b4a «redacted:API_TOKEN»"
+    );
+}
+
+#[test]
+fn bash_varlock_runner_forms_deny() {
+    let sb = Sandbox::new();
+    for cmd in [
+        "pnpm varlock printenv K",
+        "yarn run varlock printenv K",
+        "yarn exec varlock reveal K",
+        "npx --package varlock varlock printenv K",
+        "npx -p varlock varlock printenv K",
+        "pnpm --filter web exec varlock printenv K",
+        "pnpx varlock reveal K",
+        "npm exec -- varlock printenv K",
+    ] {
+        assert_eq!(decision_label(&sb.bash(cmd)), "deny", "{cmd}");
+    }
+    assert_eq!(
+        decision_label(&sb.bash("env _VARLOCK_REDACT_STDOUT=0 varlock run -- node a.js")),
+        "ask"
+    );
+    assert_silent(&sb.bash("npm install varlock"), "install");
+}
+
+#[test]
+fn bash_more_reader_forms_deny() {
+    let sb = Sandbox::new();
+    for cmd in [
+        "git -C sub show HEAD:.env",
+        "git -c core.pager=cat show HEAD:.env",
+        "sort .env",
+        "cut -d= -f2 .env",
+        "diff .env .env.local",
+        "jq . .env",
+        "dd if=.env of=/dev/stdout",
+        "echo \"$(<.env)\"",
+        "x=$(<.env)",
+        "cat .\u{17F}sh/id_rsa",
+        "cat wallet-\u{212A}eypair.json",
+    ] {
+        assert_eq!(decision_label(&sb.bash(cmd)), "deny", "{cmd}");
+    }
+    assert_silent(&sb.bash("jq .env config.json"), "jq filter named .env");
+}
+
+#[test]
+fn read_private_key_header_without_body_has_no_opinion() {
+    let sb = Sandbox::new();
+    sb.write(
+        "detector.rs",
+        "const HEADER: &str = \"-----BEGIN PRIVATE KEY-----\";\nfn main() {}\n",
+    );
+    assert_eq!(sb.read("detector.rs"), "");
 }
