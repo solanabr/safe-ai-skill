@@ -124,19 +124,21 @@ const TRIGGERS: &[&str] = &["solana", "spl-token", "anchor", "keygen", "xargs"];
 /// gate's), an expansion or an unquoted glob. `false` lets `gate-bash`, wired for every Bash
 /// call, answer no opinion before loading policy, lists or state. It parses the command once.
 pub fn may_concern(command: &str) -> bool {
-    if over_work_cap(command) {
-        return true;
-    }
     let lower = command.to_ascii_lowercase();
-    if lower.contains("$'") || lower.contains('>') {
-        return true;
-    }
     let joined = lower.replace("\\\r\n", "").replace("\\\n", "");
     let plain: String = joined
         .chars()
         .filter(|c| !matches!(c, '"' | '\'' | '\\'))
         .collect();
-    if TRIGGERS.iter().any(|w| plain.contains(w)) {
+    if lower.contains("$'") || TRIGGERS.iter().any(|w| plain.contains(w)) {
+        return true;
+    }
+    // Nothing names a trigger: an oversized command (a large here-doc, say) is ruled out
+    // without parsing; a deeply nested one could build a program name, so it asks.
+    if command.len() > MAX_PARSE_BYTES {
+        return false;
+    }
+    if over_work_cap(command) || lower.contains('>') {
         return true;
     }
     let parsed = shell::parse(command);
@@ -150,6 +152,7 @@ pub fn may_concern(command: &str) -> bool {
                 || program == "solana-keygen"
                 || crate::gates::wallet::is_file_clobber(&program)
                 || c.words.first().is_some_and(unresolved_program_word)
+                || find_exec(c).is_some()
         })
 }
 
@@ -328,6 +331,7 @@ pub fn indirection_prefilter_in(
 /// Whether the always-on hook decides `parsed` itself (see [`indirection_prefilter`]).
 fn is_routed(parsed: &Parsed) -> bool {
     parsed.unparseable
+        || parsed.opaque
         || parsed.opaque_mention
         || parsed.write_then_run
         || parsed.commands.iter().any(|c| {
@@ -377,6 +381,19 @@ fn decide_parsed(
     ctx: &Context,
     policy: &Policy,
 ) -> (Decision, GateMeta) {
+    decide_parsed_at(command, parsed, ctx, policy, 0)
+}
+
+/// Deepest dynamic `eval`/`-c` script re-parsed by [`hidden_decision`]; deeper asks.
+const MAX_HIDDEN_DEPTH: usize = 4;
+
+fn decide_parsed_at(
+    command: &str,
+    parsed: &Parsed,
+    ctx: &Context,
+    policy: &Policy,
+    depth: usize,
+) -> (Decision, GateMeta) {
     let tier = policy.tier();
     // A solana-family program named where the parser cannot follow: unparseable text, or an
     // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
@@ -397,8 +414,14 @@ fn decide_parsed(
     // config): the default for the commands after it.
     let mut config: Option<(Network, String)> = None;
     let placeholders = xargs_placeholders(command);
+    // Directories an earlier `cd`/`pushd` names (lowercased), or `None` once one cannot be
+    // placed: a relative write onto `config.yml` there may be the CLI config.
+    let mut cd_dirs: Option<Vec<String>> = Some(Vec::new());
+    // Ask components for a joined reason: (risk, description).
+    let mut asks: Vec<(u8, String)> = Vec::new();
 
     for cmd in &parsed.commands {
+        track_cd(cmd, &mut cd_dirs);
         let candidate = if cmd.is_family() {
             family_decision(
                 command,
@@ -413,13 +436,19 @@ fn decide_parsed(
             dynamic_decision(command, cmd, parsed, ctx, tier, &placeholders)
         {
             verdict
+        } else if let Some(verdict) = hidden_decision(command, cmd, parsed, ctx, policy, depth) {
+            verdict
         } else {
             unvetted = true;
-            if let Some(change) = config_write(command, cmd) {
+            if let Some(change) = config_write(command, cmd, cd_dirs.as_deref()) {
                 config = Some(change);
             }
             continue;
         };
+        if let Decision::Ask { reason } = &candidate.0 {
+            let net = segment_network(cmd, parsed, ctx, config.as_ref());
+            asks.push(ask_component(reason, &candidate.1, net, cmd));
+        }
         if let Some(change) = config_set(cmd) {
             config = Some(change);
         }
@@ -459,6 +488,11 @@ fn decide_parsed(
         }
         if matches!(decision, Decision::Ask { .. }) && (gated > 1 || hard_ask) {
             meta.hard_guard = true;
+        }
+        if asks.len() > 1 && matches!(decision, Decision::Ask { .. }) {
+            *decision = Decision::Ask {
+                reason: joined_reason(asks),
+            };
         }
     }
 
@@ -751,10 +785,19 @@ fn config_set(cmd: &SimpleCommand) -> Option<(Network, String)> {
 
 /// A command that writes, copies, moves or edits a solana CLI config file: later commands'
 /// default cluster is unknown.
-fn config_write(command: &str, cmd: &SimpleCommand) -> Option<(Network, String)> {
+fn config_write(
+    command: &str,
+    cmd: &SimpleCommand,
+    cd_dirs: Option<&[String]>,
+) -> Option<(Network, String)> {
+    // After a `cd` into a `solana/cli` directory, or one the gate cannot place, a relative
+    // `config.yml` may be the CLI config.
+    let in_cli_dir = cd_dirs.is_none_or(|dirs| dirs.iter().any(|d| d.contains("solana/cli")));
     let names_config = |t: &str| {
         let t = t.to_ascii_lowercase();
-        t.contains("solana/cli/") || t.ends_with("cli/config.yml")
+        t.contains("solana/cli/")
+            || t.ends_with("cli/config.yml")
+            || (in_cli_dir && !t.starts_with(['/', '~', '$']) && t.ends_with("config.yml"))
     };
     let program = cmd.program();
     let edits = crate::gates::wallet::is_file_clobber(&program)
@@ -763,8 +806,174 @@ fn config_write(command: &str, cmd: &SimpleCommand) -> Option<(Network, String)>
             "sed" | "perl" | "ed" | "ex" | "awk" | "python" | "python3"
         );
     let by_words = edits && cmd.words.iter().skip(1).any(|w| names_config(&w.text));
-    let by_redirect = cmd.writes_file && names_config(command);
+    let by_redirect = cmd.writes_file && {
+        let t = command.to_ascii_lowercase();
+        t.contains("solana/cli/")
+            || t.contains("cli/config.yml")
+            || (in_cli_dir && t.contains("config.yml"))
+    };
     (by_words || by_redirect).then(|| (Network::Unknown, format!("{program} onto the CLI config")))
+}
+
+/// Record a `cd`/`pushd` target (lowercased text) in `dirs`; one the gate cannot read (none,
+/// `-`, an expansion) or a `popd` makes the set unknown (`None`).
+fn track_cd(cmd: &SimpleCommand, dirs: &mut Option<Vec<String>>) {
+    let program = cmd.program();
+    if program == "popd" {
+        *dirs = None;
+        return;
+    }
+    if program != "cd" && program != "pushd" {
+        return;
+    }
+    let target = cmd.words.iter().skip(1).find(|w| !w.text.starts_with('-'));
+    match (target, dirs.as_mut()) {
+        (Some(w), Some(list)) if !w.dynamic && !w.splits => {
+            list.push(w.text.to_ascii_lowercase());
+        }
+        _ => *dirs = None,
+    }
+}
+
+/// The script of an `eval` or `sh|bash|… -c` whose text holds an expansion (the parser leaves
+/// it opaque): `eval "$S program close …"`, `bash -c "$(…) program close …"`.
+pub(crate) fn dynamic_script(cmd: &SimpleCommand) -> Option<String> {
+    let program = cmd.program();
+    let args = cmd.words.get(1..).unwrap_or_default();
+    if program == "eval" {
+        return args.iter().any(|w| w.dynamic).then(|| {
+            args.iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    }
+    const SHELLS: &[&str] = &[
+        "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "busybox",
+    ];
+    if !SHELLS.contains(&program.as_str()) {
+        return None;
+    }
+    let at = args.iter().position(|w| {
+        w.text == "-c"
+            || (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.ends_with('c'))
+    })?;
+    let script = args.get(at + 1)?;
+    script.dynamic.then(|| script.text.clone())
+}
+
+/// The command `find … -exec|-execdir|-ok|-okdir {} …` runs when its program word is the
+/// found file (`{}`): whatever the name test matched.
+fn find_exec(cmd: &SimpleCommand) -> Option<SimpleCommand> {
+    if cmd.program() != "find" {
+        return None;
+    }
+    let at = cmd
+        .words
+        .iter()
+        .position(|w| matches!(w.text.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))?;
+    let rest = cmd.words.get(at + 1..)?;
+    if !rest.first().is_some_and(|w| w.text.contains("{}")) {
+        return None;
+    }
+    let words: Vec<shell::Word> = rest
+        .iter()
+        .take_while(|w| !matches!(w.text.as_str(), ";" | "\\;" | "+"))
+        .cloned()
+        .collect();
+    Some(SimpleCommand {
+        words,
+        indirect: true,
+        writes_file: false,
+        canonical: false,
+    })
+}
+
+/// A command the parser could not open: a dynamic `eval`/`-c` script, re-parsed with its
+/// expansions as dynamic words and decided like the unwrapped form; or a `find -exec {}`,
+/// decided as an expansion program. `None` for neither, or when the script decides nothing.
+fn hidden_decision(
+    command: &str,
+    cmd: &SimpleCommand,
+    parsed: &Parsed,
+    ctx: &Context,
+    policy: &Policy,
+    depth: usize,
+) -> Option<(Decision, GateMeta)> {
+    let tier = policy.tier();
+    if let Some(script) = dynamic_script(cmd) {
+        if depth >= MAX_HIDDEN_DEPTH || over_work_cap(&script) {
+            return Some(unreadable_at(ask_unparseable(), tier));
+        }
+        let inner = shell::parse(&script);
+        let (decision, meta) = decide_parsed_at(command, &inner, ctx, policy, depth + 1);
+        return (decision != Decision::Defer).then_some((decision, meta));
+    }
+    let exec = find_exec(cmd)?;
+    dynamic_decision(command, &exec, parsed, ctx, tier, &["{}".to_string()])
+}
+
+/// The cluster a gated command was judged on, for ranking ask reasons (Unknown for a command
+/// whose program is not a family one).
+fn segment_network(
+    cmd: &SimpleCommand,
+    parsed: &Parsed,
+    ctx: &Context,
+    config: Option<&(Network, String)>,
+) -> Network {
+    if !cmd.is_family() {
+        return Network::Unknown;
+    }
+    let argv = Argv::from_shell(&cmd.words);
+    command_cluster(cmd, &argv, &cmd.program(), ctx, parsed, config).network
+}
+
+/// One ask of a joined command: its risk (hard guard, cluster) and a description naming the
+/// cluster and the command.
+fn ask_component(
+    reason: &str,
+    meta: &GateMeta,
+    network: Network,
+    cmd: &SimpleCommand,
+) -> (u8, String) {
+    let cluster_risk: u8 = match network {
+        Network::Mainnet => 3,
+        Network::Unknown => 2,
+        Network::Testnet => 1,
+        Network::Devnet | Network::Localnet => 0,
+    };
+    let counterparty = matches!(
+        meta.scope,
+        Scope::Transfer | Scope::Deploy | Scope::Authority | Scope::Destructive
+    );
+    let risk = cluster_risk
+        .saturating_mul(4)
+        .saturating_add(u8::from(counterparty).saturating_mul(2))
+        .saturating_add(u8::from(meta.hard_guard));
+    let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+    let shown = echo(&words.join(" "));
+    let what = reason.trim_end_matches(" — approve to proceed");
+    (
+        risk,
+        format!("{what} (on {}: `{shown}`)", cluster_label(network)),
+    )
+}
+
+/// The reason for an ask joined from several commands: the riskiest first.
+fn joined_reason(mut asks: Vec<(u8, String)>) -> String {
+    asks.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut parts = asks.into_iter().map(|(_, d)| d);
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<String> = parts.collect();
+    if rest.is_empty() {
+        format!("{first} — approve to proceed")
+    } else {
+        format!(
+            "Several gated actions in one call (no grant covers them together). Riskiest: \
+             {first}; also: {} — approve to proceed",
+            rest.join("; ")
+        )
+    }
 }
 
 /// Class U rows the shared list does not spell but this gate also treats as Class U (same
@@ -950,7 +1159,8 @@ fn unreadable_at((decision, meta): (Decision, GateMeta), tier: Tier) -> (Decisio
         Decision::Ask { reason } if tier == Tier::High => (
             Decision::Deny {
                 reason: format!(
-                    "{reason} — denied at tier high: the gate cannot tell what this runs"
+                    "{} — denied at tier high: the gate cannot tell what this runs",
+                    reason.trim_end_matches(" — approve to proceed")
                 ),
             },
             meta,

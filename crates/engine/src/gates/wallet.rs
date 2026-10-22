@@ -60,13 +60,27 @@ pub(crate) fn is_file_clobber(program: &str) -> bool {
 /// The verdict for a Bash `command` run in `cwd`; `None` is no opinion.
 pub fn decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
     let _ = (policy, tier);
-    let parsed = shell::parse(command);
-    let redirects = command.contains('>');
+    decide_text(command, command, cwd, 0)
+}
+
+/// Deepest dynamic `eval`/`-c` script re-parsed for wallet shapes.
+const MAX_SCRIPT_DEPTH: usize = 4;
+
+/// [`decide_bash`] for `text` (the whole `command`, or a dynamic `eval`/`-c` script in it,
+/// re-parsed with its expansions as dynamic words).
+fn decide_text(command: &str, text: &str, cwd: &Path, depth: usize) -> Option<Verdict> {
+    let parsed = shell::parse(text);
+    let redirects = text.contains('>');
     let relevant = |c: &SimpleCommand| {
         let p = c.program();
         p == "solana-keygen" || is_file_clobber(&p)
     };
-    if !redirects && !parsed.commands.iter().any(relevant) {
+    let scripts: Vec<String> = parsed
+        .commands
+        .iter()
+        .filter_map(crate::gates::bash::dynamic_script)
+        .collect();
+    if !redirects && scripts.is_empty() && !parsed.commands.iter().any(relevant) {
         return None;
     }
     let homes = Homes::from_env();
@@ -85,11 +99,17 @@ pub fn decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Op
             return Some(deny(reason, command));
         }
     }
-    if !redirects {
+    if redirects {
+        if let Some(target) = redirect_target(text, &dirs, &homes, &wallets) {
+            return Some(deny(format!("a redirection overwrites {target}"), command));
+        }
+    }
+    if depth >= MAX_SCRIPT_DEPTH {
         return None;
     }
-    redirect_target(command, &dirs, &homes, &wallets)
-        .map(|target| deny(format!("a redirection overwrites {target}"), command))
+    scripts
+        .iter()
+        .find_map(|script| decide_text(command, script, cwd, depth + 1))
 }
 
 /// The directories a relative path may resolve against, as the command line goes.
@@ -367,6 +387,9 @@ fn resolve(raw: &str, cwd: &Path, homes: &Homes) -> Option<PathBuf> {
         .iter()
         .find_map(|p| raw.strip_prefix(p));
     let joined = if let Some(rest) = home_rel {
+        if rest.contains(['$', '`']) {
+            return None;
+        }
         homes.expand_base()?.join(rest)
     } else if matches!(raw, "~" | "$HOME" | "${HOME}") {
         homes.expand_base()?.to_path_buf()
@@ -560,6 +583,18 @@ fn path_hit(
 ) -> Option<Hit> {
     let resolved = dirs.resolve_all(raw, homes);
     if resolved.is_empty() {
+        // An expansion: a delete or move under a directory holding the wallet may reach it
+        // (`rm -rf ~/.config/$X`).
+        if ancestors {
+            if let Some((prefix, _)) = raw.split_once('$').and_then(|(p, _)| p.rsplit_once('/')) {
+                let base = if prefix.is_empty() { "/" } else { prefix };
+                for dir in dirs.resolve_all(base, homes) {
+                    if let Some(t) = wallets.hit_or_holds(&dir, true) {
+                        return Some(Hit::Wallet(format!("{t} (`{raw}` may name it)")));
+                    }
+                }
+            }
+        }
         return Some(Hit::Unresolved);
     }
     let globbed = globs && raw.contains(['*', '?', '[']);

@@ -1132,7 +1132,7 @@ fn fast_path_follows_line_continuations() {
 
 #[test]
 fn oversized_or_deeply_nested_commands_ask_without_parsing() {
-    let big = format!("echo {}", "a".repeat(bash::MAX_PARSE_BYTES));
+    let big = format!("echo solana {}", "a".repeat(bash::MAX_PARSE_BYTES));
     let nested = format!("echo {}x{}", "$(".repeat(3000), ")".repeat(3000));
     for cmd in [&big, &nested] {
         assert!(bash::over_work_cap(cmd));
@@ -1196,5 +1196,136 @@ fn e2e_wallet_directories_globs_and_cd() {
         "rm ~/.config/solana/cli/*.bak",
     ] {
         assert_eq!(w.bash(cmd, Tier::Relaxed), "", "{cmd}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review 1): dynamic eval / -c scripts, find -exec {}, config writes after
+// cd, joined reasons, unreadable High reason, size cap only when not ruled out.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn dynamic_eval_and_shell_c_scripts_are_judged_like_the_unwrapped_form() {
+    for cmd in [
+        r#"eval "$S program close P --bypass-warning -um""#,
+        r#"eval "$(printf so)lana program close P --bypass-warning -um""#,
+        "eval $(echo c29sYW5h | base64 -d) program close P --bypass-warning -um",
+        r#"bash -c "$(printf 'so%sna' la) program close P --bypass-warning -um""#,
+        r#"sh -lc "$T burn A 1 -ut""#,
+        r#"eval "$S program close P --bypass-warning""#,
+    ] {
+        assert!(bash::may_concern(cmd), "{cmd}");
+        assert_eq!(x4(cmd, Setup::at), ["deny"; 4], "{cmd}");
+        assert_eq!(
+            x4(cmd, |t| Setup::at(t).grant().headless()),
+            ["deny"; 4],
+            "{cmd}"
+        );
+    }
+    // On devnet: the expansion's ask, denied at High.
+    assert_eq!(
+        x4(
+            r#"eval "$S program close P --bypass-warning -ud""#,
+            Setup::at
+        ),
+        ["ask", "ask", "ask", "deny"]
+    );
+    // A dynamic script with nothing solana-shaped keeps no opinion.
+    assert_eq!(x4(r#"eval "$CMD --help""#, Setup::at), ["", "", "", ""]);
+}
+
+#[test]
+fn find_exec_of_the_found_file_is_an_unresolved_program() {
+    for cmd in [
+        r"find /usr/local/bin -name 'sol*a' -exec {} program close P --bypass-warning -um \;",
+        "find / -name spl-token -execdir {} burn A 1 -um +",
+    ] {
+        assert!(bash::may_concern(cmd), "{cmd}");
+        assert_eq!(x4(cmd, Setup::at), ["deny"; 4], "{cmd}");
+    }
+    assert_eq!(
+        x4(r"find . -name 'x*' -exec {} --version \;", Setup::at),
+        ["ask", "ask", "ask", "deny"]
+    );
+    assert_eq!(
+        x4(r"find . -name '*.tmp' -exec rm {} \;", Setup::at),
+        ["", "", "", ""]
+    );
+}
+
+#[test]
+fn a_config_write_after_cd_makes_later_commands_unknown() {
+    let dev = |t| Setup::at(t).default_net(Network::Devnet);
+    for cmd in [
+        "cd ~/.config/solana/cli && cp ~/main.yml config.yml && spl-token burn A 1",
+        "cd ~/.config/solana/cli; echo 'json_rpc_url: x' > config.yml; spl-token close A",
+        "cd $D && cp ~/main.yml config.yml && spl-token burn A 1",
+    ] {
+        assert_eq!(x4(cmd, dev), ["deny"; 4], "{cmd}");
+    }
+    // A project config.yml elsewhere changes nothing.
+    assert_eq!(
+        x4("cd app && cp a.yml config.yml && spl-token burn A 1", dev),
+        ["ask"; 4]
+    );
+}
+
+#[test]
+fn a_joined_ask_names_the_riskiest_component() {
+    let d = run_lib(
+        &format!("solana config set -um && solana transfer {D} 5"),
+        Setup::at(Tier::Medium).default_net(Network::Devnet),
+    );
+    let reason = d.reason();
+    assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+    let riskiest = reason.split("also:").next().unwrap_or("");
+    assert!(
+        riskiest.contains("mainnet") && riskiest.contains("solana transfer"),
+        "{reason}"
+    );
+    assert!(reason.contains("solana config set"), "{reason}");
+    assert!(reason.ends_with("approve to proceed"), "{reason}");
+}
+
+#[test]
+fn unreadable_high_reason_does_not_ask() {
+    let d = run_lib("$S transfer D 1", Setup::at(Tier::High));
+    assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+    assert!(!d.reason().contains("approve to proceed"), "{d:?}");
+}
+
+#[test]
+fn the_size_cap_applies_only_when_the_fast_path_cannot_rule_out() {
+    let body = "x".repeat(bash::MAX_PARSE_BYTES);
+    let heredoc = format!("cat > notes.txt <<'EOF'\n{body}\nEOF");
+    assert!(!bash::may_concern(&heredoc));
+    let w = World::new("onchain-heredoc");
+    let run = w.run("gate-bash", &heredoc, Tier::High, &[]);
+    assert_eq!(decision_label(&run), "");
+    // With a trigger it reaches the gate, which asks without parsing (deny at High).
+    let named = format!("cat > notes.txt <<'EOF'\nsolana {body}\nEOF");
+    assert!(bash::may_concern(&named));
+    assert_eq!(
+        decision_label(&w.run("gate-bash", &named, Tier::Relaxed, &[])),
+        "ask"
+    );
+    // `>` still routes a small command to the full gate.
+    assert!(bash::may_concern("make 2>&1"));
+}
+
+#[test]
+fn e2e_wallet_shapes_inside_dynamic_scripts() {
+    let w = World::new("onchain-wallet-eval");
+    for cmd in [
+        r#"eval "rm $HOME/.config/solana/id.json""#,
+        r#"bash -c "$X; solana-keygen new --force""#,
+        r#"eval "rm -rf ~/.config/$WHAT""#,
+    ] {
+        assert_eq!(w.bash(cmd, Tier::Relaxed), "deny", "{cmd}");
+        assert_eq!(
+            decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[])),
+            "deny",
+            "gate-bash: {cmd}"
+        );
     }
 }
