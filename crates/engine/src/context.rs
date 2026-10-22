@@ -1,14 +1,38 @@
 //! Execution context: network resolution and well-known directories.
 //!
-//! [`resolve_network`] implements the precedence: explicit cluster flags in the command
-//! ([`network_from_flags`]), then `ANCHOR_PROVIDER_URL`, then `<cwd>/Anchor.toml` `[provider]
-//! cluster`, then a cached `solana config get` (60s TTL). It never panics — any failure
-//! yields [`Network::Unknown`].
+//! A command's cluster comes from its own flags first ([`explicit_network`]: `-u/--url`,
+//! attached `-um`, `--url=m`, monikers, `-C/--config <file>` read for its `json_rpc_url`).
+//! Without one, `solana` and `spl-token` use the CLI config ([`cli_network`]: `solana config
+//! get`, bounded at 2 s, cached 60 s in an authenticated state file), and `anchor` uses
+//! `Anchor.toml` `[provider] cluster` ([`anchor_network`]), falling back to the CLI config. An
+//! `ANCHOR_PROVIDER_URL` in the hook environment may only make an anchor command riskier.
+//! Nothing here panics: any failure yields [`Network::Unknown`].
 
 pub mod shell;
 
+use std::cell::OnceCell;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::datadir::{self, DataDir};
+use crate::statefile::{self, Loaded};
+
+/// How long `solana config get` may run before the CLI network counts as unknown (D1.3).
+pub const SOLANA_CONFIG_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a cached `solana config get` URL stays fresh, in seconds.
+const NETCACHE_TTL_SECS: u64 = 60;
+
+/// State file holding the cached CLI URL.
+const NETCACHE_FILE: &str = "netcache.json";
+
+/// Largest `-C` config file or `Anchor.toml` read.
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
 /// Resolved Solana cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,45 +65,109 @@ impl Network {
 /// Per-invocation execution context.
 #[derive(Debug, Clone)]
 pub struct Context {
-    /// Resolved network for the action.
+    /// The cluster a `solana`/`spl-token` command naming none runs on (the CLI config).
     pub network: Network,
+    /// The cluster an `anchor` command naming none runs on (`Anchor.toml`, else the CLI
+    /// config).
+    pub anchor_network: Network,
     /// The plugin data dir ([`plugin_data_dir`]) — where state lives.
     pub plugin_data: PathBuf,
-    /// Project root for the session.
+    /// Project root for the session (the hook `cwd`): relative `-C` paths resolve here.
     pub project_dir: PathBuf,
 }
 
 impl Context {
-    /// Build a context from a resolved command and the session cwd.
+    /// Build a context for `command` in the session `cwd`.
+    ///
+    /// The defaults are resolved only when some solana-family command in `command` names no
+    /// cluster of its own, so a command that needs none never runs `solana config get`.
     pub fn build(command: &str, cwd: &Path) -> Context {
+        let parsed = shell::parse(command);
+        let cli = OnceCell::new();
+        let cli_net = || *cli.get_or_init(|| cli_network(cwd));
+        let needs_default = |anchor: bool| {
+            parsed.commands.iter().any(|c| {
+                c.is_family()
+                    && (c.program() == "anchor") == anchor
+                    && explicit_network(&Argv::from_shell(&c.words), Some(cwd)).is_none()
+            })
+        };
+        let network = if needs_default(false) {
+            cli_net()
+        } else {
+            Network::Unknown
+        };
+        let anchor_network = if needs_default(true) {
+            anchor_network(cwd, cli_net)
+        } else {
+            Network::Unknown
+        };
         Context {
-            network: resolve_network(command, cwd),
+            network,
+            anchor_network,
             plugin_data: plugin_data_dir(),
             project_dir: project_dir(cwd),
         }
     }
 }
 
-/// Resolve the network for `command` in `cwd`.
-///
-/// Precedence: explicit flags in the command ([`network_from_flags`], which may itself be
-/// [`Network::Unknown`]) → `ANCHOR_PROVIDER_URL` env → `Anchor.toml` `[provider] cluster` →
-/// cached `solana config get` (60s TTL). Returns [`Network::Unknown`] when nothing resolves.
-/// Never panics.
+/// Resolve the network of the first solana-family command in `command`, run in `cwd`: its
+/// own flags ([`explicit_network`]), else [`anchor_network`] for `anchor` and
+/// [`cli_network`] for the rest. [`Network::Unknown`] when nothing resolves.
 pub fn resolve_network(command: &str, cwd: &Path) -> Network {
-    if let Some(net) = network_from_flags(command) {
+    let parsed = shell::parse(command);
+    let Some(cmd) = parsed.commands.iter().find(|c| c.is_family()) else {
+        return Network::Unknown;
+    };
+    if let Some(net) = explicit_network(&Argv::from_shell(&cmd.words), Some(cwd)) {
         return net;
     }
-    if let Ok(url) = std::env::var("ANCHOR_PROVIDER_URL") {
-        let net = classify_url(&url);
-        if net != Network::Unknown {
-            return net;
+    if cmd.program() == "anchor" {
+        anchor_network(cwd, || cli_network(cwd))
+    } else {
+        cli_network(cwd)
+    }
+}
+
+/// The cluster an `anchor` command naming none targets: the nearest `Anchor.toml` (cwd, then
+/// its ancestors, as anchor discovers it) `[provider] cluster`, else `cli`. A cluster value
+/// that names no recognizable cluster is [`Network::Unknown`]. `ANCHOR_PROVIDER_URL`, when
+/// set, can only make the result riskier: the hook environment may be repo-controlled.
+pub fn anchor_network(cwd: &Path, cli: impl FnOnce() -> Network) -> Network {
+    let base = network_from_anchor_toml(cwd).unwrap_or_else(cli);
+    match std::env::var("ANCHOR_PROVIDER_URL") {
+        Ok(url) if !url.trim().is_empty() => riskier(base, classify_url(&url)),
+        _ => base,
+    }
+}
+
+/// The CLI config's cluster: `solana config get`, bounded at [`SOLANA_CONFIG_TIMEOUT`] (a
+/// timeout, a missing binary or any failure is [`Network::Unknown`]), cached for 60 s in the
+/// authenticated `netcache.json` of a trusted data dir.
+pub fn cli_network(cwd: &Path) -> Network {
+    let dir = datadir::data_dir_with_cwd(Some(cwd))
+        .ok()
+        .filter(|d| d.trusted);
+    let now = now_secs();
+    let fingerprint = cli_config_fingerprint();
+    if let Some(dir) = &dir {
+        if let Some(url) = read_fresh_cache(dir, now, &fingerprint) {
+            return classify_url(&url);
         }
     }
-    if let Some(net) = network_from_anchor_toml(cwd) {
-        return net;
+    let Some(url) = solana_config_rpc_url(SOLANA_CONFIG_TIMEOUT) else {
+        return Network::Unknown;
+    };
+    if let Some(dir) = &dir {
+        let cache = NetCache {
+            url: url.clone(),
+            ts: now,
+            config: fingerprint,
+        };
+        // Best-effort: a cache that cannot be written is re-resolved next time.
+        let _ = statefile::store(dir, NETCACHE_FILE, &cache);
     }
-    network_from_solana_config().unwrap_or(Network::Unknown)
+    classify_url(&url)
 }
 
 /// Map an RPC URL or cluster moniker to a [`Network`].
@@ -101,6 +189,10 @@ fn classify_url(raw: &str) -> Network {
     if s.contains("mainnet") {
         return Network::Mainnet;
     }
+    // An expansion's value is unknown, whatever else its spelling says.
+    if s.contains('$') || s.contains('`') {
+        return Network::Unknown;
+    }
     if s.contains("127.0.0.1") || s.contains("localhost") || s.contains("localnet") {
         return Network::Localnet;
     }
@@ -112,7 +204,6 @@ fn classify_url(raw: &str) -> Network {
     }
     Network::Unknown
 }
-
 /// Long flags of the `solana` / `spl-token` / `anchor` CLIs that take a value. Without an
 /// attached `=value`, the next word is the flag's value, never a positional argument.
 const VALUE_FLAGS: &[&str] = &[
@@ -198,27 +289,91 @@ const BOOL_SHORTS: &[char] = &['v', 'h', 'V'];
 const URL_FLAGS: &[&str] = &["--url", "--cluster", "--provider.cluster"];
 
 /// The cluster `command` names explicitly, or `None` when it names none: the riskiest of what
-/// each segment's [`Argv::network`] says.
+/// each simple command's [`Argv::network`] says. Config files are not read.
 pub fn network_from_flags(command: &str) -> Option<Network> {
-    split_segments(command)
-        .into_iter()
-        .filter_map(|segment| Argv::parse(&tokenize(segment)).network())
+    shell::parse(command)
+        .commands
+        .iter()
+        .filter_map(|cmd| Argv::from_shell(&cmd.words).network())
         .reduce(riskier)
 }
 
-/// One command segment's arguments (after the program word) split into flags and positional
-/// words. This is the single flag model: network resolution and the Bash gate both read it, so
-/// a word is never a flag value to one and a flag to the other.
+/// The cluster one command's arguments name, reading a `-C/--config` file for its
+/// `json_rpc_url` (a relative path resolves against `base`; with no `base` it is unknown).
+///
+/// An explicit URL flag beats the config file, as in the CLI. A config file that cannot be
+/// read, names no `json_rpc_url`, or is spelled with an expansion is [`Network::Unknown`]: an
+/// explicit target never falls back to the default config. `None` when nothing is named.
+pub fn explicit_network(argv: &Argv, base: Option<&Path>) -> Option<Network> {
+    let named = argv.url_network();
+    let net = match (named, argv.config_file()) {
+        (Some(net), _) => Some(net),
+        (None, Some(file)) => Some(config_file_network(file, base)),
+        (None, None) if argv.config_flag_without_value() => Some(Network::Unknown),
+        (None, None) => None,
+    };
+    if argv.ambiguous_value {
+        return Some(net.map_or(Network::Unknown, |n| riskier(n, Network::Unknown)));
+    }
+    net
+}
+
+/// The cluster of a solana CLI config file's `json_rpc_url`, or [`Network::Unknown`].
+fn config_file_network(file: &str, base: Option<&Path>) -> Network {
+    if file.contains(['$', '`', '*', '?', '[']) || file.is_empty() {
+        return Network::Unknown;
+    }
+    let path = if let Some(rest) = file.strip_prefix("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => return Network::Unknown,
+        }
+    } else if Path::new(file).is_absolute() {
+        PathBuf::from(file)
+    } else {
+        match base {
+            Some(base) => base.join(file),
+            None => return Network::Unknown,
+        }
+    };
+    let Some(text) = read_small_file(&path) else {
+        return Network::Unknown;
+    };
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("json_rpc_url:"))
+        .map_or(Network::Unknown, classify_url)
+}
+
+/// Read a regular file of at most [`MAX_CONFIG_BYTES`]; `None` otherwise (a FIFO or device
+/// is never opened).
+fn read_small_file(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_CONFIG_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+/// One command's arguments (after the program word) split into flags and positional words.
+/// This is the single flag model: network resolution and the Bash gate both read it, so a
+/// word is never a flag value to one and a flag to the other.
 pub struct Argv<'a> {
     /// Positional words, without flags, flag values and fd duplications (`2>&1`).
     pub positionals: Vec<&'a str>,
     /// Index into `positionals` from which positions are uncertain: a flag of unknown arity was
-    /// followed by a word that may be its value.
+    /// followed by a word that may be its value, or a word the shell may split or glob came
+    /// first.
     pub uncertain_from: Option<usize>,
     /// Flags as `(long name, value)`; shorts appear under their long name.
     flags: Vec<(&'a str, Option<&'a str>)>,
-    /// A value-taking flag was followed by a `-`-word or by nothing. A CLI may read that word
-    /// as the flag's value or as a flag of its own, so the cluster it names is uncertain.
+    /// A value-taking flag was followed by a `-`-word or by nothing, an unknown long flag was
+    /// followed by a `-`-word, or a word may split into flags. The cluster named is uncertain.
     ambiguous_value: bool,
 }
 
@@ -226,7 +381,7 @@ pub struct Argv<'a> {
 enum Kind<'a> {
     /// A positional word.
     Positional,
-    /// A flag with its value attached (`--url=m`, `-um`).
+    /// A flag with its value attached (`--url=m`, `-um`, `-u=`).
     Attached(&'a str, &'a str),
     /// A boolean flag, or a cluster of boolean shorts.
     Bool(&'a str),
@@ -237,18 +392,29 @@ enum Kind<'a> {
 }
 
 impl<'a> Argv<'a> {
-    /// Split a tokenized segment (`tokens[0]` is the program word).
+    /// Split a tokenized command (`tokens[0]` is the program word).
     pub fn parse(tokens: &'a [String]) -> Argv<'a> {
-        let words: Vec<&'a str> = tokens
+        let words: Vec<(&'a str, bool)> = tokens
             .iter()
             .skip(1)
-            .map(String::as_str)
-            .filter(|word| !is_fd_duplication(word))
+            .map(|t| (t.as_str(), false))
+            .filter(|(word, _)| !is_fd_duplication(word))
             .collect();
         Argv::parse_words(&words)
     }
 
-    fn parse_words(words: &[&'a str]) -> Argv<'a> {
+    /// Split a parsed shell command (`words[0]` is the program word). A word the shell may
+    /// split or glob ([`shell::Word::splits`]) makes every position from it on uncertain.
+    pub fn from_shell(words: &'a [shell::Word]) -> Argv<'a> {
+        let words: Vec<(&'a str, bool)> = words
+            .iter()
+            .skip(1)
+            .map(|w| (w.text.as_str(), w.splits))
+            .collect();
+        Argv::parse_words(&words)
+    }
+
+    fn parse_words(words: &[(&'a str, bool)]) -> Argv<'a> {
         let mut argv = Argv {
             positionals: Vec::new(),
             uncertain_from: None,
@@ -256,19 +422,24 @@ impl<'a> Argv<'a> {
             ambiguous_value: false,
         };
         let mut i = 0;
-        while let Some(&word) = words.get(i) {
+        while let Some(&(word, splits)) = words.get(i) {
             i += 1;
+            if splits {
+                // Its words, flags included, are unknowable: so is everything after it.
+                argv.ambiguous_value = true;
+                argv.mark_uncertain();
+            }
             if word == "--" {
                 // Positional from here. Anchor hands these words to `solana program deploy`, so
                 // their flags (`-- --final`) count as well.
                 let rest = words.get(i..).unwrap_or_default();
-                argv.positionals.extend_from_slice(rest);
+                argv.positionals.extend(rest.iter().map(|&(w, _)| w));
                 let passed_on = Argv::parse_words(rest);
                 argv.flags.extend(passed_on.flags);
                 argv.ambiguous_value |= passed_on.ambiguous_value;
                 break;
             }
-            let next = words.get(i).copied();
+            let next = words.get(i).map(|&(w, _)| w);
             match kind(word) {
                 Kind::Positional => argv.positionals.push(word),
                 Kind::Attached(name, value) => argv.flags.push((name, Some(value))),
@@ -277,6 +448,10 @@ impl<'a> Argv<'a> {
                     Some(value) if !is_flag_like(value) => {
                         argv.flags.push((name, Some(value)));
                         i += 1;
+                        if words.get(i - 1).is_some_and(|&(_, s)| s) {
+                            argv.ambiguous_value = true;
+                            argv.mark_uncertain();
+                        }
                     }
                     // The following word stays a flag in its own right.
                     _ => {
@@ -286,14 +461,23 @@ impl<'a> Argv<'a> {
                 },
                 Kind::Unknown(name) => {
                     argv.flags.push((name, None));
-                    let word_follows = next.is_some_and(|w| !is_flag_like(w));
-                    if word_follows && argv.uncertain_from.is_none() {
-                        argv.uncertain_from = Some(argv.positionals.len());
+                    match next {
+                        Some(w) if !is_flag_like(w) => argv.mark_uncertain(),
+                        // `--mystery -ud`: `-ud` may be the mystery flag's value.
+                        Some(_) => argv.ambiguous_value = true,
+                        None => {}
                     }
                 }
             }
         }
         argv
+    }
+
+    /// Positions from the current one on are uncertain.
+    fn mark_uncertain(&mut self) {
+        if self.uncertain_from.is_none() {
+            self.uncertain_from = Some(self.positionals.len());
+        }
     }
 
     /// Whether flag `name` (a long name such as `--final`) is present, with or without a value.
@@ -305,24 +489,42 @@ impl<'a> Argv<'a> {
     ///
     /// A URL flag (`--url`, `-u`, `--cluster`, Anchor's `--provider.cluster`) whose value names
     /// no recognizable cluster is [`Network::Unknown`]: an explicit target never falls back to
-    /// the config. So is `-C/--config <file>` without a URL flag (the file is not read), and so
-    /// is an ambiguous flag value. Several flags fold to the riskiest (mainnet, then unknown).
+    /// the config. So is `-C/--config <file>` without a URL flag (the file is not read here;
+    /// [`explicit_network`] reads it), and so is an ambiguous flag value. Several flags fold to
+    /// the riskiest (mainnet, then unknown).
     pub fn network(&self) -> Option<Network> {
-        let mut named: Option<Network> = None;
-        let mut config_file = false;
-        for &(name, value) in &self.flags {
-            if URL_FLAGS.contains(&name) {
-                let net = value.map_or(Network::Unknown, classify_url);
-                named = Some(named.map_or(net, |prev| riskier(prev, net)));
-            } else if name == "--config" {
-                config_file = true;
-            }
-        }
-        let net = named.or_else(|| config_file.then_some(Network::Unknown));
+        let net = self
+            .url_network()
+            .or_else(|| self.has_flag("--config").then_some(Network::Unknown));
         if self.ambiguous_value {
             return Some(net.map_or(Network::Unknown, |n| riskier(n, Network::Unknown)));
         }
         net
+    }
+
+    /// The riskiest cluster the URL flags name, or `None` without one.
+    fn url_network(&self) -> Option<Network> {
+        self.flags
+            .iter()
+            .filter(|(name, _)| URL_FLAGS.contains(name))
+            .map(|&(_, value)| value.map_or(Network::Unknown, classify_url))
+            .reduce(riskier)
+    }
+
+    /// The last `-C/--config` value.
+    fn config_file(&self) -> Option<&'a str> {
+        self.flags
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == "--config")
+            .and_then(|&(_, value)| value)
+    }
+
+    /// Whether `-C/--config` appears with no value.
+    fn config_flag_without_value(&self) -> bool {
+        self.flags
+            .iter()
+            .any(|&(name, value)| name == "--config" && value.is_none())
     }
 }
 
@@ -343,7 +545,7 @@ fn kind(word: &str) -> Kind<'_> {
         };
     }
     // A short cluster: boolean shorts, then at most one value-taking short whose value is the
-    // rest of the word (`-um`, `-u=m`) or the next word (`-u`, `-vu`).
+    // rest of the word (`-um`, `-u=m`, `-u=`) or the next word (`-u`, `-vu`).
     let cluster = word.trim_start_matches('-');
     let rest = cluster.trim_start_matches(|c| BOOL_SHORTS.contains(&c));
     let Some(first) = rest.chars().next() else {
@@ -352,11 +554,11 @@ fn kind(word: &str) -> Kind<'_> {
     match VALUE_SHORTS.iter().find(|&&(short, _)| short == first) {
         Some(&(_, long)) => {
             let value = rest.get(first.len_utf8()..).unwrap_or_default();
-            let value = value.strip_prefix('=').unwrap_or(value);
-            if value.is_empty() {
-                Kind::TakesValue(long)
-            } else {
-                Kind::Attached(long, value)
+            match value.strip_prefix('=') {
+                // `-u=` is an empty attached value, never "take the next word".
+                Some(attached) => Kind::Attached(long, attached),
+                None if value.is_empty() => Kind::TakesValue(long),
+                None => Kind::Attached(long, value),
             }
         }
         None => Kind::Unknown(word),
@@ -369,8 +571,7 @@ fn is_flag_like(word: &str) -> bool {
 }
 
 /// Whether `word` is a file-descriptor duplication such as `2>&1`, `>&2` or `1>&-`: the shell
-/// strips it before the CLI sees its argv, and it touches no file. File redirections
-/// (`> out.log`) stay as words, so a transfer carrying one never reads as clean.
+/// strips it before the CLI sees its argv.
 fn is_fd_duplication(word: &str) -> bool {
     let op = word.trim_start_matches(|c: char| c.is_ascii_digit());
     op.strip_prefix(">&")
@@ -378,35 +579,8 @@ fn is_fd_duplication(word: &str) -> bool {
         .is_some_and(|fd| !fd.is_empty() && fd.chars().all(|c| c.is_ascii_digit() || c == '-'))
 }
 
-/// Split a command on top-level `&&`, `||`, `;`, `|` separators into segments.
-pub fn split_segments(command: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let bytes = command.as_bytes();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let two = bytes.get(i..i + 2);
-        if matches!(two, Some(b"&&")) || matches!(two, Some(b"||")) {
-            segments.push(command[start..i].trim());
-            i += 2;
-            start = i;
-            continue;
-        }
-        let c = bytes[i];
-        if c == b';' || c == b'|' {
-            segments.push(command[start..i].trim());
-            i += 1;
-            start = i;
-            continue;
-        }
-        i += 1;
-    }
-    segments.push(command[start..].trim());
-    segments.into_iter().filter(|s| !s.is_empty()).collect()
-}
-
 /// The riskier of two networks for gating: mainnet, then unknown, then any identified other.
-fn riskier(a: Network, b: Network) -> Network {
+pub fn riskier(a: Network, b: Network) -> Network {
     let rank = |n: Network| match n {
         Network::Mainnet => 2,
         Network::Unknown => 1,
@@ -419,10 +593,12 @@ fn riskier(a: Network, b: Network) -> Network {
     }
 }
 
-/// Split `text` into words on whitespace, honoring single and double quotes (quotes removed).
+/// Split `text` into words like [`shell::parse`] does for one simple command, without
+/// stripping anything: quotes removed, empty quoted words (`""`) kept.
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut started = false;
     let mut quote: Option<char> = None;
 
     for c in text.chars() {
@@ -435,25 +611,35 @@ pub fn tokenize(text: &str) -> Vec<String> {
                 }
             }
             None => match c {
-                '\'' | '"' => quote = Some(c),
+                '\'' | '"' => {
+                    quote = Some(c);
+                    started = true;
+                }
                 c if c.is_whitespace() => {
-                    if !current.is_empty() {
+                    if started {
                         tokens.push(std::mem::take(&mut current));
+                        started = false;
                     }
                 }
-                _ => current.push(c),
+                _ => {
+                    current.push(c);
+                    started = true;
+                }
             },
         }
     }
-    if !current.is_empty() {
+    if started {
         tokens.push(current);
     }
     tokens
 }
 
-/// Parse `[provider] cluster = "..."` from `<cwd>/Anchor.toml`.
+/// The nearest `Anchor.toml` (cwd, then ancestors) `[provider] cluster`: `Some` of its
+/// cluster ([`Network::Unknown`] when unrecognized), `None` when no file or no cluster.
 fn network_from_anchor_toml(cwd: &Path) -> Option<Network> {
-    let text = std::fs::read_to_string(cwd.join("Anchor.toml")).ok()?;
+    let text = cwd
+        .ancestors()
+        .find_map(|dir| read_small_file(&dir.join("Anchor.toml")))?;
     let mut in_provider = false;
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -464,84 +650,95 @@ fn network_from_anchor_toml(cwd: &Path) -> Option<Network> {
         if in_provider {
             if let Some(rest) = line.strip_prefix("cluster") {
                 let value = rest.trim_start_matches(|c: char| c == '=' || c.is_whitespace());
-                let net = classify_url(value);
-                if net != Network::Unknown {
-                    return Some(net);
-                }
+                let value = value.split('#').next().unwrap_or(value);
+                return Some(classify_url(value));
             }
         }
     }
     None
 }
 
-/// Read the cached `solana config get` RPC URL, refreshing it (60s TTL) by shelling out.
-///
-/// Cache file: `${CLAUDE_PLUGIN_DATA}/netcache.json` as `{"url":..,"ts":..}`. A missing
-/// `solana` binary or any error → `None`.
-fn network_from_solana_config() -> Option<Network> {
-    let cache_path = plugin_data_dir().join("netcache.json");
-    let now = now_secs();
-
-    if let Some(url) = read_fresh_cache(&cache_path, now) {
-        let net = classify_url(&url);
-        if net != Network::Unknown {
-            return Some(net);
-        }
-    }
-
-    let url = solana_config_rpc_url()?;
-    write_cache(&cache_path, &url, now);
-    let net = classify_url(&url);
-    if net == Network::Unknown {
-        None
-    } else {
-        Some(net)
-    }
+/// The cached `solana config get` URL.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct NetCache {
+    /// The RPC URL.
+    url: String,
+    /// When it was read (epoch seconds).
+    ts: u64,
+    /// [`cli_config_fingerprint`] when it was read: a config change invalidates it.
+    config: String,
 }
 
-/// Return the cached URL if the cache is fresh (within 60s), else `None`.
-fn read_fresh_cache(path: &Path, now: u64) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let ts = value.get("ts").and_then(serde_json::Value::as_u64)?;
-    if now.saturating_sub(ts) > 60 {
+/// The cached URL if the authenticated cache is fresh: written at most 60 s ago, never in
+/// the future, and for the current CLI config file. A forged or edited cache is ignored.
+fn read_fresh_cache(dir: &DataDir, now: u64, fingerprint: &str) -> Option<String> {
+    let Loaded::Valid(cache) = statefile::load::<NetCache>(dir, NETCACHE_FILE) else {
         return None;
-    }
-    value
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    };
+    let age = now.checked_sub(cache.ts)?;
+    (age <= NETCACHE_TTL_SECS && cache.config == fingerprint).then_some(cache.url)
 }
 
-/// Best-effort cache write (errors ignored).
-fn write_cache(path: &Path, url: &str, ts: u64) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let body = serde_json::json!({ "url": url, "ts": ts });
-    if let Ok(s) = serde_json::to_string(&body) {
-        let _ = std::fs::write(path, s);
+/// Size and mtime of the default solana CLI config (`~/.config/solana/cli/config.yml`), so
+/// `solana config set` invalidates the cache at once.
+fn cli_config_fingerprint() -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return "no-home".to_string();
+    };
+    let path = PathBuf::from(home).join(".config/solana/cli/config.yml");
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            format!("{}:{mtime}", meta.len())
+        }
+        Err(_) => "absent".to_string(),
     }
 }
 
-/// Run `solana config get` and extract the RPC URL line. `None` on any failure.
-fn solana_config_rpc_url() -> Option<String> {
-    let output = std::process::Command::new("solana")
-        .arg("config")
-        .arg("get")
-        .output()
+/// Run `solana config get` for at most `timeout` and extract the RPC URL line. `None` on a
+/// timeout (the child is killed) or any failure. Its output is read on a helper thread, so a
+/// grandchild holding the pipe open cannot stall the gate.
+fn solana_config_rpc_url(timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut child = Command::new("solana")
+        .args(["config", "get"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(64 * 1024).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("RPC URL:") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
+    let buf = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("RPC URL:"))
+        .map(|rest| rest.trim().to_string())
 }
 
 /// The plugin data dir path, resolved by [`crate::datadir::data_dir`] exactly as the hooks
@@ -822,6 +1019,126 @@ mod tests {
         // No flags, no Anchor.toml; solana config may or may not exist — accept either a
         // real network or Unknown, but the call must not panic.
         let _ = resolve_network("echo hi", &dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "safe_ai_skill_ctx_{tag}_{}_{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn netcache_from_the_future_or_forged_is_ignored() {
+        let path = temp_dir("netcache");
+        let dir = DataDir {
+            path: path.clone(),
+            trusted: true,
+        };
+        let now = 1_000_000;
+        let store = |ts: u64, config: &str| {
+            let cache = NetCache {
+                url: "https://api.devnet.solana.com".into(),
+                ts,
+                config: config.into(),
+            };
+            statefile::store(&dir, NETCACHE_FILE, &cache).unwrap();
+        };
+        store(now - 10, "fp");
+        assert_eq!(
+            read_fresh_cache(&dir, now, "fp").as_deref(),
+            Some("https://api.devnet.solana.com")
+        );
+        // Stale, written for another config, or stamped in the future.
+        store(now - 61, "fp");
+        assert_eq!(read_fresh_cache(&dir, now, "fp"), None);
+        store(now - 10, "fp");
+        assert_eq!(read_fresh_cache(&dir, now, "other"), None);
+        store(u64::MAX, "fp");
+        assert_eq!(read_fresh_cache(&dir, now, "fp"), None);
+        // A hand-written (unauthenticated) cache is tampered: ignored.
+        fs::write(
+            path.join(NETCACHE_FILE),
+            format!(r#"{{"url":"https://api.devnet.solana.com","ts":{now},"config":"fp"}}"#),
+        )
+        .unwrap();
+        assert_eq!(read_fresh_cache(&dir, now, "fp"), None);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn empty_attached_url_is_unknown_not_the_next_word() {
+        assert_eq!(
+            network_from_flags("solana transfer -u= d D 1"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer --url= d D 1"),
+            Some(Network::Unknown)
+        );
+    }
+
+    #[test]
+    fn unknown_long_flag_before_a_dash_word_is_ambiguous() {
+        assert_eq!(
+            network_from_flags("solana transfer --mystery -ud D 1"),
+            Some(Network::Unknown)
+        );
+    }
+
+    #[test]
+    fn tokenize_keeps_empty_quoted_words() {
+        assert_eq!(tokenize(r#"a "" '' b"#), vec!["a", "", "", "b"]);
+        assert_eq!(tokenize("a  b "), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn config_file_json_rpc_url_is_read() {
+        let dir = temp_dir("cfgread");
+        fs::write(
+            dir.join("c.yml"),
+            "json_rpc_url: 'https://api.mainnet-beta.solana.com'\n",
+        )
+        .unwrap();
+        let words = shell::parse("solana transfer -C c.yml D 1").commands[0]
+            .words
+            .clone();
+        let argv = Argv::from_shell(&words);
+        assert_eq!(explicit_network(&argv, Some(&dir)), Some(Network::Mainnet));
+        // Without a base, a relative path is unknown; a URL flag beats the file.
+        assert_eq!(explicit_network(&argv, None), Some(Network::Unknown));
+        let words = shell::parse("solana transfer -C c.yml -ud D 1").commands[0]
+            .words
+            .clone();
+        assert_eq!(
+            explicit_network(&Argv::from_shell(&words), Some(&dir)),
+            Some(Network::Devnet)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_toml_is_found_upward_and_unrecognized_cluster_is_unknown() {
+        let dir = temp_dir("anchorup");
+        fs::write(
+            dir.join("Anchor.toml"),
+            "[provider]\ncluster = \"Localnet\" # local\n",
+        )
+        .unwrap();
+        let sub = dir.join("programs/p");
+        fs::create_dir_all(&sub).unwrap();
+        assert_eq!(network_from_anchor_toml(&sub), Some(Network::Localnet));
+        fs::write(
+            dir.join("Anchor.toml"),
+            "[provider]\ncluster = \"https://rpc.example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(network_from_anchor_toml(&sub), Some(Network::Unknown));
         let _ = fs::remove_dir_all(&dir);
     }
 

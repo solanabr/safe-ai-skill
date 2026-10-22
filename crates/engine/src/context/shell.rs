@@ -260,6 +260,8 @@ struct Pending {
     herestrings: Vec<Word>,
     writes_file: bool,
     piped_in: bool,
+    /// Follows `|` or `||`, which Claude Code's `if` filters are not known to split on.
+    after_pipe: bool,
 }
 
 struct Lexer<'p> {
@@ -344,6 +346,7 @@ impl Lexer<'_> {
                         _ => true,
                     };
                     line_has_shell |= self.flush(&mut cmd, indirect || after_break, pipe);
+                    cmd.after_pipe = true;
                 }
                 '<' | '>' => self.redirection(&mut cmd, &mut heredocs),
                 '(' if cmd.words.iter().all(|w| {
@@ -930,13 +933,15 @@ fn is_config_var(name: &str) -> bool {
 
 /// Strip, classify and record one simple command. Returns whether it is a shell reading its
 /// standard input (so a here-document on its line is a script).
-fn finish_command(pending: Pending, mut indirect: bool, depth: usize, out: &mut Parsed) -> bool {
+fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Parsed) -> bool {
     let Pending {
         mut words,
         herestrings,
         writes_file,
         piped_in,
+        after_pipe,
     } = pending;
+    let mut indirect = indirect || after_pipe;
 
     loop {
         // Reserved words and `NAME=value` prefixes.

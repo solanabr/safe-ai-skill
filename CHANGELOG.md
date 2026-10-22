@@ -10,6 +10,10 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 - **The CLI uses the hooks' data directory.** `safe-ai-skill allow`, `mode`, `status` and the other commands now find state where the hooks keep it: `CLAUDE_PLUGIN_DATA`, else the `safe-ai-skill-*` directory under `~/.claude/plugins/data` (or `$CLAUDE_CONFIG_DIR/plugins/data`). The `~/.safe-ai-skill` and `./.safe-ai-skill` fallbacks are gone; state written there by 1.0.x was never read by the hooks.
 - **New hooks:** PreToolUse `Skill`, `UserPromptExpansion`, and SessionStart on `clear` and `compact`. All fail open (`onFailure: continue`).
+- **Bash commands are parsed like a shell parses them.** `gate-bash` splits on newlines, `;`, `&`, `&&`, `||` and `|` outside quotes, strips `FOO=1` prefixes and wrappers (`env`, `sudo`, `nohup`, `time`, `command`, `exec`, `xargs`, …), and follows `$(…)`, backticks, `(…)`, `bash -c '…'`, `eval`, here-documents fed to a shell and `find -exec`. A command naming `solana`, `spl-token` or `anchor` that can't be parsed, or that pipes code into a shell, asks. The unconditional Bash hook runs the same parse for `solana` reached through indirection, which the `if: Bash(solana *)` filters don't see. A shell expansion that could turn into flags or extra arguments (`$X`, `$(…)`, `*`) makes a transfer ask instead of allow. (#13)
+- **Network resolution follows the CLI.** `-C/--config <file>` is read for its `json_rpc_url`. `solana` and `spl-token` use the CLI config, and only `anchor` reads `Anchor.toml` (found upward, as anchor does). `ANCHOR_PROVIDER_URL` can only make an anchor command riskier. `solana config get` is given 2 s, after which the network counts as unknown, and its cache is an authenticated state file invalidated by `solana config set`. Policy `network.mainnet: deny` now denies mainnet transfers, deploys and other mainnet asks. (#13)
+- **Amounts are plain decimals.** `1e3`, `0x10`, `+1`, `inf` and overlong amounts ask instead of being parsed. (#13)
+- **Every PreToolUse gate answers within 8 s.** A gate still running at 8 s emits `ask`. `SAFE_AI_SKILL_DEADLINE_MS` can shorten the deadline, never lengthen it.
 
 ---
 

@@ -24,6 +24,7 @@ fn decide(command: &str, network: Network) -> (Decision, GateMeta) {
     let data = TempDir::new("guards");
     let ctx = Context {
         network,
+        anchor_network: network,
         plugin_data: data.path().to_path_buf(),
         project_dir: data.path().to_path_buf(),
     };
@@ -297,12 +298,13 @@ fn mainnet_url_mentioning_localhost_is_mainnet() {
 
 #[test]
 fn cluster_flag_in_another_segment_does_not_vouch_for_a_transfer() {
-    // The resolved context took `devnet` from the echo segment; the transfer names no cluster.
+    // The context network is the CLI default; `-ud` on another command does not move the
+    // transfer off it.
     for cmd in [
         format!("echo --url devnet; solana transfer {DEST} 0.5"),
         format!("solana balance -ud && solana transfer {DEST} 0.5"),
     ] {
-        let (d, _) = decide(&cmd, Network::Devnet);
+        let (d, _) = decide(&cmd, Network::Mainnet);
         assert!(is_ask(&d), "{cmd}: {d:?}");
     }
     // A segment that names its own cluster keeps it.
@@ -316,13 +318,17 @@ fn cluster_flag_in_another_segment_does_not_vouch_for_a_transfer() {
 #[test]
 fn allow_never_covers_a_command_the_gate_does_not_know() {
     // The hook's allow would skip the prompt for the whole tool call, `rm` included.
-    for cmd in [
-        format!("rm -rf ./build && solana transfer {DEST} 0.5 -ud"),
-        format!("solana transfer {DEST} 0.5 -ud | sh"),
-    ] {
-        let (d, _) = decide(&cmd, Network::Devnet);
-        assert_eq!(d, Decision::Defer, "{cmd}");
-    }
+    let (d, _) = decide(
+        &format!("rm -rf ./build && solana transfer {DEST} 0.5 -ud"),
+        Network::Devnet,
+    );
+    assert_eq!(d, Decision::Defer);
+    // Piped into a shell, its output runs as code: a hard-guard ask.
+    let (d, meta) = decide(
+        &format!("solana transfer {DEST} 0.5 -ud | sh"),
+        Network::Devnet,
+    );
+    assert!(is_ask(&d) && meta.hard_guard, "{d:?}");
     // Nor may a grant relax the ask: it would allow the `rm` as well.
     let (d, meta) = decide(
         &format!("rm -rf ./build; solana transfer {DEST} 5 -ud"),
@@ -343,12 +349,18 @@ fn allow_never_covers_command_or_process_substitution() {
     // The substitution runs code; as a flag value it would otherwise pass for a memo.
     for cmd in [
         format!("solana transfer {DEST} 0.5 -ud --with-memo \"$(reboot)\""),
-        format!("solana transfer {DEST} 0.5 -ud --with-memo $(reboot)"),
-        format!("solana transfer {DEST} 0.5 -ud --with-memo `reboot`"),
         format!("solana transfer {DEST} 0.5 -ud --with-memo <(reboot)"),
     ] {
         let (d, _) = decide(&cmd, Network::Devnet);
         assert_eq!(d, Decision::Defer, "{cmd}");
+    }
+    // Unquoted, its output is also split into words that may be flags: a hard-guard ask.
+    for cmd in [
+        format!("solana transfer {DEST} 0.5 -ud --with-memo $(reboot)"),
+        format!("solana transfer {DEST} 0.5 -ud --with-memo `reboot`"),
+    ] {
+        let (d, meta) = decide(&cmd, Network::Devnet);
+        assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
     }
 }
 
@@ -466,8 +478,6 @@ fn ambiguous_amounts_ask_as_hard_guard() {
     for cmd in [
         // Two candidate amounts.
         format!("solana transfer {DEST} 0.5 500"),
-        // A second command on a new line.
-        format!("solana transfer {DEST} 0.5\nsolana transfer {DEST} 500"),
         // A flag of unknown arity followed by a word.
         format!("solana transfer --mystery 0.5 {DEST} 500"),
         // Missing amount.
