@@ -183,9 +183,7 @@ fn collect<'a>(value: &'a Value, depth: usize, out: &mut Vec<Code<'a>>) -> bool 
             }
             complete
         }
-        Value::Array(items) => items
-            .iter()
-            .fold(true, |ok, v| collect(v, depth + 1, out) && ok),
+        Value::Array(items) => items.iter().all(|v| collect(v, depth + 1, out)),
         _ => true,
     }
 }
