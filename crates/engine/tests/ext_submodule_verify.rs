@@ -2,15 +2,16 @@
 //!
 //! The kit lays third-party code out as git submodules under `.claude/skills/ext/<name>/`.
 //! `verify session` verifies EACH submodule as its own unit (named by the submodule, not the
-//! `ext` blob) and is report-only: a High heuristic finding or content/SHA drift becomes a WARN
-//! in the SessionStart `systemMessage` + `additionalContext` (each finding at `path:line`) and
-//! the pack stays where it is. This suite seeds a project `.claude/skills/ext/` tree and asserts:
+//! `ext` blob), keyed in the state by its canonical path. A finding becomes a WARN in the
+//! SessionStart `systemMessage` + `additionalContext` (each at `path:line`); content drift is a
+//! BLOCK (denied in place by the gates); nothing moves. This suite seeds a project
+//! `.claude/skills/ext/` tree and asserts:
 //!   - a docs-only keypair reference (ai-kit `solana-dev`) → WARN at `path:line`, the pack
 //!     stays in place and `git status` stays clean,
 //!   - a telemetry SKILL.md (outbound POST) → WARN under its OWN submodule name (NOT `ext`),
 //!   - a `curl | bash` installer submodule → WARN,
-//!   - a clean submodule → TOFU-pinned at its content hash, nothing emitted,
-//!   - a re-synced (content-changed) submodule → drift WARN once, never moved.
+//!   - a clean submodule → recorded clean, nothing emitted,
+//!   - a re-synced (content-changed) submodule → drift BLOCK on every session, never moved.
 //!
 //! Fully hermetic: the project, HOME and CLAUDE_PLUGIN_DATA are sandbox temp dirs, no network.
 
@@ -112,9 +113,15 @@ fn line_of(text: &str, needle: &str) -> usize {
         .unwrap_or_else(|| panic!("fixture lacks {needle:?}"))
 }
 
-/// The sandbox lockfile body.
-fn lockfile(data: &Path) -> String {
-    std::fs::read_to_string(data.join("lockfile.json")).unwrap()
+/// The state v2 entry whose key ends with `suffix` (the body of the MAC'd `state.json`).
+fn state_entry(data: &Path, suffix: &str) -> Option<serde_json::Value> {
+    let body = std::fs::read_to_string(data.join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["body"]["packs"]
+        .as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with(suffix))
+        .map(|(_, e)| e.clone())
 }
 
 /// Run `git` in `dir` isolated from the user's and system git config (no signing, no hooks).
@@ -248,11 +255,11 @@ fn telemetry_submodule_warned_as_own_unit() {
     );
     assert!(!data.path().join("quarantine").exists());
 
-    // The clean sibling was TOFU-pinned (in the lockfile's ext section).
-    let lock = lockfile(data.path());
-    assert!(
-        lock.contains("trailofbits"),
-        "clean sibling submodule not pinned: {lock}"
+    // The clean sibling was recorded clean, as an ext pack.
+    let e = state_entry(data.path(), "/ext/trailofbits").expect("clean sibling recorded");
+    assert_eq!(
+        (e["kind"].as_str(), e["state"].as_str()),
+        (Some("ext"), Some("clean"))
     );
 }
 
@@ -298,31 +305,23 @@ fn clean_submodule_tofu_pinned_silently() {
         run.stdout
     );
 
-    let lock = lockfile(data.path());
-    assert!(
-        lock.contains("sendai"),
-        "clean submodule not TOFU-pinned: {lock}"
-    );
+    let e = state_entry(data.path(), "/ext/sendai").expect("clean submodule recorded");
+    assert_eq!(e["state"], "clean");
     assert!(pack.join("SKILL.md").exists());
 }
 
 #[test]
-fn submodule_drift_warns_until_approved() {
+fn submodule_drift_blocks_until_approved() {
     let project = TempDir::new("ext-drift-proj");
     let home = TempDir::new("ext-drift-home");
     let data = TempDir::new("ext-drift-data");
     let dir = seed_submodule(project.path(), "jupiter", "# jupiter v1\n");
 
-    // First sweep pins it clean, silently.
+    // First sweep records it clean, silently.
     assert!(emit(&verify_session(project.path(), home.path(), data.path())).is_none());
-    let lock = lockfile(data.path());
-    assert!(
-        lock.contains("jupiter"),
-        "submodule not pinned on first sweep: {lock}"
-    );
+    assert!(state_entry(data.path(), "/ext/jupiter").is_some());
 
-    // A resync bumps its content (hash-fallback drift since the fixture is not a real git repo):
-    // every following session reports it, and nothing moves.
+    // A resync bumps its content: every following session blocks it, and nothing moves.
     std::fs::write(dir.join("SKILL.md"), "# jupiter v2 (resynced)\n").unwrap();
     for _ in 0..2 {
         let swept = emit(&verify_session(project.path(), home.path(), data.path()))
@@ -331,7 +330,7 @@ fn submodule_drift_warns_until_approved() {
         for text in [&sys, &ctx] {
             let lower = text.to_lowercase();
             assert!(
-                lower.contains("warn") && lower.contains("jupiter") && lower.contains("drift"),
+                lower.contains("block") && lower.contains("jupiter") && lower.contains("drift"),
                 "drift not reported for the submodule: {text:?}"
             );
         }
@@ -339,22 +338,18 @@ fn submodule_drift_warns_until_approved() {
     assert!(dir.join("SKILL.md").exists(), "drifted submodule was moved");
     assert!(!data.path().join("quarantine").exists());
 
-    // `verify approve` re-pins it in place; the next session is quiet again.
+    // `verify approve` creates a pending request; the user's confirmation applies it.
     let run = Invocation::new(&["verify", "approve", "jupiter"])
         .plugin_data(data.path())
         .home(home.path())
         .cwd(project.path())
         .stdin("{}")
         .run();
-    let approved = run.json();
-    assert_eq!(approved["status"], "approved", "{}", run.stdout);
-    let lock: serde_json::Value = serde_json::from_str(&lockfile(data.path())).unwrap();
-    assert_eq!(lock["ext"]["jupiter"]["scan"], "approved", "{lock}");
-    let last = verify_session(project.path(), home.path(), data.path());
-    assert!(
-        emit(&last).is_none(),
-        "approved content re-reported: {}",
-        last.stdout
+    let pending = run.json();
+    assert_eq!(pending["status"], "pending", "{}", run.stdout);
+    assert_eq!(
+        state_entry(data.path(), "/ext/jupiter").unwrap()["state"],
+        "blocked"
     );
 }
 
@@ -376,17 +371,12 @@ fn ext_blob_not_treated_as_single_skill() {
 
     assert!(emit(&verify_session(project.path(), home.path(), data.path())).is_none());
 
-    let lock: serde_json::Value = serde_json::from_str(&lockfile(data.path())).unwrap();
+    let skill = state_entry(data.path(), "/address-formatter").expect("normal skill recorded");
+    assert_eq!(skill["kind"], "skill");
+    let ext = state_entry(data.path(), "/ext/metaplex").expect("ext submodule recorded");
+    assert_eq!(ext["kind"], "ext");
     assert!(
-        lock["skills"].get("address-formatter").is_some(),
-        "normal skill not pinned: {lock}"
-    );
-    assert!(
-        lock["ext"].get("metaplex").is_some(),
-        "ext submodule not pinned: {lock}"
-    );
-    assert!(
-        lock["skills"].get("ext").is_none(),
-        "the ext blob was pinned as one skill: {lock}"
+        state_entry(data.path(), "/skills/ext").is_none(),
+        "the ext blob was recorded as one pack"
     );
 }

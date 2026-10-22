@@ -1,8 +1,10 @@
-//! TOFU lockfile: sha256 dir-tree hashing, pin/diff, and quarantine.
+//! The v1 lockfile: name-keyed pins and the v1 dir-tree hash.
 //!
 //! The lockfile lives at `${CLAUDE_PLUGIN_DATA}/lockfile.json` and records, per skill /
-//! MCP, the content hash pinned on first use (trust-on-first-use). A later content change
-//! surfaces as drift (current hash != pinned) rather than a silent update.
+//! MCP / ext submodule name, the identity pinned on first use. Since state v2
+//! ([`super::state`]) the session sweep only reads it: to carry v1 pins over (spec D2.3) and to
+//! find the packs `install --from` put in `~/.claude/skills`. `add` / `install` still write
+//! their pins here, with the v1 [`hash_tree`].
 //!
 //! Pure, hermetic helpers ([`hash_tree`], [`detect_drift`], the (de)serialization round-trip)
 //! are unit-tested against tempdir fixtures; the only side effects are the atomic [`save`].

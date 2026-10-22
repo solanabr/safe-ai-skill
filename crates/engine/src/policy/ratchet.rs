@@ -213,6 +213,13 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         &asked_chain.ext_dir,
         n,
     );
+    // Moving packs is the user's opt-in, never the repo's.
+    keep_fixed(
+        "supply_chain.on_block",
+        &chain.on_block,
+        &asked_chain.on_block,
+        n,
+    );
     keep_stricter(
         "supply_chain.exec_install_scripts",
         &mut chain.exec_install_scripts,

@@ -385,6 +385,22 @@
       }
     },
     {
+      "name": "gate-prompt-expansion: typed slash command at UserPromptSubmit",
+      "args": [
+        "gate-prompt-expansion"
+      ],
+      "stdin": {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "prompt": "/review the diff"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
       "name": "verify session: startup",
       "args": [
         "verify",

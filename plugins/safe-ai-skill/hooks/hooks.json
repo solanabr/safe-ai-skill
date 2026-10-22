@@ -23,7 +23,8 @@
       ]}
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill prompt-guard", "timeout": 10, "onFailure": "continue" } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill prompt-guard", "timeout": 10, "onFailure": "continue" } ] },
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-prompt-expansion", "timeout": 10, "onFailure": "continue" } ] }
     ],
     "UserPromptExpansion": [
       { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-prompt-expansion", "timeout": 10, "onFailure": "continue" } ] }

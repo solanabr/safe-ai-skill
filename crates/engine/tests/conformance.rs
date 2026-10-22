@@ -233,6 +233,8 @@ fn hooks_json_wires_the_shared_contract_hooks() {
     };
     assert!(runs("PreToolUse", "Skill", "gate-skill"));
     assert!(runs("UserPromptExpansion", "", "gate-prompt-expansion"));
+    // A typed `/name` is also checked at UserPromptSubmit, for versions without the event.
+    assert!(runs("UserPromptSubmit", "", "gate-prompt-expansion"));
     assert!(runs(
         "SessionStart",
         "startup|resume|clear|compact",

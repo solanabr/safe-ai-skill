@@ -68,6 +68,7 @@ supply_chain:
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny
+  on_block: deny                    # blocked skill packs: deny in place | move to quarantine
 profiles:
   strict: {}
   autopilot:
