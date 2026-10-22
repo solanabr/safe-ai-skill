@@ -140,8 +140,12 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
             .first()
             .is_some_and(|w| w.text.contains('/') || w.text.contains('\\'));
         let skip = usize::from(!program_path);
-        for word in cmd.words.iter().skip(skip) {
+        let identity = identity_values(&program, cmd);
+        for (i, word) in cmd.words.iter().enumerate().skip(skip) {
             budget = budget.checked_sub(1)?;
+            if identity.contains(&i) {
+                continue;
+            }
             if let Some(hit) = word_hit(&word.text, &cwds, signer) {
                 return Some(format!("{program} {hit}"));
             }
@@ -151,6 +155,58 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Indices of the words that are an SSH identity value, which may name a private key: `-i
+/// <path>`, `-i<path>`, `-o IdentityFile=<path>` (also `-oIdentityFile=…` and the one-word
+/// `IdentityFile <path>`) for `ssh`, `scp` and `sftp`, and `-f <path>` of `ssh-keygen -y`
+/// (prints the public key). Every other use of a key (`scp ~/.ssh/id_rsa host:`, `ssh-add
+/// <key>`, `ssh-keygen -p -f <key>`) is still a credential path.
+fn identity_values(program: &str, cmd: &SimpleCommand) -> Vec<usize> {
+    let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+    let mut out = Vec::new();
+    match program {
+        "ssh" | "scp" | "sftp" => {
+            for (i, w) in words.iter().enumerate().skip(1) {
+                let lower = w.to_ascii_lowercase();
+                if *w == "-i" || *w == "-o" {
+                    // The next word is the value; an `-o` value counts only for IdentityFile.
+                    let next = words.get(i + 1).map(|n| n.to_ascii_lowercase());
+                    if *w == "-i" || next.is_some_and(|n| n.starts_with("identityfile")) {
+                        out.push(i);
+                        out.push(i + 1);
+                    }
+                } else if (w.starts_with("-i") && !w.starts_with("-i=") && w.len() > 2)
+                    || lower.starts_with("-oidentityfile")
+                    || lower.starts_with("identityfile")
+                {
+                    out.push(i);
+                }
+            }
+        }
+        "ssh-keygen" => {
+            let public_key = words
+                .iter()
+                .skip(1)
+                .any(|w| w.starts_with('-') && !w.starts_with("--") && w[1..].contains('y'));
+            if public_key {
+                for (i, w) in words.iter().enumerate().skip(1) {
+                    if *w == "-f"
+                        || (w.starts_with('-')
+                            && !w.starts_with("--")
+                            && w.ends_with('f')
+                            && w[1..].contains('y'))
+                    {
+                        out.push(i + 1);
+                    } else if w.starts_with("-f") && w.len() > 2 {
+                        out.push(i);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Record the directory a `cd`/`pushd` goes to (the home when it names none).
@@ -760,6 +816,34 @@ mod tests {
         assert!(matches!(verdict, Some(Verdict::Ask(_))), "{verdict:?}");
         let short = "cd x && ".repeat(100);
         assert_eq!(decide(&short, Path::new("/tmp"), &policy, Tier::Off), None);
+    }
+
+    #[test]
+    fn ssh_identity_values_are_the_only_exempt_key_paths() {
+        // The path check alone (the secrets gate may deny some of these first).
+        let d =
+            |c: &str| path_check(&shell::parse(c).commands, Path::new("/tmp")).map(Verdict::Deny);
+        for c in [
+            "ssh -i ~/.ssh/id_rsa host",
+            "ssh -i~/.ssh/id_rsa host",
+            "ssh -o IdentityFile=~/.ssh/id_rsa host",
+            "ssh -oIdentityFile=~/.ssh/id_rsa host",
+            "scp -i ~/.ssh/id_rsa f host:",
+            "sftp -i ~/.ssh/id_rsa host",
+            "ssh-keygen -y -f ~/.ssh/id_rsa",
+            "ssh-keygen -yf ~/.ssh/id_rsa",
+        ] {
+            assert_eq!(d(c), None, "{c}");
+        }
+        for c in [
+            "scp ~/.ssh/id_rsa host:",
+            "ssh-add ~/.ssh/id_rsa",
+            "ssh-keygen -p -f ~/.ssh/id_rsa",
+            "ssh -o StrictHostKeyChecking=no ~/.ssh/id_rsa",
+            "ssh -i ~/.ssh/a host cat ~/.aws/credentials",
+        ] {
+            assert!(matches!(d(c), Some(Verdict::Deny(_))), "{c}");
+        }
     }
 
     #[test]
