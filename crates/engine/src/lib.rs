@@ -11,8 +11,11 @@
 //! - Output / prompt guards: [`redact`], [`promptguard`].
 //! - Secrets CLI: [`env`] (`safe-ai-skill env keys|set|unset`).
 //! - Spend & swap: [`spend`], [`rugcheck`].
-//! - Relaxation layer: [`grants`], [`mode`], [`relax`], plus [`migrate`] (1.0 state) and
-//!   [`notice`] (the SessionStart loosenings notice).
+//! - Relaxation layer: [`grants`], [`relax`], plus [`migrate`] (1.0 and WS-B state) and
+//!   [`notice`] (the SessionStart tier line and loosenings notice).
+//! - Tiers (D8 v2): [`policy::tier`] (tier, sources, resolution), [`tierstate`] (`tier.json`),
+//!   [`mode`] (legacy profile alias shim), [`sandbox`] (declared sandbox state),
+//!   [`headless`] (the shared headless rule), [`lists`] (the embedded `policy/shared` lists).
 //! - Supply chain & session: [`verify`], [`registry`], [`squads`], [`session`].
 //! - Shared contracts (1.1.0): [`datadir`] (where state lives, and whether it is trusted),
 //!   [`statefile`] (MAC'd state), [`confirm`] (prompt-nonce confirmation), and
@@ -31,7 +34,9 @@ pub mod error;
 pub mod gate;
 pub mod gates;
 pub mod grants;
+pub mod headless;
 pub mod io;
+pub mod lists;
 pub mod migrate;
 pub mod mode;
 pub mod notice;
@@ -42,8 +47,10 @@ pub mod redact;
 pub mod registry;
 pub mod relax;
 pub mod rugcheck;
+pub mod sandbox;
 pub mod session;
 pub mod spend;
 pub mod squads;
 pub mod statefile;
+pub mod tierstate;
 pub mod verify;

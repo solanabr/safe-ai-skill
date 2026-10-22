@@ -23,13 +23,16 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::read;
+use safe_ai_skill::gates::{creddump, envwrite, exfil, read, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
-use safe_ai_skill::policy::Policy;
+use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
+use safe_ai_skill::policy::{self, Policy};
 use safe_ai_skill::spend::{self, SpendLedger};
 use safe_ai_skill::statefile::Loaded;
+use safe_ai_skill::tierstate::{self, Plan};
 use safe_ai_skill::{
-    grants, migrate, mode, notice, platform, promptguard, redact, registry, relax, session, verify,
+    grants, headless, migrate, notice, platform, promptguard, redact, registry, relax, sandbox,
+    session, verify,
 };
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
@@ -107,6 +110,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("registry", cmd_registry),
     ("session", cmd_session),
     ("allow", cmd_allow),
+    ("tier", cmd_tier),
     ("mode", cmd_mode),
     ("revoke", |_| cmd_revoke()),
     ("status", |_| cmd_status()),
@@ -164,13 +168,16 @@ fn record_decision(decision: &Decision) {
 }
 
 /// What the deadline emits: the gate's deny if it already reached one, else an `ask` with
-/// `reason`.
+/// `reason` (a `deny` when headless).
 fn deadline_decision(reason: &str) -> Decision {
     match DECIDED.lock().ok().and_then(|slot| slot.clone()) {
         Some(deny @ Decision::Deny { .. }) => deny,
-        _ => Decision::Ask {
-            reason: reason.to_string(),
-        },
+        _ => headless::apply(
+            Decision::Ask {
+                reason: reason.to_string(),
+            },
+            headless::detect(),
+        ),
     }
 }
 
@@ -296,20 +303,82 @@ fn ask_unreadable(why: Unreadable, input: &HookInput, raw: &[u8]) -> ExitCode {
         reason: reason.to_string(),
     };
     let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &dir);
+    let decision = headless::apply(decision, effective.runtime.headless);
     record_decision(&decision);
     write_audit(&effective, &dir.path, input, raw, "unreadable", &decision);
     let _ = io::emit_pretooluse(&decision);
     ExitCode::SUCCESS
 }
 
-/// Load the policy for `cwd` and resolve it to its EFFECTIVE form (profile overlay applied).
-///
-/// The persistent runtime override written by `safe-ai-skill mode <profile>` (`mode.json`)
-/// replaces the policy's profile; the `SAFE_AI_SKILL_PROFILE` env var may then only select a
-/// stricter one (see [`Policy::load_with_mode`]). Only an authenticated `mode.json` in a
-/// trusted data dir counts ([`mode::persisted`]).
+/// Load the policy for `cwd` with its runtime tier context ([`load_runtime`]).
 fn load_effective_policy(cwd: &Path, dir: &DataDir) -> Policy {
-    Policy::load_with_mode(cwd, mode::persisted(dir).as_deref()).effective()
+    load_runtime(cwd, dir).0
+}
+
+/// Load the policy for `cwd` and resolve the tier (the user's authenticated `tier.json` in a
+/// trusted data dir, raised by the kit, repo and env hints), the sandbox state of the project
+/// root and the headless rule ([`policy::load_runtime`]).
+fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
+    let root = tier::project_root(cwd);
+    policy::load_runtime(
+        cwd,
+        dir,
+        &|k| std::env::var(k).ok(),
+        sandbox::state(&root),
+        headless::detect(),
+    )
+}
+
+/// The strictest of several verdicts (`deny` > `ask` > `allow` > no opinion); `None` when
+/// none has an opinion.
+fn strictest(verdicts: impl IntoIterator<Item = Option<Verdict>>) -> Option<Verdict> {
+    verdicts
+        .into_iter()
+        .flatten()
+        .max_by_key(verdict_rank)
+        .filter(|v| !matches!(v, Verdict::NoOpinion))
+}
+
+fn verdict_rank(v: &Verdict) -> u8 {
+    match v {
+        Verdict::NoOpinion => 0,
+        Verdict::Allow(_) => 1,
+        Verdict::Ask(_) => 2,
+        Verdict::Deny(_) => 3,
+    }
+}
+
+fn decision_rank(d: &Decision) -> u8 {
+    match d {
+        Decision::Defer => 0,
+        Decision::Allow => 1,
+        Decision::Ask { .. } => 2,
+        Decision::Deny { .. } => 3,
+    }
+}
+
+/// Join a tier gate's verdict with a gate's decision: the tier verdict wins when it is
+/// stricter, under a hard-guard meta (no grant relaxes it).
+fn join_tier(
+    tier_verdict: Option<Verdict>,
+    decision: Decision,
+    meta: GateMeta,
+) -> (Decision, GateMeta) {
+    match tier_verdict {
+        Some(v) if verdict_rank(&v) > decision_rank(&decision) => {
+            (v.into(), GateMeta::new(Scope::SecretRead, true))
+        }
+        _ => (decision, meta),
+    }
+}
+
+/// A blocked-pack verdict as the tier has it act ([`verify::tier_action`]): `Some` when it
+/// still denies.
+fn blocked_pack(verdict: Verdict, tier: Tier) -> Option<Verdict> {
+    match verify::tier_action(verdict, tier) {
+        deny @ Verdict::Deny(_) => Some(deny),
+        _ => None,
+    }
 }
 
 /// The plugin data dir for a session rooted at `cwd`, resolved exactly as for a hook
@@ -344,6 +413,9 @@ fn finish_pretooluse(
 ) -> ExitCode {
     let plugin_data = dir.path.as_path();
     let decision = relax::apply(natural, meta, effective, dir);
+    // Headless (contract §3.3): every remaining ask becomes a deny; a grant the user confirmed
+    // earlier has already become an allow above.
+    let decision = headless::apply(decision, effective.runtime.headless);
     record_decision(&decision);
 
     // Commit-on-allow: once the FINAL (post-relaxation) decision for a transfer with a
@@ -460,13 +532,7 @@ fn cmd_gate_bash() -> ExitCode {
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let ctx = Context::build(command, &cwd);
-    let (mut decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
-    // paranoid: every Solana CLI command asks, including the ones with no opinion.
-    if matches!(decision, Decision::Defer) && effective.active_overlay().ask_all {
-        decision = Decision::Ask {
-            reason: relax::ASK_ALL_REASON.to_string(),
-        };
-    }
+    let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
@@ -481,9 +547,17 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let command = input.bash_command().unwrap_or("");
-    if let deny @ Verdict::Deny(_) = verify::enforce::bash_verdict(&dir, command, &cwd) {
+    let tier = effective.tier();
+    if let Some(deny) = blocked_pack(verify::enforce::bash_verdict(&dir, command, &cwd), tier) {
         return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
     }
+    // The D8 v2 tier gates (one call line each); the strictest joins the secrets decision.
+    let tier_verdict = strictest([
+        wallet::decide_bash(command, &cwd, &effective, tier),
+        creddump::decide(command, &cwd, &effective, tier),
+        envwrite::decide_cli(command, &cwd, &effective, tier),
+        exfil::decide_bash(command, &cwd, &effective, tier),
+    ]);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
     let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
@@ -493,6 +567,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         &cwd,
         &effective,
     );
+    let (decision, meta) = join_tier(tier_verdict, decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
@@ -508,8 +583,8 @@ fn cmd_gate_read() -> ExitCode {
     let effective = load_effective_policy(&cwd, &dir);
     let tool = input.tool_name.as_deref().unwrap_or("Read");
     if let Some(tool_input) = input.tool_input.as_ref() {
-        if let deny @ Verdict::Deny(_) = verify::enforce::read_verdict(&dir, tool, tool_input, &cwd)
-        {
+        let pack = verify::enforce::read_verdict(&dir, tool, tool_input, &cwd);
+        if let Some(deny) = blocked_pack(pack, effective.tier()) {
             return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
         }
     }
@@ -552,7 +627,9 @@ fn cmd_gate_mcp() -> ExitCode {
         return finish_pretooluse(secret, &meta, &effective, &dir, &input, &raw);
     }
     let ctx = Context::build("", &cwd);
+    let tier_verdict = exfil::decide_mcp(&tool, payload, &cwd, &effective, effective.tier());
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
+    let (decision, meta) = join_tier(tier_verdict, decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
@@ -627,9 +704,17 @@ fn cmd_gate_tamper() -> ExitCode {
     let dir = state_dir(&cwd);
     let effective = load_effective_policy(&cwd, &dir);
     let protected = safe_ai_skill::gates::tamper::Protected::from_env();
-    let decision =
-        safe_ai_skill::gates::tamper::decide_file(input.tool_input.as_ref(), &cwd, &protected);
-    // A tamper verdict is final: no grant or profile relaxes it, so it skips `relax::apply`.
+    let tool_input = input.tool_input.as_ref();
+    let decision = safe_ai_skill::gates::tamper::decide_file(tool_input, &cwd, &protected);
+    let tier = effective.tier();
+    let tier_verdict = strictest([
+        wallet::decide_file(tool_input, &cwd, &effective, tier),
+        envwrite::decide_file(tool_input, &cwd, &effective, tier),
+    ]);
+    let (decision, _) = join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true));
+    // A tamper verdict is final: no grant or tier relaxes it, so it skips `relax::apply`.
+    let decision = headless::apply(decision, effective.runtime.headless);
+    record_decision(&decision);
     write_audit(&effective, &dir.path, &input, &raw, "tamper", &decision);
     let _ = io::emit_pretooluse(&decision);
     ExitCode::SUCCESS
@@ -750,35 +835,55 @@ fn cmd_verify_session() -> ExitCode {
 
     // 1.0 state is migrated once, before anything creates the state key; then the spend
     // ledger is started (or repaired), which creates the key on a first run.
-    let migrated = migrate::run(&dir, now);
+    let mut migrated = migrate::run(&dir, now);
+    migrated.extend(migrate::mode_to_tier(&dir, now));
     let spend_state = spend::ledger_state(&plugin_data);
     let _ = SpendLedger::load(&plugin_data);
 
-    let effective = load_effective_policy(&cwd, &dir);
+    let (effective, resolution) = load_runtime(&cwd, &dir);
     let mut res = verify::run_session(&dir, &cwd, &effective);
 
-    // Overrides the policy ratchet refused (project overlay, looser profile env var, removed
-    // settings), then the active loosenings (spec D4.4): shown to the user and given to the
-    // model.
-    let env_profile = std::env::var(safe_ai_skill::policy::PROFILE_ENV).ok();
-    let project = std::env::var_os("CLAUDE_PROJECT_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.clone());
+    // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
+    // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
+    // user and given to the model.
+    let root = tier::project_root(&cwd);
     let loosenings = notice::loosenings(&notice::Inputs {
         dir: &dir,
-        env_profile: env_profile.as_deref(),
+        root: &root,
         spend: spend_state,
         migrated: &migrated,
-        sandbox: notice::sandbox_state(&project),
+        sandbox: sandbox::declared(&root),
         now,
     });
-    // Then install and platform notices (duplicate install, old Claude Code, Windows scope).
-    for text in [effective.ignored_notice(), loosenings]
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings]
         .into_iter()
         .flatten()
         .chain(platform::session_notices())
-    {
+        .collect();
+    // The tier line leads whenever there is anything to say, or the tier is not the plain
+    // default; a clean default session stays silent.
+    let plain_default = resolution.tier == Tier::Relaxed
+        && resolution.source == tier::TierSource::Base
+        && resolution.notes.is_empty();
+    let quiet = plain_default
+        && notices.is_empty()
+        && res.system_message.is_empty()
+        && res.additional_context.is_empty();
+    if !quiet {
+        let tier_text = std::iter::once(notice::tier_line(&resolution, &effective.runtime))
+            .chain(resolution.notes.iter().map(|n| format!(" - {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for field in [&mut res.system_message, &mut res.additional_context] {
+            *field = if field.is_empty() {
+                tier_text.clone()
+            } else {
+                format!("{tier_text}\n{field}")
+            };
+        }
+    }
+    // Then install and platform notices (duplicate install, old Claude Code, Windows scope).
+    for text in notices {
         for field in [&mut res.system_message, &mut res.additional_context] {
             if !field.is_empty() {
                 field.push('\n');
@@ -1586,7 +1691,7 @@ fn park_pending(
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::Grant => "grant_create",
-        PendingKind::Mode => "mode_set",
+        PendingKind::Mode | PendingKind::Tier => "tier_set",
         PendingKind::Trust => "verify_trust",
         PendingKind::Approve => "verify_approve",
     }
@@ -1636,48 +1741,119 @@ fn cmd_allow(rest: &[String]) -> ExitCode {
     )
 }
 
-/// `mode [<profile>]` — show the active profile, or select one. A stricter profile is
-/// written at once; a looser one (`autopilot`) is parked for prompt-nonce confirmation.
+/// `mode [<name>]` — deprecated alias of [`cmd_tier`] (profile names are tier aliases).
 fn cmd_mode(rest: &[String]) -> ExitCode {
+    let _ = writeln!(
+        std::io::stderr(),
+        "safe-ai-skill: `mode` is deprecated; use `safe-ai-skill tier` (strict/autopilot = \
+         relaxed, paranoid = high)."
+    );
+    cmd_tier(rest)
+}
+
+/// `tier [<name>] [--project] [--env-read deny|ask|tier] | --clear [--project]` — show the
+/// tier (no argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising
+/// the tier or tightening `env_read` applies at once; lowering or loosening is parked for the
+/// user's whole-prompt confirmation (the code reaches the user alone).
+fn cmd_tier(rest: &[String]) -> ExitCode {
     let cwd = process_cwd();
-    let Some(dir) = cli_state_dir("mode", &cwd) else {
+    let Some(dir) = cli_state_dir("tier", &cwd) else {
         return ExitCode::FAILURE;
     };
-    let Some(profile) = rest.first() else {
-        let current = load_effective_policy(&cwd, &dir).active_profile;
-        print_json(&serde_json::json!({ "command": "mode", "active_profile": current }));
-        return ExitCode::SUCCESS;
+    let mut name: Option<&str> = None;
+    let mut env_read: Option<EnvRead> = None;
+    let (mut project, mut clear) = (false, false);
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--project" => project = true,
+            "--clear" => clear = true,
+            "--env-read" => match args.next().map(|v| EnvRead::parse(v)) {
+                Some(Some(v)) => env_read = Some(v),
+                _ => return cli_error("tier", "--env-read: expected deny|ask|tier"),
+            },
+            a if a.starts_with('-') || name.is_some() => return cli_error(
+                "tier",
+                "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|ask|tier] \
+                     | tier --clear [--project]",
+            ),
+            a => name = Some(a),
+        }
+    }
+    let tier = match name.map(Tier::parse) {
+        Some(None) => return cli_error("tier", &tierstate::unknown_tier().to_string()),
+        Some(Some(t)) => Some(t),
+        None => None,
     };
-    if !mode::is_known_profile(profile) {
-        return cli_error("mode", &mode::unknown_profile(profile));
+    if clear && (tier.is_some() || env_read.is_some()) {
+        return cli_error("tier", "--clear takes no tier or --env-read");
     }
-    let current = Policy::load_with_mode(&cwd, mode::persisted(&dir).as_deref()).active_profile;
-    if mode::is_looser(profile, &current) {
-        return park_pending(
-            "mode",
+    if tier.is_none() && env_read.is_none() && !clear {
+        return print_tier(&cwd, &dir, "tier");
+    }
+    let root = tier::project_root(&cwd);
+    let change = tierstate::Change {
+        project: project.then(|| tierstate::root_key(&root)),
+        tier,
+        env_read,
+        clear,
+    };
+    let summary = tierstate::summary(&change);
+    let base = policy::base().base_tier;
+    match tierstate::plan(&dir, base, &change) {
+        Plan::NeedsConfirm => park_pending(
+            "tier",
             &dir,
-            PendingKind::Mode,
-            &format!("mode {profile} (from {current})"),
-            serde_json::json!({ "profile": profile }),
-        );
-    }
-    match mode::set(&dir, profile, now_secs()) {
-        Ok(()) => {
-            audit_event(
-                &dir.path,
-                "mode_set",
-                "mode",
-                &format!("active_profile={profile}"),
-            );
+            PendingKind::Tier,
+            &summary,
+            tierstate::to_payload(&change),
+        ),
+        Plan::NoChange => {
             print_json(&serde_json::json!({
-                "command": "mode",
-                "status": "set",
-                "active_profile": profile,
+                "command": "tier",
+                "status": "unchanged",
+                "summary": summary,
             }));
             ExitCode::SUCCESS
         }
-        Err(e) => cli_error("mode", &e.to_string()),
+        Plan::Immediate => match tierstate::apply(&dir, base, &change, now_secs()) {
+            Ok(()) => {
+                audit_event(&dir.path, "tier_set", "tier", &summary);
+                let (effective, resolution) = load_runtime(&cwd, &dir);
+                print_json(&serde_json::json!({
+                    "command": "tier",
+                    "status": "set",
+                    "summary": summary,
+                    "tier": resolution.tier.label(),
+                    "line": notice::tier_line(&resolution, &effective.runtime),
+                    "data_dir_trusted": dir.trusted,
+                }));
+                ExitCode::SUCCESS
+            }
+            Err(e) => cli_error("tier", &e.to_string()),
+        },
     }
+}
+
+/// Print the effective tier for `cwd`: where it comes from, the user's choice, `env_read`,
+/// the sandbox state, and every ignored hint.
+fn print_tier(cwd: &Path, dir: &DataDir, command: &str) -> ExitCode {
+    let (effective, resolution) = load_runtime(cwd, dir);
+    print_json(&serde_json::json!({
+        "command": command,
+        "tier": resolution.tier.label(),
+        "source": resolution.source.label(),
+        "user": resolution.user.label(),
+        "user_source": resolution.user_source.label(),
+        "env_read": resolution.env_read.label(),
+        "sandbox": effective.runtime.sandbox.label(),
+        "headless": effective.runtime.headless,
+        "line": notice::tier_line(&resolution, &effective.runtime),
+        "notes": resolution.notes,
+        "tier_state": state_label(&tierstate::load(dir)),
+        "data_dir_trusted": dir.trusted,
+    }));
+    ExitCode::SUCCESS
 }
 
 /// `revoke` — clear every grant (tightening, so it takes effect at once).
@@ -1721,7 +1897,7 @@ fn cmd_status() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let plugin_data = dir.path.clone();
-    let effective = load_effective_policy(&cwd, &dir);
+    let (effective, resolution) = load_runtime(&cwd, &dir);
 
     // Grants with derived remaining-budget / time-left (authenticated file only).
     let now = now_secs();
@@ -1762,10 +1938,15 @@ fn cmd_status() -> ExitCode {
     print_json(&serde_json::json!({
         "command": "status",
         "plugin_data": plugin_data.display().to_string(),
-        "active_profile": effective.active_profile,
+        "tier": resolution.tier.label(),
+        "tier_source": resolution.source.label(),
+        "tier_line": notice::tier_line(&resolution, &effective.runtime),
+        "tier_notes": resolution.notes,
+        "env_read": resolution.env_read.label(),
+        "sandbox": effective.runtime.sandbox.label(),
         "data_dir_trusted": dir.trusted,
         "grants_state": grants_state,
-        "mode_state": state_label(&mode::load(&dir)),
+        "tier_state": state_label(&tierstate::load(&dir)),
         "grants": grants_view,
         "spend": spend_view,
         "recent_audit": recent_audit_lines(&plugin_data, 5),

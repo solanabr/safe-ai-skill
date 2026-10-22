@@ -27,33 +27,10 @@ use serde_json::Value;
 use crate::env::render::Shown;
 use crate::env::schema::{self, Schema, ValueKind};
 use crate::gates::secretpath::{self, Class, Sniffed, Suspect};
+use crate::gates::{credpaths, envread};
 use crate::io::Decision;
 use crate::policy::Policy;
 use crate::redact;
-
-/// Appended to a directory Grep's `glob`: env-class names, key files and the hard-deny trees,
-/// case-insensitive (`rg --glob` is case-sensitive). Template and schema files fall under
-/// `.env.*` too, so a directory Grep never searches `.env.example` or `.env.schema` (read them
-/// directly); re-including them would turn the glob list into a whitelist.
-const GREP_EXCLUDED: &[&str] = &[
-    "**/.env",
-    "**/.env.*",
-    "**/*.env",
-    "**/.envrc",
-    "**/.dev.vars",
-    "**/.dev.vars.*",
-    "**/.varlock-frozen-env",
-    "**/*-keypair.json",
-    "**/id.json",
-    "**/*.pem",
-    "**/*.key",
-    "**/.ssh/id_*",
-    "**/.config/solana/**",
-    "**/.superstack/**",
-    "**/.config/varlock/**",
-    "**/.varlock/**",
-    "**/.claude/projects/**",
-];
 
 /// Names a Grep `glob` is tried against: one that matches a secret probe and no benign probe
 /// is an explicit search of secret files.
@@ -308,19 +285,10 @@ fn hard_deny(what: &str) -> Decision {
     }
 }
 
-/// The verdict for a raw read of an env-class file: `deny` with the `safe-ai-skill env`
-/// commands, or `ask` under `secrets.env_read: ask`.
+/// The verdict for a raw read of an env-class file, by tier, `env_read` and sandbox
+/// ([`envread::verdict`]): `deny` with the `safe-ai-skill env` commands by default.
 pub fn env_verdict(file: &str, policy: &Policy, varlock: bool) -> Decision {
-    let reason = env_reason(file, varlock);
-    if policy.secrets.env_read == "ask" {
-        Decision::Ask {
-            reason: format!(
-                "Raw read of an env file (secrets.env_read: ask): approving shows its values to the model. {reason}"
-            ),
-        }
-    } else {
-        Decision::Deny { reason }
-    }
+    envread::decision(policy, env_reason(file, varlock))
 }
 
 /// The actionable env-class message (spec D3.3, D3.8.6). `varlock` adds the varlock hint.
@@ -478,28 +446,15 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     }
 
     let real = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-    let in_hard_tree = [&target, &real]
-        .iter()
-        .any(|p| secretpath::is_hard_tree(&p.to_string_lossy(), &homes));
-    if in_hard_tree {
-        return ReadVerdict::Decide(hard_deny("search inside a key directory"));
-    }
-    // Grep passes `--hidden`: a search from $HOME, ~/.config or any ancestor reaches ~/.ssh and
-    // ~/.config/solana, and name exclusions cannot cover every key file name there.
-    if [&target, &real]
-        .iter()
-        .any(|p| contains_hard_tree(p, &homes))
-    {
-        return ReadVerdict::Decide(hard_deny(
-            "search over a directory that contains ~/.ssh or ~/.config/solana; pass a project path",
-        ));
+    if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
+        return ReadVerdict::Decide(verdict.into());
     }
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
         return ReadVerdict::Decide(env_verdict(first, policy, varlock_hint(cwd, &real)));
     }
 
-    let exclusion = grep_exclusion();
+    let exclusion = grep_exclusion(&real);
     let new_glob = if glob.trim().is_empty() {
         exclusion
     } else {
@@ -510,33 +465,13 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     ReadVerdict::Rewrite(Value::Object(updated))
 }
 
-/// Whether `dir` is an ancestor of (or equal to) a home hard-deny tree.
-fn contains_hard_tree(dir: &Path, homes: &[String]) -> bool {
-    let dir = PathBuf::from(secretpath::normalize(&dir.to_string_lossy(), None));
-    homes.iter().any(|home| {
-        let home = secretpath::normalize(home, None);
-        [
-            ".ssh",
-            ".config/solana",
-            ".superstack",
-            ".config/varlock",
-            ".varlock",
-        ]
+/// The ` !{…}` negated brace group appended to a Grep's glob over `dir`
+/// ([`credpaths::grep_exclusions`]).
+pub fn grep_exclusion(dir: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions(dir)
         .iter()
-        .any(|tree| Path::new(&home).join(tree).starts_with(&dir))
-    }) || std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|x| !x.is_empty())
-        .is_some_and(|x| {
-            Path::new(&secretpath::normalize(&x, None))
-                .join("varlock")
-                .starts_with(&dir)
-        })
-}
-
-/// The ` !{…}` negated brace group appended to a directory Grep's glob.
-pub fn grep_exclusion() -> String {
-    let alts: Vec<String> = GREP_EXCLUDED.iter().map(|g| case_insensitive(g)).collect();
+        .map(|g| case_insensitive(g))
+        .collect();
     format!("!{{{}}}", alts.join(","))
 }
 
@@ -762,7 +697,7 @@ mod tests {
     #[test]
     fn env_read_ask_policy() {
         let mut p = policy();
-        p.secrets.env_read = "ask".into();
+        p.runtime.env_read = crate::policy::tier::EnvRead::Ask;
         assert!(matches!(
             decide_path(".env", &here(), &p),
             Decision::Ask { .. }
@@ -804,7 +739,7 @@ mod tests {
 
     #[test]
     fn exclusion_is_the_q10_recipe_extended() {
-        let ex = grep_exclusion();
+        let ex = grep_exclusion(Path::new("/"));
         assert!(
             ex.starts_with("!{**/.[eE][nN][vV],**/.[eE][nN][vV].*,"),
             "{ex}"

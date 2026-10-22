@@ -71,6 +71,9 @@ pub fn classify(path: &str) -> Class {
 /// canonical home too, since resolved paths go through symlinked homes).
 pub fn classify_with_homes(path: &str, homes: &[String]) -> Class {
     let full = normalize(path, homes.first().map(String::as_str));
+    if crate::gates::credpaths::is_credential(Path::new(&full)) {
+        return Class::HardDeny("credential store");
+    }
     if let Some(class) = tree_class(&full) {
         return class;
     }

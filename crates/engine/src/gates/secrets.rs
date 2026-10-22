@@ -539,11 +539,7 @@ fn decide_varlock(args: &[String], assignments: &[&String], policy: &Policy) -> 
             "safe-ai-skill: `varlock {sub}` prints resolved secret values into the transcript. {}",
             "Use `varlock load --agent` (redacted) to see the config, or `varlock run -- <cmd>` to run a tool with the values injected; `safe-ai-skill env keys <file>` lists keys with values masked."
         );
-        return if policy.secrets.env_read == "ask" {
-            Decision::Ask { reason }
-        } else {
-            Decision::Deny { reason }
-        };
+        return crate::gates::envread::decision(policy, reason);
     }
     let unredacted = has("--no-redact-stdout")
         || assignments.iter().any(|a| {

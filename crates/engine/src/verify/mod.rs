@@ -553,6 +553,20 @@ pub fn quarantined_packs(plugin_data: &Path, st: &State) -> Vec<String> {
         .collect()
 }
 
+/// What a blocked-pack verdict becomes at `tier` (D8 v2 spec §6; owned by F5): Off reports
+/// instead of denying, High also denies HIGH-heuristic (`unreviewed`) packs until trusted.
+///
+/// **F0 stub:** identity (1.1.0 denies in place at every tier). Call line:
+/// `main::blocked_pack` (Read/Grep/Bash path access under a pack); F5 wires the Skill and
+/// slash gates in [`crate::gates::skill`] itself.
+pub fn tier_action(
+    verdict: crate::gate::Verdict,
+    tier: crate::policy::tier::Tier,
+) -> crate::gate::Verdict {
+    let _ = tier;
+    verdict
+}
+
 /// The repository root at or above `start`: the nearest directory holding `.git` or
 /// `.gitmodules` (`start` itself when none does), so `verify approve` resolves `.gitmodules` and
 /// the swept roots the same way from any subdirectory of the project.
@@ -2023,7 +2037,7 @@ pub fn apply_confirmed(dir: &DataDir, confirmed: &Confirmed) -> Result<String, E
     match confirmed.kind {
         PendingKind::Trust => apply_trust(dir, &confirmed.payload),
         PendingKind::Approve => apply_approve(dir, &confirmed.payload),
-        PendingKind::Grant | PendingKind::Mode => {
+        PendingKind::Grant | PendingKind::Mode | PendingKind::Tier => {
             Err(Error::Other("not a verify confirmation".to_string()))
         }
     }
