@@ -137,13 +137,11 @@ pub fn confirm_prompt(
     confirm_prompt_in(dir, prompt, now, session, crate::headless::session_check)
 }
 
-/// [`confirm_prompt`] with the session check given. On a confirmation line:
-/// - [`SessionCheck::Refused`]: nothing changes (no entry consumed, no wrong code counted)
-///   and only the user is told;
-/// - [`SessionCheck::Unknown`]: only a request made inside this session can be confirmed (the
-///   session binding vouches for it); one made from a terminal is refused, with how to make it
-///   from inside the session instead;
-/// - [`SessionCheck::Interactive`]: any request of this session.
+/// [`confirm_prompt`] with the session check given. On a confirmation line in a session that
+/// is not [`SessionCheck::Interactive`] nothing changes (no entry consumed, no wrong code
+/// counted) and only the user is told why. An undetermined ancestry is refused like a known
+/// `-p` or nested one: the session id alone cannot vouch for a session, because the agent can
+/// steer it (`CLAUDE_CODE_SESSION_ID`, `--session-id`, `--resume`, `-c`).
 pub fn confirm_prompt_in(
     dir: &DataDir,
     prompt: &str,
@@ -151,8 +149,6 @@ pub fn confirm_prompt_in(
     session: Option<&str>,
     check: impl FnOnce() -> SessionCheck,
 ) -> Option<ConfirmOutcome> {
-    let mut reach = confirm::Reach::Any;
-    let mut unknown = None;
     if matches!(confirm::classify(prompt), confirm::PromptForm::Line(_)) {
         match check() {
             SessionCheck::Refused(why) => {
@@ -162,21 +158,11 @@ pub fn confirm_prompt_in(
                      request is still pending."
                 )));
             }
-            SessionCheck::Unknown(why) => {
-                reach = confirm::Reach::MadeHere;
-                unknown = Some(why);
-            }
+            SessionCheck::Unknown(why) => return Some(user_only(unknown_refusal(&why))),
             SessionCheck::Interactive => {}
         }
     }
-    match confirm::confirm_attempt_in(dir, prompt, now, session.unwrap_or(""), reach) {
-        Attempt::NeedsInteractive => Some(user_only(format!(
-            "safe-ai-skill: nothing confirmed: {}. A request made outside this Claude Code \
-             session (from a terminal) needs that check; make the request from inside this \
-             session instead, with `! safe-ai-skill tier …` (or `! safe-ai-skill allow …`), \
-             and confirm the code it shows here.",
-            unknown.unwrap_or_default()
-        ))),
+    match confirm::confirm_attempt_for(dir, prompt, now, session.unwrap_or("")) {
         Attempt::NotThisSession => Some(user_only(
             "safe-ai-skill: nothing confirmed. No pending request belongs to this Claude Code \
              session: a code works only in the session that made the request or first showed \
@@ -213,6 +199,17 @@ pub fn confirm_prompt_in(
     }
 }
 
+/// The refusal when the ancestry is undetermined (native Windows has no process table).
+fn unknown_refusal(why: &str) -> String {
+    format!(
+        "safe-ai-skill: nothing confirmed: {why}. Confirmations (lowering the tier, loosening \
+         env_read, grants, verify trust/approve) need that check, so they are unavailable \
+         where the engine cannot read the process table: on native Windows (use WSL for these \
+         actions) and in sessions whose hooks run sandboxed. Raising the tier and everything \
+         else work. The request is still pending."
+    )
+}
+
 /// A note for the user only (`systemMessage`, nothing for the model).
 fn user_only(text: String) -> ConfirmOutcome {
     ConfirmOutcome {
@@ -222,10 +219,9 @@ fn user_only(text: String) -> ConfirmOutcome {
 }
 
 /// The `systemMessage` announcing new confirmation codes of `session`, if any (user only).
-/// Nothing is announced without a session id or in a refused session
-/// ([`crate::headless::session_check`]): a code shown there could reach an agent. When the
-/// check is [`SessionCheck::Unknown`] only requests made inside this session are announced;
-/// a terminal-made one stays unannounced for a session that passes the check.
+/// Nothing is announced without a session id, or unless the session is
+/// [`SessionCheck::Interactive`] ([`crate::headless::session_check`]): a code shown elsewhere
+/// could reach an agent.
 pub fn announce(dir: &DataDir, now: u64, session: Option<&str>) -> Option<String> {
     announce_in(dir, now, session, crate::headless::session_check)
 }
@@ -238,15 +234,10 @@ pub fn announce_in(
     check: impl FnOnce() -> SessionCheck,
 ) -> Option<String> {
     let session = session?;
-    if !confirm::has_unannounced(dir, now, session, confirm::Reach::Any) {
+    if !confirm::has_unannounced(dir, now, session) || check() != SessionCheck::Interactive {
         return None;
     }
-    let reach = match check() {
-        SessionCheck::Refused(_) => return None,
-        SessionCheck::Unknown(_) => confirm::Reach::MadeHere,
-        SessionCheck::Interactive => confirm::Reach::Any,
-    };
-    confirm::announcement_message(&confirm::announce_pending_in(dir, now, session, reach))
+    confirm::announcement_message(&confirm::announce_pending_for(dir, now, session))
 }
 
 /// Perform a confirmed pending entry and describe the result.
@@ -411,11 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_ancestry_confirms_only_requests_made_in_the_session() {
+    fn an_unknown_ancestry_shows_and_confirms_nothing() {
         let s = Some(crate::confirm::TEST_SESSION);
-        let unknown = || SessionCheck::Unknown("could not determine (no ps)".into());
-        // Made from a terminal: not announced, not confirmable, and the user is told how.
-        let dir = tmp_data("relax_unknown_terminal");
+        let unknown = || SessionCheck::Unknown("no process table on this platform".into());
+        let dir = tmp_data("relax_unknown");
         crate::confirm::create_pending(
             &dir,
             PendingKind::Tier,
@@ -423,44 +413,26 @@ mod tests {
             serde_json::json!({"tier": "off"}),
         )
         .unwrap();
+        // Not even for a request bound to this session: the id is agent-steerable.
         assert_eq!(announce_in(&dir, now(), s, unknown), None);
-        let out =
-            confirm_prompt_in(&dir, "safe-ai-skill confirm 12345678", now(), s, unknown).unwrap();
-        assert!(
-            out.system_message.contains("! safe-ai-skill tier"),
-            "{out:?}"
-        );
-        assert!(out.additional_context.is_empty());
-        let _ = std::fs::remove_dir_all(&dir.path);
-        // Made inside this session: announced and confirmed on the binding alone.
-        let dir = tmp_data("relax_unknown_made");
-        crate::confirm::create_pending(
+        let code = crate::confirm::tests::announced(
             &dir,
             PendingKind::Tier,
-            "tier off",
             serde_json::json!({"tier": "off"}),
-        )
-        .unwrap();
-        crate::confirm::tests::made_in(&dir, crate::confirm::TEST_SESSION);
-        let msg = announce_in(&dir, now(), s, unknown).expect("announced");
-        let code: String = msg
-            .split("safe-ai-skill confirm ")
-            .nth(1)
-            .unwrap()
-            .chars()
-            .take(8)
-            .collect();
-        let line = format!("safe-ai-skill confirm {code}");
-        // Another session still cannot, and a refused (known `-p`) session cannot either.
-        let other = confirm_prompt_in(&dir, &line, now(), Some("other"), unknown).unwrap();
-        assert!(
-            other.system_message.contains("nothing confirmed"),
-            "{other:?}"
         );
-        let refused = || SessionCheck::Refused("runs non-interactively".into());
-        let r = confirm_prompt_in(&dir, &line, now(), s, refused).unwrap();
-        assert!(r.system_message.contains("non-interactively"), "{r:?}");
-        let ok = confirm_prompt_in(&dir, &line, now(), s, unknown).unwrap();
+        let line = format!("safe-ai-skill confirm {}", code.as_str());
+        for _ in 0..4 {
+            let out = confirm_prompt_in(&dir, &line, now(), s, unknown).unwrap();
+            assert!(
+                out.system_message.contains("native Windows")
+                    && out.system_message.contains("WSL")
+                    && !out.system_message.contains("! safe-ai-skill"),
+                "{out:?}"
+            );
+            assert!(out.additional_context.is_empty());
+        }
+        // Still pending and not locked out: an interactive session confirms it.
+        let ok = confirm_prompt_in(&dir, &line, now(), s, || SessionCheck::Interactive).unwrap();
         assert!(!ok.system_message.contains("nothing confirmed"), "{ok:?}");
         let _ = std::fs::remove_dir_all(&dir.path);
     }

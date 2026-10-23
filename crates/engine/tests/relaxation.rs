@@ -766,12 +766,12 @@ fn a_request_made_in_a_session_belongs_to_it_from_the_start() {
 }
 
 /// With the process table unavailable (a `ps` a sandbox denies, or native Windows, which has
-/// none), the session cannot be shown to be interactive. A request made from a terminal is
-/// then neither shown nor confirmable there, and the user is told to make it from inside the
-/// session; a request made inside the session is shown and confirmed on its session binding.
+/// none), the session cannot be shown to be interactive: no code is shown and none is accepted,
+/// whether the request was made from a terminal or inside the session (its session id is
+/// agent-steerable), and the user is told why, with the WSL advice.
 #[cfg(feature = "test-hooks")]
 #[test]
-fn an_unreadable_process_table_confirms_only_requests_made_in_the_session() {
+fn an_unreadable_process_table_shows_and_confirms_nothing() {
     let no_ps = [("SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE", "1")];
     let prompt = |sb: &Sandbox, text: &str| {
         let run = sb.hook(
@@ -786,37 +786,36 @@ fn an_unreadable_process_table_confirms_only_requests_made_in_the_session() {
             run.json()
         }
     };
-    // Terminal-made.
-    let sb = Sandbox::new("relax-no-ps-terminal");
-    allow_transfer(&sb);
-    assert_eq!(prompt(&sb, "hi"), serde_json::Value::Null, "no code shown");
-    let pending = sb.state("pending.json");
-    let v = prompt(&sb, "safe-ai-skill confirm 12345678");
-    let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
-    assert!(
-        msg.contains("could not determine whether this Claude Code session is interactive")
-            && msg.contains("! safe-ai-skill"),
-        "{msg}"
-    );
-    assert!(v.get("hookSpecificOutput").is_none(), "{v}");
-    assert_eq!(sb.state("pending.json"), pending);
-    // Made inside the session (its Bash tool, or `!`), as on native Windows.
-    let sb = Sandbox::new("relax-no-ps-session");
-    let run = sb.cli_env(
-        &[
-            "allow", "--scope", "transfer", "--for", "30m", "--max-tx", "1", "--budget", "5",
-        ],
-        &[("CLAUDE_CODE_SESSION_ID", "it-relax")],
-    );
-    assert_eq!(run.code, Some(0), "{}", run.stderr);
-    let v = prompt(&sb, "hi");
-    let code = code_in(v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}")));
-    let ok = prompt(&sb, &format!("safe-ai-skill confirm {code}"));
-    assert!(
-        ok["systemMessage"]
-            .as_str()
-            .unwrap()
-            .contains("you confirmed"),
-        "{ok}"
-    );
+    for made_in_session in [false, true] {
+        let sb = Sandbox::new(if made_in_session {
+            "relax-no-ps-session"
+        } else {
+            "relax-no-ps-terminal"
+        });
+        let session: &[(&str, &str)] = if made_in_session {
+            &[("CLAUDE_CODE_SESSION_ID", "it-relax")]
+        } else {
+            &[]
+        };
+        let run = sb.cli_env(
+            &[
+                "allow", "--scope", "transfer", "--for", "30m", "--max-tx", "1", "--budget", "5",
+            ],
+            session,
+        );
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert_eq!(prompt(&sb, "hi"), serde_json::Value::Null, "no code shown");
+        let pending = sb.state("pending.json");
+        let v = prompt(&sb, "safe-ai-skill confirm 12345678");
+        let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+        assert!(
+            msg.contains("could not determine whether this Claude Code session is interactive")
+                && msg.contains("native Windows")
+                && msg.contains("WSL")
+                && !msg.contains("! safe-ai-skill"),
+            "{msg}"
+        );
+        assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+        assert_eq!(sb.state("pending.json"), pending);
+    }
 }

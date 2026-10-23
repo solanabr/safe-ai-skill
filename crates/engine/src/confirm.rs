@@ -35,11 +35,10 @@
 //! the direct forms; the Bash gates also ask about (deny at High or headless) any
 //! non-interactive `claude` they can see. A session that is headless, runs non-interactively
 //! or was started from inside another Claude Code session
-//! ([`crate::headless::session_check`]) neither announces codes nor confirms: a code typed
-//! there is refused without consuming anything, and the user is told so. Where the ancestry
-//! cannot be determined, only requests made inside the same session ([`Reach::MadeHere`]) are
-//! announced and confirmed. Obfuscated nested sessions whose ancestry the engine cannot follow
-//! remain; the sandbox is the hard boundary.
+//! ([`crate::headless::confirmation_refused`]) neither announces codes nor confirms: a code
+//! typed there is refused without consuming anything, and the user is told so. Obfuscated
+//! nested sessions whose ancestry the engine cannot follow remain; the sandbox is the hard
+//! boundary.
 //!
 //! Live entries are capped at [`MAX_PENDING`]; an announced entry is confirmable for
 //! [`TTL_SECS`] after its announcement, an unannounced one is dropped [`TTL_SECS`] after
@@ -172,9 +171,6 @@ pub enum Attempt {
     LockedOut,
     /// No live request belongs to this session: refused, not counted, nothing consumed.
     NotThisSession,
-    /// With [`Reach::MadeHere`], only a request made from a terminal is pending for this
-    /// session: it needs an interactive check. Refused, not counted, nothing consumed.
-    NeedsInteractive,
 }
 
 /// The shape of a prompt, by one whitespace rule (tokens split on any whitespace).
@@ -226,10 +222,6 @@ struct Entry {
     /// announced it. Its code is shown and accepted only there.
     #[serde(default)]
     session: Option<String>,
-    /// `session` was recorded when the request was made (inside that session), not when a
-    /// session first announced it.
-    #[serde(default)]
-    made_in_session: bool,
 }
 
 /// The `pending.json` body.
@@ -254,7 +246,6 @@ pub fn create_pending(
     // Read the clock under the lock: an earlier reading would prune entries stamped by
     // whoever held the lock meanwhile as "from the future".
     let now = now_secs();
-    let made_in = creating_session();
     let mut pending = load_pending(dir);
     pending.entries.retain(|e| !is_expired(e, now));
     let id = loop {
@@ -271,8 +262,7 @@ pub fn create_pending(
         created_at: now,
         announced_at: None,
         code_hash: None,
-        made_in_session: made_in.is_some(),
-        session: made_in,
+        session: creating_session(),
     });
     let excess = pending.entries.len().saturating_sub(MAX_PENDING);
     pending.entries.drain(..excess);
@@ -299,44 +289,13 @@ fn is_session_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// Which of a session's requests a call may announce or confirm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reach {
-    /// Requests made in the session, and (announce) unbound ones it then takes: the session
-    /// passed the interactive check.
-    Any,
-    /// Only requests made inside the session: its interactivity could not be determined, so
-    /// the session binding alone vouches for them.
-    MadeHere,
-}
-
-impl Reach {
-    fn covers(self, e: &Entry, session: &str) -> bool {
-        match self {
-            Reach::Any => e.session.as_deref().is_none_or(|s| s == session),
-            Reach::MadeHere => e.made_in_session && e.session.as_deref() == Some(session),
-        }
-    }
-}
-
-/// [`announce_pending_in`] with [`Reach::Any`].
-pub fn announce_pending_for(dir: &DataDir, now: u64, session: &str) -> Vec<Announcement> {
-    announce_pending_in(dir, now, session, Reach::Any)
-}
-
 /// Make and record a code for every live, unannounced entry, and return them for a
 /// `systemMessage`. Empty when there is nothing to announce or the codes cannot be persisted
 /// (a code is never shown that could not be checked later). Creates nothing when there is no
 /// `pending.json`.
 ///
-/// Only entries of `session` (or bound to none yet, which `session` then takes) within `reach`
-/// are announced.
-pub fn announce_pending_in(
-    dir: &DataDir,
-    now: u64,
-    session: &str,
-    reach: Reach,
-) -> Vec<Announcement> {
+/// Only entries of `session` (or bound to none yet, which `session` then takes) are announced.
+pub fn announce_pending_for(dir: &DataDir, now: u64, session: &str) -> Vec<Announcement> {
     if !is_session_id(session) {
         return Vec::new();
     }
@@ -354,11 +313,11 @@ pub fn announce_pending_in(
     };
     pending.entries.retain(|e| !is_expired(e, now));
     let mut out = Vec::new();
-    for e in pending
-        .entries
-        .iter_mut()
-        .filter(|e| e.announced_at.is_none() && e.created_at <= now && reach.covers(e, session))
-    {
+    for e in pending.entries.iter_mut().filter(|e| {
+        e.announced_at.is_none()
+            && e.created_at <= now
+            && e.session.as_deref().is_none_or(|s| s == session)
+    }) {
         e.session = Some(session.to_string());
         let Ok(code) = random_nonce() else {
             return Vec::new();
@@ -415,7 +374,7 @@ pub fn pending_list(dir: &DataDir, now: u64) -> Vec<Value> {
 }
 
 /// Whether [`announce_pending_for`] would announce anything at `now` (read only, no lock).
-pub fn has_unannounced(dir: &DataDir, now: u64, session: &str, reach: Reach) -> bool {
+pub fn has_unannounced(dir: &DataDir, now: u64, session: &str) -> bool {
     if !is_session_id(session) {
         return false;
     }
@@ -427,7 +386,7 @@ pub fn has_unannounced(dir: &DataDir, now: u64, session: &str, reach: Reach) -> 
             e.announced_at.is_none()
                 && e.created_at <= now
                 && !is_expired(e, now)
-                && reach.covers(e, session)
+                && e.session.as_deref().is_none_or(|s| s == session)
         }),
         _ => false,
     }
@@ -445,18 +404,6 @@ pub fn has_unannounced(dir: &DataDir, now: u64, session: &str, reach: Reach) -> 
 /// own gets [`Attempt::NotThisSession`]: nothing is counted, so another session cannot run the
 /// user's requests into the lockout. The lockout cancels the entries of `session`.
 pub fn confirm_attempt_for(dir: &DataDir, prompt: &str, now: u64, session: &str) -> Attempt {
-    confirm_attempt_in(dir, prompt, now, session, Reach::Any)
-}
-
-/// [`confirm_attempt_for`] limited to the entries within `reach` ([`Reach::MadeHere`]: only
-/// requests made inside `session`).
-pub fn confirm_attempt_in(
-    dir: &DataDir,
-    prompt: &str,
-    now: u64,
-    session: &str,
-    reach: Reach,
-) -> Attempt {
     let code = match classify(prompt) {
         PromptForm::NotAConfirm => return Attempt::NotAnAttempt,
         PromptForm::Embedded => return Attempt::Embedded,
@@ -477,21 +424,9 @@ pub fn confirm_attempt_in(
         let _ = statefile::store(dir, PENDING_FILE, &pending);
         return wrong;
     }
-    let mine = |e: &Entry| {
-        is_session_id(session) && e.session.as_deref() == Some(session) && reach.covers(e, session)
-    };
+    let mine = |e: &Entry| is_session_id(session) && e.session.as_deref() == Some(session);
     if !pending.entries.iter().any(|e| mine(e) && is_live(e, now)) {
-        // A request this session could take, or holds, but not on the binding alone.
-        let terminal_made = reach == Reach::MadeHere
-            && pending
-                .entries
-                .iter()
-                .any(|e| !e.made_in_session && e.session.as_deref().is_none_or(|s| s == session));
-        return if terminal_made {
-            Attempt::NeedsInteractive
-        } else {
-            Attempt::NotThisSession
-        };
+        return Attempt::NotThisSession;
     }
     let hit = match (is_nonce(code), statefile::derived_key(dir, SALT_LABEL)) {
         (true, Ok(salt)) => pending.entries.iter().position(|e| {
@@ -701,17 +636,6 @@ pub(crate) mod tests {
     }
 
     /// Create an entry and announce it, returning the code the user would see.
-    /// Mark every entry as made inside `session` (as the CLI does in a session's Bash tool).
-    pub(crate) fn made_in(dir: &DataDir, session: &str) {
-        let _lock = FileLock::acquire(&dir.path, LOCK_FILE).unwrap();
-        let mut p = load_pending(dir);
-        for e in &mut p.entries {
-            e.session = Some(session.to_string());
-            e.made_in_session = true;
-        }
-        statefile::store(dir, PENDING_FILE, &p).unwrap();
-    }
-
     pub(crate) fn announced(dir: &DataDir, kind: PendingKind, payload: Value) -> Nonce {
         let id = create_pending(dir, kind, "summary", payload).unwrap();
         announce_pending(dir, now_secs())
@@ -767,7 +691,7 @@ pub(crate) mod tests {
             create_pending(&dir, PendingKind::Tier, "tier off", serde_json::json!({})).unwrap();
         let now = now_secs();
         assert!(
-            !has_unannounced(&dir, now, "", Reach::Any),
+            !has_unannounced(&dir, now, ""),
             "no session id, no announcement"
         );
         assert!(announce_pending_for(&dir, now, "").is_empty());
@@ -777,7 +701,7 @@ pub(crate) mod tests {
         let line = format!("safe-ai-skill confirm {}", shown[0].code.as_str());
         // Another session (a nested `claude -p` has its own id) sees nothing and cannot use
         // the code, and its attempts are not counted toward the lockout.
-        assert!(!has_unannounced(&dir, now, "session-b", Reach::Any));
+        assert!(!has_unannounced(&dir, now, "session-b"));
         assert!(announce_pending_for(&dir, now, "session-b").is_empty());
         for _ in 0..(MAX_FAILURES + 1) {
             assert!(matches!(
@@ -803,7 +727,6 @@ pub(crate) mod tests {
             let _lock = FileLock::acquire(&dir.path, LOCK_FILE).unwrap();
             let mut p = load_pending(&dir);
             p.entries[0].session = Some("session-a".into());
-            p.entries[0].made_in_session = true;
             statefile::store(&dir, PENDING_FILE, &p).unwrap();
         }
         assert!(announce_pending_for(&dir, now, "session-b").is_empty());

@@ -23,7 +23,7 @@
 //! started from another Claude Code CLI (an agent's nested `claude`). Neither can be seen in
 //! the hook payload or in a variable Claude Code documents. When the ancestry cannot be
 //! determined (no process table, as on native Windows; `ps` denied or too slow; a missing
-//! parent; the depth cap) only requests made inside the same session can be confirmed. Processes are recognised by their argument words, which a nested
+//! parent; the depth cap) nothing is announced or confirmed either. Processes are recognised by their argument words, which a nested
 //! session's launcher controls (`exec -a`): that residual is why `confirm` also binds each
 //! request to one Claude Code session.
 
@@ -94,8 +94,8 @@ pub enum SessionCheck {
     /// Headless, non-interactive or nested: nothing is announced or confirmed.
     Refused(String),
     /// The ancestry could not be determined (no process table by design on native Windows, a
-    /// denied or slow `ps`): only requests made inside this very session are announced and
-    /// confirmed, on the session binding alone.
+    /// denied or slow `ps`): refused like [`SessionCheck::Refused`], with the platform advice.
+    /// The session id cannot stand in for the check: the agent can steer it.
     Unknown(String),
 }
 
@@ -444,6 +444,24 @@ mod tests {
                 "this Claude Code session was started from inside another Claude Code session"
             )
         );
+        // Children of an agent's Bash tool that take over or name a session are nested all
+        // the same: `--resume <the user's id>`, `-c`, `--session-id <id>`, with or without -p.
+        for child in [
+            "claude --resume 7c5dcf5d-user-session",
+            "claude -c",
+            "claude --session-id 550e8400-e29b-41d4-a716-446655440000",
+            "claude --resume 7c5dcf5d-user-session -p hi",
+        ] {
+            let t = table(&[
+                (1, 0, "launchd"),
+                (5, 1, "claude"),
+                (6, 5, "/bin/bash -c ..."),
+                (7, 6, child),
+                (8, 7, "sh -c hook"),
+                (9, 8, "safe-ai-skill prompt-guard"),
+            ]);
+            assert!(refused(ancestry_verdict(9, &t)), "{child}");
+        }
         // The Claude Desktop app (or an IDE) hosting the CLI is not a Claude Code CLI.
         for host in [
             "/Applications/Claude.app/Contents/MacOS/Claude",
