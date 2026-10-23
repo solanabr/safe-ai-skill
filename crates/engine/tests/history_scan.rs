@@ -335,7 +335,8 @@ fn a_docs_commit_that_adds_code_is_flagged() {
     );
     assert_eq!(rules::grade(&h.report), Grade::Warn);
     let v = check(&dir);
-    assert_eq!(v["verdict"], "warn", "{v}");
+    // Report-only: shown, but it never holds `add`/`install`.
+    assert_eq!(v["verdict"], "pass", "{v}");
     assert!(kinds(&v).iter().any(|k| k == "docs_commit_code"), "{v}");
 
     // An honest docs commit touching only docs is not flagged.
@@ -391,6 +392,41 @@ fn a_docs_commit_that_slips_in_a_sink_blocks() {
     );
     assert_eq!(sink.parts, vec!["docs_commit_code", "secret_read"]);
     assert_eq!(check(&dir)["verdict"], "block");
+}
+
+#[test]
+fn a_docs_commit_editing_around_an_existing_sink_does_not_block() {
+    if !have_git() {
+        return;
+    }
+    let tmp = TempDir::new("hist-docs-old-sink");
+    let dir = repo(&tmp);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    let body = "const fs = require('fs');\nconst k = fs.readFileSync(require('os').homedir() + '/.config/solana/id.json');\n";
+    fs::write(
+        dir.join("src/wallet.js"),
+        format!("// loads the wallet\n{body}"),
+    )
+    .unwrap();
+    commit_all(&dir, "feat: wallet");
+    fs::write(
+        dir.join("src/wallet.js"),
+        format!("// Loads the CLI wallet keypair.\n{body}"),
+    )
+    .unwrap();
+    commit_all(&dir, "docs: clarify wallet comment");
+
+    let h = history::scan(&dir);
+    assert!(
+        h.report.combos.iter().all(|c| c.rule != "docs_commit_sink"),
+        "{:?}",
+        h.report
+    );
+    assert!(h
+        .report
+        .findings
+        .iter()
+        .any(|f| f.rule == "docs_commit_code"));
 }
 
 #[test]
@@ -566,10 +602,23 @@ fn corrupted_objects_never_panic_and_are_reported() {
         "{:?}",
         h.unscanned
     );
+
+    // An enumerated loose object that cannot be opened is reported, not skipped.
+    #[cfg(unix)]
+    {
+        fs::remove_file(&loose).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &loose).unwrap();
+        let h = history::scan_with(&dir, unlimited());
+        assert!(
+            h.unscanned.iter().any(|u| u.contains("corrupt")),
+            "{:?}",
+            h.unscanned
+        );
+    }
 }
 
 #[test]
-fn a_gitdir_file_is_followed_and_a_symlinked_git_is_not() {
+fn a_gitdir_file_is_followed_only_into_the_pack_or_its_submodule_dir() {
     if !have_git() {
         return;
     }
@@ -583,17 +632,40 @@ fn a_gitdir_file_is_followed_and_a_symlinked_git_is_not() {
     commit_all(&dir, "feat: runner");
     fs::remove_file(dir.join("run.js")).unwrap();
     commit_all(&dir, "chore: drop");
-    // Submodule layout: `.git` is a file naming the real git dir.
-    let modules = tmp.join("modules/pack");
-    fs::create_dir_all(modules.parent().unwrap()).unwrap();
+    // Submodule layout: the superproject keeps the pack's git dir in `.git/modules/<path>`.
+    fs::create_dir_all(tmp.join(".git/modules")).unwrap();
+    let modules = tmp.join(".git/modules/pack");
     fs::rename(dir.join(".git"), &modules).unwrap();
-    fs::write(dir.join(".git"), "gitdir: ../modules/pack\n").unwrap();
+    fs::write(dir.join(".git"), "gitdir: ../.git/modules/pack\n").unwrap();
     assert_eq!(rules::grade(&history::scan(&dir).report), Grade::Block);
+
+    // A pointer anywhere else (an unrelated repository) is not followed.
+    let other = tmp.join("elsewhere/repo.git");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::rename(&modules, &other).unwrap();
+    for target in [
+        other.display().to_string(),
+        "../elsewhere/repo.git".to_string(),
+    ] {
+        fs::write(dir.join(".git"), format!("gitdir: {target}\n")).unwrap();
+        let h = history::scan(&dir);
+        assert!(
+            h.unscanned.iter().any(|u| u.contains("outside the pack")),
+            "{target}: {:?}",
+            h.unscanned
+        );
+        assert!(h.report.combos.is_empty(), "{:?}", h.report);
+        assert!(h
+            .report
+            .findings
+            .iter()
+            .any(|f| f.rule == "history_unscanned"));
+    }
 
     #[cfg(unix)]
     {
         fs::remove_file(dir.join(".git")).unwrap();
-        std::os::unix::fs::symlink(&modules, dir.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&other, dir.join(".git")).unwrap();
         let h = history::scan(&dir);
         assert!(
             h.unscanned.iter().any(|u| u.contains("symlink")),
@@ -601,7 +673,118 @@ fn a_gitdir_file_is_followed_and_a_symlinked_git_is_not() {
             h.unscanned
         );
         assert!(rules::grade(&h.report) >= Grade::Warn);
+
+        // A commondir leading out of the pack is refused too.
+        fs::remove_file(dir.join(".git")).unwrap();
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(dir.join(".git/commondir"), format!("{}\n", other.display())).unwrap();
+        let h = history::scan(&dir);
+        assert!(
+            h.unscanned.iter().any(|u| u.contains("commondir")),
+            "{:?}",
+            h.unscanned
+        );
     }
+}
+
+/// `T0` empty, `T_i = {a: T_{i-1}, b: T_{i-1}}`: 2^levels paths over `levels + 1` trees.
+fn tree_bomb(dir: &Path, levels: usize) -> String {
+    let mut tree = git_stdin(dir, &["mktree"], "").trim().to_string();
+    for _ in 0..levels {
+        let body = format!("040000 tree {tree}\ta\n040000 tree {tree}\tb\n");
+        tree = git_stdin(dir, &["mktree"], &body).trim().to_string();
+    }
+    tree
+}
+
+fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("run git");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn a_shared_subtree_dag_costs_linear_work() {
+    if !have_git() {
+        return;
+    }
+    let tmp = TempDir::new("hist-dag");
+    let dir = repo(&tmp);
+    let bomb = tree_bomb(&dir, 40);
+    let root = git_stdin(&dir, &["mktree"], &format!("040000 tree {bomb}\tdocsdir\n"))
+        .trim()
+        .to_string();
+    let head = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
+    // A docs-described commit on a side branch (the diff walk) ...
+    let side = git(
+        &dir,
+        &["commit-tree", &root, "-p", &head, "-m", "docs: update"],
+    )
+    .trim()
+    .to_string();
+    git(&dir, &["update-ref", "refs/heads/side", &side]);
+    for (what, setup) in [("side branch", None), ("HEAD", Some(&side))] {
+        // ... and the same tree as HEAD (the checkout walk).
+        if let Some(c) = setup {
+            git(&dir, &["update-ref", "refs/heads/main", c]);
+        }
+        let t0 = Instant::now();
+        let h = history::scan(&dir);
+        let took = t0.elapsed();
+        assert!(
+            took < history::HISTORY_TIME + Duration::from_secs(5),
+            "{what}: took {took:?}"
+        );
+        assert!(h.stats.commits >= 2, "{what}: {:?}", h.stats);
+    }
+}
+
+#[test]
+fn a_renamed_payload_is_scanned_under_every_name() {
+    if !have_git() {
+        return;
+    }
+    let tmp = TempDir::new("hist-rename");
+    let dir = repo(&tmp);
+    let payload = format!("go(() => {{\n{}", stealer_line());
+    fs::write(dir.join("notes.txt"), &payload).unwrap();
+    commit_all(&dir, "notes");
+    git(&dir, &["mv", "notes.txt", "index.js"]);
+    commit_all(&dir, "rename");
+    // Checked out again under the harmless name: the code-name version is still history.
+    git(&dir, &["mv", "index.js", "notes.txt"]);
+    commit_all(&dir, "rename back");
+
+    let h = history::scan(&dir);
+    assert!(
+        h.report
+            .combos
+            .iter()
+            .any(|c| c.rule == "padding_sink" && c.path.to_string_lossy().ends_with(":index.js")),
+        "{:?}",
+        h.report
+    );
 }
 
 #[test]

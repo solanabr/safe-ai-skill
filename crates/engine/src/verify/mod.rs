@@ -150,8 +150,18 @@ pub fn verdict(report: &Report) -> Verdict {
 /// osv.dev step is invoked by [`pipeline_npm`] for package sources; this directory pipeline is
 /// network-free, runs no process, and is fully hermetic.
 pub fn pipeline_dir(dir: &Path, source: Option<&str>) -> Report {
+    pipeline_dir_with(dir, source, &history::scan(dir))
+}
+
+/// [`pipeline_dir`] with a history scan already made (`install` scans a directory twice, before
+/// and after neutralizing telemetry; its history is read once).
+pub fn pipeline_dir_with(
+    dir: &Path,
+    source: Option<&str>,
+    history: &history::HistoryReport,
+) -> Report {
     let mut report = heuristics::scan(dir);
-    report.merge(history::scan(dir).legacy());
+    report.merge(history.legacy());
     if let Some(src) = source {
         report.merge(provenance::resolve(src));
     }

@@ -104,8 +104,8 @@ The checklist from ai-kit's `docs/skill-packs.md` ("Non-official pack provenance
 | Invisible and bidirectional Unicode | `unicode_bidi`, `unicode_invisible` WARN / INFO; `unicode_tag` WARN. Emoji joiners, script joiners and a leading BOM are ignored. | Trojan Source review of flagged lines |
 | Symlinks (target, and whether it leaves the pack) | `symlink` INFO; combo `symlink_escape`. Links are never followed. | — |
 | Executables (`find -perm -u+x`, naming each) | `executable` INFO for each file with an exec bit; shebang and exec-bit files are scanned as code | **What each executable does** |
-| Every blob in full history | At `verify add|check` only (not at SessionStart): every blob in the pack's own `.git` object store (loose objects and packfiles, deltas resolved, unreachable objects included) is scanned with the same rules; findings at WARN or above and combos are kept, located `git:<commit>:<path>`. Blobs identical to the checked-out file are left to the checkout scan. `history_unscanned` WARN when a budget (10 s, 512 MiB inflated, 500k objects), the 16 MiB per-object cap or an unreadable object leaves part of it unread | Reading what each historical version did |
-| A commit whose message is docs-only but whose diff touches source | `docs_commit_code` WARN: a non-merge commit whose subject claims docs (`docs:`, "Update README.md", "fix typo") and that adds or changes a code file (by name or exec bit) or a `package.json`; combo `docs_commit_sink` when a blob that commit introduced grades HIGH or worse on its own (`verify add|check`) | Commits with an honest-looking subject that still slip code in |
+| Every blob in full history | At `verify add|check` and `install` (not at SessionStart; `install` only for a skill directory that holds its own `.git`): every blob in the pack's own `.git` object store (loose objects and packfiles, deltas resolved, unreachable objects included) is scanned with the same rules under each distinct file name it had (up to 8), so a rename does not move it out of a rule's context; findings at WARN or above and combos are kept, located `git:<commit>:<path>`. A blob is left to the checkout scan only under a name whose checked-out file holds the same bytes. `history_unscanned` WARN when a budget (10 s, 512 MiB of inflated and parsed data, 500k objects and tree visits), the 16 MiB per-object cap, or a missing or unreadable object leaves part of it unread | Reading what each historical version did |
+| A commit whose message is docs-only but whose diff touches source | `docs_commit_code` WARN, report-only (never holds `add` or `install`): a non-merge commit whose subject claims docs (`docs:`, "Update README.md", "fix typo") and that adds or changes a code file (by name or exec bit) or a `package.json`. Combo `docs_commit_sink` (BLOCK) only when the lines that commit added carry a HIGH signal that the parent version did not have | Subjects that do not claim docs ("Docs update", "chore(docs): …", emoji), merge commits (skipped), and changes the subject describes honestly |
 | `hooks.json` | `harness_hooks` WARN (`hooks/`, `.claude-plugin/`, `.codex-plugin/`) | — |
 | `.claude/settings.json` | `harness_settings` WARN; combo `harness_bypass` | — |
 | `.mcp.json` | `mcp_config` INFO; `unpinned_npx` INFO for `@latest` / unpinned runners | Each connector's scope |
@@ -272,13 +272,17 @@ rule ideas were reimplemented here; no rule lists were copied.
   command files.
 * **Unknown endpoint variables.** An unresolved variable named like an endpoint (`$RPC_URL`) is
   treated as user-configured.
-* **History.** The full-history and docs-only-commit checks run at `verify add|check`, not at
-  SessionStart (their cost depends on the history's size), so a pack picked up only by the sweep
-  has its checkout scanned and its history unread until `verify check` runs on it. The reader
-  never runs git: it reads `.git/objects` directly, follows a `.git` file's `gitdir:` (a
-  submodule checkout) and a worktree's `commondir`, and refuses a symlinked `.git` or objects
-  directory. Not read, and reported as `history_unscanned`: object alternates, SHA-256
-  repositories, objects over 16 MiB, corrupt objects, and whatever a spent budget leaves. A
-  shallow clone's missing parents are not reported (that history is not on disk to check out).
-  Symlink and submodule entries in old trees are not scanned. Combos that span files (a
-  `` !`cmd` `` running a script, `.pyc` next to its `.py`) see one historical blob at a time.
+* **History.** The full-history and docs-only-commit checks run at `verify add|check` and
+  `install`, not at SessionStart (their cost depends on the history's size), so a pack picked up
+  only by the sweep has its checkout scanned and its history unread until `verify check` runs on
+  it. `install --from` reads history only for a skill directory with its own `.git`, not for the
+  repository it was cloned from. The reader never runs git: it reads `.git/objects` directly.
+  A `.git` file's `gitdir:` and a `commondir` are followed only when they resolve (canonically)
+  inside the pack, or, for a submodule checkout, to exactly `<A>/.git/modules/<pack path>` in a
+  directory above the pack; a symlinked `.git`, `objects` or `objects/pack` is refused. Not read,
+  and reported as `history_unscanned`: such pointers, object alternates, SHA-256 repositories,
+  objects over 16 MiB, missing, unopenable or corrupt objects, blobs a partial clone did not
+  fetch, and whatever a spent budget leaves (the time budget is wall-clock, so a heavily loaded
+  machine can report it). A shallow clone's missing parents are not reported. Symlink and
+  submodule entries in old trees are not scanned. Combos that span files see one historical
+  blob at a time.

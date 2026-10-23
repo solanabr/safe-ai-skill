@@ -1329,7 +1329,8 @@ fn cmd_install(rest: &[String]) -> ExitCode {
         // Scan the ORIGINAL (pre-neutralization) content first so the telemetry curl and
         // any other danger are reported to the user. Then neutralize the telemetry preamble
         // in SKILL.md before the installed copy is written.
-        let pre_report = verify::pipeline_dir(&dir, None);
+        let history = verify::history::scan(&dir);
+        let pre_report = verify::pipeline_dir_with(&dir, None, &history);
         for f in &pre_report.findings {
             flagged.push(serde_json::json!({
                 "skill": name,
@@ -1350,7 +1351,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
 
         // Re-scan the neutralized content: this is the verdict the install gate uses, so a
         // skill whose ONLY danger was the (now-removed) telemetry preamble installs cleanly.
-        let report = verify::pipeline_dir(&dir, None);
+        let report = verify::pipeline_dir_with(&dir, None, &history);
         let verdict = verify::verdict(&report);
 
         let proceed = match verdict {
@@ -1465,7 +1466,8 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
             None => continue,
         };
 
-        let pre_report = verify::pipeline_dir(&dir, None);
+        let history = verify::history::scan(&dir);
+        let pre_report = verify::pipeline_dir_with(&dir, None, &history);
         for f in &pre_report.findings {
             flagged.push(serde_json::json!({
                 "skill": name,
@@ -1483,7 +1485,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
             }
         }
 
-        let report = verify::pipeline_dir(&dir, None);
+        let report = verify::pipeline_dir_with(&dir, None, &history);
         let verdict = verify::verdict(&report);
         let proceed = match verdict {
             verify::Verdict::Pass => true,

@@ -1,23 +1,27 @@
-//! Git history scan of a pack (#10), at `verify add|check` only (spec D2 §9: the SessionStart
-//! sweep keeps its budget).
+//! Git history scan of a pack (#10), at `verify add|check` and `install` only (spec D2 §9: the
+//! SessionStart sweep keeps its budget).
 //!
 //! A pack checked out from git carries every earlier version of its files in `.git`: content
 //! that was added and then removed, a quietly amended commit, a branch the user can check out.
 //! This module reads the pack's own object store through [`gitobj`] (git is never run) and:
 //!
-//! * scans every blob in the store with the content rules ([`rules::scan_blob`]), named by the
-//!   first commit (oldest committer time) whose tree holds it. Blobs byte-identical to the
-//!   working-tree file at the same `HEAD` path are skipped: the checkout scan already covers them.
-//!   Unreachable objects are scanned too (an amend leaves the old commit behind);
-//! * flags a commit whose subject says documentation (`docs:`, "Update README.md", "fix typo")
+//! * scans every blob in the store with the content rules ([`rules::scan_blob`]) under each
+//!   distinct file name (and exec bit) it appears at in any commit's tree, up to
+//!   [`MAX_VARIANTS`], so a rename cannot move a payload out of a rule's context. A blob is
+//!   skipped under a name only when the working-tree file at the same `HEAD` path holds the same
+//!   bytes (the checkout scan covers it there). Unreachable objects are scanned too;
+//! * reports a commit whose subject says documentation (`docs:`, "Update README.md", "fix typo")
 //!   but whose diff against its parent adds or changes executable files: `docs_commit_code`
-//!   (WARN), and `docs_commit_sink` (BLOCK) when a blob that commit introduced grades HIGH or
-//!   worse on its own (the #10 stealer: "Update README.md" slipping a padded `eval` into a test).
+//!   (WARN, report-only), and `docs_commit_sink` (BLOCK) when the lines that commit *added* to
+//!   such a file carry a HIGH signal (the #10 stealer: "Update README.md" slipping a padded
+//!   `eval` into a test). A signal already present in the parent version does not count.
 //!
+//! Every tree walk keeps a visited set and charges each tree visit to the shared [`Budget`], so
+//! a crafted object graph (a deep DAG of shared subtrees) costs work linear in distinct trees.
 //! Only findings at WARN or above and combos are kept, deduplicated per rule and path across
 //! versions; their path reads `git:<commit>:<path>`. Every cap that stops the scan (time, bytes,
-//! objects, the per-object size cap) or object that cannot be read is reported as
-//! `history_unscanned` (WARN) with its reason, never as a clean history.
+//! objects, the per-object size cap) and every object that is missing or cannot be read is
+//! reported as `history_unscanned` (WARN) with its reason, never as a clean history.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,19 +32,21 @@ use super::gitobj::{
     self, parse_commit, parse_tree, Budget, Commit, Error, Kind, Limits, ObjectId, Repo, Store,
     TreeEntry,
 };
-use super::rules::{self, ComboHit, Ctx, Finding, Grade, PackReport, Severity};
+use super::rules::{self, ComboHit, Ctx, Finding, PackReport, Severity};
 use super::{heuristics, Report};
 
 /// Time one history scan may take.
 pub const HISTORY_TIME: Duration = Duration::from_secs(10);
-/// Inflated bytes one history scan may produce.
+/// Inflated bytes (and parsed index/tree memory) one history scan may use.
 pub const HISTORY_BYTES: u64 = 512 * 1024 * 1024;
-/// Objects one history scan may enumerate and read.
+/// Objects one history scan may enumerate and read, tree visits included.
 pub const HISTORY_OBJECTS: u64 = 500_000;
 /// Deepest tree nesting walked.
 const MAX_TREE_DEPTH: usize = 64;
 /// Changed files collected per commit diff.
 const MAX_DIFF_FILES: usize = 10_000;
+/// Distinct file names one blob is scanned under.
+pub const MAX_VARIANTS: usize = 8;
 
 /// The caps `verify add|check` scans history under.
 pub fn check_limits() -> Limits {
@@ -57,8 +63,9 @@ pub fn check_limits() -> Limits {
 pub struct Stats {
     pub commits: usize,
     pub blobs: usize,
+    /// Blob scans run (one per blob and name).
     pub blobs_scanned: usize,
-    /// Blobs skipped as identical to the checked-out file.
+    /// Blob names skipped as identical to the checked-out file.
     pub in_checkout: usize,
 }
 
@@ -73,14 +80,17 @@ pub struct HistoryReport {
 }
 
 impl HistoryReport {
-    /// The v1 [`Report`] view `verify add|check` prints: the rule mapping of the checkout scan,
-    /// and `history_unscanned` carrying its reasons.
+    /// The v1 [`Report`] view `verify add|check` and `install` use: the rule mapping of the
+    /// checkout scan, `history_unscanned` carrying its reasons, and `docs_commit_code` at Low
+    /// (report-only: it never holds an install, `docs_commit_sink` is the blocking rule).
     pub fn legacy(&self) -> Report {
         let mut report = heuristics::legacy_report(&self.report);
         let why = self.unscanned.join("; ");
         for f in &mut report.findings {
             if f.kind == "history_unscanned" {
                 f.detail = format!("{}: {why}", rules::describe("history_unscanned"));
+            } else if f.kind == "docs_commit_code" {
+                f.severity = super::Severity::Low;
             }
         }
         report
@@ -110,10 +120,7 @@ pub fn scan_with(root: &Path, limits: Limits) -> HistoryReport {
                 store,
                 budget,
                 trees: HashMap::new(),
-                corrupt: 0,
-                oversize: 0,
-                missing_trees: 0,
-                deep: false,
+                gaps: Gaps::default(),
                 out: &mut out,
                 seen: HashSet::new(),
             };
@@ -133,9 +140,9 @@ pub fn scan_with(root: &Path, limits: Limits) -> HistoryReport {
     out
 }
 
-/// Where a blob was first seen.
+/// One name a blob appears under.
 #[derive(Clone)]
-struct Origin {
+struct Variant {
     commit: ObjectId,
     path: String,
     executable: bool,
@@ -143,15 +150,49 @@ struct Origin {
     order: usize,
 }
 
+/// The key a blob is scanned once per: its lowercased file name and exec bit (the rules read
+/// context from both).
+type NameKey = (String, bool);
+
+fn name_key(path: &str, executable: bool) -> NameKey {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    (name.to_ascii_lowercase(), executable)
+}
+
+/// A code file a docs-described commit added or changed.
+struct DocsHit {
+    commit: ObjectId,
+    path: String,
+    executable: bool,
+    /// The same path's blob in the parent, when it existed.
+    prev: Option<ObjectId>,
+}
+
+/// A file a diff found added or changed.
+struct Changed {
+    path: String,
+    entry: TreeEntry,
+    prev: Option<ObjectId>,
+}
+
+/// Reasons part of the history went unread.
+#[derive(Default)]
+struct Gaps {
+    corrupt: usize,
+    oversize: usize,
+    missing: usize,
+    missing_trees: usize,
+    missing_blobs: usize,
+    extra_names: usize,
+    deep: bool,
+}
+
 struct Walk<'a> {
     root: &'a Path,
     store: Store,
     budget: Budget,
     trees: HashMap<ObjectId, Rc<Vec<TreeEntry>>>,
-    corrupt: usize,
-    oversize: usize,
-    missing_trees: usize,
-    deep: bool,
+    gaps: Gaps,
     out: &'a mut HistoryReport,
     /// `(rule, path, severity)` already reported from another version.
     seen: HashSet<(&'static str, String, Severity)>,
@@ -163,19 +204,27 @@ impl Walk<'_> {
         let commits = self.commits(&commit_ids);
         self.out.stats.commits = commits.len();
         self.out.stats.blobs = blobs.len();
-        let origins = self.name_blobs(&commits);
+        let names = self.name_blobs(&commits);
+        self.gaps.missing_blobs = names.keys().filter(|id| !self.store.contains(id)).count();
         let in_checkout = self.in_checkout(repo);
         let docs = self.docs_commits(&commits);
-        self.scan_blobs(&blobs, &origins, &in_checkout, &docs);
-        self.report_gaps(blobs.len());
+        self.docs_sinks(&docs);
+        self.scan_blobs(&blobs, &names, &in_checkout);
+        self.report_gaps();
     }
 
     fn note(&mut self, err: Error) {
         match err {
-            Error::TooLarge => self.oversize += 1,
-            Error::Corrupt(_) => self.corrupt += 1,
-            Error::Missing | Error::Budget => {}
+            Error::TooLarge => self.gaps.oversize += 1,
+            Error::Corrupt(_) => self.gaps.corrupt += 1,
+            Error::Missing => self.gaps.missing += 1,
+            Error::Budget => {}
         }
+    }
+
+    /// Charge one tree visit (cached trees included): false once the budget is spent.
+    fn visit(&mut self) -> bool {
+        self.budget.object().is_ok()
     }
 
     /// Commit ids and blob ids of every object in the store.
@@ -218,7 +267,14 @@ impl Walk<'_> {
         if obj.kind != Kind::Tree {
             return Err(Error::Corrupt("not a tree"));
         }
-        let entries = Rc::new(parse_tree(&obj.data)?);
+        let entries = parse_tree(&obj.data)?;
+        // Parsed entries outweigh their raw bytes: charge what is kept.
+        let held = entries.iter().fold(0usize, |n, e| {
+            n.saturating_add(std::mem::size_of::<TreeEntry>())
+                .saturating_add(e.name.len())
+        });
+        self.budget.bytes(held)?;
+        let entries = Rc::new(entries);
         self.trees.insert(*id, entries.clone());
         Ok(entries)
     }
@@ -228,7 +284,7 @@ impl Walk<'_> {
         match self.tree(id) {
             Ok(t) => Some(t),
             Err(Error::Missing) => {
-                self.missing_trees += 1;
+                self.gaps.missing_trees += 1;
                 None
             }
             Err(e) => {
@@ -238,18 +294,18 @@ impl Walk<'_> {
         }
     }
 
-    /// Each blob's first path, walking every commit's tree (each tree once).
-    fn name_blobs(&mut self, commits: &[(ObjectId, Commit)]) -> HashMap<ObjectId, Origin> {
-        let mut origins: HashMap<ObjectId, Origin> = HashMap::new();
+    /// The names each blob appears under, walking every commit's tree (each tree once).
+    fn name_blobs(&mut self, commits: &[(ObjectId, Commit)]) -> HashMap<ObjectId, Vec<Variant>> {
+        let mut names: HashMap<ObjectId, Vec<Variant>> = HashMap::new();
         let mut visited: HashSet<ObjectId> = HashSet::new();
         for (order, (cid, commit)) in commits.iter().enumerate() {
             let mut stack = vec![(commit.tree, String::new(), 0usize)];
             while let Some((tree, prefix, depth)) = stack.pop() {
-                if self.budget.check().is_err() {
-                    return origins;
-                }
                 if !visited.insert(tree) {
                     continue;
+                }
+                if !self.visit() {
+                    return names;
                 }
                 let Some(entries) = self.tree_or_note(&tree) else {
                     continue;
@@ -260,10 +316,19 @@ impl Walk<'_> {
                         if depth < MAX_TREE_DEPTH {
                             stack.push((e.id, path, depth + 1));
                         } else {
-                            self.deep = true;
+                            self.gaps.deep = true;
                         }
                     } else if e.is_file() {
-                        origins.entry(e.id).or_insert(Origin {
+                        let list = names.entry(e.id).or_default();
+                        let key = name_key(&path, e.is_executable());
+                        if list.iter().any(|v| name_key(&v.path, v.executable) == key) {
+                            continue;
+                        }
+                        if list.len() >= MAX_VARIANTS {
+                            self.gaps.extra_names += 1;
+                            continue;
+                        }
+                        list.push(Variant {
                             commit: *cid,
                             path,
                             executable: e.is_executable(),
@@ -273,11 +338,12 @@ impl Walk<'_> {
                 }
             }
         }
-        origins
+        names
     }
 
-    /// Blobs of `HEAD`'s tree whose bytes equal the working-tree file at the same path.
-    fn in_checkout(&mut self, repo: &Repo) -> HashSet<ObjectId> {
+    /// `(blob, name)` pairs of `HEAD`'s tree whose bytes equal the working-tree file at the same
+    /// path.
+    fn in_checkout(&mut self, repo: &Repo) -> HashSet<(ObjectId, NameKey)> {
         let mut same = HashSet::new();
         let Some(head) = repo.head() else {
             return same;
@@ -288,8 +354,15 @@ impl Walk<'_> {
         let Ok(commit) = parse_commit(&obj.data) else {
             return same;
         };
+        let mut visited: HashSet<ObjectId> = HashSet::new();
         let mut stack = vec![(commit.tree, String::new(), 0usize)];
         while let Some((tree, prefix, depth)) = stack.pop() {
+            if !visited.insert(tree) {
+                continue;
+            }
+            if !self.visit() {
+                return same;
+            }
             let Ok(entries) = self.tree(&tree) else {
                 continue;
             };
@@ -299,7 +372,8 @@ impl Walk<'_> {
                     stack.push((e.id, path, depth + 1));
                     continue;
                 }
-                if !e.is_file() || same.contains(&e.id) {
+                let key = (e.id, name_key(&path, e.is_executable()));
+                if !e.is_file() || same.contains(&key) {
                     continue;
                 }
                 let cap = self.budget.limits.max_object as u64;
@@ -308,7 +382,7 @@ impl Walk<'_> {
                 };
                 match self.store.read(&e.id, &mut self.budget) {
                     Ok(blob) if *blob.data == *disk => {
-                        same.insert(e.id);
+                        same.insert(key);
                     }
                     Err(Error::Budget) => return same,
                     _ => {}
@@ -318,12 +392,16 @@ impl Walk<'_> {
         same
     }
 
-    /// Docs-described commits that touch executable files: blob → the commit that introduced it.
-    fn docs_commits(&mut self, commits: &[(ObjectId, Commit)]) -> HashMap<ObjectId, ObjectId> {
+    /// Docs-described commits that touch executable files: each reported `docs_commit_code`,
+    /// and every code file they added or changed returned for the sink check.
+    fn docs_commits(&mut self, commits: &[(ObjectId, Commit)]) -> Vec<DocsHit> {
         let trees: HashMap<ObjectId, ObjectId> =
             commits.iter().map(|(id, c)| (*id, c.tree)).collect();
-        let mut introduced = HashMap::new();
+        let mut hits = Vec::new();
         for (cid, commit) in commits {
+            if self.budget.check().is_err() {
+                break;
+            }
             if commit.parents.len() > 1 || !is_docs_subject(&commit.subject) {
                 continue;
             }
@@ -336,42 +414,51 @@ impl Walk<'_> {
                 },
             };
             let mut changed = Vec::new();
-            self.diff(parent_tree, commit.tree, "", 0, &mut changed);
-            let code: Vec<(String, TreeEntry)> = changed
+            let mut visited = HashSet::new();
+            self.diff(parent_tree, commit.tree, "", 0, &mut visited, &mut changed);
+            let code: Vec<Changed> = changed
                 .into_iter()
-                .filter(|(path, e)| executable_path(path, e))
+                .filter(|c| executable_path(&c.path, &c.entry))
                 .collect();
-            let Some((first, _)) = code.first() else {
+            let Some(first) = code.first() else {
                 continue;
             };
             self.out.report.findings.push(Finding {
                 rule: "docs_commit_code",
                 sev: Severity::Warn,
-                path: shown(cid, first),
+                path: shown(cid, &first.path),
                 line: None,
                 ctx: Ctx::Meta,
             });
-            for (_, e) in code {
-                introduced.entry(e.id).or_insert(*cid);
-            }
+            hits.extend(code.into_iter().map(|c| DocsHit {
+                commit: *cid,
+                executable: c.entry.is_executable(),
+                path: c.path,
+                prev: c.prev,
+            }));
         }
-        introduced
+        hits
     }
 
-    /// Files added or changed (content or mode) from `old` to `new`.
+    /// Files added or changed (content or mode) from `old` to `new`. Each `(old, new)` tree pair
+    /// is walked once and every visit is charged to the budget.
     fn diff(
         &mut self,
         old: Option<ObjectId>,
         new: ObjectId,
         prefix: &str,
         depth: usize,
-        out: &mut Vec<(String, TreeEntry)>,
+        visited: &mut HashSet<(Option<ObjectId>, ObjectId)>,
+        out: &mut Vec<Changed>,
     ) {
-        if old == Some(new) || out.len() >= MAX_DIFF_FILES {
+        if old == Some(new) || out.len() >= MAX_DIFF_FILES || !visited.insert((old, new)) {
             return;
         }
         if depth > MAX_TREE_DEPTH {
-            self.deep = true;
+            self.gaps.deep = true;
+            return;
+        }
+        if !self.visit() {
             return;
         }
         let Some(new_entries) = self.tree_or_note(&new) else {
@@ -391,38 +478,130 @@ impl Walk<'_> {
             let prev = before.get(e.name.as_str());
             if e.is_tree() {
                 let prev_tree = prev.filter(|p| p.is_tree()).map(|p| p.id);
-                self.diff(prev_tree, e.id, &path, depth + 1, out);
+                self.diff(prev_tree, e.id, &path, depth + 1, visited, out);
             } else if e.is_file() && !prev.is_some_and(|p| p.id == e.id && p.mode == e.mode) {
-                out.push((path, e.clone()));
+                out.push(Changed {
+                    path,
+                    entry: e.clone(),
+                    prev: prev.filter(|p| p.is_file()).map(|p| p.id),
+                });
             }
         }
+    }
+
+    /// `docs_commit_sink` for each docs-commit code file whose added lines carry a HIGH signal.
+    fn docs_sinks(&mut self, hits: &[DocsHit]) {
+        let deadline = self.budget.limits.deadline;
+        let mut done: HashSet<(ObjectId, String)> = HashSet::new();
+        for hit in hits {
+            if !done.insert((hit.commit, hit.path.clone())) {
+                continue;
+            }
+            let Some(new_id) = self.blob_at(hit) else {
+                continue;
+            };
+            let new = match self.store.read(&new_id, &mut self.budget) {
+                Ok(b) => b,
+                Err(Error::Budget) => return,
+                Err(e) => {
+                    self.note(e);
+                    continue;
+                }
+            };
+            let old = match hit.prev {
+                None => None,
+                Some(p) => match self.store.read(&p, &mut self.budget) {
+                    Ok(b) => Some(b),
+                    Err(Error::Budget) => return,
+                    Err(e) => {
+                        // Without the parent version the added lines are unknown: skip.
+                        self.note(e);
+                        continue;
+                    }
+                },
+            };
+            let rel = Path::new(&hit.path);
+            let now = rules::scan_blob(rel, &new.data, hit.executable, deadline);
+            let before = old
+                .as_ref()
+                .map(|o| rules::scan_blob(rel, &o.data, hit.executable, deadline).report);
+            if now.expired {
+                let _ = self.budget.check();
+                return;
+            }
+            let added = match &old {
+                Some(o) => added_lines(&o.data, &new.data),
+                None => None,
+            };
+            if let Some(signal) = new_signal(&now.report, before.as_ref(), added.as_ref()) {
+                self.out.report.combos.push(ComboHit {
+                    rule: "docs_commit_sink",
+                    path: shown(&hit.commit, &hit.path),
+                    line: None,
+                    parts: vec!["docs_commit_code", signal],
+                });
+            }
+        }
+    }
+
+    /// The blob a docs hit names (looked up again from the commit's tree).
+    fn blob_at(&mut self, hit: &DocsHit) -> Option<ObjectId> {
+        let obj = self.store.read(&hit.commit, &mut self.budget).ok()?;
+        let mut tree = parse_commit(&obj.data).ok()?.tree;
+        let mut parts = hit.path.split('/').peekable();
+        while let Some(part) = parts.next() {
+            if !self.visit() {
+                return None;
+            }
+            let entries = self.tree_or_note(&tree)?;
+            let e = entries.iter().find(|e| e.name == part)?;
+            if parts.peek().is_none() {
+                return e.is_file().then_some(e.id);
+            }
+            tree = e.id;
+        }
+        None
     }
 
     fn scan_blobs(
         &mut self,
         blobs: &[ObjectId],
-        origins: &HashMap<ObjectId, Origin>,
-        in_checkout: &HashSet<ObjectId>,
-        docs: &HashMap<ObjectId, ObjectId>,
+        names: &HashMap<ObjectId, Vec<Variant>>,
+        in_checkout: &HashSet<(ObjectId, NameKey)>,
     ) {
-        // A checked-out blob is scanned only when a docs commit introduced it (for the combo);
-        // its own findings come from the checkout scan.
-        let mut order: Vec<ObjectId> = blobs
-            .iter()
-            .filter(|id| !in_checkout.contains(*id) || docs.contains_key(*id))
-            .copied()
-            .collect();
-        self.out.stats.in_checkout = blobs.iter().filter(|id| in_checkout.contains(*id)).count();
-        // Blobs a docs commit slipped in first, then by the commit that first holds them.
+        let mut order: Vec<ObjectId> = blobs.to_vec();
         order.sort_by_key(|id| {
             (
-                !docs.contains_key(id),
-                origins.get(id).map_or(usize::MAX, |o| o.order),
+                names
+                    .get(id)
+                    .and_then(|v| v.iter().map(|v| v.order).min())
+                    .unwrap_or(usize::MAX),
                 *id,
             )
         });
         let deadline = self.budget.limits.deadline;
         for id in order {
+            let unnamed;
+            let variants: &[Variant] = match names.get(&id) {
+                Some(v) if !v.is_empty() => v,
+                _ => {
+                    unnamed = [Variant {
+                        commit: id,
+                        path: format!("unnamed-{}", &gitobj::hex(&id)[..12]),
+                        executable: false,
+                        order: usize::MAX,
+                    }];
+                    &unnamed
+                }
+            };
+            let todo: Vec<&Variant> = variants
+                .iter()
+                .filter(|v| !in_checkout.contains(&(id, name_key(&v.path, v.executable))))
+                .collect();
+            self.out.stats.in_checkout += variants.len() - todo.len();
+            if todo.is_empty() {
+                continue;
+            }
             let blob = match self.store.read(&id, &mut self.budget) {
                 Ok(b) => b,
                 Err(Error::Budget) => return,
@@ -431,50 +610,20 @@ impl Walk<'_> {
                     continue;
                 }
             };
-            let origin = origins.get(&id);
-            let (rel, executable) = match origin {
-                Some(o) => (o.path.clone(), o.executable),
-                None => (format!("unnamed-{}", &gitobj::hex(&id)[..12]), false),
-            };
-            let scan = rules::scan_blob(Path::new(&rel), &blob.data, executable, deadline);
-            if scan.expired {
-                // Out of time mid-blob: what it found so far still counts.
-                let _ = self.budget.check();
-            } else if !in_checkout.contains(&id) {
-                self.out.stats.blobs_scanned += 1;
-            }
-            let path = match origin {
-                Some(o) => shown(&o.commit, &rel),
-                None => PathBuf::from(format!("git:{rel}")),
-            };
-            if !in_checkout.contains(&id) {
-                self.keep(&scan.report, &rel, &path);
-            }
-            if let Some(commit) = docs.get(&id) {
-                if rules::grade(&scan.report) >= Grade::High {
-                    let signal = scan
-                        .report
-                        .combos
-                        .first()
-                        .map(|c| c.rule)
-                        .or_else(|| {
-                            scan.report
-                                .findings
-                                .iter()
-                                .find(|f| f.effective_sev() == Severity::High)
-                                .map(|f| f.rule)
-                        })
-                        .unwrap_or("capped");
-                    self.out.report.combos.push(ComboHit {
-                        rule: "docs_commit_sink",
-                        path: shown(commit, &rel),
-                        line: None,
-                        parts: vec!["docs_commit_code", signal],
-                    });
+            for v in todo {
+                let scan = rules::scan_blob(Path::new(&v.path), &blob.data, v.executable, deadline);
+                let path = if v.order == usize::MAX {
+                    PathBuf::from(format!("git:{}", v.path))
+                } else {
+                    shown(&v.commit, &v.path)
+                };
+                self.keep(&scan.report, &v.path, &path);
+                if scan.expired {
+                    // Out of time mid-blob: what it found so far still counts.
+                    let _ = self.budget.check();
+                    return;
                 }
-            }
-            if scan.expired {
-                return;
+                self.out.stats.blobs_scanned += 1;
             }
         }
     }
@@ -511,34 +660,118 @@ impl Walk<'_> {
         }
     }
 
-    fn report_gaps(&mut self, blobs: usize) {
+    fn report_gaps(&mut self) {
+        let g = &self.gaps;
         let gaps = &mut self.out.unscanned;
         if let Some(what) = self.budget.spent {
             gaps.push(format!(
-                "{what} budget spent ({} of {} history blobs scanned)",
-                self.out.stats.blobs_scanned,
-                blobs.saturating_sub(self.out.stats.in_checkout)
+                "{what} budget spent ({} blob scans done, {} blobs in the store)",
+                self.out.stats.blobs_scanned, self.out.stats.blobs
             ));
         }
-        if self.oversize > 0 {
+        if g.oversize > 0 {
             gaps.push(format!(
                 "{} objects over the per-object size cap ({} bytes)",
-                self.oversize, self.budget.limits.max_object
+                g.oversize, self.budget.limits.max_object
             ));
         }
-        if self.corrupt > 0 {
-            gaps.push(format!("{} unreadable or corrupt objects", self.corrupt));
+        if g.corrupt > 0 {
+            gaps.push(format!("{} unreadable or corrupt objects", g.corrupt));
         }
-        if self.missing_trees > 0 {
+        if g.missing > 0 {
+            gaps.push(format!(
+                "{} objects missing (delta base or object not in the store)",
+                g.missing
+            ));
+        }
+        if g.missing_trees > 0 {
             gaps.push(format!(
                 "{} trees missing (partial clone?)",
-                self.missing_trees
+                g.missing_trees
             ));
         }
-        if self.deep {
+        if g.missing_blobs > 0 {
+            gaps.push(format!(
+                "{} history blobs not present (partial clone?)",
+                g.missing_blobs
+            ));
+        }
+        if g.extra_names > 0 {
+            gaps.push(format!(
+                "{} blob names past {MAX_VARIANTS} per blob not scanned",
+                g.extra_names
+            ));
+        }
+        if g.deep {
             gaps.push(format!("trees nested past {MAX_TREE_DEPTH} levels"));
         }
     }
+}
+
+/// 1-based line numbers of `new` that are not in `old` (a multiset line diff). `None` when the
+/// content is not line-comparable as UTF-8 (the whole file then counts as added).
+fn added_lines(old: &[u8], new: &[u8]) -> Option<HashSet<u32>> {
+    let (old, new) = (
+        std::str::from_utf8(old).ok()?,
+        std::str::from_utf8(new).ok()?,
+    );
+    let mut have: HashMap<&str, usize> = HashMap::new();
+    for line in old.lines() {
+        *have.entry(line).or_default() += 1;
+    }
+    let mut added = HashSet::new();
+    for (i, line) in new.lines().enumerate() {
+        match have.get_mut(line) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => {
+                added.insert(rules::line_no(i));
+            }
+        }
+    }
+    Some(added)
+}
+
+/// The first HIGH signal of `now` that the docs commit introduced: on an added line, or (for a
+/// file-level signal, or when lines cannot be compared) absent from the parent's report.
+fn new_signal(
+    now: &PackReport,
+    before: Option<&PackReport>,
+    added: Option<&HashSet<u32>>,
+) -> Option<&'static str> {
+    let had = |rule: &str| {
+        before.is_some_and(|b| {
+            b.combos.iter().any(|c| c.rule == rule)
+                || b.findings
+                    .iter()
+                    .any(|f| f.rule == rule && f.effective_sev() == Severity::High)
+                || b.capped.iter().any(|c| c.rule == rule)
+        })
+    };
+    let fresh = |rule: &str, line: Option<u32>| match (before, added, line) {
+        (None, _, _) => true,
+        (Some(_), Some(added), Some(l)) => added.contains(&l),
+        _ => !had(rule),
+    };
+    now.combos
+        .iter()
+        .find(|c| fresh(c.rule, c.line))
+        .map(|c| c.rule)
+        .or_else(|| {
+            now.findings
+                .iter()
+                .filter(|f| f.effective_sev() == Severity::High)
+                .find(|f| fresh(f.rule, f.line))
+                .map(|f| f.rule)
+        })
+        .or_else(|| {
+            now.capped
+                .iter()
+                .find(|c| {
+                    rules::code_severity(c.rule).is_some_and(|s| s >= Severity::Warn)
+                        && !had(c.rule)
+                })
+                .map(|c| c.rule)
+        })
 }
 
 fn join(prefix: &str, name: &str) -> String {

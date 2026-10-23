@@ -34,6 +34,8 @@ const MAX_IDX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SMALL_FILE: u64 = 4096;
 /// Largest `packed-refs` or `config` read.
 const MAX_META_FILE: u64 = 16 * 1024 * 1024;
+/// Pack indexes read; more are reported unscanned.
+const MAX_PACKS: usize = 1024;
 /// Resolved pack objects kept for delta bases.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest object header (`"commit 18446744073709551615\0"`).
@@ -116,7 +118,7 @@ impl Budget {
         }
     }
 
-    fn fail(&mut self, what: &'static str) -> Error {
+    pub(crate) fn fail(&mut self, what: &'static str) -> Error {
         self.spent.get_or_insert(what);
         Error::Budget
     }
@@ -189,6 +191,16 @@ pub fn read_regular(path: &Path, cap: u64) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= cap).then_some(bytes)
 }
 
+/// True when `git_dir` is the submodule git directory git keeps for the pack at `root_c`:
+/// `<A>/.git/modules/<root_c relative to A>` for an ancestor `A` whose `.git` is a directory.
+fn is_submodule_git_dir(root_c: &Path, git_dir: &Path) -> bool {
+    root_c.ancestors().skip(1).any(|a| {
+        root_c.strip_prefix(a).is_ok_and(|rel| {
+            is_real_dir(&a.join(".git")) && git_dir == a.join(".git/modules").join(rel)
+        })
+    })
+}
+
 /// True when `path` is a real directory (not a symlink to one).
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
@@ -238,16 +250,25 @@ pub struct Repo {
 impl Repo {
     /// The repository whose `.git` sits directly in `root`. `Ok(None)` when there is none;
     /// `Err` with a reason when there is one that cannot be read safely.
+    ///
+    /// Confinement: the git directory, its `commondir` and its `objects/` must resolve
+    /// (canonically, so no symlink in any component leads out) inside the pack root. The one
+    /// exception is a submodule checkout: a `.git` file whose `gitdir:` resolves to exactly
+    /// `<A>/.git/modules/<path of the pack under A>` for a directory `A` above the pack. Anything
+    /// else is refused with a reason, never followed. Alternates are never followed.
     pub fn open(root: &Path) -> Result<Option<Repo>, String> {
         let dot = root.join(".git");
         let meta = match std::fs::symlink_metadata(&dot) {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
-        let git_dir = if meta.file_type().is_symlink() {
+        let root_c = root
+            .canonicalize()
+            .map_err(|_| "pack root cannot be resolved".to_string())?;
+        let (git_dir, base) = if meta.file_type().is_symlink() {
             return Err("`.git` is a symlink (not followed)".into());
         } else if meta.is_dir() {
-            dot
+            (dot, root_c.clone())
         } else {
             let body = read_regular(&dot, MAX_SMALL_FILE).ok_or("`.git` file is unreadable")?;
             let text = String::from_utf8_lossy(&body);
@@ -258,20 +279,42 @@ impl Repo {
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .ok_or("`.git` file has no `gitdir:` line")?;
-            root.join(target)
+            let resolved = root
+                .join(target)
+                .canonicalize()
+                .map_err(|_| "`.git` file names a missing git directory".to_string())?;
+            if resolved.starts_with(&root_c) {
+                (resolved, root_c.clone())
+            } else if is_submodule_git_dir(&root_c, &resolved) {
+                (resolved.clone(), resolved)
+            } else {
+                return Err("`.git` file points outside the pack (gitdir: not followed)".into());
+            }
         };
-        if !is_real_dir(&git_dir) {
-            return Err("git directory is missing or a symlink".into());
-        }
+        let git_dir = git_dir
+            .canonicalize()
+            .ok()
+            .filter(|d| d.starts_with(&base) && is_real_dir(d))
+            .ok_or("git directory is missing, a symlink, or outside the pack")?;
         let common_dir = match read_regular(&git_dir.join("commondir"), MAX_SMALL_FILE) {
             Some(body) => {
                 let text = String::from_utf8_lossy(&body);
-                git_dir.join(text.trim())
+                git_dir
+                    .join(text.trim())
+                    .canonicalize()
+                    .ok()
+                    .filter(|d| d.starts_with(&base))
+                    .ok_or("commondir points outside the pack (not followed)")?
             }
             None => git_dir.clone(),
         };
-        if !is_real_dir(&common_dir.join("objects")) {
+        let objects = common_dir.join("objects");
+        if !is_real_dir(&objects) || objects.canonicalize().ok().as_ref() != Some(&objects) {
             return Err("objects directory is missing or a symlink".into());
+        }
+        let pack_dir = objects.join("pack");
+        if std::fs::symlink_metadata(&pack_dir).is_ok() && !is_real_dir(&pack_dir) {
+            return Err("objects/pack is a symlink (not followed)".into());
         }
         if let Some(config) = read_regular(&common_dir.join("config"), MAX_META_FILE) {
             let lower = String::from_utf8_lossy(&config).to_ascii_lowercase();
@@ -283,7 +326,7 @@ impl Repo {
             }
         }
         let mut notes = Vec::new();
-        if std::fs::symlink_metadata(common_dir.join("objects/info/alternates")).is_ok() {
+        if std::fs::symlink_metadata(objects.join("info/alternates")).is_ok() {
             notes.push("objects/info/alternates is not followed".into());
         }
         Ok(Some(Repo {
@@ -406,6 +449,9 @@ impl Store {
         let mut dirs: Vec<_> = dirs.flatten().collect();
         dirs.sort_by_key(|d| d.file_name());
         for dir in dirs {
+            if budget.check().is_err() {
+                return;
+            }
             let name = dir.file_name();
             let Some(prefix) = name.to_str().filter(|n| n.len() == 2) else {
                 continue;
@@ -417,6 +463,9 @@ impl Store {
                 continue;
             };
             for entry in entries.flatten() {
+                if budget.check().is_err() {
+                    return;
+                }
                 let file = entry.file_name();
                 let Some(rest) = file.to_str().filter(|n| n.len() == 38) else {
                     continue;
@@ -446,6 +495,13 @@ impl Store {
             .filter(|p| p.extension().is_some_and(|e| e == "idx"))
             .collect();
         idx_files.sort();
+        if idx_files.len() > MAX_PACKS {
+            self.skipped.push(format!(
+                "{} pack indexes past the first {MAX_PACKS}",
+                idx_files.len() - MAX_PACKS
+            ));
+            idx_files.truncate(MAX_PACKS);
+        }
         for idx_path in idx_files {
             let label = idx_path
                 .file_name()
@@ -460,9 +516,7 @@ impl Store {
     }
 
     fn load_pack(&mut self, idx_path: &Path, budget: &mut Budget) -> Result<(), Error> {
-        let idx =
-            read_regular(idx_path, MAX_IDX_BYTES).ok_or(Error::Corrupt("index unreadable"))?;
-        let entries = parse_idx(&idx)?;
+        budget.check()?;
         let (mut file, len) = open_regular(&idx_path.with_extension("pack"))
             .map_err(|_| Error::Corrupt("pack unreadable"))?;
         let mut head = [0u8; 12];
@@ -470,7 +524,22 @@ impl Store {
             .map_err(|_| Error::Corrupt("pack header"))?;
         let version = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
         let count = u32::from_be_bytes([head[8], head[9], head[10], head[11]]);
-        if &head[..4] != b"PACK" || !(2..=3).contains(&version) || count as usize != entries.len() {
+        if &head[..4] != b"PACK" || !(2..=3).contains(&version) {
+            return Err(Error::Corrupt("pack header"));
+        }
+        // Each entry costs an index read now and a parsed `(id, offset)` held in memory.
+        let count = count as usize;
+        let remaining = budget.limits.max_objects.saturating_sub(budget.objects);
+        if count as u64 > remaining {
+            budget.objects = budget.limits.max_objects;
+            return Err(budget.fail("objects"));
+        }
+        let idx =
+            read_regular(idx_path, MAX_IDX_BYTES).ok_or(Error::Corrupt("index unreadable"))?;
+        budget.bytes(idx.len())?;
+        budget.bytes(count.saturating_mul(std::mem::size_of::<(ObjectId, u64)>() * 2))?;
+        let entries = parse_idx(&idx)?;
+        if count != entries.len() {
             return Err(Error::Corrupt("pack header"));
         }
         let trailer_at = len
@@ -519,12 +588,13 @@ impl Store {
 
     /// Compressed bytes allowed for a loose object (deflate grows stored data slightly).
     fn loose_cap(max_object: usize) -> u64 {
-        let raw = max_object as u64 + MAX_HEADER as u64;
-        raw + raw / 64 + 4096
+        let raw = (max_object as u64).saturating_add(MAX_HEADER as u64);
+        raw.saturating_add(raw / 64).saturating_add(4096)
     }
 
     fn loose_header(&mut self, id: &ObjectId) -> Result<(Kind, u64), Error> {
-        let (file, _) = open_regular(&self.loose_path(id)).map_err(|_| Error::Missing)?;
+        let (file, _) = open_regular(&self.loose_path(id))
+            .map_err(|_| Error::Corrupt("loose object unopenable"))?;
         let mut head = Vec::new();
         file.take(1024)
             .read_to_end(&mut head)
@@ -539,7 +609,8 @@ impl Store {
 
     fn read_loose(&mut self, id: &ObjectId, budget: &mut Budget) -> Result<Object, Error> {
         let max = budget.limits.max_object;
-        let (file, len) = open_regular(&self.loose_path(id)).map_err(|_| Error::Missing)?;
+        let (file, len) = open_regular(&self.loose_path(id))
+            .map_err(|_| Error::Corrupt("loose object unopenable"))?;
         if len > Self::loose_cap(max) {
             return Err(Error::TooLarge);
         }
@@ -786,11 +857,11 @@ impl Store {
         if obj.data.len() > CACHE_BYTES / 4 {
             return;
         }
-        if self.cache_bytes + obj.data.len() > CACHE_BYTES {
+        if self.cache_bytes.saturating_add(obj.data.len()) > CACHE_BYTES {
             self.cache.clear();
             self.cache_bytes = 0;
         }
-        self.cache_bytes += obj.data.len();
+        self.cache_bytes = self.cache_bytes.saturating_add(obj.data.len());
         self.cache.insert(at, obj.clone());
     }
 }
@@ -881,9 +952,12 @@ fn parse_idx(idx: &[u8]) -> Result<Vec<(ObjectId, u64)>, Error> {
             let id = id_at(table + i * 20)?;
             let raw = be32(off32 + i * 4)?;
             let offset = if raw & 0x8000_0000 != 0 {
-                let at = off64 + (raw & 0x7fff_ffff) as usize * 8;
+                let at = ((raw & 0x7fff_ffff) as usize)
+                    .checked_mul(8)
+                    .and_then(|o| o.checked_add(off64))
+                    .ok_or(Error::Corrupt("index large offset"))?;
                 let b = idx
-                    .get(at..at + 8)
+                    .get(at..at.saturating_add(8))
                     .ok_or(Error::Corrupt("index large offset"))?;
                 u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
             } else {
@@ -965,7 +1039,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max: usize) -> Result<Vec<u8>, Err
                 .checked_add(size)
                 .and_then(|end| base.get(offset..end))
                 .ok_or(Error::Corrupt("delta copy outside the base"))?;
-            if out.len() + chunk.len() > result_len {
+            if out.len().saturating_add(chunk.len()) > result_len {
                 return Err(Error::Corrupt("delta overruns its result"));
             }
             out.extend_from_slice(chunk);
@@ -975,7 +1049,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], max: usize) -> Result<Vec<u8>, Err
                 .get(pos..pos + n)
                 .ok_or(Error::Corrupt("delta insert"))?;
             pos += n;
-            if out.len() + n > result_len {
+            if out.len().saturating_add(n) > result_len {
                 return Err(Error::Corrupt("delta overruns its result"));
             }
             out.extend_from_slice(chunk);
