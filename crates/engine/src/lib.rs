@@ -25,6 +25,7 @@
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
 pub mod audit;
+pub mod bip39;
 pub mod confirm;
 pub mod context;
 pub mod datadir;
@@ -48,6 +49,7 @@ pub mod registry;
 pub mod relax;
 pub mod rugcheck;
 pub mod sandbox;
+pub mod seedphrase;
 pub mod session;
 pub mod spend;
 pub mod squads;

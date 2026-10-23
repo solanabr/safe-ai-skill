@@ -2,9 +2,8 @@
 //!
 //! Scans tool output for high-signal secrets and replaces each match with a
 //! `***REDACTED:<kind>***` marker. This module also hosts the shared secret
-//! *detectors* (`find_keypair_array`, `is_base58_secret_key`, `find_seed_phrase`)
-//! reused by [`crate::promptguard`] — kept here rather than in a separate module per
-//! the architecture's no-new-module constraint.
+//! *detectors* (`find_keypair_array`, `is_base58_secret_key`, `find_seed_phrases`, the last
+//! backed by [`crate::seedphrase`]) reused by [`crate::promptguard`].
 //!
 //! Everything is pure in-memory byte/char scanning with no compiled-regex dependency,
 //! so it stays cheap enough to run on every tool output.
@@ -30,6 +29,7 @@ use crate::gates::read::{self, ReadVerdict};
 use crate::gates::secretpath::{self, Class};
 use crate::io::{Decision, HookInput};
 use crate::policy::Policy;
+use crate::seedphrase;
 
 /// Largest PostToolUse payload the redact hook parses (8 MiB). Larger payloads pass unscanned.
 pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -132,9 +132,14 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
             ))
         }
         Value::Object(map) => {
+            // Bash `{isImage:true,…}`: `stdout` holds the image; `stderr` is still text.
+            let image_stdout = map.get("isImage").and_then(Value::as_bool) == Some(true);
             let mut changed = false;
             let mut out = map.clone();
             for (key, value) in map {
+                if image_stdout && key == "stdout" {
+                    continue;
+                }
                 if let Some(new) = scrub_value(value, values) {
                     out.insert(key.clone(), new);
                     changed = true;
@@ -148,16 +153,15 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
 
 /// Image / PDF payloads are left alone: their base64 data would trip the base58 detector
 /// (about once per 200 KB of random base64) and a changed byte corrupts the file. Read
-/// `{type:"image"|"pdf",file:{…}}`, Bash `{isImage:true,…}`, MCP `{type:"image",data:…}`.
+/// `{type:"image"|"pdf",file:{…}}`, MCP `{type:"image",data:…}`. Bash `{isImage:true,…}`
+/// skips only its `stdout` (see [`scrub_value`]).
 fn is_binary_payload(value: &Value) -> bool {
     let Value::Object(map) = value else {
         return false;
     };
-    let typed = map
-        .get("type")
+    map.get("type")
         .and_then(Value::as_str)
-        .is_some_and(|t| matches!(t, "image" | "pdf" | "document" | "audio"));
-    typed || map.get("isImage").and_then(Value::as_bool) == Some(true)
+        .is_some_and(|t| matches!(t, "image" | "pdf" | "document" | "audio"))
 }
 
 /// One unbroken base64 / base64url run longer than 1 KiB (an inline file, not text), bare or
@@ -296,7 +300,8 @@ struct Span {
 /// text is unchanged (no `updatedToolOutput` is emitted). Detected classes:
 /// - Solana keypair JSON byte arrays (`[12,34,...]` of 32 or 64 ints in `0..=255`).
 /// - 64-byte base58 secret keys, plus `"secretKey"`/`"privateKey"` JSON field values.
-/// - BIP-39 seed phrases (a run of 12/24 lowercase words near a mnemonic/seed hint).
+/// - BIP-39 seed phrases ([`crate::seedphrase`]: checksum-valid runs of wordlist words, and
+///   phrase-shaped runs when a mnemonic/seed/phrase/recovery/secret keyword is in the string).
 /// - Common API-key shapes (`*_API_KEY=`, `PRIVATE_KEY=`, `sk-…`, `eyJ…` JWTs).
 /// - PEM / OpenSSH private-key blocks (`-----BEGIN … PRIVATE KEY-----` through its `END` line).
 /// - Vendor tokens ([`API_TOKEN_PREFIXES`]: GitHub, AWS, Slack, Google, Stripe, OpenAI).
@@ -382,65 +387,9 @@ pub(crate) fn is_base58_secret_key(s: &str) -> bool {
     matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 64)
 }
 
-/// Find a BIP-39-shaped seed phrase in `text` near a `mnemonic`/`seed`/`phrase` hint and
-/// return its `[start, end)` byte range. Detects a run of 12 or 24 space-separated
-/// lowercase a–z words (3–8 chars each, the wordlist shape). The hint requirement keeps
-/// false positives low. Returns `None` when no qualifying run is found.
-pub(crate) fn find_seed_phrase(text: &str) -> Option<(usize, usize)> {
-    let lower = text.to_ascii_lowercase();
-    if !(lower.contains("mnemonic") || lower.contains("seed") || lower.contains("phrase")) {
-        return None;
-    }
-
-    let bytes = text.as_bytes();
-    let mut word_starts: Vec<(usize, usize)> = Vec::new(); // (start, end) of each lowercase word
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if is_lower_alpha(bytes[i]) {
-            let start = i;
-            while i < bytes.len() && is_lower_alpha(bytes[i]) {
-                i += 1;
-            }
-            word_starts.push((start, i));
-        } else {
-            i += 1;
-        }
-    }
-
-    // Find a maximal run of consecutive wordlist-shaped words separated only by single spaces.
-    let n = word_starts.len();
-    let mut idx = 0usize;
-    while idx < n {
-        if !is_wordlist_shape(&text[word_starts[idx].0..word_starts[idx].1]) {
-            idx += 1;
-            continue;
-        }
-        let run_start_word = idx;
-        let mut j = idx;
-        while j + 1 < n {
-            let (_, end_cur) = word_starts[j];
-            let (start_next, _) = word_starts[j + 1];
-            // Words must be separated only by spaces (the seed-phrase shape).
-            let gap = &text[end_cur..start_next];
-            if !gap.chars().all(|c| c == ' ') || gap.is_empty() {
-                break;
-            }
-            if !is_wordlist_shape(&text[word_starts[j + 1].0..word_starts[j + 1].1]) {
-                break;
-            }
-            j += 1;
-        }
-        let count = j - run_start_word + 1;
-        if count >= 12 {
-            let span_start = word_starts[run_start_word].0;
-            // Take the largest valid prefix: exactly 24 if available, else exactly 12.
-            let take = if count >= 24 { 24 } else { 12 };
-            let span_end = word_starts[run_start_word + take - 1].1;
-            return Some((span_start, span_end));
-        }
-        idx = j + 1;
-    }
-    None
+/// Every seed phrase in `text` ([`crate::seedphrase::find`]).
+pub(crate) fn find_seed_phrases(text: &str) -> Vec<(usize, usize)> {
+    seedphrase::find(text)
 }
 
 /// Whether `text` holds key material: a keypair-style byte array, a base58-encoded 64-byte
@@ -593,7 +542,7 @@ fn collect_keypair_arrays(text: &str, spans: &mut Vec<Span>) {
 }
 
 fn collect_seed_phrases(text: &str, spans: &mut Vec<Span>) {
-    if let Some((start, end)) = find_seed_phrase(text) {
+    for (start, end) in find_seed_phrases(text) {
         spans.push(Span {
             start,
             end,
@@ -946,11 +895,6 @@ fn is_base58_char(b: u8) -> bool {
 }
 
 #[inline]
-fn is_lower_alpha(b: u8) -> bool {
-    b.is_ascii_lowercase()
-}
-
-#[inline]
 fn is_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -963,13 +907,6 @@ fn is_token_char(b: u8) -> bool {
 #[inline]
 fn is_b64url_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
-}
-
-/// A BIP-39 wordlist word is 3–8 lowercase a–z characters.
-#[inline]
-fn is_wordlist_shape(w: &str) -> bool {
-    let len = w.len();
-    (3..=8).contains(&len) && w.bytes().all(|b| b.is_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -1026,6 +963,19 @@ mod tests {
         assert_eq!(scrub_response(&json!(blob), &[]), None);
         let uri = format!("data:image/png;base64,{blob}");
         assert_eq!(scrub_response(&json!(uri), &[]), None);
+    }
+
+    #[test]
+    fn bash_image_result_still_scrubs_stderr() {
+        let arr: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let keypair = format!("[{}]", arr.join(","));
+        let v = json!({ "stdout": keypair, "stderr": format!("k {keypair}"), "isImage": true });
+        assert_eq!(
+            scrub_response(&v, &[]),
+            Some(
+                json!({ "stdout": keypair, "stderr": "k ***REDACTED:keypair***", "isImage": true })
+            )
+        );
     }
 
     #[test]

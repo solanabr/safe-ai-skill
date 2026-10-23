@@ -6,9 +6,10 @@
 //! out of the model.
 //!
 //! The detectors are shared with [`crate::redact`] (the keypair-array, 64-byte base58
-//! secret-key, and seed-phrase scanners) per the no-new-shared-module constraint.
+//! secret-key, and seed-phrase scanners). The published BIP-39 test vectors
+//! ([`crate::bip39::TEST_VECTORS`]) are not blocked: they are public test data.
 
-use crate::redact;
+use crate::{bip39, redact};
 
 /// Inspect a user prompt for raw secrets.
 ///
@@ -24,7 +25,16 @@ pub fn check(prompt: &str) -> Option<String> {
         );
     }
 
-    if redact::find_seed_phrase(prompt).is_some() {
+    // Checksum-validated phrases only: the keyword rules redact output, where a false positive
+    // costs a few words, but would block ordinary prompts about seeds and secrets.
+    let phrase = crate::seedphrase::find_checksummed(prompt)
+        .into_iter()
+        .any(|(start, end)| {
+            prompt
+                .get(start..end)
+                .is_some_and(|p| !bip39::is_test_vector(p))
+        });
+    if phrase {
         return Some(
             "Prompt blocked: it contains what looks like a BIP-39 seed phrase. The secret \
              was kept out of the model context — never paste a recovery phrase."
@@ -57,9 +67,55 @@ mod tests {
 
     #[test]
     fn seed_phrase_blocks() {
-        let prompt = "here is my seed phrase: legal winner thank year wave sausage worth \
-                      useful legal winner thank yellow please import it";
+        let prompt = "here is my seed phrase: session twin stem shop glass chat dune switch \
+                      upset such noble wave please import it";
         assert!(check(prompt).is_some());
+    }
+
+    #[test]
+    fn bare_checksum_valid_seed_phrase_blocks() {
+        let prompt = "import session twin stem shop glass chat dune switch upset such noble wave";
+        assert!(check(prompt).is_some());
+        let prompt = "import session twin stem shop glass chat dune switch upset such noble zoo";
+        assert!(check(prompt).is_none(), "checksum fails, no keyword");
+    }
+
+    #[test]
+    fn published_test_vectors_are_not_blocked() {
+        for vector in crate::bip39::TEST_VECTORS {
+            assert!(check(vector).is_none(), "{vector}");
+            assert!(check(&format!("add a test with the mnemonic \"{vector}\"")).is_none());
+            assert!(check(&format!("seed phrase: {vector}")).is_none());
+        }
+        // A real phrase next to a vector still blocks.
+        let both = format!(
+            "{}\nsession twin stem shop glass chat dune switch upset such noble wave",
+            crate::bip39::TEST_VECTORS[0]
+        );
+        assert!(check(&both).is_some());
+    }
+
+    #[test]
+    fn prose_about_seeds_and_secrets_is_not_blocked() {
+        // Only checksum-valid phrases block; the keyword rules are for output redaction.
+        for prompt in [
+            "Explain how the seed bytes are used by the program and can you check that the \
+             account does not get logged anywhere when the app runs",
+            "keep this secret until everyone arrives near the office tomorrow morning because \
+             our surprise party needs careful planning",
+            "seed phrase: session twin stem shop glass chat dune switch upset such noble wvae",
+        ] {
+            assert!(check(prompt).is_none(), "{prompt}");
+        }
+        for prompt in [
+            "session twin stem shop glass chat dune switch upset such noble wave",
+            "my wallet words are \"session, twin, stem, shop, glass, chat, dune, switch, upset, \
+             such, noble, wave\" can you import them",
+            "1. session 2. twin 3. stem 4. shop 5. glass 6. chat 7. dune 8. switch 9. upset \
+             10. such 11. noble 12. wave",
+        ] {
+            assert!(check(prompt).is_some(), "{prompt}");
+        }
     }
 
     #[test]

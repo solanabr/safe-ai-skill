@@ -195,7 +195,7 @@ pub struct HookInput {
     pub session_id: Option<String>, pub cwd: Option<String>,
     pub permission_mode: Option<String>, pub hook_event_name: Option<String>,
     pub tool_name: Option<String>, pub tool_input: Option<serde_json::Value>,
-    pub tool_output: Option<serde_json::Value>, pub prompt: Option<String>,
+    pub tool_response: Option<serde_json::Value>, pub prompt: Option<String>,
     pub source: Option<String>,
 }
 impl HookInput {
@@ -413,6 +413,11 @@ pub fn redact::scrub(text: &str) -> Option<String>;
 pub fn redact::scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value>;
 pub fn promptguard::check(prompt: &str) -> Option<String>;
 ```
+
+Seed phrases are found by `seedphrase::find` (behind `redact::find_seed_phrases`, shared with
+`promptguard`), which uses `bip39`: the embedded official English wordlist
+(`src/bip39_english.txt`), the mnemonic checksum, and the published test vectors that
+`promptguard` lets through.
 
 `cmd_redact` reads `tool_response` (up to `redact::MAX_SCAN_BYTES`, larger passes unchanged),
 scrubs literal values from the project's env files (`env::values`) and the pattern classes, and
