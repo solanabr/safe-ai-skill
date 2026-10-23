@@ -1,0 +1,50 @@
+#!/bin/sh
+# safe-ai-skill-codex: Codex CLI hook wrapper for `safe-ai-skill adapt codex <gate>`
+# (experimental, issue #23).
+#
+# Codex runs the tool call when a PreToolUse hook exits with any status other than 0 or 2,
+# is killed, or prints output it cannot parse. This wrapper runs the engine and turns every
+# such outcome into a deny, printed as Codex's deny JSON with exit 0:
+#   - no engine (none next to this wrapper, none on PATH);
+#   - the engine exits non-zero (a crash, an abort, a usage error) or is killed by a signal;
+#   - the engine prints anything but nothing or a deny.
+# Nothing printed by the engine (exit 0) is no opinion and passes through as nothing.
+# What it cannot cover: Codex's own hook timeout killing this wrapper (the engine bounds
+# itself at 8 s; keep the hook timeout above that).
+
+set -fu
+
+deny() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}' "$1"
+  exit 0
+}
+
+gate=${1:-}
+case $gate in
+  gate-bash | gate-bash-secrets | gate-tamper | gate-mcp) ;;
+  *) deny "safe-ai-skill-codex: unknown gate in the Codex hook config; blocked until it is fixed." ;;
+esac
+
+case $0 in
+  */*) self_dir=${0%/*} ;;
+  *) self_dir= ;;
+esac
+engine=
+if [ -n "$self_dir" ] && [ -f "$self_dir/safe-ai-skill" ] && [ -x "$self_dir/safe-ai-skill" ]; then
+  engine=$self_dir/safe-ai-skill
+else
+  engine=$(command -v safe-ai-skill 2>/dev/null) || engine=
+fi
+[ -n "$engine" ] || deny "safe-ai-skill-codex: the safe-ai-skill engine is not installed (not next to this wrapper, not on PATH); review this call manually."
+
+out=$("$engine" adapt codex "$gate")
+status=$?
+[ "$status" -eq 0 ] || deny "safe-ai-skill-codex: the engine failed (exit $status) while inspecting this call; review this call manually."
+[ -n "$out" ] || exit 0
+case $out in
+  '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",'*'}}')
+    printf '%s' "$out"
+    exit 0
+    ;;
+esac
+deny "safe-ai-skill-codex: the engine gave an answer Codex cannot use; review this call manually."

@@ -224,7 +224,7 @@ fn usage_errors_exit_3_with_no_output() {
     }
 }
 
-/// The shipped template wires only gates `adapt codex` offers, on Codex's tool names.
+/// The shipped template wires only gates `adapt codex` offers, through the wrapper.
 #[test]
 fn codex_hooks_template_names_offered_gates() {
     let path = concat!(
@@ -241,7 +241,7 @@ fn codex_hooks_template_names_offered_gates() {
         for hook in group["hooks"].as_array().expect("hooks array") {
             let command = hook["command"].as_str().expect("command");
             let gate = command
-                .strip_prefix("safe-ai-skill adapt codex ")
+                .strip_prefix("safe-ai-skill-codex ")
                 .unwrap_or_else(|| panic!("unexpected command {command}"));
             assert!(safe_ai_skill::adapt::CODEX_GATES.contains(&gate), "{gate}");
             gates.push(gate.to_string());
@@ -250,4 +250,156 @@ fn codex_hooks_template_names_offered_gates() {
     for gate in safe_ai_skill::adapt::CODEX_GATES {
         assert!(gates.iter().any(|g| g == gate), "{gate} not wired");
     }
+}
+
+#[test]
+fn apply_patch_run_through_the_shell_gets_the_patch_checks() {
+    let w = World::new("adapt-shell-patch");
+    for command in [
+        "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: ~/.config/solana/id.json\n+[]\n*** End Patch\nEOF",
+        "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: .codex/hooks.json\n@@\n-a\n+b\n*** End Patch\nEOF",
+        "applypatch \"*** Begin Patch\n*** Delete File: ~/.config/solana/id.json\n*** End Patch\"",
+        "printf '%s' \"$P\" | apply_patch $'*** Begin Patch\\n*** Delete File: .codex/config.toml\\n*** End Patch'",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    let ok =
+        "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: src/new.rs\n+x\n*** End Patch\nEOF";
+    let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": ok }));
+    assert_eq!(codex_label(&run), "");
+}
+
+#[test]
+fn relative_state_writes_deny_whatever_the_workdir() {
+    let w = World::new("adapt-workdir");
+    for command in ["rm tier.json", "rm -f grants.json", "echo {} > tier.json"] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    let run = w.codex(
+        "gate-tamper",
+        "apply_patch",
+        patch(&["*** Delete File: tier.json"]),
+    );
+    assert_eq!(codex_label(&run), "deny");
+}
+
+#[test]
+fn a_workdir_in_the_payload_is_where_relative_paths_resolve() {
+    let w = World::new("adapt-workdir-field");
+    let data = w.data.path().to_str().unwrap().to_string();
+    let run = w.codex(
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": "rm -rf ./quarantine", "workdir": data }),
+    );
+    assert_eq!(codex_label(&run), "deny", "{}", run.stdout);
+}
+
+#[test]
+fn claude_settings_and_the_engine_binary_are_protected() {
+    let w = World::new("adapt-settings");
+    let engine = common::bin().to_string();
+    for header in [
+        "*** Update File: .claude/settings.local.json".to_string(),
+        "*** Add File: .claude/settings.json".to_string(),
+        format!(
+            "*** Update File: {}/.claude/settings.json",
+            w.home.path().display()
+        ),
+        format!("*** Delete File: {engine}"),
+        format!("*** Add File: {engine}-codex"),
+    ] {
+        let run = w.codex("gate-tamper", "apply_patch", patch(&[&header]));
+        assert_eq!(codex_label(&run), "deny", "{header}");
+    }
+    for command in [
+        format!("rm -f {engine}"),
+        format!("cp /tmp/x {engine}"),
+        "echo '{}' > .claude/settings.local.json".to_string(),
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+}
+
+#[test]
+fn codex_home_from_the_environment_is_protected() {
+    let w = World::new("adapt-codexhome");
+    let codex_home = TempDir::new("adapt-codexhome-dir");
+    let target = codex_home.join("hooks.json");
+    let header = format!("*** Update File: {}", target.display());
+    let no_tools = TempDir::new("adapt-path");
+    let run = Invocation::new(&["adapt", "codex", "gate-tamper"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .env("PATH", no_tools.path().to_str().unwrap())
+        .env("CODEX_HOME", codex_home.path().to_str().unwrap())
+        .stdin(w.payload("apply_patch", patch(&[&header])))
+        .run();
+    assert_eq!(codex_label(&run), "deny");
+}
+
+#[test]
+fn the_discovered_data_dir_is_protected_without_claude_plugin_data() {
+    let home = TempDir::new("adapt-disc-home");
+    let proj = TempDir::new("adapt-disc-proj");
+    let data = home.join(".claude/plugins/data/safe-ai-skill-safe-ai-skill");
+    std::fs::create_dir_all(&data).unwrap();
+    let header = format!("*** Add File: {}", data.join("grants.json").display());
+    let payload = json!({
+        "cwd": proj.path(), "hook_event_name": "PreToolUse", "tool_name": "apply_patch",
+        "tool_input": patch(&[&header]),
+    });
+    let no_tools = TempDir::new("adapt-path");
+    let run = Invocation::new(&["adapt", "codex", "gate-tamper"])
+        .home(home.path())
+        .cwd(proj.path())
+        .env("PATH", no_tools.path().to_str().unwrap())
+        .stdin(payload.to_string())
+        .run();
+    assert_eq!(codex_label(&run), "deny", "{}", run.stdout);
+}
+
+#[test]
+fn oversized_patches_deny_with_a_clear_reason() {
+    let w = World::new("adapt-bigpatch");
+    let headers: Vec<String> = (0..=safe_ai_skill::adapt::MAX_PATCH_PATHS)
+        .map(|i| format!("*** Add File: src/f{i}.rs"))
+        .collect();
+    let refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let run = w.codex("gate-tamper", "apply_patch", patch(&refs));
+    assert_eq!(codex_label(&run), "deny");
+    assert!(reason(&run).contains("split it"), "{}", reason(&run));
+}
+
+#[test]
+fn the_ask_reason_reads_cleanly() {
+    let w = World::new("adapt-reason");
+    let input = json!({ "destination": DEST, "lamports": 1_000_000_000u64 });
+    let run = w.codex("gate-mcp", "mcp__helius__heliusWrite.sendSol", input);
+    let r = reason(&run);
+    assert!(!r.contains("approve to proceed"), "{r}");
+    assert!(
+        r.contains(&format!(". {}", safe_ai_skill::adapt::CODEX_ASK_SUFFIX)),
+        "{r}"
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_panic_still_denies_with_exit_0() {
+    let w = World::new("adapt-panic");
+    let no_tools = TempDir::new("adapt-path");
+    let run = Invocation::new(&["adapt", "codex", "gate-bash"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .env("PATH", no_tools.path().to_str().unwrap())
+        .env("SAFE_AI_SKILL_TEST_PANIC", "1")
+        .stdin(w.payload("Bash", json!({ "command": "ls" })))
+        .run();
+    assert_eq!(codex_label(&run), "deny", "{}", run.stderr);
 }

@@ -2,18 +2,25 @@
 //!
 //! `safe-ai-skill adapt codex <gate>` runs one PreToolUse gate on a Codex CLI hook payload.
 //! Codex sends Claude-shaped PreToolUse JSON (`tool_name` `Bash` with `tool_input.command`,
-//! MCP tools as `mcp__<server>__<tool>`), so the gates read it unchanged. Two things differ:
+//! MCP tools as `mcp__<server>__<tool>`), so the gates read it unchanged. What differs:
 //!
 //! - **Output.** Codex PreToolUse honours only `deny`. An `ask` or a bare `allow` is an
 //!   "unsupported" output that Codex logs and then runs the call anyway, so [`render`] turns
 //!   every `ask` into a `deny` (adding [`CODEX_ASK_SUFFIX`]) and an `allow` into no output.
-//! - **File edits.** Codex edits files through `apply_patch`, whose `tool_input.command` is
-//!   the patch text. [`patch_paths`] lists the files it touches, so the tamper gate can judge
-//!   each one.
+//! - **File edits.** Codex edits files through `apply_patch`: the tool (patch text in
+//!   `tool_input.command`) or an `apply_patch` command in the shell, which Codex intercepts.
+//!   [`patch_paths`] / [`patch_paths_in_command`] list the files a patch touches.
+//! - **What guards the guard.** Nothing in Codex protects Claude Code's settings, the Codex
+//!   hook config or the `safe-ai-skill` binary on `PATH`, so [`CodexTargets`] names them and
+//!   [`patch_target_reason`] / [`bash_reason`] deny writes to them.
+//! - **Unknown working dir.** Codex's `exec_command` may run in a `workdir` the payload does
+//!   not carry, so a relative write naming a safe-ai-skill state file or a wallet is denied
+//!   wherever it would land.
 //!
 //! The client is a process-wide setting chosen once by the `adapt` subcommand before the gate
 //! runs; every emitter consults it through [`current`].
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -40,6 +47,11 @@ pub fn current() -> Client {
     CLIENT.get().copied().unwrap_or(Client::ClaudeCode)
 }
 
+/// Whether this process answers Codex.
+pub fn is_codex() -> bool {
+    current() == Client::Codex
+}
+
 /// Parse an `adapt` client name.
 pub fn client_named(name: &str) -> Option<Client> {
     match name {
@@ -57,13 +69,23 @@ pub const CODEX_ASK_SUFFIX: &str = "Codex hooks cannot ask for approval, so safe
      blocked it: run it yourself, approve it in a Claude Code session, or confirm a grant there \
      first where one applies.";
 
-/// Translate a decision for `client`: under Codex an `ask` becomes a `deny` (same reason plus
-/// [`CODEX_ASK_SUFFIX`]) and an `allow` becomes no opinion, since Codex runs the call on both.
+/// The most files one patch may touch under Codex; a bigger patch is denied unread.
+pub const MAX_PATCH_PATHS: usize = 1000;
+
+/// Translate a decision for `client`: under Codex an `ask` becomes a `deny` (same reason, minus
+/// any "approve to proceed" tail, plus [`CODEX_ASK_SUFFIX`]) and an `allow` becomes no opinion,
+/// since Codex runs the call on both.
 pub fn render(decision: &Decision, client: Client) -> Decision {
     match (client, decision) {
-        (Client::Codex, Decision::Ask { reason }) => Decision::Deny {
-            reason: format!("{reason} {CODEX_ASK_SUFFIX}"),
-        },
+        (Client::Codex, Decision::Ask { reason }) => {
+            let base = reason
+                .trim_end()
+                .trim_end_matches("— approve to proceed")
+                .trim_end_matches(|c: char| c.is_whitespace() || c == '.' || c == '—');
+            Decision::Deny {
+                reason: format!("{base}. {CODEX_ASK_SUFFIX}"),
+            }
+        }
         (Client::Codex, Decision::Allow) => Decision::Defer,
         _ => decision.clone(),
     }
@@ -72,14 +94,34 @@ pub fn render(decision: &Decision, client: Client) -> Decision {
 /// The file paths an `apply_patch` patch adds, updates, deletes or moves to, in order, without
 /// duplicates. Lines are matched after trimming, so an indented or CRLF patch still parses.
 pub fn patch_paths(patch: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    collect_patch_paths(patch, &mut seen, &mut paths);
+    paths
+}
+
+/// [`patch_paths`] for a shell command that may run `apply_patch` (heredoc, quoted argument,
+/// `$'…\n…'`, piped): the text is also read with `\n` escapes as newlines, and a path a closing
+/// quote is glued to is listed with and without it.
+pub fn patch_paths_in_command(command: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    collect_patch_paths(command, &mut seen, &mut paths);
+    if command.contains("\\n") {
+        collect_patch_paths(&command.replace("\\n", "\n"), &mut seen, &mut paths);
+    }
+    paths
+}
+
+fn collect_patch_paths(text: &str, seen: &mut HashSet<String>, paths: &mut Vec<String>) {
     const MARKERS: [&str; 4] = [
         "*** Add File:",
         "*** Update File:",
         "*** Delete File:",
         "*** Move to:",
     ];
-    let mut paths: Vec<String> = Vec::new();
-    for line in patch.lines().map(str::trim) {
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches(['\'', '"']);
         let Some(path) = MARKERS
             .iter()
             .find_map(|m| line.strip_prefix(m))
@@ -88,54 +130,457 @@ pub fn patch_paths(patch: &str) -> Vec<String> {
         else {
             continue;
         };
-        if !paths.iter().any(|p| p == path) {
-            paths.push(path.to_string());
+        let unquoted = path.trim_end_matches(['\'', '"', ')', ';']).trim_end();
+        for p in [path, unquoted] {
+            if !p.is_empty() && seen.insert(p.to_string()) {
+                paths.push(p.to_string());
+            }
         }
     }
-    paths
 }
 
-/// Whether `target` (relative to `cwd`, `~` expanded with `home`) is a Codex hook config file:
-/// `.codex/hooks.json` or `.codex/config.toml` anywhere, the files that wire these gates in.
-pub fn is_codex_hook_config(target: &str, cwd: &Path, home: Option<&Path>) -> bool {
-    let expanded = match (target.strip_prefix("~/"), home) {
+/// safe-ai-skill state file names (and the default wallet's) that a relative write is denied
+/// on under Codex, where the command's working dir is unknown.
+const RELATIVE_STATE_NAMES: &[&str] = &[
+    "grants.json",
+    "grants.lock",
+    "mode.json",
+    "tier.json",
+    "tier.lock",
+    "spend.json",
+    "lockfile.json",
+    "netcache.json",
+    "audit.jsonl",
+    "trust.json",
+    "pending.json",
+    "pending.lock",
+    "sessions.json",
+    "generations.json",
+    "migrated.json",
+    "id.json",
+];
+
+/// Names of the binaries a Codex hook runs.
+const ENGINE_NAMES: [&str; 2] = ["safe-ai-skill", "safe-ai-skill-codex"];
+
+/// Locations nothing in Codex protects, which a Codex session must not write.
+#[derive(Debug, Clone, Default)]
+pub struct CodexTargets {
+    home: Option<PathBuf>,
+    /// Codex config dirs: `<home>/.codex`, `$CODEX_HOME` (as given and canonical).
+    codex_homes: Vec<PathBuf>,
+    /// Claude Code config dirs: `<home>/.claude`, `$CLAUDE_CONFIG_DIR`.
+    claude_dirs: Vec<PathBuf>,
+    /// The engine and wrapper: this executable, its siblings by [`ENGINE_NAMES`], and each
+    /// name found on `PATH` (as given and canonical).
+    engines: Vec<PathBuf>,
+}
+
+impl CodexTargets {
+    /// Read `HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PATH` and the current executable.
+    pub fn from_env() -> Self {
+        let var = |k: &str| {
+            std::env::var_os(k)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        let home = var("HOME").filter(|h| h.is_absolute());
+        let mut t = CodexTargets {
+            home: home.clone(),
+            ..CodexTargets::default()
+        };
+        if let Some(h) = &home {
+            t.push_codex_home(h.join(".codex"));
+            t.push_claude_dir(h.join(".claude"));
+        }
+        if let Some(c) = var("CODEX_HOME").filter(|c| c.is_absolute()) {
+            t.push_codex_home(c);
+        }
+        if let Some(c) = var("CLAUDE_CONFIG_DIR").filter(|c| c.is_absolute()) {
+            t.push_claude_dir(c);
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for name in ENGINE_NAMES {
+                    t.push_engine(dir.join(name));
+                }
+            }
+            t.push_engine(exe);
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
+                for name in ENGINE_NAMES {
+                    let candidate = dir.join(name);
+                    if candidate.exists() {
+                        t.push_engine(candidate);
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    fn push_codex_home(&mut self, dir: PathBuf) {
+        push_spellings(&mut self.codex_homes, dir);
+    }
+
+    fn push_claude_dir(&mut self, dir: PathBuf) {
+        push_spellings(&mut self.claude_dirs, dir);
+    }
+
+    fn push_engine(&mut self, file: PathBuf) {
+        push_spellings(&mut self.engines, file);
+    }
+}
+
+fn push_spellings(list: &mut Vec<PathBuf>, path: PathBuf) {
+    let lexical = lexical(&path);
+    let canonical = canonical_prefix(&lexical);
+    for p in [lexical, canonical] {
+        if !list.contains(&p) {
+            list.push(p);
+        }
+    }
+}
+
+/// `path` resolved against `cwd` (`~/` expanded with `home`), lexically normalised.
+fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let expanded = match (path.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(target),
+        _ if path == "~" => home.map(Path::to_path_buf).unwrap_or_default(),
+        _ => PathBuf::from(path),
     };
     let full = if expanded.is_absolute() {
         expanded
     } else {
         cwd.join(expanded)
     };
-    let mut parts: Vec<String> = Vec::new();
-    for c in full.components() {
+    lexical(&full)
+}
+
+/// Drop `.` and resolve `..` without touching the filesystem.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
         match c {
             Component::ParentDir => {
-                parts.pop();
+                out.pop();
             }
-            Component::Normal(s) => parts.push(s.to_string_lossy().to_ascii_lowercase()),
-            _ => {}
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
         }
     }
-    match parts.as_slice() {
-        [.., dir, file] => dir == ".codex" && (file == "hooks.json" || file == "config.toml"),
-        _ => false,
+    out
+}
+
+/// `path` with its longest existing ancestor canonicalised (symlinks resolved), the rest
+/// appended; `path` itself when nothing resolves.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            let mut out = canon;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
+}
+
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    lower_components(a) == lower_components(b)
+}
+
+/// Why a Codex session may not write `target` (a patch path or a shell word), or `None`.
+///
+/// Denied: Codex hook config (`.codex/hooks.json|config.toml`, `$CODEX_HOME/…`, through
+/// symlinks), Claude Code settings (`.claude/settings.json|settings.local.json`, the user's
+/// and `$CLAUDE_CONFIG_DIR`'s), the `safe-ai-skill` binary and wrapper, and, for a relative
+/// path, a safe-ai-skill state file or wallet name (the working dir may not be `cwd`).
+pub fn patch_target_reason(target: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    let lexical = absolute(target, cwd, targets.home.as_deref());
+    let canonical = canonical_prefix(&lexical);
+    for full in [&lexical, &canonical] {
+        let comps = lower_components(full);
+        let (dir, file) = match comps.as_slice() {
+            [.., dir, file] => (dir.as_str(), file.as_str()),
+            _ => continue,
+        };
+        let parent = full.parent().unwrap_or(full);
+        let codex_file = file == "hooks.json" || file == "config.toml";
+        if codex_file
+            && (dir == ".codex" || targets.codex_homes.iter().any(|h| same_path(h, parent)))
+        {
+            return Some(format!(
+                "safe-ai-skill: `{target}` is Codex hook config, which runs safe-ai-skill's \
+                 gates; edit it yourself, outside the agent."
+            ));
+        }
+        let settings = file == "settings.json" || file == "settings.local.json";
+        if settings
+            && (dir == ".claude" || targets.claude_dirs.iter().any(|d| same_path(d, parent)))
+        {
+            return Some(format!(
+                "safe-ai-skill: `{target}` is Claude Code settings; a Codex session may not \
+                 change them. Edit it yourself, outside the agent."
+            ));
+        }
+        if targets.engines.iter().any(|e| same_path(e, full)) {
+            return Some(format!(
+                "safe-ai-skill: `{target}` is the safe-ai-skill binary the Codex hooks run; \
+                 replacing or deleting it would turn the gates off."
+            ));
+        }
+    }
+    let relative = !target.starts_with('/') && !target.starts_with('~');
+    let name = target
+        .rsplit('/')
+        .next()
+        .unwrap_or(target)
+        .to_ascii_lowercase();
+    if relative && RELATIVE_STATE_NAMES.contains(&name.as_str()) {
+        return Some(format!(
+            "safe-ai-skill: `{target}` names a safe-ai-skill state file or a wallet, and a \
+             Codex command's working dir is not known to the hook; write it yourself."
+        ));
+    }
+    None
+}
+
+/// Commands that only read their arguments.
+const READ_ONLY: &[&str] = &[
+    "cat",
+    "less",
+    "more",
+    "head",
+    "tail",
+    "ls",
+    "stat",
+    "file",
+    "wc",
+    "grep",
+    "rg",
+    "jq",
+    "diff",
+    "cmp",
+    "sha256sum",
+    "shasum",
+    "md5",
+    "md5sum",
+    "which",
+    "type",
+    "command",
+    "readlink",
+    "realpath",
+    "test",
+    "[",
+    "echo",
+    "printf",
+    "true",
+    "basename",
+    "dirname",
+];
+
+/// Commands that write, move or remove their arguments.
+const MUTATORS: &[&str] = &[
+    "rm",
+    "mv",
+    "cp",
+    "ln",
+    "chmod",
+    "chown",
+    "truncate",
+    "install",
+    "unlink",
+    "dd",
+    "tee",
+    "sed",
+    "perl",
+    "shred",
+    "touch",
+    "rsync",
+    "patch",
+    "apply_patch",
+    "applypatch",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "curl",
+    "wget",
+];
+
+/// Wrappers skipped when finding the command a segment runs.
+const PREFIXES: &[&str] = &["sudo", "env", "exec", "nohup", "nice", "time", "builtin"];
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Word(String),
+    /// A segment break (`;`, `|`, `&`, `(`, `)`, newline).
+    Break,
+    /// An output redirection (`>`, `>>`, `>|`).
+    Out,
+}
+
+/// A rough shell tokenizer: quotes are removed (their content stays in the word), segment
+/// breaks and output redirections are kept.
+fn tokenize(command: &str) -> Vec<Tok> {
+    let mut toks = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let flush = |word: &mut String, toks: &mut Vec<Tok>| {
+        if !word.is_empty() {
+            toks.push(Tok::Word(std::mem::take(word)));
+        }
+    };
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            (None, ';' | '|' | '&' | '(' | ')' | '\n' | '`') => {
+                flush(&mut word, &mut toks);
+                toks.push(Tok::Break);
+            }
+            (None, '>') => {
+                // `2>` / `&>` keep their fd prefix out of the next word.
+                if word.chars().all(|d| d.is_ascii_digit()) {
+                    word.clear();
+                }
+                flush(&mut word, &mut toks);
+                while matches!(chars.peek(), Some('>' | '|')) {
+                    chars.next();
+                }
+                toks.push(Tok::Out);
+            }
+            (None, c) if c.is_whitespace() => flush(&mut word, &mut toks),
+            (None, c) => word.push(c),
+        }
+    }
+    flush(&mut word, &mut toks);
+    toks
+}
+
+/// Why a Codex shell command may not run, judged on what it writes: a [`patch_target_reason`]
+/// target named as an output redirection, or as an argument of a command that is not
+/// read-only (bare names only for [`MUTATORS`]), or the binary by name for a mutator.
+pub fn bash_reason(command: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    bash_reason_depth(command, cwd, targets, 0)
+}
+
+fn bash_reason_depth(
+    command: &str,
+    cwd: &Path,
+    targets: &CodexTargets,
+    depth: usize,
+) -> Option<String> {
+    let toks = tokenize(command);
+    let mut leader: Option<String> = None;
+    let mut after_out = false;
+    for tok in &toks {
+        let word = match tok {
+            Tok::Break => {
+                leader = None;
+                after_out = false;
+                continue;
+            }
+            Tok::Out => {
+                after_out = true;
+                continue;
+            }
+            Tok::Word(w) => w,
+        };
+        // A quoted script (`sh -c '…'`) is scanned as a command of its own.
+        if depth < 2 && word.contains(char::is_whitespace) {
+            if let Some(reason) = bash_reason_depth(word, cwd, targets, depth + 1) {
+                return Some(reason);
+            }
+        }
+        if after_out {
+            after_out = false;
+            if let Some(reason) = patch_target_reason(word, cwd, targets) {
+                return Some(reason);
+            }
+            continue;
+        }
+        let Some(cmd) = leader.as_deref() else {
+            let base = word.rsplit('/').next().unwrap_or(word);
+            let is_assignment = word.contains('=') && !word.starts_with('=');
+            if !is_assignment && !PREFIXES.contains(&base) {
+                leader = Some(base.to_string());
+            }
+            continue;
+        };
+        if word.starts_with('-') || word.starts_with('@') || READ_ONLY.contains(&cmd) {
+            continue;
+        }
+        let mutator = MUTATORS.contains(&cmd);
+        let path_like = word.contains('/') || word.starts_with('~');
+        let name = word.rsplit('/').next().unwrap_or(word);
+        if mutator && ENGINE_NAMES.contains(&name) {
+            return Some(format!(
+                "safe-ai-skill: `{word}` names the safe-ai-skill binary the Codex hooks run; \
+                 changing it would turn the gates off."
+            ));
+        }
+        if path_like || mutator {
+            if let Some(reason) = patch_target_reason(word, cwd, targets) {
+                return Some(reason);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn targets() -> CodexTargets {
+        let mut t = CodexTargets {
+            home: Some(PathBuf::from("/home/u")),
+            ..CodexTargets::default()
+        };
+        t.push_codex_home(PathBuf::from("/home/u/.codex"));
+        t.push_codex_home(PathBuf::from("/opt/cx"));
+        t.push_claude_dir(PathBuf::from("/home/u/.claude"));
+        t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill"));
+        t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill-codex"));
+        t
+    }
+
     #[test]
     fn codex_ask_becomes_deny_and_allow_becomes_no_output() {
         let ask = Decision::Ask {
-            reason: "mainnet deploy".into(),
+            reason: "MAINNET DEPLOY — approve to proceed".into(),
         };
         match render(&ask, Client::Codex) {
             Decision::Deny { reason } => {
-                assert!(reason.starts_with("mainnet deploy "), "{reason}");
-                assert!(reason.ends_with(CODEX_ASK_SUFFIX), "{reason}");
+                assert_eq!(reason, format!("MAINNET DEPLOY. {CODEX_ASK_SUFFIX}"));
             }
             other => panic!("expected deny, got {other:?}"),
         }
@@ -175,20 +620,100 @@ mod tests {
     }
 
     #[test]
-    fn codex_hook_config_paths_are_recognized() {
+    fn patch_paths_in_shell_commands() {
+        let heredoc = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: ~/.config/solana/id.json\n+[]\n*** End Patch\nEOF";
+        assert_eq!(
+            patch_paths_in_command(heredoc),
+            ["~/.config/solana/id.json"]
+        );
+        let escaped =
+            r"apply_patch $'*** Begin Patch\n*** Delete File: .codex/hooks.json\n*** End Patch'";
+        assert!(patch_paths_in_command(escaped).contains(&".codex/hooks.json".to_string()));
+        let quoted = "apply_patch \"*** Begin Patch\n*** Delete File: tier.json\"";
+        assert!(patch_paths_in_command(quoted).contains(&"tier.json".to_string()));
+    }
+
+    #[test]
+    fn protected_targets_are_recognized() {
         let cwd = Path::new("/w/proj");
-        let home = Some(Path::new("/home/u"));
+        let t = targets();
         for p in [
             ".codex/hooks.json",
             ".codex/config.toml",
             "sub/../.codex/hooks.json",
             "/w/proj/.CODEX/Hooks.json",
             "~/.codex/hooks.json",
+            "/opt/cx/hooks.json",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            "~/.claude/settings.json",
+            "/home/u/.local/bin/safe-ai-skill",
+            "~/.local/bin/safe-ai-skill-codex",
+            "tier.json",
+            "sub/grants.json",
+            "id.json",
         ] {
-            assert!(is_codex_hook_config(p, cwd, home), "{p}");
+            assert!(patch_target_reason(p, cwd, &t).is_some(), "{p}");
         }
-        for p in [".codex/notes.md", "codex/hooks.json", "hooks.json", "/"] {
-            assert!(!is_codex_hook_config(p, cwd, home), "{p}");
+        for p in [
+            ".codex/notes.md",
+            "codex/hooks.json",
+            "hooks.json",
+            "/",
+            "src/settings.json",
+            "/w/proj/tier.json.md",
+            "bin/safe-ai-skill",
+        ] {
+            assert!(patch_target_reason(p, cwd, &t).is_none(), "{p}");
         }
+    }
+
+    #[test]
+    fn bash_writes_to_protected_targets_are_denied() {
+        let cwd = Path::new("/w/proj");
+        let t = targets();
+        for c in [
+            "rm tier.json",
+            "cd /data && rm -f grants.json",
+            "echo {} > .codex/hooks.json",
+            "cat x >> ~/.codex/config.toml",
+            "cp evil ~/.local/bin/safe-ai-skill",
+            "cd ~/.local/bin && rm safe-ai-skill",
+            "sh -c 'rm -f ~/.codex/hooks.json'",
+            "sudo mv a /opt/cx/hooks.json",
+            "printf x | tee .claude/settings.local.json",
+            "FOO=1 truncate -s0 id.json",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_some(), "{c}");
+        }
+        for c in [
+            "cat .codex/hooks.json",
+            "ls ~/.local/bin/safe-ai-skill",
+            "which safe-ai-skill",
+            "safe-ai-skill status",
+            "git commit -m 'update safe-ai-skill docs'",
+            "npx @stbr/safe-ai-skill add skill x",
+            "grep tier.json README.md",
+            "echo hello > out.txt",
+            "cargo build",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
+        }
+    }
+
+    #[test]
+    fn symlinked_codex_home_is_resolved() {
+        let base = std::env::temp_dir().join(format!("adapt-symlink-{}", std::process::id()));
+        let real = base.join("real-codex");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("cx");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut t = targets();
+        t.push_codex_home(real.clone());
+        #[cfg(unix)]
+        assert!(patch_target_reason("cx/hooks.json", &base, &t).is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

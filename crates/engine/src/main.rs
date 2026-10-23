@@ -209,6 +209,11 @@ fn install_panic_ask() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
+        // Codex reads stdout only on exit 0, and a release build aborts after this hook: end
+        // here so the deny counts.
+        if adapt::is_codex() {
+            std::process::exit(0);
+        }
         default(info);
     }));
 }
@@ -325,7 +330,13 @@ fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
         cwd,
         dir,
         &|k| std::env::var(k).ok(),
-        sandbox::state(&root),
+        // Claude Code's sandbox does not wrap a Codex process, and nothing in Codex stops the
+        // agent from editing the settings that declare it.
+        if adapt::is_codex() {
+            sandbox::SandboxState::Off
+        } else {
+            sandbox::state(&root)
+        },
         headless::detect(),
     )
 }
@@ -399,12 +410,24 @@ fn process_cwd() -> PathBuf {
 }
 
 /// Resolve the session cwd from the hook payload, defaulting to the process cwd.
+///
+/// Under Codex a `tool_input.workdir` (where `exec_command` runs) is joined on when present.
 fn cwd_of(input: &HookInput) -> PathBuf {
-    input
+    let cwd = input
         .cwd
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let workdir = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.get("workdir"))
+        .and_then(|w| w.as_str())
+        .filter(|w| !w.is_empty());
+    match workdir {
+        Some(w) if adapt::is_codex() => cwd.join(w),
+        _ => cwd,
+    }
 }
 
 /// Run the full PreToolUse pipeline for a gate result: relax → audit → emit.
@@ -568,6 +591,12 @@ fn cmd_gate_bash_secrets() -> ExitCode {
     let effective = load_effective_policy(&cwd, &dir);
     let command = input.bash_command().unwrap_or("");
     let tier = effective.tier();
+    if adapt::is_codex() {
+        if let Some(deny) = codex_bash_writes(command, &cwd, &effective) {
+            let meta = GateMeta::new(Scope::Other, true);
+            return finish_pretooluse(deny, &meta, &effective, &dir, &input, &raw);
+        }
+    }
     if let Some(deny) = blocked_pack(verify::enforce::bash_verdict(&dir, command, &cwd), tier) {
         return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
     }
@@ -731,6 +760,25 @@ fn cmd_gate_prompt_expansion() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Codex-only Bash checks: an `apply_patch` the shell runs (Codex intercepts it) gets the
+/// per-file patch checks, and writes to [`adapt::CodexTargets`] are denied. `Some` is the
+/// deny (or hard-guard ask) to emit.
+fn codex_bash_writes(command: &str, cwd: &Path, effective: &Policy) -> Option<Decision> {
+    let targets = adapt::CodexTargets::from_env();
+    if let Some(reason) = adapt::bash_reason(command, cwd, &targets) {
+        return Some(Decision::Deny { reason });
+    }
+    let paths = adapt::patch_paths_in_command(command);
+    if paths.is_empty() {
+        return None;
+    }
+    let protected = safe_ai_skill::gates::tamper::Protected::from_env();
+    match apply_patch_decision(&paths, cwd, effective, &protected) {
+        d @ (Decision::Deny { .. } | Decision::Ask { .. }) => Some(d),
+        _ => None,
+    }
+}
+
 /// The tamper and tier verdict on one file write (`file_path` / `notebook_path`).
 fn file_write_decision(
     tool_input: Option<&serde_json::Value>,
@@ -747,36 +795,62 @@ fn file_write_decision(
     join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true)).0
 }
 
-/// The strictest [`file_write_decision`] over the files an `apply_patch` patch touches. Under
-/// Codex a patch to `.codex/hooks.json` or `.codex/config.toml` is denied too: those files
-/// wire these gates in.
+/// The strictest verdict over the files an `apply_patch` patch touches: the tamper check (one
+/// resolution for all paths), the wallet and env-write tier gates per path, and under Codex the
+/// [`adapt::patch_target_reason`] targets. Over [`adapt::MAX_PATCH_PATHS`] files is a deny.
 fn apply_patch_decision(
-    patch: &str,
+    paths: &[String],
     cwd: &Path,
     effective: &Policy,
     protected: &safe_ai_skill::gates::tamper::Protected,
 ) -> Decision {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut strictest = Decision::Defer;
-    for path in adapt::patch_paths(patch) {
-        let decision = if adapt::current() == adapt::Client::Codex
-            && adapt::is_codex_hook_config(&path, cwd, home.as_deref())
-        {
-            Decision::Deny {
-                reason: format!(
-                    "safe-ai-skill: `{path}` is Codex hook config that runs safe-ai-skill's \
-                     gates; edit it yourself, outside the agent."
-                ),
-            }
-        } else {
-            let file = serde_json::json!({ "file_path": path });
-            file_write_decision(Some(&file), cwd, effective, protected)
+    if paths.len() > adapt::MAX_PATCH_PATHS {
+        return Decision::Deny {
+            reason: format!(
+                "safe-ai-skill: this patch touches {} files, more than the {} it inspects; \
+                 split it into smaller patches.",
+                paths.len(),
+                adapt::MAX_PATCH_PATHS
+            ),
         };
+    }
+    if adapt::is_codex() {
+        let targets = adapt::CodexTargets::from_env();
+        if let Some(reason) = paths
+            .iter()
+            .find_map(|p| adapt::patch_target_reason(p, cwd, &targets))
+        {
+            return Decision::Deny { reason };
+        }
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let mut strictest = safe_ai_skill::gates::tamper::decide_paths(&refs, cwd, protected);
+    if matches!(strictest, Decision::Deny { .. }) {
+        return strictest;
+    }
+    let tier = effective.tier();
+    for path in paths {
+        let file = serde_json::json!({ "file_path": path });
+        let verdict = strictest_verdict_of(&file, cwd, effective, tier);
+        let (decision, _) = join_tier(verdict, Decision::Defer, GateMeta::new(Scope::Other, true));
         if decision_rank(&decision) > decision_rank(&strictest) {
             strictest = decision;
         }
     }
     strictest
+}
+
+/// The wallet and env-write tier verdicts on one file write.
+fn strictest_verdict_of(
+    file: &serde_json::Value,
+    cwd: &Path,
+    effective: &Policy,
+    tier: Tier,
+) -> Option<Verdict> {
+    strictest([
+        wallet::decide_file(Some(file), cwd, effective, tier),
+        envwrite::decide_file(Some(file), cwd, effective, tier),
+    ])
 }
 
 /// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
@@ -830,7 +904,7 @@ fn cmd_gate_tamper() -> ExitCode {
         else {
             return ask_unreadable(Unreadable::Malformed, &input, &raw);
         };
-        apply_patch_decision(patch, &cwd, &effective, &protected)
+        apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected)
     } else {
         file_write_decision(tool_input, &cwd, &effective, &protected)
     };
