@@ -325,11 +325,9 @@ fn home_roots(concrete_only: bool) -> Vec<Vec<String>> {
 
 /// The config dirs a [`Root::ConfigDir`] entry covers.
 fn config_dirs() -> Vec<Vec<String>> {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(|v| segments(&secretpath::normalize(&v, None)))
-        .into_iter()
+    secretpath::config_dirs()
+        .iter()
+        .map(|c| segments(c))
         .collect()
 }
 
@@ -422,7 +420,13 @@ pub fn reaches_store(dir: &Path) -> bool {
     let Some(entries) = entries() else {
         return true;
     };
-    if secretpath::data_dir_reach(&dir.to_string_lossy(), &secretpath::homes_resolved()).is_some() {
+    let homes = secretpath::homes_resolved();
+    let text = dir.to_string_lossy();
+    let real = canonical(&text);
+    let claude_state = |d: &str| {
+        secretpath::data_dir_reach(d, &homes).is_some() || secretpath::is_transcript_tree(d, &homes)
+    };
+    if claude_state(&text) || real.as_deref().is_some_and(claude_state) {
         return true;
     }
     let text = secretpath::normalize(&dir.to_string_lossy(), None);
@@ -530,6 +534,12 @@ fn data_key_globs() -> Vec<String> {
 /// relative search root. Exceptions cannot be re-included, so `~/.ssh/config` is not searched
 /// by a directory Grep either.
 pub fn grep_exclusions(dir: &Path) -> Vec<String> {
+    grep_exclusions_as(dir, dir)
+}
+
+/// [`grep_exclusions`] for the canonical root `dir` that the Grep names as `given` (a symlink
+/// or another spelling): ripgrep prints paths under `given`.
+pub fn grep_exclusions_as(dir: &Path, given: &Path) -> Vec<String> {
     let mut globs: Vec<String> = GREP_EXCLUDED.iter().map(|g| g.to_string()).collect();
     let all: &[Entry] = entries().unwrap_or_default();
     let push = |glob: String, globs: &mut Vec<String>| {
@@ -551,6 +561,9 @@ pub fn grep_exclusions(dir: &Path) -> Vec<String> {
             push(glob, &mut globs);
         }
     }
+    for glob in config_dir_globs(dir, given, all) {
+        push(glob, &mut globs);
+    }
     if !touches_home(dir) {
         return globs;
     }
@@ -563,6 +576,87 @@ pub fn grep_exclusions(dir: &Path) -> Vec<String> {
         }
     }
     globs
+}
+
+/// The exclusion globs for what `$CLAUDE_CONFIG_DIR` protects (the transcripts under
+/// `projects/` and the list's `${CLAUDE_CONFIG_DIR:-~/.claude}/…` records), when the Grep root
+/// `dir` is the config dir or above it. ripgrep matches a glob against the path as it prints
+/// it (relative to a relative root, absolute under an absolute one), so each item is emitted
+/// relative to `dir` and as `**/<path from dir>/…` (`**/<config dir name>/…` when `dir` is
+/// the config dir itself). A config path holding glob syntax falls back to `**/<item>`.
+fn config_dir_globs(dir: &Path, given: &Path, entries: &[Entry]) -> Vec<String> {
+    let mut items: Vec<String> = vec!["projects/**".to_string()];
+    for entry in entries
+        .iter()
+        .filter(|e| !e.exception && e.root == Root::ConfigDir)
+    {
+        let rest = entry.source.trim_start_matches(CONFIG_DIR_PREFIX);
+        items.push(match rest.strip_suffix('/') {
+            Some(d) => format!("{d}/**"),
+            None => rest.to_string(),
+        });
+    }
+    let dir_forms: Vec<String> = [
+        Some(dir.to_string_lossy().into_owned()),
+        canonical(&dir.to_string_lossy()),
+        Some(given.to_string_lossy().into_owned()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|d| {
+        secretpath::normalize(&d, None)
+            .trim_end_matches('/')
+            .to_string()
+    })
+    .collect();
+    let given_name = Path::new(given.to_string_lossy().trim_end_matches(['/', '\\']))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    let mut out = Vec::new();
+    for config in secretpath::config_dirs() {
+        let rel = dir_forms.iter().find_map(|d| {
+            if *d == config {
+                Some(String::new())
+            } else if d.is_empty() || d == "/" {
+                Some(config.trim_start_matches('/').to_string())
+            } else {
+                config.strip_prefix(&format!("{d}/")).map(str::to_string)
+            }
+        });
+        let Some(rel) = rel else {
+            continue;
+        };
+        let unsafe_glob = |t: &str| t.contains(['*', '?', '[', ']', '{', '}', ',', '!', '\\']);
+        // (prefix, the path text in it that must hold no glob syntax)
+        let mut prefixes: Vec<(String, String)> = Vec::new();
+        if rel.is_empty() {
+            prefixes.push((String::new(), String::new()));
+            let names = [
+                config.rsplit('/').next().map(str::to_string),
+                given_name.clone(),
+            ];
+            for name in names.into_iter().flatten().filter(|n| !n.is_empty()) {
+                prefixes.push((format!("**/{name}/"), name));
+            }
+        } else {
+            prefixes.push((format!("{rel}/"), rel.clone()));
+            prefixes.push((format!("**/{rel}/"), rel.clone()));
+        }
+        for (prefix, text) in prefixes {
+            for item in &items {
+                let glob = if unsafe_glob(&text) {
+                    format!("**/{item}")
+                } else {
+                    format!("{prefix}{item}").replace(' ', "?")
+                };
+                if !out.contains(&glob) {
+                    out.push(glob);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Whether `dir` is at or above a home directory, or inside one in a dot directory,

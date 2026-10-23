@@ -647,7 +647,7 @@ fn f2_test_output_is_redacted_at_every_tier() {
     let stdout = format!("anchor test\n  provider: HELIUS_KEY={HELIUS}\n  1 passing\n");
     for tier in TIERS {
         let payload = json!({
-            "hook_event_name": "PostToolUse", "cwd": w.proj.path(), "tool_name": "Bash",
+            "session_id":"it-matrix","hook_event_name": "PostToolUse", "cwd": w.proj.path(), "tool_name": "Bash",
             "tool_input": { "command": "anchor test" },
             "tool_response": { "stdout": stdout, "stderr": "", "interrupted": false, "isImage": false },
         });
@@ -1323,7 +1323,7 @@ impl World {
             .invocation(
                 &["verify", "session"],
                 Setup::at(tier),
-                json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": self.proj.path()})
+                json!({"session_id":"it-matrix","hook_event_name": "SessionStart", "source": "startup", "cwd": self.proj.path()})
                     .to_string(),
             )
             .run();
@@ -1467,16 +1467,24 @@ fn f5_after_verify_trust_a_high_pack_has_no_opinion_but_a_trusted_combo_still_de
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let code = confirm::announce_pending(&dir, now)
+    // In-process, a request binds to this process's Claude Code session if it has one.
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_else(|_| "it".into());
+    let code = confirm::announce_pending_for(&dir, now, &session)
         .into_iter()
         .find(|a| a.id.as_str() == req.id)
         .expect("announced")
         .code
         .as_str()
         .to_string();
-    let confirmed =
-        confirm::confirm_from_prompt(&dir, &format!("safe-ai-skill confirm {code}"), now)
-            .expect("confirmed");
+    let confirmed = match confirm::confirm_attempt_for(
+        &dir,
+        &format!("safe-ai-skill confirm {code}"),
+        now,
+        &session,
+    ) {
+        confirm::Attempt::Confirmed(c) => c,
+        other => panic!("not confirmed: {other:?}"),
+    };
     verify::apply_confirmed(&dir, &confirmed).expect("trusted");
     w.assert_reach("keys", "keys", NEVER);
 

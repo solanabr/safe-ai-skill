@@ -30,6 +30,7 @@ Known holes, in short (the full table, with what closes each, is in [SECURITY.md
 - **Bash writes to `.env`** (`sed -i`, `perl -pi`): not covered at any tier.
 - **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
 - **Values already in context:** a secret that was read has reached the model provider and the transcripts; nothing recalls it.
+- **Failed tool calls are not redacted:** redaction applies to successful tool results only. When a Bash command exits non-zero (or an MCP or Read call errors), Claude Code gives the model the raw output and offers hooks no way to replace it; the plugin only warns you and the model when that output held a secret.
 - **Egress:** no exfil tripwire ships in 1.1.0 (planned, [#19](https://github.com/solanabr/safe-ai-skill/issues/19)). Sending a secret file by path (`curl -d @.env`, `-T`, `-F`, `scp`) is denied and an inline `curl`/`wget` POST to a non-localhost host asks (below High, not when it goes to a known Solana RPC host), but requests to request-bin, tunnel and paste hosts, IP literals, redirects, DNS and `WebFetch` URLs are not gated. The kit's sandbox `deniedDomains`, or Claude Code's own sandbox with the entries in [SECURITY.md](SECURITY.md#recommended-setup), closes the host list.
 - **Code run through an MCP executor** (for example context-mode's `ctx_execute`): shell code gets the same checks as a Bash call, but code in other languages gets only its string literals checked as paths and shell commands, and a Solana CLI named there asks. Anything built at runtime gets through, as in Bash.
 - **Directory search through Bash `grep`/`rg`:** only a pattern nudge applies there.
@@ -154,8 +155,8 @@ The plugin takes a tier as an input: `off < relaxed < medium < high`, default `r
 | `.env.schema` and templates (content guard applies) | n/o | n/o | n/o | n/o |
 | Write/Edit/MultiEdit to a project env file; agent `env set\|unset` | n/o | n/o | deny | deny |
 | `env keys` | n/o | n/o | n/o | n/o |
-| Pattern redaction (keys, seeds, PEM, vendor tokens) | on | on | on | on |
-| Value scrub of project env values in tool output, except an opted-in raw read | on | on | on | on |
+| Pattern redaction (keys, seeds, PEM, vendor tokens) in successful tool results | on | on | on | on |
+| Value scrub of project env values in successful tool results, except an opted-in raw read | on | on | on | on |
 | Irreversible on-chain action (`--final`, `program close` (program or buffer), `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
 | … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
 | Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
@@ -204,7 +205,7 @@ The hooks stop a careless or prompt-injected model; for a hard boundary enable C
 
 safe-ai-skill protects against a careless model and prompt-injected instructions. It is not a sandbox. Code that runs unsandboxed as your user can rewrite any user-space state, including the plugin's grants, pins and settings, so the Claude Code sandbox is the hard boundary. A tamper tripwire denies agent tool calls that would loosen the firewall from the inside, but encoded commands, variable indirection and scripts written now and run later can get past it. [What this plugin cannot protect on its own](#read-this-first-what-this-plugin-cannot-protect-on-its-own) lists the known holes. Run `allow`, `tier <lower>` and `verify approve` yourself in a terminal.
 
-If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE, but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
+If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE with the reason (that SessionStart message is the only place you see it: Claude Code keeps an exit-0 hook's stderr in its debug log), but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
 
 ## Upgrading to 1.1.0 (read before upgrading)
 
@@ -251,7 +252,7 @@ safe-ai-skill revoke                 # drop every grant at once
 safe-ai-skill session                # show active session state
 ```
 
-`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`. `status` prints the dir it used.
+`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`; when the plugin is installed but no session has run yet (Claude Code creates the data dir on the first hook run), it says to start a session once. `status` prints the dir it used and lists pending requests (id, kind, when created and when they lapse, how to confirm; never the code).
 
 **Relaxations need your confirmation in the prompt.** `allow` and a `tier` lowering (or an `--env-read` loosening) change
 nothing on their own (the agent may run them, because they only create a request it cannot confirm): they record a request (`request r3fa91c`) and print no code. Claude Code
@@ -259,8 +260,17 @@ then shows **you** a confirmation code in a hook message (right after the comman
 next prompt or session start) that is never put in the agent's context. The request takes
 effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
 (within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
-pasted text is refused, and three wrong codes cancel every pending request. In headless `claude -p`, where
-hook messages aren't shown, nothing can be confirmed. Raising the tier (or tightening `--env-read`) and `revoke` apply at
+pasted text is refused, and three wrong codes cancel the session's pending requests. A request belongs to
+one Claude Code session (the one whose agent ran the command, or, for a request made in your terminal, the
+first interactive session that shows its code): its code is shown and accepted only there (resuming keeps
+the session; `/clear` starts a new one). Nothing is announced or confirmed in a headless session (CI or a
+headless switch), in a non-interactive `claude -p`, or in a Claude Code session started from inside
+another one (an agent's nested `claude`): a code typed there changes nothing, you are told why, and the
+request stays pending. The same holds wherever the engine can't read the process table to tell: **on
+native Windows, confirmations (lowering the tier, loosening `env_read`, grants, `verify trust`/`approve`)
+are unavailable; raising the tier and everything else work, and WSL works for those actions.** Whether
+desktop or IDE hosts run Claude Code in print mode (which can't confirm) is unverified; a terminal
+session on macOS, Linux or WSL works. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 

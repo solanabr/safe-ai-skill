@@ -1,7 +1,8 @@
 //! Secret path classification (spec D3.1, D3.2), shared by the read gate, the Bash secrets
 //! gate, MCP path arguments and `safe-ai-skill env`.
 //!
-//! [`classify`] is pure string work (it reads `$HOME`/`$XDG_CONFIG_HOME`, nothing else) so the
+//! [`classify`] is pure string work (it reads `$HOME`/`$XDG_CONFIG_HOME`/`$CLAUDE_CONFIG_DIR`,
+//! expanding a literal `$CLAUDE_CONFIG_DIR` in the path from the hook's environment) so the
 //! Bash gate can call it on every command. [`sniff`] is the bounded content check the read gate
 //! adds for files whose name alone does not decide.
 //!
@@ -70,7 +71,10 @@ pub fn classify(path: &str) -> Class {
 /// Classify `path`, treating each of `homes` as the home directory (callers pass the
 /// canonical home too, since resolved paths go through symlinked homes).
 pub fn classify_with_homes(path: &str, homes: &[String]) -> Class {
-    let full = normalize(path, homes.first().map(String::as_str));
+    let full = normalize(
+        &expand_config_dir_var(path),
+        homes.first().map(String::as_str),
+    );
     if crate::gates::credpaths::is_credential(Path::new(&full)) {
         return Class::HardDeny("credential store");
     }
@@ -149,9 +153,7 @@ fn tree_class(full: &str) -> Option<Class> {
     }
     // Claude Code transcripts record hook `systemMessage`s, which carry safe-ai-skill's
     // confirmation codes (spec D4.1): the agent must not read them back.
-    if tree_rest(&rooted, ".claude/projects").is_some()
-        || under_env_dir(full, "CLAUDE_CONFIG_DIR", "projects")
-    {
+    if tree_rest(&rooted, ".claude/projects").is_some() || under_config_dir(full, "projects") {
         return Some(Class::HardDeny("Claude Code transcripts"));
     }
     // The state MAC key of a safe-ai-skill data dir.
@@ -172,6 +174,101 @@ fn tree_class(full: &str) -> Option<Class> {
         }
     }
     None
+}
+
+/// Whether `full` is `<config dir>/<entry>` or lies under it, for every spelling of
+/// `$CLAUDE_CONFIG_DIR` ([`config_dirs`]).
+fn under_config_dir(full: &str, entry: &str) -> bool {
+    config_dirs().iter().any(|c| {
+        let dir = format!("{c}/{entry}");
+        full == dir || full.starts_with(&format!("{dir}/"))
+    })
+}
+
+/// `$CLAUDE_CONFIG_DIR` as the hook process has it (it replaces `~/.claude`, which stays
+/// protected too): normalised, plus its symlink-resolved form when that differs. Empty when
+/// unset, blank or not absolute.
+pub fn config_dirs() -> Vec<String> {
+    static CACHE: std::sync::Mutex<Option<(String, Vec<String>)>> = std::sync::Mutex::new(None);
+    let Some(raw) = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+    let Ok(mut cache) = CACHE.lock() else {
+        return config_dir_forms(&raw);
+    };
+    match cache.as_ref() {
+        Some((key, forms)) if *key == raw => forms.clone(),
+        _ => {
+            let forms = config_dir_forms(&raw);
+            *cache = Some((raw, forms.clone()));
+            forms
+        }
+    }
+}
+
+/// [`config_dirs`] for the value `raw` (one `canonicalize`).
+fn config_dir_forms(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let given = normalize(raw, None).trim_end_matches('/').to_string();
+    if given.starts_with('/') || given.as_bytes().get(1) == Some(&b':') {
+        out.push(given);
+    }
+    if let Some(real) = std::fs::canonicalize(raw.trim())
+        .ok()
+        .and_then(|p| p.to_str().map(|s| normalize(s, None)))
+    {
+        let real = real.trim_end_matches('/').to_string();
+        if !real.is_empty() && !out.contains(&real) {
+            out.push(real);
+        }
+    }
+    out
+}
+
+/// `word` with every `$CLAUDE_CONFIG_DIR` / `${CLAUDE_CONFIG_DIR…}` replaced by the value the
+/// hook process has (else `~/.claude`, Claude Code's default), as the agent's shell would
+/// expand it. Other text is kept.
+pub fn expand_config_dir_var(word: &str) -> String {
+    const NAME: &str = "CLAUDE_CONFIG_DIR";
+    if !word.contains(NAME) {
+        return word.to_string();
+    }
+    let value = std::env::var(NAME)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().trim_end_matches(['/', '\\']).to_string())
+        .unwrap_or_else(|| "~/.claude".to_string());
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let braced = tail
+            .strip_prefix("${")
+            .filter(|t| t.starts_with(NAME))
+            .and_then(|t| t.find('}'))
+            .and_then(|end| end.checked_add(3));
+        let plain = tail
+            .strip_prefix('$')
+            .and_then(|t| t.strip_prefix(NAME))
+            .filter(|after| !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+            .map(|_| 1 + NAME.len());
+        match braced.or(plain) {
+            Some(len) => {
+                out.push_str(&value);
+                rest = &tail[len..];
+            }
+            None => {
+                out.push('$');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether `full` is `$<var>/<entry>` or lies under it.
@@ -196,10 +293,16 @@ fn tree_rest<'a>(rooted: &'a str, dir: &str) -> Option<&'a str> {
 }
 
 /// Whether `dir` is, or lies inside, a hard-deny tree (`.config/solana`, `.ssh`,
-/// `.superstack`, the varlock key store, Claude Code transcripts). A directory search there cannot be made safe by
-/// excluding file names.
+/// `.superstack`, the varlock key store, Claude Code transcripts under `~/.claude` or
+/// `$CLAUDE_CONFIG_DIR`). A directory search there cannot be made safe by excluding file names.
 pub fn is_hard_tree(dir: &str, homes: &[String]) -> bool {
-    let full = normalize(dir, homes.first().map(String::as_str));
+    let full = normalize(
+        &expand_config_dir_var(dir),
+        homes.first().map(String::as_str),
+    );
+    if under_config_dir(full.trim_end_matches('/'), "projects") {
+        return true;
+    }
     let rooted = if full.starts_with('/') {
         full
     } else {
@@ -208,6 +311,29 @@ pub fn is_hard_tree(dir: &str, homes: &[String]) -> bool {
     HARD_TREES
         .iter()
         .any(|tree| tree_rest(&rooted, tree).is_some())
+}
+
+/// Whether `dir` is, or lies inside, a Claude Code transcript tree: `.claude/projects`
+/// anywhere, or `$CLAUDE_CONFIG_DIR/projects`.
+pub fn is_transcript_tree(dir: &str, homes: &[String]) -> bool {
+    let full = normalize(
+        &expand_config_dir_var(dir),
+        homes.first().map(String::as_str),
+    );
+    let full = full.trim_end_matches('/');
+    let rooted = if full.starts_with('/') {
+        full.to_string()
+    } else {
+        format!("/{full}")
+    };
+    under_config_dir(full, "projects") || tree_rest(&rooted, ".claude/projects").is_some()
+}
+
+/// Whether `path` is Claude Code or safe-ai-skill secret state by path: inside a transcript
+/// tree ([`is_transcript_tree`]) or a data dir's state `key`.
+pub fn is_claude_secret(path: &str, homes: &[String]) -> bool {
+    is_transcript_tree(path, homes)
+        || classify_with_homes(path, homes) == Class::HardDeny("safe-ai-skill state key")
 }
 
 /// Where a directory stands relative to a safe-ai-skill data dir (whose `key` authenticates
@@ -260,7 +386,7 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
             return Some(DataDirReach::Above);
         }
     }
-    if let Some(config) = env_dir("CLAUDE_CONFIG_DIR") {
+    for config in config_dirs() {
         let inside = rooted
             .strip_prefix(&format!("{config}/plugins/data/"))
             .is_some_and(|rest| rest.starts_with("safe-ai-skill-"));
@@ -276,7 +402,11 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
                 normalize(h, None).trim_end_matches('/')
             )
         })
-        .chain(env_dir("CLAUDE_CONFIG_DIR").map(|c| format!("{c}/plugins/data")));
+        .chain(
+            config_dirs()
+                .into_iter()
+                .map(|c| format!("{c}/plugins/data")),
+        );
     for parent in parents {
         if below(&rooted, &parent) {
             return Some(DataDirReach::Above);

@@ -92,7 +92,7 @@ impl World {
     fn code_shown(&self) -> String {
         let run = self.hook(
             &["pending-notice"],
-            json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
+            json!({"session_id":"it-tiers","hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
                    "tool_input":{"command":"safe-ai-skill tier off"}}),
         );
         let msg = run.json()["systemMessage"].as_str().unwrap().to_string();
@@ -107,14 +107,14 @@ impl World {
     fn prompt(&self, prompt: &str) -> Run {
         self.hook(
             &["prompt-guard"],
-            json!({"hook_event_name":"UserPromptSubmit","cwd": self.proj.path(),"prompt": prompt}),
+            json!({"session_id":"it-tiers","hook_event_name":"UserPromptSubmit","cwd": self.proj.path(),"prompt": prompt}),
         )
     }
 
     fn session(&self) -> String {
         let run = self.hook(
             &["verify", "session"],
-            json!({"hook_event_name":"SessionStart","source":"startup","cwd": self.proj.path()}),
+            json!({"session_id":"it-tiers","hook_event_name":"SessionStart","source":"startup","cwd": self.proj.path()}),
         );
         if run.stdout.trim().is_empty() {
             String::new()
@@ -412,7 +412,7 @@ fn a_tampered_tier_json_is_reported_by_status_and_session_start() {
         .cwd(w.proj.path())
         .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
         .stdin(
-            json!({"hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
+            json!({"session_id":"it-tiers","hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
                 .to_string(),
         )
         .run();
@@ -797,7 +797,7 @@ fn a_deleted_tier_json_fails_closed_to_high_with_a_note() {
             .cwd(w.proj.path())
             .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
             .stdin(
-                json!({"hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
+                json!({"session_id":"it-tiers","hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
                     .to_string(),
             )
             .run();

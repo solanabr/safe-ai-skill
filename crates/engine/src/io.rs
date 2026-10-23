@@ -55,6 +55,8 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Event source (`startup`, `resume`, ...).
     pub source: Option<String>,
+    /// What went wrong (PostToolUseFailure); for Bash, `Exit code N` and the output.
+    pub error: Option<String>,
 }
 
 impl HookInput {
@@ -228,6 +230,11 @@ pub fn emit_posttooluse_redact(updated: Option<Value>) -> std::io::Result<()> {
 /// Build the UserPromptSubmit JSON value (no I/O).
 ///
 /// `Some(reason)` → `{"decision":"block","reason":…}`; `None` → `None` (no output).
+///
+/// `hookSpecificOutput.suppressOriginalPrompt` (keeps the prompt text out of the block
+/// message) is deliberately not set: neither the hooks docs nor the Claude Code changelog give
+/// the version that introduced it, nor say unknown fields are ignored, and a field an older
+/// supported version rejected would fail schema validation and let the prompt through.
 pub fn render_userpromptsubmit(block: Option<&str>) -> Option<Value> {
     block.map(|reason| json!({ "decision": "block", "reason": reason }))
 }

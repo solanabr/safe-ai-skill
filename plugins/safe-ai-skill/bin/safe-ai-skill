@@ -50,7 +50,7 @@ case $sub in
   # A fail-open Skill gate would let a blocked pack's `!cmd` run (spec D6.2 as amended).
   gate-skill) kind=skill ;;
   # Hooks on events other than PreToolUse, where `ask` means nothing.
-  gate-prompt-expansion | redact | prompt-guard | pending-notice) kind=other ;;
+  gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice) kind=other ;;
   gate-*) kind=broad ;;
   verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
   *) kind=cli ;;
@@ -125,9 +125,15 @@ case $label in
 esac
 
 # env_failure <reason> [<detail>]: the engine can't run here, so fail open with a notice.
-# <reason> is a fixed phrase (it goes into JSON); <detail> is for stderr only.
+# <reason> is a fixed phrase (it goes into JSON). <detail> goes to stderr, which Claude Code
+# keeps in its debug log for an exit-0 hook, and, reduced to a JSON-safe character set, into
+# the SessionStart systemMessage: the one place the user sees why.
 env_failure() {
   printf 'safe-ai-skill: firewall inactive on %s: %s%s\n' "$label" "$1" "${2:+: $2}" >&2
+  why=
+  if [ -n "${2:-}" ]; then
+    why=$(printf '%s' "$2" | tr -cd 'A-Za-z0-9 ._:/()=,+-' 2>/dev/null | cut -c1-200 2>/dev/null) || why=
+  fi
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
     solana)
@@ -139,7 +145,7 @@ env_failure() {
       fi
       ;;
     skill) ask_json "safe-ai-skill inactive on $label: $1; review this skill call manually" ;;
-    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
+    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1${why:+ ($why)}. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
     cli) exit 1 ;;
   esac
   exit 0

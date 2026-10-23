@@ -10,7 +10,7 @@
 //! 2. **Any word that names a credential path**, in any command, whatever the program: `vim
 //!    ~/.aws/credentials`, `gpg -d ~/.password-store/x.gpg`, `tar cz ~/.aws`, `python3 x.py
 //!    ~/.npmrc`, `ln ~/.aws/credentials k`. A word is a path candidate after `~`/`$HOME`/
-//!    `${HOME…}`/`$USERPROFILE` expansion, splitting at `=` and `:` (`--file=~/.npmrc`,
+//!    `${HOME…}`/`$USERPROFILE`/`$CLAUDE_CONFIG_DIR` expansion, splitting at `=` and `:` (`--file=~/.npmrc`,
 //!    `-v ~/.aws:/root/.aws`), brace expansion, and joining to every effective cwd (the hook's
 //!    and each `cd`/`pushd` target seen so far). It is judged lexically, as a shell pattern
 //!    ([`credpaths::is_credential_glob`]), and after symlink resolution where the file exists;
@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
-use crate::gates::{credpaths, read};
+use crate::gates::{credpaths, read, secretpath};
 use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -1294,9 +1294,11 @@ fn track_cd(cmd: &SimpleCommand, cwds: &mut Vec<PathBuf>) {
 }
 
 /// `~`, `$HOME`, `${HOME…}`, `$USERPROFILE`, `%USERPROFILE%` at the start of `word` or after
-/// `=`/`:` become the home directories; `None` entries of unknown variables drop the word.
+/// `=`/`:` become the home directories, `$CLAUDE_CONFIG_DIR` / `${CLAUDE_CONFIG_DIR…}` the
+/// hook's config dir ([`crate::gates::secretpath::expand_config_dir_var`]); a word with any other variable
+/// is dropped.
 fn expand_vars(word: &str) -> Vec<String> {
-    let mut text = word.to_string();
+    let mut text = crate::gates::secretpath::expand_config_dir_var(word);
     for name in ["HOME", "USERPROFILE"] {
         while let Some(i) = text.find(&format!("${{{name}")) {
             let Some(len) = text[i..].find('}') else {
@@ -1491,13 +1493,18 @@ impl Exempt {
     }
 }
 
-/// [`credpaths::is_credential`] of `path` and of its resolved form, each form unless exempt.
+/// [`credpaths::is_credential`] (or Claude Code transcripts and the state key,
+/// [`secretpath::is_claude_secret`]) of `path` and of its resolved form, each form unless
+/// exempt.
 fn literal_hit(path: &Path, exempt: Exempt) -> bool {
-    if !exempt.allows(path) && credpaths::is_credential(path) {
+    let secret = |p: &Path| {
+        credpaths::is_credential(p)
+            || secretpath::is_claude_secret(&p.to_string_lossy(), &secretpath::homes_resolved())
+    };
+    if !exempt.allows(path) && secret(path) {
         return true;
     }
-    std::fs::canonicalize(path)
-        .is_ok_and(|real| !exempt.allows(&real) && credpaths::is_credential(&real))
+    std::fs::canonicalize(path).is_ok_and(|real| !exempt.allows(&real) && secret(&real))
 }
 
 fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
@@ -1508,7 +1515,12 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
     let bare = is_bare(word);
     let judged = |path: &Path| -> bool {
         if wild {
-            !exempt.allows(path) && credpaths::is_credential_glob(path)
+            !exempt.allows(path)
+                && (credpaths::is_credential_glob(path)
+                    || secretpath::is_transcript_tree(
+                        &path.to_string_lossy(),
+                        &secretpath::homes_resolved(),
+                    ))
         } else {
             literal_hit(path, exempt)
         }

@@ -23,7 +23,7 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, wallet};
+use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, tamper, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
 use safe_ai_skill::policy::{self, Policy};
@@ -102,6 +102,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-skill", |_| cmd_gate_skill()),
     ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
     ("redact", |_| cmd_redact()),
+    ("failure-notice", |_| cmd_failure_notice()),
     ("prompt-guard", |_| cmd_prompt_guard()),
     ("pending-notice", |_| cmd_pending_notice()),
     ("verify", cmd_verify),
@@ -532,9 +533,14 @@ fn cmd_gate_bash() -> ExitCode {
     let Some(command) = input.bash_command() else {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
-    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen
-    // or a wallet write → no opinion, before any policy, list or state is loaded.
-    if !safe_ai_skill::gates::bash::may_concern(command) {
+    // A nested non-interactive Claude Code session (`claude -p`, a prompt on its stdin) runs
+    // with the user's hooks and state where nobody sees it: decided here too, so this
+    // `onFailure: block` entry asks (denies at High or headless) on its own.
+    let nested = tamper::decide_nested_claude(command);
+    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen,
+    // a wallet write or a nested session → no opinion, before any policy, list or state is
+    // loaded.
+    if matches!(nested, Decision::Defer) && !safe_ai_skill::gates::bash::may_concern(command) {
         return ExitCode::SUCCESS;
     }
     let cwd = cwd_of(&input);
@@ -551,8 +557,21 @@ fn cmd_gate_bash() -> ExitCode {
     // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
     // entry as well as from `gate-bash-secrets`.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
-    let (decision, meta) = join_tier(strictest([wallet_verdict]), decision, meta);
+    let nested_verdict = nested_claude_verdict(nested, effective.tier());
+    let (decision, meta) = join_tier(strictest([wallet_verdict, nested_verdict]), decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// [`tamper::decide_nested_claude`] as a tier verdict: its `ask` is a deny at High.
+fn nested_claude_verdict(decision: Decision, tier: Tier) -> Option<Verdict> {
+    match decision {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } if tier == Tier::High => {
+            Some(Verdict::Deny(format!("{reason} Denied at tier high.")))
+        }
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    }
 }
 
 fn cmd_gate_bash_secrets() -> ExitCode {
@@ -778,6 +797,64 @@ fn cmd_redact() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `failure-notice` — the PostToolUseFailure hook. Claude Code gives the model a failed tool's
+/// output unchanged: this event's only output is `additionalContext` (plus the common
+/// `systemMessage`), so it cannot be redacted. When the error text holds what `redact` would
+/// scrub, the model is told not to repeat or send it and the user is warned; names only, never
+/// a value. Otherwise, or on anything unreadable, no output.
+fn cmd_failure_notice() -> ExitCode {
+    let input = match io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 {
+        Ok(input) => input,
+        // Too large to scan: the model is told to treat it as possibly secret (this hook is
+        // wired to PostToolUseFailure only).
+        Err(Unreadable::Oversized) => {
+            print_json(&serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUseFailure",
+                    "additionalContext": "safe-ai-skill: the output of this failed tool call \
+                         was too large to check for secret material, and a failed call's output \
+                         cannot be redacted. Do not repeat, quote, store or send any key, token \
+                         or env value it may hold.",
+                },
+            }));
+            return ExitCode::SUCCESS;
+        }
+        Err(_) => return ExitCode::SUCCESS,
+    };
+    if input.hook_event_name.as_deref() != Some("PostToolUseFailure") {
+        return ExitCode::SUCCESS;
+    }
+    let Some(error) = input.error.as_deref().filter(|e| !e.is_empty()) else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let effective = load_effective_policy(&cwd, &state_dir(&cwd));
+    if !effective.redact.enabled {
+        return ExitCode::SUCCESS;
+    }
+    let values = safe_ai_skill::env::values::load(&cwd);
+    let response = serde_json::Value::String(error.to_string());
+    if redact::scrub_tool_response(&input, &response, &values, &cwd, &effective).is_none() {
+        return ExitCode::SUCCESS;
+    }
+    let tool = input.tool_name.as_deref().unwrap_or("tool");
+    print_json(&serde_json::json!({
+        "systemMessage": format!(
+            "safe-ai-skill: the failed {tool} call's output held secret material (an env value \
+             or key) and reached the model unredacted: Claude Code cannot replace the output of \
+             a failed tool call. Rotate the value if this session's transcript can leave this \
+             machine."
+        ),
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "additionalContext": "safe-ai-skill: the error output of this failed tool call \
+                 contains secret material (an env value or key) that could not be redacted. Do \
+                 not repeat, quote, store, or send it anywhere; refer to it only by its name.",
+        },
+    }));
+    ExitCode::SUCCESS
+}
+
 /// `prompt-guard` — the UserPromptSubmit hook: block a prompt carrying a raw secret, else
 /// handle a `safe-ai-skill confirm <nonce>` prompt (spec D4.1). The nonce is read from the
 /// UserPromptSubmit `prompt` alone ([`confirm::user_prompt`]).
@@ -795,10 +872,11 @@ fn cmd_prompt_guard() -> ExitCode {
     };
     let dir = state_dir(&cwd_of(&input));
     let now = now_secs();
-    let outcome = relax::confirm_prompt(&dir, user_prompt, now);
+    let session = hook_session(&input);
+    let outcome = relax::confirm_prompt(&dir, user_prompt, now, session.as_deref());
     // Codes for requests made outside a Bash tool call (a terminal, `!` mode): shown to the
     // user only, in the systemMessage.
-    let codes = relax::announce(&dir, now);
+    let codes = relax::announce(&dir, now, session.as_deref());
     let mut out = match (outcome, &codes) {
         (Some(o), _) => o.hook_output(),
         (None, Some(_)) => serde_json::json!({}),
@@ -813,6 +891,17 @@ fn cmd_prompt_guard() -> ExitCode {
     }
     print_json(&out);
     ExitCode::SUCCESS
+}
+
+/// The Claude Code session a hook runs in: the payload's `session_id`, else
+/// `CLAUDE_CODE_SESSION_ID` (Claude Code sets both to the same value for hooks).
+fn hook_session(input: &HookInput) -> Option<String> {
+    input
+        .session_id
+        .clone()
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// `pending-notice` — the PostToolUse (Bash) hook that shows the user the confirmation code
@@ -830,7 +919,7 @@ fn cmd_pending_notice() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let dir = state_dir(&cwd_of(&input));
-    if let Some(codes) = relax::announce(&dir, now_secs()) {
+    if let Some(codes) = relax::announce(&dir, now_secs(), hook_session(&input).as_deref()) {
         print_json(&serde_json::json!({ "systemMessage": codes }));
     }
     ExitCode::SUCCESS
@@ -1078,7 +1167,7 @@ fn cmd_verify_session() -> ExitCode {
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
     // user's systemMessage only.
-    if let Some(codes) = relax::announce(&dir, now) {
+    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
         }
@@ -2141,6 +2230,7 @@ fn cmd_status() -> ExitCode {
         "tier_state": tier_state_label(&dir),
         "grants": grants_view,
         "spend": spend_view,
+        "pending": confirm::pending_list(&dir, now),
         "recent_audit": recent_audit_lines(&plugin_data, 5),
     }));
     ExitCode::SUCCESS

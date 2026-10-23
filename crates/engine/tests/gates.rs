@@ -297,6 +297,13 @@ fn prompt_with_seed_phrase_blocks() {
     let v = run.json();
     assert_eq!(v["decision"], "block");
     assert!(v.get("reason").and_then(|r| r.as_str()).is_some());
+    // Exactly `decision` + `reason`: no `hookSpecificOutput.suppressOriginalPrompt`. The docs
+    // give no version for that field and don't say older versions ignore unknown fields; a
+    // schema error there would turn the block into a non-blocking error (the prompt goes
+    // through), so the block stays on fields every supported version knows.
+    let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["decision", "reason"], "{v}");
+    assert!(!run.stdout.contains("suppressOriginalPrompt"));
 }
 
 #[test]

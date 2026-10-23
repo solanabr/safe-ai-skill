@@ -90,7 +90,7 @@ impl Sandbox {
         let run = self.hook(
             &["verify", "session"],
             json!({
-                "hook_event_name": "SessionStart",
+                "session_id":"it-relax","hook_event_name": "SessionStart",
                 "source": "startup",
                 "cwd": self.proj.path(),
             }),
@@ -139,7 +139,7 @@ impl Sandbox {
     fn code_shown(&self) -> String {
         let run = self.hook(
             &["pending-notice"],
-            json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
+            json!({"session_id":"it-relax","hook_event_name":"PostToolUse","tool_name":"Bash","cwd": self.proj.path(),
                    "tool_input":{"command":"safe-ai-skill allow"},"tool_response":{"stdout":""}}),
             &[],
         );
@@ -229,7 +229,7 @@ fn a_nonce_outside_the_users_prompt_never_confirms() {
     // and in the model-visible fields of a UserPromptSubmit payload other than `prompt`.
     sb.hook(
         &["redact"],
-        json!({"hook_event_name":"PostToolUse","tool_name":"Bash",
+        json!({"session_id":"it-relax","hook_event_name":"PostToolUse","tool_name":"Bash",
                "tool_input":{"command":"cat notes.txt"},"tool_response":{"stdout": line}}),
         &[],
     );
@@ -246,7 +246,7 @@ fn a_nonce_outside_the_users_prompt_never_confirms() {
     );
     sb.hook(
         &["prompt-guard"],
-        json!({"hook_event_name":"UserPromptSubmit","prompt":"continue",
+        json!({"session_id":"it-relax","hook_event_name":"UserPromptSubmit","prompt":"continue",
                "transcript_path": line, "tool_input": {"x": line}}),
         &[],
     );
@@ -538,8 +538,8 @@ fn pending_notice_needs_a_post_tool_use_bash_payload() {
     let sb = Sandbox::new("relax-notice-shape");
     allow_transfer(&sb);
     for payload in [
-        json!({"hook_event_name":"UserPromptSubmit","prompt":"hi","cwd": sb.proj.path()}),
-        json!({"hook_event_name":"PostToolUse","tool_name":"Read","cwd": sb.proj.path()}),
+        json!({"session_id":"it-relax","hook_event_name":"UserPromptSubmit","prompt":"hi","cwd": sb.proj.path()}),
+        json!({"session_id":"it-relax","hook_event_name":"PostToolUse","tool_name":"Read","cwd": sb.proj.path()}),
         json!({"cwd": sb.proj.path()}),
     ] {
         let run = sb.hook(&["pending-notice"], payload, &[]);
@@ -557,7 +557,7 @@ fn the_code_is_announced_once_in_system_message_only() {
     // A second PostToolUse shows nothing (a later forged call gets nothing either).
     let again = sb.hook(
         &["pending-notice"],
-        json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": sb.proj.path()}),
+        json!({"session_id":"it-relax","hook_event_name":"PostToolUse","tool_name":"Bash","cwd": sb.proj.path()}),
         &[],
     );
     assert_eq!(again.stdout.trim(), "");
@@ -623,7 +623,7 @@ fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
     let session = |env: &[(&str, &str)]| {
         sb.hook(
             &["verify", "session"],
-            json!({"hook_event_name":"SessionStart","source":"startup","cwd": sb.proj.path()}),
+            json!({"session_id":"it-relax","hook_event_name":"SessionStart","source":"startup","cwd": sb.proj.path()}),
             env,
         )
         .json()
@@ -643,4 +643,179 @@ fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
     let text = v["systemMessage"].as_str().unwrap();
     assert!(text.starts_with("safe-ai-skill tier: relaxed"), "{text}");
     assert!(text.contains("SAFE_AI_SKILL_TIER: off` ignored"), "{text}");
+}
+
+// ---------------------------------------------------------------------------------------
+// No confirmation or announcement in a headless session (nested `claude -p`)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_headless_session_neither_announces_nor_confirms() {
+    let sb = Sandbox::new("relax-headless");
+    allow_transfer(&sb);
+    let headless = [("SAFE_AI_SKILL_HEADLESS", "1")];
+    // No code is shown there, and the request stays unannounced.
+    let notice = sb.hook(
+        &["pending-notice"],
+        json!({"session_id":"it-relax","hook_event_name":"PostToolUse","tool_name":"Bash","cwd": sb.proj.path()}),
+        &headless,
+    );
+    assert_eq!(notice.stdout.trim(), "");
+    let code = sb.code_shown();
+    let pending_before = sb.state("pending.json");
+    let payload = json!({"session_id":"it-relax","cwd": sb.proj.path(),
+                         "hook_event_name":"UserPromptSubmit",
+                         "prompt": format!("safe-ai-skill confirm {code}")});
+    for env in [&headless[..], &[("CI", "true")][..]] {
+        for _ in 0..4 {
+            let v = sb.hook(&["prompt-guard"], payload.clone(), env).json();
+            let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+            assert!(
+                msg.contains("nothing confirmed") && msg.contains("headless"),
+                "{msg}"
+            );
+            assert!(!msg.contains(&code), "{msg}");
+            // Told to the user only: nothing for the model.
+            assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+        }
+    }
+    // No state change: nothing consumed, no wrong code counted.
+    assert_eq!(sb.state("pending.json"), pending_before);
+    assert!(sb.state("grants.json").is_none());
+    let ok = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(ok["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
+}
+
+// ---------------------------------------------------------------------------------------
+// Session binding: a request's code is shown and accepted only in its own session
+// ---------------------------------------------------------------------------------------
+
+impl Sandbox {
+    fn prompt_in(&self, session: &str, prompt: &str) -> serde_json::Value {
+        let run = self.hook(
+            &["prompt-guard"],
+            json!({"session_id": session, "cwd": self.proj.path(),
+                   "hook_event_name": "UserPromptSubmit", "prompt": prompt}),
+            &[],
+        );
+        if run.stdout.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            run.json()
+        }
+    }
+}
+
+#[test]
+fn another_session_neither_sees_nor_confirms_a_request() {
+    let sb = Sandbox::new("relax-other-session");
+    allow_transfer(&sb);
+    // The owning session (the first to announce a terminal-made request) gets the code.
+    let code = sb.code_shown();
+    let line = format!("safe-ai-skill confirm {code}");
+    // A nested `claude -p` runs as its own session: no code, and the code does nothing there,
+    // however often it is tried (no lockout of the owner's request).
+    assert_eq!(
+        sb.prompt_in("nested-session", "hello"),
+        serde_json::Value::Null
+    );
+    for _ in 0..4 {
+        let v = sb.prompt_in("nested-session", &line);
+        let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+        assert!(msg.contains("belongs to this Claude Code"), "{msg}");
+        assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+    }
+    assert!(sb.state("grants.json").is_none());
+    let ok = sb.prompt_in("it-relax", &line);
+    assert!(
+        ok["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("you confirmed"),
+        "{ok}"
+    );
+}
+
+#[test]
+fn a_request_made_in_a_session_belongs_to_it_from_the_start() {
+    let sb = Sandbox::new("relax-bound");
+    // As run from that session's Bash tool, which Claude Code gives CLAUDE_CODE_SESSION_ID.
+    let run = sb.cli_env(
+        &[
+            "allow", "--scope", "transfer", "--for", "30m", "--max-tx", "1", "--budget", "5",
+        ],
+        &[("CLAUDE_CODE_SESSION_ID", "owner-session")],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    // Another session announcing first gets nothing; the owner gets the code.
+    assert_eq!(sb.prompt_in("it-relax", "hi"), serde_json::Value::Null);
+    let v = sb.prompt_in("owner-session", "hi");
+    let code = code_in(v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}")));
+    let line = format!("safe-ai-skill confirm {code}");
+    assert!(sb.prompt_in("it-relax", &line)["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("belongs to this"));
+    assert!(sb.prompt_in("owner-session", &line)["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
+}
+
+/// With the process table unavailable (a `ps` a sandbox denies, or native Windows, which has
+/// none), the session cannot be shown to be interactive: no code is shown and none is accepted,
+/// whether the request was made from a terminal or inside the session (its session id is
+/// agent-steerable), and the user is told why, with the WSL advice.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_unreadable_process_table_shows_and_confirms_nothing() {
+    let no_ps = [("SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE", "1")];
+    let prompt = |sb: &Sandbox, text: &str| {
+        let run = sb.hook(
+            &["prompt-guard"],
+            json!({"session_id":"it-relax","cwd": sb.proj.path(),
+                   "hook_event_name":"UserPromptSubmit","prompt": text}),
+            &no_ps,
+        );
+        if run.stdout.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            run.json()
+        }
+    };
+    for made_in_session in [false, true] {
+        let sb = Sandbox::new(if made_in_session {
+            "relax-no-ps-session"
+        } else {
+            "relax-no-ps-terminal"
+        });
+        let session: &[(&str, &str)] = if made_in_session {
+            &[("CLAUDE_CODE_SESSION_ID", "it-relax")]
+        } else {
+            &[]
+        };
+        let run = sb.cli_env(
+            &[
+                "allow", "--scope", "transfer", "--for", "30m", "--max-tx", "1", "--budget", "5",
+            ],
+            session,
+        );
+        assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert_eq!(prompt(&sb, "hi"), serde_json::Value::Null, "no code shown");
+        let pending = sb.state("pending.json");
+        let v = prompt(&sb, "safe-ai-skill confirm 12345678");
+        let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+        assert!(
+            msg.contains("could not determine whether this Claude Code session is interactive")
+                && msg.contains("native Windows")
+                && msg.contains("WSL")
+                && !msg.contains("! safe-ai-skill"),
+            "{msg}"
+        );
+        assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+        assert_eq!(sb.state("pending.json"), pending);
+    }
 }

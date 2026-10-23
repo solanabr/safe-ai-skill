@@ -142,7 +142,7 @@ impl World {
         let run = self
             .inv(&["verify", "session"], tier)
             .stdin(
-                serde_json::json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": self.cwd()})
+                serde_json::json!({"session_id":"it-sc","hook_event_name": "SessionStart", "source": "startup", "cwd": self.cwd()})
                     .to_string(),
             )
             .run();
@@ -522,16 +522,24 @@ fn after_verify_trust_a_high_pack_has_no_opinion_even_at_high() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let code = confirm::announce_pending(&dir, now)
+    // In-process, a request binds to this process's Claude Code session if it has one.
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_else(|_| "it".into());
+    let code = confirm::announce_pending_for(&dir, now, &session)
         .into_iter()
         .find(|a| a.id.as_str() == req.id)
         .expect("announced")
         .code
         .as_str()
         .to_string();
-    let confirmed =
-        confirm::confirm_from_prompt(&dir, &format!("safe-ai-skill confirm {code}"), now)
-            .expect("confirmed");
+    let confirmed = match confirm::confirm_attempt_for(
+        &dir,
+        &format!("safe-ai-skill confirm {code}"),
+        now,
+        &session,
+    ) {
+        confirm::Attempt::Confirmed(c) => c,
+        other => panic!("not confirmed: {other:?}"),
+    };
     verify::apply_confirmed(&dir, &confirmed).expect("trusted");
     for tier in tiers() {
         assert_eq!(w.reach("keys", "keys", tier), Reach::all(false), "{tier:?}");

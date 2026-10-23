@@ -6,7 +6,7 @@
 //! ([`PendingId`]) in the authenticated `pending.json`. **No code exists yet**, and the CLI
 //! prints none: the agent that ran the command learns only the id.
 //!
-//! The code is made at announcement. [`announce_pending`] runs in hooks whose output the user
+//! The code is made at announcement. [`announce_pending_for`] runs in hooks whose output the user
 //! sees: the PostToolUse `pending-notice` hook right after the Bash call that created the
 //! entry, `UserPromptSubmit` and `SessionStart`. It draws a fresh 8-digit code (OS CSPRNG),
 //! stores only `sha256(code ‖ id ‖ salt)` (the salt is derived from the state key), marks the
@@ -15,8 +15,15 @@
 //! run before the model gets the tool result, so the announcement normally happens before
 //! the agent can act again.
 //!
+//! Each entry belongs to one Claude Code session (`session_id`): the session whose Bash tool
+//! created it (`CLAUDE_CODE_SESSION_ID`), else the first interactive session that announces it.
+//! Its code is shown and accepted only there; resuming keeps the id (`--fork-session` and
+//! `/clear` make a new one). A nested `claude -p` runs as another session, so it cannot see or
+//! use the code, unless it is started with the owner's id (`--resume <id>`, `--session-id`):
+//! that case is left to the ancestry check and the Bash gates' ask on such a `claude`.
+//!
 //! The entry activates only when the user's next prompt is `safe-ai-skill confirm <code>`:
-//! the `UserPromptSubmit` hook passes the prompt to [`confirm_attempt`], which consumes the
+//! the `UserPromptSubmit` hook passes the prompt to [`confirm_attempt_for`], which consumes the
 //! entry (single use). The prompt must only ever come from the `UserPromptSubmit` payload
 //! ([`user_prompt`]). Three wrong codes cancel every pending entry ([`Attempt::LockedOut`]).
 //!
@@ -25,9 +32,13 @@
 //! Code running as the user outside the Claude Code sandbox can do anything: run the hook
 //! subcommands itself (`pending-notice`, `prompt-guard`), read the key, rewrite state. The
 //! tripwire hook denies Bash calls that invoke the hook subcommands or `confirm`, which stops
-//! the direct forms; obfuscated ones, and a nested `claude -p` session, remain. The sandbox is
-//! the hard boundary. When Claude Code cannot show a `systemMessage` (headless `claude -p`), a
-//! relaxation simply cannot be confirmed.
+//! the direct forms; the Bash gates also ask about (deny at High or headless) any
+//! non-interactive `claude` they can see. A session that is headless, runs non-interactively
+//! or was started from inside another Claude Code session
+//! ([`crate::headless::confirmation_refused`]) neither announces codes nor confirms: a code
+//! typed there is refused without consuming anything, and the user is told so. Obfuscated
+//! nested sessions whose ancestry the engine cannot follow remain; the sandbox is the hard
+//! boundary.
 //!
 //! Live entries are capped at [`MAX_PENDING`]; an announced entry is confirmable for
 //! [`TTL_SECS`] after its announcement, an unannounced one is dropped [`TTL_SECS`] after
@@ -83,7 +94,7 @@ pub enum PendingKind {
 }
 
 /// A confirmation code: [`NONCE_DIGITS`] ASCII digits. Only ever held in memory between
-/// [`announce_pending`] and the hook's `systemMessage`.
+/// [`announce_pending_for`] and the hook's `systemMessage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nonce(String);
 
@@ -142,7 +153,7 @@ pub struct Announcement {
     pub code: Nonce,
 }
 
-/// The outcome of a prompt given to [`confirm_attempt`].
+/// The outcome of a prompt given to [`confirm_attempt_for`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Attempt {
     /// The prompt is not a confirmation.
@@ -156,8 +167,10 @@ pub enum Attempt {
         /// Wrong codes left before every pending entry is cancelled.
         remaining: u32,
     },
-    /// The [`MAX_FAILURES`]th wrong code: every pending entry was cancelled.
+    /// The [`MAX_FAILURES`]th wrong code: every pending entry of this session was cancelled.
     LockedOut,
+    /// No live request belongs to this session: refused, not counted, nothing consumed.
+    NotThisSession,
 }
 
 /// The shape of a prompt, by one whitespace rule (tokens split on any whitespace).
@@ -204,6 +217,11 @@ struct Entry {
     announced_at: Option<u64>,
     /// Hex `sha256(code ‖ 0 ‖ id ‖ 0 ‖ salt)`; `None` until announced.
     code_hash: Option<String>,
+    /// The Claude Code `session_id` the request belongs to: the session whose Bash tool ran
+    /// the command (`CLAUDE_CODE_SESSION_ID`), else the first interactive session that
+    /// announced it. Its code is shown and accepted only there.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 /// The `pending.json` body.
@@ -244,6 +262,7 @@ pub fn create_pending(
         created_at: now,
         announced_at: None,
         code_hash: None,
+        session: creating_session(),
     });
     let excess = pending.entries.len().saturating_sub(MAX_PENDING);
     pending.entries.drain(..excess);
@@ -251,11 +270,35 @@ pub fn create_pending(
     Ok(id)
 }
 
+/// The session a new request belongs to: `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in
+/// its Bash tool's environment (and a hook's). `None` from a terminal outside any session: the
+/// request then binds to the first interactive session that announces it. Unit tests never
+/// read the environment (the developer's own Claude Code session would leak in).
+fn creating_session() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| is_session_id(s))
+}
+
+/// A usable session id: non-empty, short, printable ASCII without spaces.
+fn is_session_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// Make and record a code for every live, unannounced entry, and return them for a
 /// `systemMessage`. Empty when there is nothing to announce or the codes cannot be persisted
 /// (a code is never shown that could not be checked later). Creates nothing when there is no
 /// `pending.json`.
-pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
+///
+/// Only entries of `session` (or bound to none yet, which `session` then takes) are announced.
+pub fn announce_pending_for(dir: &DataDir, now: u64, session: &str) -> Vec<Announcement> {
+    if !is_session_id(session) {
+        return Vec::new();
+    }
     if dir.is_unresolved() || std::fs::symlink_metadata(dir.path.join(PENDING_FILE)).is_err() {
         return Vec::new();
     }
@@ -270,11 +313,12 @@ pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
     };
     pending.entries.retain(|e| !is_expired(e, now));
     let mut out = Vec::new();
-    for e in pending
-        .entries
-        .iter_mut()
-        .filter(|e| e.announced_at.is_none() && e.created_at <= now)
-    {
+    for e in pending.entries.iter_mut().filter(|e| {
+        e.announced_at.is_none()
+            && e.created_at <= now
+            && e.session.as_deref().is_none_or(|s| s == session)
+    }) {
+        e.session = Some(session.to_string());
         let Ok(code) = random_nonce() else {
             return Vec::new();
         };
@@ -293,6 +337,61 @@ pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
     out
 }
 
+/// The live pending entries for `status`: request id, kind, summary, when it was created and
+/// (if) announced, when it lapses, and how to confirm it. Never a code or its hash. Empty when
+/// there is no valid `pending.json`.
+pub fn pending_list(dir: &DataDir, now: u64) -> Vec<Value> {
+    if dir.is_unresolved() {
+        return Vec::new();
+    }
+    let Loaded::Valid(p) = statefile::load::<Pending>(dir, PENDING_FILE) else {
+        return Vec::new();
+    };
+    p.entries
+        .iter()
+        .filter(|e| !is_expired(e, now))
+        .map(|e| {
+            let how = if e.announced_at.is_some() {
+                "type `safe-ai-skill confirm <code>` as your entire next prompt in the Claude Code \
+                 session it belongs to, with the code safe-ai-skill showed you there (lost it? \
+                 run the command again)"
+            } else {
+                "the code is shown to you at your next prompt or session start; then type \
+                 `safe-ai-skill confirm <code>` as your entire prompt"
+            };
+            serde_json::json!({
+                "request": e.id.as_str(),
+                "kind": e.kind,
+                "summary": e.summary,
+                "created_at": e.created_at,
+                "announced": e.announced_at.is_some(),
+                "expires_at": clock(e).saturating_add(TTL_SECS),
+                "session": e.session,
+                "how_to_confirm": how,
+            })
+        })
+        .collect()
+}
+
+/// Whether [`announce_pending_for`] would announce anything at `now` (read only, no lock).
+pub fn has_unannounced(dir: &DataDir, now: u64, session: &str) -> bool {
+    if !is_session_id(session) {
+        return false;
+    }
+    if dir.is_unresolved() || std::fs::symlink_metadata(dir.path.join(PENDING_FILE)).is_err() {
+        return false;
+    }
+    match statefile::load::<Pending>(dir, PENDING_FILE) {
+        Loaded::Valid(p) => p.entries.iter().any(|e| {
+            e.announced_at.is_none()
+                && e.created_at <= now
+                && !is_expired(e, now)
+                && e.session.as_deref().is_none_or(|s| s == session)
+        }),
+        _ => false,
+    }
+}
+
 /// Check a user prompt against the announced entries.
 ///
 /// `prompt` MUST be the `UserPromptSubmit` payload's `prompt` field (see [`user_prompt`]).
@@ -300,7 +399,11 @@ pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
 /// ([`classify`]). Such a line that matches no live announced entry counts as a wrong code
 /// while any entry is live; the [`MAX_FAILURES`]th cancels them all. A missing or tampered
 /// `pending.json`, or a consumption that cannot be persisted, confirms nothing.
-pub fn confirm_attempt(dir: &DataDir, prompt: &str, now: u64) -> Attempt {
+///
+/// Only entries bound to `session` can be confirmed there. A session with no live entry of its
+/// own gets [`Attempt::NotThisSession`]: nothing is counted, so another session cannot run the
+/// user's requests into the lockout. The lockout cancels the entries of `session`.
+pub fn confirm_attempt_for(dir: &DataDir, prompt: &str, now: u64, session: &str) -> Attempt {
     let code = match classify(prompt) {
         PromptForm::NotAConfirm => return Attempt::NotAnAttempt,
         PromptForm::Embedded => return Attempt::Embedded,
@@ -321,9 +424,14 @@ pub fn confirm_attempt(dir: &DataDir, prompt: &str, now: u64) -> Attempt {
         let _ = statefile::store(dir, PENDING_FILE, &pending);
         return wrong;
     }
+    let mine = |e: &Entry| is_session_id(session) && e.session.as_deref() == Some(session);
+    if !pending.entries.iter().any(|e| mine(e) && is_live(e, now)) {
+        return Attempt::NotThisSession;
+    }
     let hit = match (is_nonce(code), statefile::derived_key(dir, SALT_LABEL)) {
         (true, Ok(salt)) => pending.entries.iter().position(|e| {
-            is_live(e, now)
+            mine(e)
+                && is_live(e, now)
                 && e.code_hash.as_deref().is_some_and(|h| {
                     constant_time_eq(
                         h.as_bytes(),
@@ -336,7 +444,7 @@ pub fn confirm_attempt(dir: &DataDir, prompt: &str, now: u64) -> Attempt {
     let Some(i) = hit else {
         pending.failures = pending.failures.saturating_add(1);
         if pending.failures >= MAX_FAILURES {
-            pending.entries.clear();
+            pending.entries.retain(|e| !mine(e));
             pending.failures = 0;
             let _ = statefile::store(dir, PENDING_FILE, &pending);
             return Attempt::LockedOut;
@@ -360,8 +468,25 @@ pub fn confirm_attempt(dir: &DataDir, prompt: &str, now: u64) -> Attempt {
     })
 }
 
+/// The session the unit tests act in.
+#[cfg(test)]
+pub(crate) const TEST_SESSION: &str = "test-session";
+
+/// [`announce_pending_for`] in [`TEST_SESSION`].
+#[cfg(test)]
+pub(crate) fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
+    announce_pending_for(dir, now, TEST_SESSION)
+}
+
+/// [`confirm_attempt_for`] in [`TEST_SESSION`].
+#[cfg(test)]
+pub(crate) fn confirm_attempt(dir: &DataDir, prompt: &str, now: u64) -> Attempt {
+    confirm_attempt_for(dir, prompt, now, TEST_SESSION)
+}
+
 /// [`confirm_attempt`], keeping only a confirmation.
-pub fn confirm_from_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<Confirmed> {
+#[cfg(test)]
+pub(crate) fn confirm_from_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<Confirmed> {
     match confirm_attempt(dir, prompt, now) {
         Attempt::Confirmed(c) => Some(c),
         _ => None,
@@ -369,7 +494,7 @@ pub fn confirm_from_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<Conf
 }
 
 /// The prompt of a `UserPromptSubmit` payload; `None` for any other event. This is the only
-/// payload text [`confirm_attempt`] may be given.
+/// payload text [`confirm_attempt_for`] may be given.
 pub fn user_prompt(input: &HookInput) -> Option<&str> {
     if input.hook_event_name.as_deref() != Some("UserPromptSubmit") {
         return None;
@@ -553,8 +678,71 @@ pub(crate) mod tests {
         // Unannounced: nothing confirms, whatever is typed.
         assert!(matches!(
             confirm_attempt(&dir, "safe-ai-skill confirm 12345678", now_secs()),
-            Attempt::Wrong { .. }
+            Attempt::NotThisSession
         ));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_request_is_shown_and_confirmed_only_in_its_session() {
+        let dir = tmp_data("session-bind");
+        // Made from a terminal (no session): the first session to announce it takes it.
+        let id =
+            create_pending(&dir, PendingKind::Tier, "tier off", serde_json::json!({})).unwrap();
+        let now = now_secs();
+        assert!(
+            !has_unannounced(&dir, now, ""),
+            "no session id, no announcement"
+        );
+        assert!(announce_pending_for(&dir, now, "").is_empty());
+        let shown = announce_pending_for(&dir, now, "session-a");
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].id, id);
+        let line = format!("safe-ai-skill confirm {}", shown[0].code.as_str());
+        // Another session (a nested `claude -p` has its own id) sees nothing and cannot use
+        // the code, and its attempts are not counted toward the lockout.
+        assert!(!has_unannounced(&dir, now, "session-b"));
+        assert!(announce_pending_for(&dir, now, "session-b").is_empty());
+        for _ in 0..(MAX_FAILURES + 1) {
+            assert!(matches!(
+                confirm_attempt_for(&dir, &line, now, "session-b"),
+                Attempt::NotThisSession
+            ));
+        }
+        // The owning session confirms.
+        assert!(matches!(
+            confirm_attempt_for(&dir, &line, now, "session-a"),
+            Attempt::Confirmed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_request_bound_at_creation_is_never_shown_elsewhere() {
+        let dir = tmp_data("session-created");
+        create_pending(&dir, PendingKind::Tier, "tier off", serde_json::json!({})).unwrap();
+        let now = now_secs();
+        // Bind as the CLI does when run from a session's Bash tool.
+        {
+            let _lock = FileLock::acquire(&dir.path, LOCK_FILE).unwrap();
+            let mut p = load_pending(&dir);
+            p.entries[0].session = Some("session-a".into());
+            statefile::store(&dir, PENDING_FILE, &p).unwrap();
+        }
+        assert!(announce_pending_for(&dir, now, "session-b").is_empty());
+        let shown = announce_pending_for(&dir, now, "session-a");
+        assert_eq!(shown.len(), 1);
+        // A lockout in its own session cancels only its own requests.
+        create_pending(&dir, PendingKind::Tier, "other", serde_json::json!({})).unwrap();
+        // A fresh clock: the new entry may be stamped a second after `now`.
+        let now = now_secs();
+        assert_eq!(announce_pending_for(&dir, now, "session-c").len(), 1);
+        for _ in 0..MAX_FAILURES {
+            confirm_attempt_for(&dir, "safe-ai-skill confirm 00000000", now, "session-a");
+        }
+        let left = load_pending(&dir);
+        assert_eq!(left.entries.len(), 1);
+        assert_eq!(left.entries[0].session.as_deref(), Some("session-c"));
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

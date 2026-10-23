@@ -116,6 +116,9 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
   response shape (Read, Bash, Grep, MCP).
 - **PostToolUse pending-notice** (Bash): no output, or `{"systemMessage":"…"}` with confirmation
   codes (user only).
+- **PostToolUseFailure failure-notice** (Bash, Read, Grep, MCP): no output, or, when the error
+  text holds what `redact` would scrub, `{"systemMessage":"…","hookSpecificOutput":{"hookEventName":"PostToolUseFailure","additionalContext":"…"}}`
+  (a warning, never a value; the event cannot replace the output).
 - **PreToolUse Read/Grep rewrite**: `{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":…}}`
   (no permission decision) for a directory Grep whose `glob` gets the env/key exclusions.
 - **UserPromptSubmit / UserPromptExpansion**: no output (allow), `{"decision":"block","reason":"…"}`
@@ -558,7 +561,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ## Subcommands (`main.rs`, complete)
 
 `gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `gate-skill` ·
-`gate-prompt-expansion` · `redact` · `prompt-guard` · `pending-notice` ·
+`gate-prompt-expansion` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·

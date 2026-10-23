@@ -293,6 +293,11 @@ fn hooks_json_final_shape() {
         "gate-tamper"
     ));
     assert!(has("PostToolUse", "Bash", "pending-notice"));
+    assert!(has(
+        "PostToolUseFailure",
+        "Bash|Read|Grep|mcp__.*",
+        "failure-notice"
+    ));
     assert!(has("PreToolUse", "Skill", "gate-skill"));
     assert!(has("UserPromptExpansion", "", "gate-prompt-expansion"));
     assert!(has(

@@ -29,6 +29,7 @@ use crate::confirm::{self, Attempt, PendingKind};
 use crate::datadir::DataDir;
 use crate::gate::{AllowReason, GateMeta, GrantId, Verdict};
 use crate::grants::{self, GrantRequest};
+use crate::headless::SessionCheck;
 use crate::io::Decision;
 use crate::mode;
 use crate::policy::tier::Tier;
@@ -96,6 +97,9 @@ impl ConfirmOutcome {
     /// The hook JSON: `systemMessage` plus `hookSpecificOutput.additionalContext`. The prompt
     /// itself is not blocked.
     pub fn hook_output(&self) -> Value {
+        if self.additional_context.is_empty() {
+            return json!({ "systemMessage": self.system_message });
+        }
         json!({
             "systemMessage": self.system_message,
             "hookSpecificOutput": {
@@ -121,9 +125,51 @@ impl ConfirmOutcome {
 /// The whole prompt, trimmed, must be the single line `safe-ai-skill confirm <code>`
 /// ([`confirm::classify`]): a confirm line inside pasted text is refused without consuming
 /// anything. Wrong codes count toward the lockout ([`confirm::MAX_FAILURES`]), which cancels
-/// every pending request and is audited as a tamper event. The outcome never contains a code.
-pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome> {
-    match confirm::confirm_attempt(dir, prompt, now) {
+/// every pending request of this session and is audited as a tamper event. Only requests
+/// bound to `session` (the payload's `session_id`) can be confirmed. The outcome never contains
+/// a code.
+pub fn confirm_prompt(
+    dir: &DataDir,
+    prompt: &str,
+    now: u64,
+    session: Option<&str>,
+) -> Option<ConfirmOutcome> {
+    confirm_prompt_in(dir, prompt, now, session, crate::headless::session_check)
+}
+
+/// [`confirm_prompt`] with the session check given. On a confirmation line in a session that
+/// is not [`SessionCheck::Interactive`] nothing changes (no entry consumed, no wrong code
+/// counted) and only the user is told why. An undetermined ancestry is refused like a known
+/// `-p` or nested one: the session id alone cannot vouch for a session, because the agent can
+/// steer it (`CLAUDE_CODE_SESSION_ID`, `--session-id`, `--resume`, `-c`).
+pub fn confirm_prompt_in(
+    dir: &DataDir,
+    prompt: &str,
+    now: u64,
+    session: Option<&str>,
+    check: impl FnOnce() -> SessionCheck,
+) -> Option<ConfirmOutcome> {
+    if matches!(confirm::classify(prompt), confirm::PromptForm::Line(_)) {
+        match check() {
+            SessionCheck::Refused(why) => {
+                return Some(user_only(format!(
+                    "safe-ai-skill: nothing confirmed: {why}. Confirmation codes are accepted \
+                     only in an interactive Claude Code session you started yourself; the \
+                     request is still pending."
+                )));
+            }
+            SessionCheck::Unknown(why) => return Some(user_only(unknown_refusal(&why))),
+            SessionCheck::Interactive => {}
+        }
+    }
+    match confirm::confirm_attempt_for(dir, prompt, now, session.unwrap_or("")) {
+        Attempt::NotThisSession => Some(user_only(
+            "safe-ai-skill: nothing confirmed. No pending request belongs to this Claude Code \
+             session: a code works only in the session that made the request or first showed \
+             its code (`/clear` starts a new one). Run the command again here to get a code \
+             for this session."
+                .to_string(),
+        )),
         Attempt::NotAnAttempt => None,
         Attempt::Embedded => Some(ConfirmOutcome::note(
             "safe-ai-skill: nothing confirmed. Type `safe-ai-skill confirm <code>` as the whole \
@@ -133,18 +179,19 @@ pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOu
         Attempt::Wrong { remaining } => Some(ConfirmOutcome::note(format!(
             "safe-ai-skill: nothing confirmed. No pending request matches that code; it may have \
              expired (10 minutes) or been used already. {remaining} more wrong code(s) cancel \
-             every pending request."
+             every pending request of this session."
         ))),
         Attempt::LockedOut => {
             audit_event(
                 dir,
                 "state_tamper",
                 "confirm_lockout",
-                "too many wrong confirmation codes; every pending request was cancelled",
+                "too many wrong confirmation codes; every pending request of the session was \
+                 cancelled",
             );
             Some(ConfirmOutcome::note(
-                "safe-ai-skill: too many wrong confirmation codes, so every pending request was \
-                 cancelled. Run the command again to get a new code."
+                "safe-ai-skill: too many wrong confirmation codes, so every pending request of \
+                 this session was cancelled. Run the command again to get a new code."
                     .to_string(),
             ))
         }
@@ -152,9 +199,45 @@ pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOu
     }
 }
 
-/// The `systemMessage` announcing new confirmation codes, if any (user only).
-pub fn announce(dir: &DataDir, now: u64) -> Option<String> {
-    confirm::announcement_message(&confirm::announce_pending(dir, now))
+/// The refusal when the ancestry is undetermined (native Windows has no process table).
+fn unknown_refusal(why: &str) -> String {
+    format!(
+        "safe-ai-skill: nothing confirmed: {why}. Confirmations (lowering the tier, loosening \
+         env_read, grants, verify trust/approve) need that check, so they are unavailable \
+         where the engine cannot read the process table: on native Windows (use WSL for these \
+         actions) and in sessions whose hooks run sandboxed. Raising the tier and everything \
+         else work. The request is still pending."
+    )
+}
+
+/// A note for the user only (`systemMessage`, nothing for the model).
+fn user_only(text: String) -> ConfirmOutcome {
+    ConfirmOutcome {
+        system_message: text,
+        additional_context: String::new(),
+    }
+}
+
+/// The `systemMessage` announcing new confirmation codes of `session`, if any (user only).
+/// Nothing is announced without a session id, or unless the session is
+/// [`SessionCheck::Interactive`] ([`crate::headless::session_check`]): a code shown elsewhere
+/// could reach an agent.
+pub fn announce(dir: &DataDir, now: u64, session: Option<&str>) -> Option<String> {
+    announce_in(dir, now, session, crate::headless::session_check)
+}
+
+/// [`announce`] with the session check given.
+pub fn announce_in(
+    dir: &DataDir,
+    now: u64,
+    session: Option<&str>,
+    check: impl FnOnce() -> SessionCheck,
+) -> Option<String> {
+    let session = session?;
+    if !confirm::has_unannounced(dir, now, session) || check() != SessionCheck::Interactive {
+        return None;
+    }
+    confirm::announcement_message(&confirm::announce_pending_for(dir, now, session))
 }
 
 /// Perform a confirmed pending entry and describe the result.
@@ -263,6 +346,20 @@ mod tests {
         Policy::fail_closed()
     }
 
+    /// [`super::confirm_prompt`] in the unit tests' session, as an interactive one.
+    fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome> {
+        confirm_prompt_in(dir, prompt, now, Some(crate::confirm::TEST_SESSION), || {
+            SessionCheck::Interactive
+        })
+    }
+
+    /// [`super::announce`] in the unit tests' session, as an interactive one.
+    fn announce(dir: &DataDir, now: u64) -> Option<String> {
+        announce_in(dir, now, Some(crate::confirm::TEST_SESSION), || {
+            SessionCheck::Interactive
+        })
+    }
+
     fn high_policy() -> Policy {
         let mut p = Policy::from_sources(crate::policy::DEFAULT_POLICY_YAML, None);
         p.runtime.tier = Tier::High;
@@ -302,6 +399,86 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_unknown_ancestry_shows_and_confirms_nothing() {
+        let s = Some(crate::confirm::TEST_SESSION);
+        let unknown = || SessionCheck::Unknown("no process table on this platform".into());
+        let dir = tmp_data("relax_unknown");
+        crate::confirm::create_pending(
+            &dir,
+            PendingKind::Tier,
+            "tier off",
+            serde_json::json!({"tier": "off"}),
+        )
+        .unwrap();
+        // Not even for a request bound to this session: the id is agent-steerable.
+        assert_eq!(announce_in(&dir, now(), s, unknown), None);
+        let code = crate::confirm::tests::announced(
+            &dir,
+            PendingKind::Tier,
+            serde_json::json!({"tier": "off"}),
+        );
+        let line = format!("safe-ai-skill confirm {}", code.as_str());
+        for _ in 0..4 {
+            let out = confirm_prompt_in(&dir, &line, now(), s, unknown).unwrap();
+            assert!(
+                out.system_message.contains("native Windows")
+                    && out.system_message.contains("WSL")
+                    && !out.system_message.contains("! safe-ai-skill"),
+                "{out:?}"
+            );
+            assert!(out.additional_context.is_empty());
+        }
+        // Still pending and not locked out: an interactive session confirms it.
+        let ok = confirm_prompt_in(&dir, &line, now(), s, || SessionCheck::Interactive).unwrap();
+        assert!(!ok.system_message.contains("nothing confirmed"), "{ok:?}");
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_refused_session_confirms_nothing_and_counts_no_wrong_code() {
+        let dir = tmp_data("relax_refused");
+        let code = crate::confirm::tests::announced(
+            &dir,
+            PendingKind::Tier,
+            serde_json::json!({"tier": "off"}),
+        );
+        let line = format!("safe-ai-skill confirm {}", code.as_str());
+        let s = Some(crate::confirm::TEST_SESSION);
+        let refused =
+            || SessionCheck::Refused("this Claude Code session runs non-interactively".into());
+        for _ in 0..4 {
+            let out = confirm_prompt_in(&dir, &line, now(), s, refused).unwrap();
+            assert!(out.system_message.contains("nothing confirmed"), "{out:?}");
+            assert!(out.additional_context.is_empty());
+            let hook = out.hook_output();
+            assert!(hook.get("hookSpecificOutput").is_none(), "{hook}");
+            assert!(!hook.to_string().contains(code.as_str()));
+        }
+        // Still pending and confirmable once the session is interactive (no lockout counted).
+        // Another session can neither confirm nor count a wrong code.
+        for _ in 0..4 {
+            let other = confirm_prompt_in(&dir, &line, now(), Some("other"), || {
+                SessionCheck::Interactive
+            })
+            .unwrap();
+            assert!(
+                other.system_message.contains("belongs to this"),
+                "{other:?}"
+            );
+        }
+        let ok = confirm_prompt_in(&dir, &line, now(), s, || SessionCheck::Interactive).unwrap();
+        assert!(!ok.system_message.contains("nothing confirmed"), "{ok:?}");
+        let again = confirm_prompt_in(&dir, &line, now(), s, || SessionCheck::Interactive).unwrap();
+        assert!(
+            again.system_message.contains("nothing confirmed"),
+            "{again:?}"
+        );
+        // A non-confirm prompt is not answered at all in a refused session.
+        assert!(confirm_prompt_in(&dir, "hello", now(), s, refused).is_none());
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
