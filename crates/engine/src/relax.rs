@@ -357,7 +357,12 @@ mod tests {
         }
         // Still pending and confirmable once the session is interactive (no lockout counted).
         let ok = confirm_prompt_in(&dir, &line, now(), || None).unwrap();
-        assert!(ok.system_message.contains("you confirmed"), "{ok:?}");
+        assert!(!ok.system_message.contains("nothing confirmed"), "{ok:?}");
+        let again = confirm_prompt_in(&dir, &line, now(), || None).unwrap();
+        assert!(
+            again.system_message.contains("nothing confirmed"),
+            "{again:?}"
+        );
         // A non-confirm prompt is not answered at all in a refused session.
         assert!(confirm_prompt_in(&dir, "hello", now(), refused).is_none());
         let _ = std::fs::remove_dir_all(&dir.path);

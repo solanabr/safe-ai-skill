@@ -312,6 +312,22 @@ pub fn is_hard_tree(dir: &str, homes: &[String]) -> bool {
         .any(|tree| tree_rest(&rooted, tree).is_some())
 }
 
+/// Whether `dir` is, or lies inside, a Claude Code transcript tree: `.claude/projects`
+/// anywhere, or `$CLAUDE_CONFIG_DIR/projects`.
+pub fn is_transcript_tree(dir: &str, homes: &[String]) -> bool {
+    let full = normalize(
+        &expand_config_dir_var(dir),
+        homes.first().map(String::as_str),
+    );
+    let full = full.trim_end_matches('/');
+    let rooted = if full.starts_with('/') {
+        full.to_string()
+    } else {
+        format!("/{full}")
+    };
+    under_config_dir(full, "projects") || tree_rest(&rooted, ".claude/projects").is_some()
+}
+
 /// Where a directory stands relative to a safe-ai-skill data dir (whose `key` authenticates
 /// the tier, grants and pending requests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

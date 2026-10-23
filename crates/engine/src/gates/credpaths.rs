@@ -422,7 +422,7 @@ pub fn reaches_store(dir: &Path) -> bool {
     };
     let homes = secretpath::homes_resolved();
     if secretpath::data_dir_reach(&dir.to_string_lossy(), &homes).is_some()
-        || secretpath::is_hard_tree(&dir.to_string_lossy(), &homes)
+        || secretpath::is_transcript_tree(&dir.to_string_lossy(), &homes)
     {
         return true;
     }
