@@ -341,7 +341,12 @@
         "tool_input": {
           "command": "echo hello"
         },
-        "tool_output": "hello world"
+        "tool_response": {
+          "stdout": "hello world\n",
+          "stderr": "",
+          "interrupted": false,
+          "isImage": false
+        }
       },
       "expect": {
         "exit": 0,

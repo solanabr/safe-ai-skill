@@ -193,7 +193,7 @@ pub struct HookInput {
     pub session_id: Option<String>, pub cwd: Option<String>,
     pub permission_mode: Option<String>, pub hook_event_name: Option<String>,
     pub tool_name: Option<String>, pub tool_input: Option<serde_json::Value>,
-    pub tool_output: Option<serde_json::Value>, pub prompt: Option<String>,
+    pub tool_response: Option<serde_json::Value>, pub prompt: Option<String>,
     pub source: Option<String>,
 }
 impl HookInput {

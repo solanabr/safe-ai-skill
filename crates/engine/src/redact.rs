@@ -132,9 +132,14 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
             ))
         }
         Value::Object(map) => {
+            // Bash `{isImage:true,…}`: `stdout` holds the image; `stderr` is still text.
+            let image_stdout = map.get("isImage").and_then(Value::as_bool) == Some(true);
             let mut changed = false;
             let mut out = map.clone();
             for (key, value) in map {
+                if image_stdout && key == "stdout" {
+                    continue;
+                }
                 if let Some(new) = scrub_value(value, values) {
                     out.insert(key.clone(), new);
                     changed = true;
@@ -148,16 +153,15 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
 
 /// Image / PDF payloads are left alone: their base64 data would trip the base58 detector
 /// (about once per 200 KB of random base64) and a changed byte corrupts the file. Read
-/// `{type:"image"|"pdf",file:{…}}`, Bash `{isImage:true,…}`, MCP `{type:"image",data:…}`.
+/// `{type:"image"|"pdf",file:{…}}`, MCP `{type:"image",data:…}`. Bash `{isImage:true,…}`
+/// skips only its `stdout` (see [`scrub_value`]).
 fn is_binary_payload(value: &Value) -> bool {
     let Value::Object(map) = value else {
         return false;
     };
-    let typed = map
-        .get("type")
+    map.get("type")
         .and_then(Value::as_str)
-        .is_some_and(|t| matches!(t, "image" | "pdf" | "document" | "audio"));
-    typed || map.get("isImage").and_then(Value::as_bool) == Some(true)
+        .is_some_and(|t| matches!(t, "image" | "pdf" | "document" | "audio"))
 }
 
 /// One unbroken base64 / base64url run longer than 1 KiB (an inline file, not text), bare or
@@ -1026,6 +1030,19 @@ mod tests {
         assert_eq!(scrub_response(&json!(blob), &[]), None);
         let uri = format!("data:image/png;base64,{blob}");
         assert_eq!(scrub_response(&json!(uri), &[]), None);
+    }
+
+    #[test]
+    fn bash_image_result_still_scrubs_stderr() {
+        let arr: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        let keypair = format!("[{}]", arr.join(","));
+        let v = json!({ "stdout": keypair, "stderr": format!("k {keypair}"), "isImage": true });
+        assert_eq!(
+            scrub_response(&v, &[]),
+            Some(
+                json!({ "stdout": keypair, "stderr": "k ***REDACTED:keypair***", "isImage": true })
+            )
+        );
     }
 
     #[test]
