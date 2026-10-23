@@ -483,9 +483,10 @@ pub fn confirm_attempt_in(
     if !pending.entries.iter().any(|e| mine(e) && is_live(e, now)) {
         // A request this session could take, or holds, but not on the binding alone.
         let terminal_made = reach == Reach::MadeHere
-            && pending.entries.iter().any(|e| {
-                !e.made_in_session && e.session.as_deref().is_none_or(|s| s == session)
-            });
+            && pending
+                .entries
+                .iter()
+                .any(|e| !e.made_in_session && e.session.as_deref().is_none_or(|s| s == session));
         return if terminal_made {
             Attempt::NeedsInteractive
         } else {
