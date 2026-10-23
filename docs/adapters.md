@@ -86,6 +86,21 @@ The engine also exits 0 after a panic under Codex.
   started can still be fed input with no gate seeing it: a program that reads commands from
   stdin, a TUI, or an `ssh` session. Every Bash gate and all of the self-protection is skipped
   for that input.
+- **Shells started in other forms are not denied.** Only a bare interactive start is caught
+  (`bash`, `python3`, `psql mydb`, …). These forms also read the model's `write_stdin` input as
+  commands, and they pass:
+  - `cat | bash`
+  - `bash /dev/stdin`, `python3 /dev/stdin`
+  - `bash < /dev/tty`
+  - `script -q /dev/null`
+  - `while read l; do eval "$l"; done`
+  - `xargs -I{} sh -c {}`
+  - `perl -ne 'system $_'`
+  - `tmux`, `screen`
+  - `ssh host` with no remote command
+
+  Treat this as an open hole in the experimental adapter. Once one of these is running, nothing
+  sent to it is gated.
 - **Hosted tools (web search).** Codex does not run hooks for them.
 - **Shell writes are judged on their words; nothing is run.** These are not seen:
   - a write whose path is computed (variables the gate cannot expand, string building in
@@ -96,9 +111,20 @@ The engine also exits 0 after a panic under Codex.
     tracked protected file.
 
   Literal paths in `sh -c '…'` and in `-c`/`-e` interpreter code are seen.
-- **False positives.** A heredoc body is read as commands, so a heredoc whose text mentions
-  `rm tier.json` can be denied. Bare `hooks.json`/`config.toml` given to a writing command are
-  denied wherever the command runs, because the working dir is unknown.
+- **False positives.**
+  - A heredoc body is read as commands, so a heredoc whose text mentions `rm tier.json` can be
+    denied.
+  - Bare `hooks.json`/`config.toml` given to a writing command are denied wherever the command
+    runs, because the working dir is unknown.
+  - In a project with a `.codex/` dir (the project-scope install), three ordinary commands are
+    denied:
+    - `find . … -delete` (or `-exec`): it starts at a directory that holds `.codex/hooks.json`.
+    - `git clean -fd`: a path-less clean sweeps the tree, and the scan does not check whether
+      `.codex/` is tracked.
+    - A bare `rm config.toml`: the hook cannot tell it apart from `.codex/config.toml`.
+
+    Each deny gives its reason. Run such a command yourself, or narrow its path (for example
+    `find src -name '*.tmp' -delete`).
 - **Codex plugin hook files.** A plugin-bundled `hooks/hooks.json` is not protected.
 - **State.** Grants, the tier and the audit log come from the Claude Code plugin's data dir. If
   the plugin is not installed, nothing can be relaxed and nothing is audited. The gates still
