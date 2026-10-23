@@ -260,8 +260,10 @@ then shows **you** a confirmation code in a hook message (right after the comman
 next prompt or session start) that is never put in the agent's context. The request takes
 effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
 (within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
-pasted text is refused, and three wrong codes cancel every pending request. In headless `claude -p`, where
-hook messages aren't shown, nothing can be confirmed. Raising the tier (or tightening `--env-read`) and `revoke` apply at
+pasted text is refused, and three wrong codes cancel every pending request. Nothing is announced or confirmed
+in a headless session (CI or a headless switch), in a non-interactive `claude -p`, or in a Claude Code
+session started from inside another one (an agent's nested `claude`): a code typed there changes nothing,
+and the request stays pending for your own interactive session. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 
