@@ -4,9 +4,10 @@
 //! A *token* is a maximal run of ASCII letters; a *list word* is a token in the BIP-39 English
 //! list ([`crate::bip39`]), in any case. Tokens join into a run when the bytes between them
 //! are a *joiner*: whitespace, `,` `"` `'` `[` `]`, and numbering (`12.` `3)` `4:`), at most
-//! [`MAX_GAP`] bytes. Three kinds of run are tracked at once:
+//! [`MAX_GAP`] bytes. Four kinds of run are tracked at once:
 //!
-//! - **list run**: list words only, joined by joiners;
+//! - **line run**: list words joined by joiners without a newline;
+//! - **list run**: list words joined by joiners, newlines included;
 //! - **phrase-shaped run**: tokens of 3 to 8 letters (list words, or lowercase non-list words),
 //!   joined by joiners;
 //! - **old-shape run** (the 1.0 rule): lowercase tokens of 3 to 8 letters separated by exactly
@@ -14,19 +15,23 @@
 //!
 //! A span is a seed phrase when:
 //!
-//! - **bare (checksum)**: a list run of at most [`MAX_RUN`] words, or one line of it, has
-//!   exactly 12/15/18/21/24 words and its checksum validates; or the run (or line) has at most
-//!   [`WINDOW_SLACK`] extra words on each side of such a window (so at most 18 words) and the
-//!   window has at least [`MIN_DISTINCT`] distinct words;
+//! - **bare (checksum)**: a line run of at most [`MAX_RUN`] words, or a list run of at most
+//!   [`MAX_RUN`] words that spans lines, has exactly 12/15/18/21/24 words and its checksum
+//!   validates; or it has at most 18 words and a checksum-valid window sits with at most
+//!   [`WINDOW_SLACK`] extra words on each side, the window having at least [`MIN_DISTINCT`]
+//!   distinct words. Each line is judged on its own, however long the list run around it.
 //! - **keyword**: a keyword ([`KEYWORDS`], whole word, optional plural, camelCase and `_` parts
 //!   count) appears in the same string outside the run, and the run is a list run of 12 to
 //!   [`MAX_RUN`] words, or a phrase-shaped run of 12 to [`MAX_RUN`] tokens with at most one in
 //!   six off the list (typos), or an old-shape run of 12 or more words (whole up to
-//!   [`MAX_RUN`]; past that its first 24 words, unless every word is a list word).
+//!   [`MAX_RUN`]; past that its first 24 words, unless every word is a list word). For list and
+//!   phrase-shaped runs, a keyword among the first or last 3 tokens is cut off the run and
+//!   counts as outside it (`seed phrase session twin …`).
 //!
-//! A list run longer than [`MAX_RUN`] is a wordlist dump and is never a phrase. Work is linear
-//! in the text plus at most [`MAX_CHECKSUM_TESTS`] checksums, and each tracker keeps at most
-//! `MAX_RUN + 1` tokens.
+//! The keyword rules are for output redaction; the prompt guard uses [`find_checksummed`]. A
+//! list run or line longer than [`MAX_RUN`] is a wordlist dump. Work is linear in the text
+//! plus at most [`MAX_EXACT_TESTS`] + [`MAX_WINDOW_TESTS`] checksums, which cover every run a
+//! payload of `MAX_SCAN_BYTES` can hold, and each tracker keeps at most `MAX_RUN + 1` tokens.
 
 use crate::bip39;
 
@@ -38,8 +43,13 @@ pub const WINDOW_SLACK: usize = 3;
 pub const MIN_DISTINCT: usize = 8;
 /// Longest joiner between two words of a run, in bytes.
 pub const MAX_GAP: usize = 16;
-/// Checksum tests per text: enough for every 48-byte slice of the largest scanned payload.
-pub const MAX_CHECKSUM_TESTS: usize = crate::redact::MAX_SCAN_BYTES / 48;
+/// Exact-length checksum tests per text. A judged run has at least 12 tokens of at least 4
+/// bytes each (word and joiner), and at most two judged runs (a line and a multi-line list run)
+/// can share bytes, so a `MAX_SCAN_BYTES` payload holds at most `MAX_SCAN_BYTES / 24` of them.
+pub const MAX_EXACT_TESTS: usize = crate::redact::MAX_SCAN_BYTES / 24;
+/// Window checksum tests per text: at most 5 per judged run of 13 to 18 words (see
+/// [`Scan::checksum_candidate`]), so `MAX_SCAN_BYTES / 4` covers the largest payload too.
+pub const MAX_WINDOW_TESTS: usize = crate::redact::MAX_SCAN_BYTES / 4;
 /// Words that make a nearby run a phrase without a checksum.
 pub const KEYWORDS: [&str; 5] = ["mnemonic", "seed", "phrase", "recovery", "secret"];
 
@@ -48,14 +58,22 @@ pub fn find(text: &str) -> Vec<(usize, usize)> {
     find_with(text, None)
 }
 
+/// The checksum-validated phrases of [`find`] only (no keyword rules), for the prompt guard:
+/// blocking a prompt costs far more than redacting a few words of output.
+pub fn find_checksummed(text: &str) -> Vec<(usize, usize)> {
+    find_with(text, Some(None))
+}
+
 /// [`find`], with the keyword bounds given (`Some(None)`: no keyword anywhere) or computed.
 fn find_with(text: &str, keywords: Option<Option<(usize, usize)>>) -> Vec<(usize, usize)> {
     let mut scan = Scan {
         text: text.as_bytes(),
         spans: Vec::new(),
-        budget: MAX_CHECKSUM_TESTS,
+        exact_budget: MAX_EXACT_TESTS,
+        window_budget: MAX_WINDOW_TESTS,
         keywords,
     };
+    let mut line = Run::default();
     let mut list = Run::default();
     let mut shaped = Run::default();
     let mut old = Run::default();
@@ -82,6 +100,11 @@ fn find_with(text: &str, keywords: Option<Option<(usize, usize)>>) -> Vec<(usize
                 .and_then(|end| bytes.get(end..start))
                 .is_some_and(is_joiner)
         };
+        let same_line = |run: &Run| {
+            run.last_end
+                .and_then(|end| bytes.get(end..start))
+                .is_some_and(|gap| is_joiner(gap) && !gap.contains(&b'\n'))
+        };
         let single_space = |run: &Run| {
             run.last_end
                 .and_then(|end| bytes.get(end..start))
@@ -89,6 +112,8 @@ fn find_with(text: &str, keywords: Option<Option<(usize, usize)>>) -> Vec<(usize
         };
 
         let ok = tok.idx.is_some();
+        let join = same_line(&line);
+        scan.feed(&mut line, tok, ok, join, Kind::Line);
         let join = joiner_ok(&list);
         scan.feed(&mut list, tok, ok, join, Kind::List);
         let ok = tok.idx.is_some() || lower_shape;
@@ -97,6 +122,7 @@ fn find_with(text: &str, keywords: Option<Option<(usize, usize)>>) -> Vec<(usize
         let join = single_space(&old);
         scan.feed(&mut old, tok, lower_shape, join, Kind::Old);
     }
+    scan.flush(&mut line, Kind::Line);
     scan.flush(&mut list, Kind::List);
     scan.flush(&mut shaped, Kind::Shaped);
     scan.flush(&mut old, Kind::Old);
@@ -131,6 +157,7 @@ struct Tok {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
+    Line,
     List,
     Shaped,
     Old,
@@ -145,10 +172,15 @@ struct Run {
     non_list: usize,
     end: usize,
     last_end: Option<usize>,
+    /// Whether a joiner inside the run holds a newline.
+    multiline: bool,
 }
 
 impl Run {
-    fn push(&mut self, tok: Tok) {
+    fn push(&mut self, tok: Tok, text: &[u8]) {
+        if let Some(gap) = self.last_end.and_then(|end| text.get(end..tok.start)) {
+            self.multiline |= gap.contains(&b'\n');
+        }
         if self.toks.len() <= MAX_RUN {
             self.toks.push(tok);
         }
@@ -168,7 +200,8 @@ impl Run {
 struct Scan<'a> {
     text: &'a [u8],
     spans: Vec<(usize, usize)>,
-    budget: usize,
+    exact_budget: usize,
+    window_budget: usize,
     /// First and last start of a keyword in the text, computed on first use.
     keywords: Option<Option<(usize, usize)>>,
 }
@@ -182,7 +215,7 @@ impl Scan<'_> {
         if run.count > 0 && !joins {
             self.flush(run, kind);
         }
-        run.push(tok);
+        run.push(tok, self.text);
     }
 
     fn flush(&mut self, run: &mut Run, kind: Kind) {
@@ -195,22 +228,37 @@ impl Scan<'_> {
     fn judge(&mut self, run: &Run, kind: Kind) {
         let (start, end) = (run.start(), run.end);
         match kind {
+            Kind::Line => {
+                if run.count <= MAX_RUN {
+                    self.checksum(&run.toks);
+                }
+            }
             Kind::List => {
                 if run.count > MAX_RUN {
                     return;
                 }
-                if self.keyword_outside(start, end) {
-                    self.spans.push((start, end));
-                } else {
+                let toks = self.trim_keywords(&run.toks);
+                let keyed = toks.len() >= 12 && {
+                    let (a, b) = span_of(toks);
+                    self.keyword_outside(a, b)
+                };
+                if keyed {
+                    self.spans.push(span_of(toks));
+                } else if run.multiline {
                     self.checksum(&run.toks);
                 }
             }
             Kind::Shaped => {
-                if run.count <= MAX_RUN
-                    && run.non_list * 6 <= run.count
-                    && self.keyword_outside(start, end)
-                {
-                    self.spans.push((start, end));
+                if run.count > MAX_RUN {
+                    return;
+                }
+                let toks = self.trim_keywords(&run.toks);
+                let non_list = toks.iter().filter(|t| t.idx.is_none()).count();
+                if toks.len() >= 12 && non_list * 6 <= toks.len() {
+                    let (a, b) = span_of(toks);
+                    if self.keyword_outside(a, b) {
+                        self.spans.push((a, b));
+                    }
                 }
             }
             Kind::Old => {
@@ -228,28 +276,27 @@ impl Scan<'_> {
         }
     }
 
-    /// Checksum the whole list run and each line of it (see the module docs).
-    fn checksum(&mut self, toks: &[Tok]) {
+    /// `toks` without a keyword among its first or last 3 tokens (and the tokens before or
+    /// after that keyword), so `seed phrase <words>` counts its keywords as outside the run.
+    fn trim_keywords<'t>(&self, toks: &'t [Tok]) -> &'t [Tok] {
+        let is_kw = |t: &Tok| {
+            self.text
+                .get(t.start..t.end)
+                .is_some_and(|w| keyword_bounds(w).is_some())
+        };
         let n = toks.len();
-        let mut candidates = vec![(0usize, n)];
-        let mut line_start = 0usize;
-        for j in 1..=n {
-            let breaks = j == n
-                || self
-                    .text
-                    .get(toks[j - 1].end..toks[j].start)
-                    .is_some_and(|gap| gap.contains(&b'\n'));
-            if breaks {
-                if (line_start, j) != (0, n) {
-                    candidates.push((line_start, j));
-                }
-                line_start = j;
-            }
-        }
-        for (from, to) in candidates {
-            if let Some((a, b)) = self.checksum_candidate(&toks[from..to]) {
-                self.spans
-                    .push((toks[from + a].start, toks[from + b - 1].end));
+        let from = toks.iter().take(3).rposition(is_kw).map_or(0, |i| i + 1);
+        let to = (n.saturating_sub(3).max(from)..n)
+            .find(|&i| toks.get(i).is_some_and(is_kw))
+            .unwrap_or(n);
+        toks.get(from..to).unwrap_or(&[])
+    }
+
+    /// Checksum `toks` as one candidate and record a phrase it holds.
+    fn checksum(&mut self, toks: &[Tok]) {
+        if let Some((a, b)) = self.checksum_candidate(toks) {
+            if let (Some(first), Some(last)) = (toks.get(a), toks.get(b.wrapping_sub(1))) {
+                self.spans.push((first.start, last.end));
             }
         }
     }
@@ -261,7 +308,7 @@ impl Scan<'_> {
         if indices.len() != len {
             return None;
         }
-        if bip39::LENGTHS.contains(&len) && self.test(&indices) {
+        if bip39::LENGTHS.contains(&len) && self.test(&indices, false) {
             return Some((0, len));
         }
         if len > 12 + 2 * WINDOW_SLACK {
@@ -277,7 +324,7 @@ impl Scan<'_> {
                     continue;
                 }
                 let window = &indices[off..off + n];
-                if distinct(window) >= MIN_DISTINCT && self.test(window) {
+                if distinct(window) >= MIN_DISTINCT && self.test(window, true) {
                     hit = Some(hit.map_or((off, off + n), |(a, _)| (a, off + n)));
                 }
             }
@@ -288,11 +335,16 @@ impl Scan<'_> {
         None
     }
 
-    fn test(&mut self, indices: &[u16]) -> bool {
-        if self.budget == 0 {
+    fn test(&mut self, indices: &[u16], window: bool) -> bool {
+        let budget = if window {
+            &mut self.window_budget
+        } else {
+            &mut self.exact_budget
+        };
+        if *budget == 0 {
             return false;
         }
-        self.budget -= 1;
+        *budget -= 1;
         bip39::checksum_ok(indices)
     }
 
@@ -300,6 +352,13 @@ impl Scan<'_> {
         let text = self.text;
         let found = *self.keywords.get_or_insert_with(|| keyword_bounds(text));
         found.is_some_and(|(first, last)| first < start || last >= end)
+    }
+}
+
+fn span_of(toks: &[Tok]) -> (usize, usize) {
+    match (toks.first(), toks.last()) {
+        (Some(a), Some(b)) => (a.start, b.end),
+        _ => (0, 0),
     }
 }
 
@@ -417,6 +476,43 @@ mod tests {
     }
 
     #[test]
+    fn many_phrases_one_per_line_are_all_found() {
+        // The lines join into one list run past MAX_RUN; each line is still judged on its own.
+        for (phrase, lines) in [(P12, 5), (P24, 3), (P12, 60), (P15, 10)] {
+            let text = format!("{phrase}\n").repeat(lines);
+            assert_eq!(found(&text).len(), lines, "{lines} x {phrase}");
+            assert_eq!(bare(&text).len(), lines, "{lines} x {phrase}");
+        }
+        let mixed = format!("{P12}\n{P24}\n{P15}\n{P12}\n{P24}\n");
+        assert_eq!(found(&mixed), [P12, P24, P15, P12, P24]);
+        // A single line of more than MAX_RUN list words is a dump.
+        let long_line = format!("{P24} {P24} {P12}");
+        assert_eq!(bare(&long_line), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn keyword_right_before_the_phrase_counts_as_outside() {
+        let typo = P12.replace("wave", "wvae");
+        for prefix in [
+            "seed phrase",
+            "your seed phrase",
+            "Secret Recovery Phrase",
+            "mnemonic",
+        ] {
+            let text = format!("{prefix} {typo}");
+            assert_eq!(found(&text), [typo.as_str()], "{text}");
+        }
+        assert_eq!(
+            found(&format!("{typo} is the seed phrase")),
+            [typo.as_str()]
+        );
+        // Prose with a keyword among its first words stays: off-list words are too many.
+        let prose = "keep this secret until everyone arrives near the office tomorrow morning \
+                     because our surprise party needs careful planning";
+        assert_eq!(found(prose), Vec::<&str>::new());
+    }
+
+    #[test]
     fn bare_phrase_with_adjacent_list_words() {
         for text in [
             format!("please use {P12} wallet"),
@@ -452,7 +548,6 @@ mod tests {
             "review any major change before release because random network issue can cause",
             "please review any major change before release because random network issue can \
              cause total system crash during busy weekend",
-            "review any major change before release because random network issue can secret",
         ] {
             assert!(
                 prose.split_whitespace().all(|w| bip39::index(w).is_some()),
@@ -592,13 +687,21 @@ mod tests {
         assert_eq!(find(&one_run), Vec::new());
         let lines = format!("{}\n", ["zoo"; 12].join(" ")).repeat(50_000);
         assert_eq!(find(&lines), Vec::new());
-        // Lines joined by newlines are one run past MAX_RUN (a dump); ended by `.` each is its
-        // own 17-word run, three window tests each, until the budget runs out.
+        // Window-heavy lines (17 words each), joined by newlines or not: every line is judged
+        // and none exhausts the budget.
         let joined = format!("{P15} zoo zoo\n").repeat(20_000);
-        assert_eq!(find(&joined), Vec::new());
+        assert_eq!(find(&joined).len(), 20_000);
         let windows = format!("{P15} zoo zoo.\n").repeat(70_000);
-        let hits = find(&windows).len();
-        assert!(hits > 50_000 && hits < 70_000, "{hits}");
+        assert_eq!(find(&windows).len(), 70_000);
+        // About 2 MiB of 16-word lines whose windows all fail, then a phrase: still found.
+        let pad = "please review any major change before release because random network issue can cause total system.\n";
+        let padded = format!("{}{P12}\n", pad.repeat(20_000));
+        assert_eq!(
+            find_checksummed(&padded)
+                .last()
+                .map(|&(a, b)| &padded[a..b]),
+            Some(P12)
+        );
         let keyed = format!(
             "seed:\n{}",
             format!("{} quux\n", ["zoo"; 12].join(" ")).repeat(20_000)

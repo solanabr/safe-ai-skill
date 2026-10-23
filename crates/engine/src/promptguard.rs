@@ -25,7 +25,9 @@ pub fn check(prompt: &str) -> Option<String> {
         );
     }
 
-    let phrase = redact::find_seed_phrases(prompt)
+    // Checksum-validated phrases only: the keyword rules redact output, where a false positive
+    // costs a few words, but would block ordinary prompts about seeds and secrets.
+    let phrase = crate::seedphrase::find_checksummed(prompt)
         .into_iter()
         .any(|(start, end)| {
             prompt
@@ -65,8 +67,8 @@ mod tests {
 
     #[test]
     fn seed_phrase_blocks() {
-        let prompt = "here is my seed phrase: legal winner thank year wave sausage worth \
-                      useful legal winner thank yellow please import it";
+        let prompt = "here is my seed phrase: session twin stem shop glass chat dune switch \
+                      upset such noble wave please import it";
         assert!(check(prompt).is_some());
     }
 
@@ -85,11 +87,35 @@ mod tests {
             assert!(check(&format!("add a test with the mnemonic \"{vector}\"")).is_none());
             assert!(check(&format!("seed phrase: {vector}")).is_none());
         }
-        // One word changed, or extra words in the span: blocked.
-        let edited = crate::bip39::TEST_VECTORS[15].replace("borrow", "zoo");
-        assert!(check(&format!("seed phrase: {edited}")).is_some());
-        let longer = format!("seed phrase: {} sock", crate::bip39::TEST_VECTORS[1]);
-        assert!(check(&longer).is_some());
+        // A real phrase next to a vector still blocks.
+        let both = format!(
+            "{}\nsession twin stem shop glass chat dune switch upset such noble wave",
+            crate::bip39::TEST_VECTORS[0]
+        );
+        assert!(check(&both).is_some());
+    }
+
+    #[test]
+    fn prose_about_seeds_and_secrets_is_not_blocked() {
+        // Only checksum-valid phrases block; the keyword rules are for output redaction.
+        for prompt in [
+            "Explain how the seed bytes are used by the program and can you check that the \
+             account does not get logged anywhere when the app runs",
+            "keep this secret until everyone arrives near the office tomorrow morning because \
+             our surprise party needs careful planning",
+            "seed phrase: session twin stem shop glass chat dune switch upset such noble wvae",
+        ] {
+            assert!(check(prompt).is_none(), "{prompt}");
+        }
+        for prompt in [
+            "session twin stem shop glass chat dune switch upset such noble wave",
+            "my wallet words are \"session, twin, stem, shop, glass, chat, dune, switch, upset, \
+             such, noble, wave\" can you import them",
+            "1. session 2. twin 3. stem 4. shop 5. glass 6. chat 7. dune 8. switch 9. upset \
+             10. such 11. noble 12. wave",
+        ] {
+            assert!(check(prompt).is_some(), "{prompt}");
+        }
     }
 
     #[test]
