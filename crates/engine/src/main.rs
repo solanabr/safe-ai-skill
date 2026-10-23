@@ -31,8 +31,8 @@ use safe_ai_skill::spend::{self, SpendLedger};
 use safe_ai_skill::statefile::Loaded;
 use safe_ai_skill::tierstate::{self, Plan};
 use safe_ai_skill::{
-    grants, headless, migrate, notice, platform, promptguard, redact, registry, relax, sandbox,
-    session, verify,
+    adapt, grants, headless, migrate, notice, platform, promptguard, redact, registry, relax,
+    sandbox, session, verify,
 };
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
@@ -114,6 +114,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("mode", cmd_mode),
     ("revoke", |_| cmd_revoke()),
     ("status", |_| cmd_status()),
+    ("adapt", cmd_adapt),
     ("env", safe_ai_skill::env::main),
     ("doctor", safe_ai_skill::doctor::main),
     ("--version", |_| cmd_version()),
@@ -730,6 +731,84 @@ fn cmd_gate_prompt_expansion() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The tamper and tier verdict on one file write (`file_path` / `notebook_path`).
+fn file_write_decision(
+    tool_input: Option<&serde_json::Value>,
+    cwd: &Path,
+    effective: &Policy,
+    protected: &safe_ai_skill::gates::tamper::Protected,
+) -> Decision {
+    let decision = safe_ai_skill::gates::tamper::decide_file(tool_input, cwd, protected);
+    let tier = effective.tier();
+    let tier_verdict = strictest([
+        wallet::decide_file(tool_input, cwd, effective, tier),
+        envwrite::decide_file(tool_input, cwd, effective, tier),
+    ]);
+    join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true)).0
+}
+
+/// The strictest [`file_write_decision`] over the files an `apply_patch` patch touches. Under
+/// Codex a patch to `.codex/hooks.json` or `.codex/config.toml` is denied too: those files
+/// wire these gates in.
+fn apply_patch_decision(
+    patch: &str,
+    cwd: &Path,
+    effective: &Policy,
+    protected: &safe_ai_skill::gates::tamper::Protected,
+) -> Decision {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut strictest = Decision::Defer;
+    for path in adapt::patch_paths(patch) {
+        let decision = if adapt::current() == adapt::Client::Codex
+            && adapt::is_codex_hook_config(&path, cwd, home.as_deref())
+        {
+            Decision::Deny {
+                reason: format!(
+                    "safe-ai-skill: `{path}` is Codex hook config that runs safe-ai-skill's \
+                     gates; edit it yourself, outside the agent."
+                ),
+            }
+        } else {
+            let file = serde_json::json!({ "file_path": path });
+            file_write_decision(Some(&file), cwd, effective, protected)
+        };
+        if decision_rank(&decision) > decision_rank(&strictest) {
+            strictest = decision;
+        }
+    }
+    strictest
+}
+
+/// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
+/// payload and answer in that client's output contract ([`adapt`]). An unknown client or a
+/// gate the client does not offer is a usage error (exit 3, nothing on stdout).
+fn cmd_adapt(rest: &[String]) -> ExitCode {
+    let client = rest.first().and_then(|c| adapt::client_named(c));
+    let gate = rest.get(1).map(String::as_str).unwrap_or("");
+    let handler = SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == gate)
+        .map(|(_, handler)| *handler);
+    let (Some(client), Some(handler), 2) = (client, handler, rest.len()) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "safe-ai-skill: usage: safe-ai-skill adapt codex <{}>",
+            adapt::CODEX_GATES.join("|")
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
+    if !adapt::CODEX_GATES.contains(&gate) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "safe-ai-skill: `{gate}` is not available through `adapt codex`"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    adapt::set(client);
+    install_panic_ask();
+    run_with_deadline(gate_deadline(), handler, Vec::new())
+}
+
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
 fn cmd_gate_tamper() -> ExitCode {
     let (raw, parsed) = read_input();
@@ -743,13 +822,18 @@ fn cmd_gate_tamper() -> ExitCode {
     let effective = load_effective_policy(&cwd, &dir);
     let protected = safe_ai_skill::gates::tamper::Protected::from_env();
     let tool_input = input.tool_input.as_ref();
-    let decision = safe_ai_skill::gates::tamper::decide_file(tool_input, &cwd, &protected);
-    let tier = effective.tier();
-    let tier_verdict = strictest([
-        wallet::decide_file(tool_input, &cwd, &effective, tier),
-        envwrite::decide_file(tool_input, &cwd, &effective, tier),
-    ]);
-    let (decision, _) = join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true));
+    let decision = if input.tool_name.as_deref() == Some("apply_patch") {
+        // Codex's `apply_patch` carries the patch text in `command`: judge every file it names.
+        let Some(patch) = tool_input
+            .and_then(|t| t.get("command"))
+            .and_then(|c| c.as_str())
+        else {
+            return ask_unreadable(Unreadable::Malformed, &input, &raw);
+        };
+        apply_patch_decision(patch, &cwd, &effective, &protected)
+    } else {
+        file_write_decision(tool_input, &cwd, &effective, &protected)
+    };
     // A tamper verdict is final: no grant or tier relaxes it, so it skips `relax::apply`.
     let decision = headless::apply(decision, effective.runtime.headless);
     record_decision(&decision);
