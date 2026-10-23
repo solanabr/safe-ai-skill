@@ -26,23 +26,110 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "busybox",
 ];
 
-/// Interpreters whose `-c`/`-e` code runs programs the parser cannot see.
+/// Interpreters whose `-c`/`-e` code runs programs the parser cannot see (a versioned name,
+/// `python3.12`, counts as its base).
 const INTERPRETERS: &[&str] = &[
     "python",
     "python2",
     "python3",
+    "pypy",
+    "pypy3",
     "node",
     "nodejs",
+    "tsx",
+    "ts-node",
     "perl",
     "ruby",
     "deno",
     "bun",
     "php",
     "lua",
+    "luajit",
+    "rscript",
+    "julia",
+    "tclsh",
     "osascript",
     "pwsh",
     "powershell",
 ];
+
+/// Whether `program` (a base name, [`base_name`]) is one of [`INTERPRETERS`].
+pub fn is_interpreter(program: &str) -> bool {
+    INTERPRETERS
+        .iter()
+        .any(|i| program == *i || program.starts_with(&format!("{i}.")))
+}
+
+/// Project runners that run their command in an environment: `(name, subcommand)`, where an
+/// empty subcommand means the name alone (`npx tsx`).
+const RUNNERS: &[(&str, &str)] = &[
+    ("uv", "run"),
+    ("uvx", ""),
+    ("poetry", "run"),
+    ("pipenv", "run"),
+    ("pdm", "run"),
+    ("hatch", "run"),
+    ("rye", "run"),
+    ("conda", "run"),
+    ("mamba", "run"),
+    ("micromamba", "run"),
+    ("npx", ""),
+    ("bunx", ""),
+    ("pnpx", ""),
+    ("pnpm", "exec"),
+    ("pnpm", "dlx"),
+    ("yarn", "exec"),
+    ("yarn", "dlx"),
+    ("npm", "exec"),
+];
+
+/// Value-taking options of [`RUNNERS`].
+const RUNNER_VALUE_FLAGS: &[&str] = &[
+    "--with",
+    "--python",
+    "-p",
+    "--project",
+    "--directory",
+    "-n",
+    "--name",
+    "--prefix",
+    "--package",
+    "--from",
+    "-e",
+    "--env",
+];
+
+/// The index of the interpreter a command runs: 0 for `python3 …`, the inner one behind a
+/// project runner (`uv run python …`, `npx tsx …`, `conda run -n x python …`). `None` when it
+/// runs none.
+pub fn interpreter_at(words: &[Word]) -> Option<usize> {
+    let first = base_name(&words.first()?.text);
+    if is_interpreter(&first) {
+        return Some(0);
+    }
+    let second = words.get(1).map(|w| w.text.as_str()).unwrap_or_default();
+    let (_, sub) = RUNNERS
+        .iter()
+        .find(|(name, sub)| *name == first && (sub.is_empty() || *sub == second))?;
+    let mut i = if sub.is_empty() { 1 } else { 2 };
+    while let Some(word) = words.get(i) {
+        let text = word.text.as_str();
+        if text == "--" {
+            i += 1;
+            break;
+        }
+        if !text.starts_with('-') {
+            break;
+        }
+        i += if RUNNER_VALUE_FLAGS.contains(&text) {
+            2
+        } else {
+            1
+        };
+    }
+    let inner = base_name(&words.get(i)?.text);
+    is_interpreter(&inner).then_some(i)
+}
 
 /// Programs that run one of their later arguments as a command (`find … -exec solana …`).
 const LAUNCHERS: &[&str] = &[
@@ -595,6 +682,9 @@ pub struct Parsed {
     /// Interpreter code fed on standard input (`python3 - <<EOF`, `python3 <<< '…'`, `echo '…' |
     /// node`), which no word carries: checked for the files it names.
     pub stdin_code: Vec<String>,
+    /// Input redirect targets (`< F`, `3< F`, `<> F`), which [`SimpleCommand::words`] drops:
+    /// checked as reads.
+    pub input_files: Vec<String>,
 }
 
 /// Record that a command runs a file or stdin as code: after a family write, that is a
@@ -1034,8 +1124,14 @@ impl Lexer<'_> {
             });
         } else if herestring {
             cmd.herestrings.push(target);
-        } else if writes && !is_harmless_target(&target.text) {
-            cmd.writes_file = true;
+        } else {
+            let descriptor = target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
+            if first == '<' && !descriptor {
+                self.out.input_files.push(target.text.clone());
+            }
+            if writes && !is_harmless_target(&target.text) {
+                cmd.writes_file = true;
+            }
         }
     }
 
@@ -1568,7 +1664,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         if appends
             && words.first().is_some_and(|w| {
                 let p = base_name(&w.text);
-                SHELLS.contains(&p.as_str()) || INTERPRETERS.contains(&p.as_str())
+                SHELLS.contains(&p.as_str()) || is_interpreter(&p)
             })
         {
             // `xargs -a x.sh sh -c '{}'`: its input becomes code.
@@ -1640,6 +1736,11 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         executes(out);
     }
 
+    // `uv run python …`, `npx tsx …`: the interpreter behind a project runner.
+    let (program, args) = match interpreter_at(&words).and_then(|i| words.get(i..)) {
+        Some([inner, rest @ ..]) if !std::ptr::eq(inner, first) => (base_name(&inner.text), rest),
+        _ => (program, args),
+    };
     match program.as_str() {
         "cd" | "pushd" | "popd" => out.cwd_changed = true,
         "export" | "declare" | "typeset" | "local" | "readonly" => {
@@ -1711,12 +1812,17 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 }
             }
         }
-        p if INTERPRETERS
-            .iter()
-            .any(|i| p == *i || p.starts_with(&format!("{i}."))) =>
-        {
+        p if is_interpreter(p) => {
+            // `deno run -`, `deno eval CODE`: the subcommand is not the script.
+            let deno_eval = p == "deno" && args.first().is_some_and(|w| w.text == "eval");
+            let args = match args.first() {
+                Some(w) if p == "deno" && matches!(w.text.as_str(), "run" | "eval") => {
+                    args.get(1..).unwrap_or_default()
+                }
+                _ => args,
+            };
             let code_flag = |w: &Word| matches!(w.text.as_str(), "-c" | "-e" | "-E" | "--eval");
-            let runs_code = args.iter().any(code_flag) || !herestrings.is_empty();
+            let runs_code = deno_eval || args.iter().any(code_flag) || !herestrings.is_empty();
             let code: Vec<&str> = args
                 .iter()
                 .chain(herestrings.iter())
@@ -1735,7 +1841,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             if runs_code {
                 opaque(out, &code.join(" "));
             }
-            if !args.iter().any(code_flag) {
+            if !deno_eval && !args.iter().any(code_flag) {
                 // A script file or stdin: either way it runs code.
                 executes(out);
                 if interpreter_reads_stdin(args) {
@@ -1849,27 +1955,34 @@ fn env_split_string(words: &[Word]) -> Option<String> {
     None
 }
 
-/// Words a wrapper takes before its command (its own name included).
-/// The `-a F`, `-aF`, `--arg-file F` and `--arg-file=F` values among `xargs`'s own words.
+/// Whether `text` spells xargs's `--arg-file` as getopt accepts it: any prefix from `--arg`.
+fn is_xargs_arg_file(text: &str) -> bool {
+    text.len() >= "--arg".len() && "--arg-file".starts_with(text)
+}
+
+/// The `-a F`, `-aF`, `--arg-file F` and `--arg-file=F` values (long form abbreviated down to
+/// `--arg`) among `xargs`'s own words.
 fn xargs_arg_files(words: &[Word]) -> Vec<String> {
     let mut out = Vec::new();
     let mut iter = words.iter().skip(1).map(|w| w.text.as_str());
     while let Some(text) = iter.next() {
-        if let Some(value) = text.strip_prefix("--arg-file=") {
-            out.push(value.to_string());
-        } else if text == "--arg-file" {
+        if let Some((flag, value)) = text.split_once('=') {
+            if is_xargs_arg_file(flag) {
+                out.push(value.to_string());
+            }
+        } else if is_xargs_arg_file(text) {
             out.extend(iter.next().map(str::to_string));
-        } else if text.starts_with('-') && !text.starts_with("--") {
+        } else if let Some(cluster) = text.strip_prefix('-').filter(|c| !c.starts_with('-')) {
             // A short cluster: the first value-taking short consumes the rest or the next word.
-            let cluster = &text[1..];
             if let Some(pos) = cluster.find(|c| "ILnPsdEa".contains(c)) {
-                let value = &cluster[pos + 1..];
-                let value = if value.is_empty() {
-                    iter.next().unwrap_or_default()
-                } else {
-                    value
+                let (_, rest) = cluster.split_at(pos);
+                let mut chars = rest.chars();
+                let short = chars.next();
+                let value = match chars.as_str() {
+                    "" => iter.next().unwrap_or_default(),
+                    v => v,
                 };
-                if cluster.as_bytes()[pos] == b'a' && !value.is_empty() {
+                if short == Some('a') && !value.is_empty() {
                     out.push(value.to_string());
                 }
             }
@@ -1878,6 +1991,7 @@ fn xargs_arg_files(words: &[Word]) -> Vec<String> {
     out
 }
 
+/// Words a wrapper takes before its command (its own name included).
 fn wrapper_len(words: &[Word], shorts: &str, longs: &[&str], positionals: usize) -> usize {
     let mut i = 1;
     while let Some(word) = words.get(i) {
@@ -1895,7 +2009,8 @@ fn wrapper_len(words: &[Word], shorts: &str, longs: &[&str], positionals: usize)
         }
         i += 1;
         if text.starts_with("--") {
-            if !text.contains('=') && longs.contains(&text) {
+            let xargs_file = longs.contains(&"--arg-file") && is_xargs_arg_file(text);
+            if !text.contains('=') && (longs.contains(&text) || xargs_file) {
                 i += 1;
             }
             continue;

@@ -1729,9 +1729,77 @@ fn i22_interpreter_code_naming_an_env_file_denies_at_every_tier() {
         // A credential store named the same ways.
         "python3 -c \"print(open('~/.aws/credentials').read())\"",
         "node - <<'JS'\nrequire('fs').readFileSync('~/.ssh/id_ed25519')\nJS",
+        // An apostrophe outside a string does not hide the path (review round 1).
+        "python3 -c \"# it's\nprint(open('.env').read())\"",
+        "python3 -c \"x=1 # don't\nprint(open('.env').read())\"",
+        "python3 - <<'PY'\n# load the config, don't print\nprint(open('.env').read())\nPY",
+        // Escapes, adjacent literals, quote-like operators.
+        "python3 -c \"open('\\x2eenv').read()\"",
+        "python3 -c \"open('\\56env').read()\"",
+        "node -e \"require('fs').readFileSync('\\u002eenv')\"",
+        "python3 -c \"open('.e' 'nv').read()\"",
+        "python3 -c \"open('.en''v').read()\"",
+        "perl -e 'open F, q{.env}; print <F>'",
+        "ruby -e 'puts File.read(%q(.env))'",
+        // Launchers and other interpreters.
+        "nodejs -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "powershell -c \"Get-Content '.env'\"",
+        "uv run python -c \"print(open('.env').read())\"",
+        "uv run --with requests python -c \"print(open('.env').read())\"",
+        "poetry run python -c \"print(open('.env').read())\"",
+        "npx tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "ts-node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "pypy3 -c \"print(open('.env').read())\"",
+        "Rscript -e \"readLines('.env')\"",
+        "deno run - <<'TS'\nconsole.log(Deno.readTextFileSync('.env'))\nTS",
+        "uv run python - <<'PY'\nprint(open('.env').read())\nPY",
+        // Folded and spaced paths.
+        "python3 -c \"open('apps/my app/.env').read()\"",
+        // A mention is not proof of a read, but the scan cannot tell: it fails closed.
+        "python3 -c \"print('see .env for keys')\"",
+        "python3 - <<'PY'\nIGNORE = ['.env', 'node_modules']\nPY",
     ] {
         check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
     }
+    let folded = format!(
+        "python3 -c \"print(open('{}.env').read())\"",
+        "./".repeat(2100)
+    );
+    check("folded ./ path", w.x4("Bash", &bash(&folded)), DENY4);
+}
+
+#[test]
+fn i22_input_redirects_behind_quoted_separators_deny_at_every_tier() {
+    let w = i22_world("i22-redirect");
+    for cmd in [
+        "python3 -c 'import sys;print(sys.stdin.read())' < ~/.ssh/id_ed25519",
+        "python3 -c \"import sys; print(sys.stdin.read())\" < .env",
+        "sed 's/a/b/;s/c/d/' < .env",
+        "tr ';' '\\n' < .env",
+        "awk -F'|' 1 < .env",
+        "cut -d';' -f1 < ~/.aws/credentials",
+        "exec 3<.env; cat <&3",
+        "xargs --arg .env echo",
+        "xargs --arg-f=.env echo",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn i22_code_over_the_inspection_limits_never_passes_quietly() {
+    let w = i22_world("i22-limits");
+    // Junk literals before the path are not judged (data literals cost nothing): the path is.
+    let junk: Vec<String> = (0..4200).map(|i| format!("'a{i}'")).collect();
+    let cmd = format!(
+        "python3 -c \"x=[{}]; print(open('.env').read())\"",
+        junk.join(",")
+    );
+    check("4200 literals then .env", w.x4("Bash", &bash(&cmd)), DENY4);
+    // More distinct paths than the checks examine asks (a hard guard).
+    let paths: Vec<String> = (0..4200).map(|i| format!("'/p/{i}'")).collect();
+    let cmd = format!("python3 -c \"x=[{}]\"", paths.join(","));
+    check("4200 paths", w.x4("Bash", &bash(&cmd)), ASK4);
 }
 
 #[test]
@@ -1801,7 +1869,10 @@ fn i22_templates_and_metadata_have_no_opinion() {
         "echo .env | xargs ls -la",
         "node -e \"console.log(process.env)\"",
         "python3 -c \"import os; print(os.environ.get('KEY'))\"",
-        "python3 -c \"print('see .env for keys')\"",
+        "node -e \"console.log('process.env')\"",
+        "awk '$0 ~ \".env\"' .gitignore",
+        "perl -ne \"print if /'\\.env'/\" src/config.py",
+        "tr ';' '\\n' < notes.md",
         // Known hole (SECURITY.md, "Directory search"): a recursive search whose operands
         // name no env file is not judged a read; the sandbox `denyRead` closes it.
         "grep -r KEY .",

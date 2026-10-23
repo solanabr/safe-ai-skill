@@ -1104,13 +1104,39 @@ fn is_flag(tok: &str) -> bool {
     tok.starts_with('-')
 }
 
-/// Split a command on top-level `&&`, `||`, `;`, `|` separators into segments.
+/// Split a command on top-level `&&`, `||`, `;`, `|` separators into segments. A separator
+/// inside quotes or after a backslash is text (`tr ';' x < .env` stays one segment).
 fn split_segments(command: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let bytes = command.as_bytes();
     let mut start = 0;
     let mut i = 0;
+    let mut quote: Option<u8> = None;
     while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && q == b'"' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
         let two = bytes.get(i..i + 2);
         if matches!(two, Some(b"&&")) || matches!(two, Some(b"||")) {
             segments.push(command[start..i].trim());
@@ -1118,7 +1144,6 @@ fn split_segments(command: &str) -> Vec<&str> {
             start = i;
             continue;
         }
-        let c = bytes[i];
         if c == b';' || c == b'|' {
             segments.push(command[start..i].trim());
             i += 1;
@@ -1127,7 +1152,7 @@ fn split_segments(command: &str) -> Vec<&str> {
         }
         i += 1;
     }
-    segments.push(command[start..].trim());
+    segments.push(command.get(start..).unwrap_or_default().trim());
     segments.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
