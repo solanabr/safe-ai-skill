@@ -222,9 +222,29 @@ fn analyse(kind: Kind, rel: &Path, text: &str, pack: &PackFiles<'_>, out: &mut F
     }
 }
 
-/// `path` as text, BOM dropped, or `None` when unreadable or longer than `limit` bytes.
+/// Open `path` for reading only if it is a regular file reached without following a symlink:
+/// `O_NOFOLLOW` refuses a link swapped in after the walk, `O_NONBLOCK` keeps a FIFO from
+/// hanging `open()`, and the `fstat` check refuses FIFOs, sockets and devices.
+pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let meta = path.symlink_metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// `path` as text, BOM dropped, or `None` when it is not a regular file (see
+/// [`open_regular`]), unreadable, or longer than `limit` bytes.
 pub(crate) fn read_capped(path: &Path, limit: u64) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_regular(path)?;
     let mut buf = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut buf)
@@ -468,6 +488,22 @@ pub(crate) mod tests {
         let r = p.scan();
         assert_eq!(rules_at(&r, "dep_unanalysed").len(), 1);
         assert_eq!(rules_at(&r, "dep_manifest").len(), MAX_DEP_FILES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifos_and_links_named_like_dependency_files_are_never_opened() {
+        let p = TempPack::new("deps-fifo");
+        p.file("SKILL.md", "# x\n");
+        crate::statefile::tests::mkfifo(&p.root.join("Cargo.lock"));
+        crate::statefile::tests::mkfifo(&p.root.join("package.json"));
+        p.symlink("Cargo.toml", "SKILL.md");
+        assert!(read_capped(&p.root.join("Cargo.lock"), MAX_DEP_BYTES).is_none());
+        assert!(read_capped(&p.root.join("Cargo.toml"), MAX_DEP_BYTES).is_none());
+        let started = Instant::now();
+        let r = p.scan();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(grade(&r) <= Grade::Warn, "{r:?}");
     }
 
     #[test]

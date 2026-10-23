@@ -53,11 +53,11 @@ pub(super) fn manifest(rel: &Path, text: &str, pack: &PackFiles<'_>, out: &mut F
     let mut dep_header: Option<u32> = None;
     for e in &all {
         if e.header {
-            dep_header = (dep_table(&e.table) == Some(None)).then_some(e.line);
-            if e.table == "package" {
+            dep_header = (dep_table(e.table()) == Some(None)).then_some(e.line);
+            if e.table() == "package" {
                 package_line = Some(e.line);
             }
-            if e.table.starts_with("patch.") || e.table == "patch" || e.table == "replace" {
+            if e.table().starts_with("patch.") || e.table() == "patch" || e.table() == "replace" {
                 out.emit(
                     "dep_nonregistry_source",
                     Severity::Warn,
@@ -65,21 +65,23 @@ pub(super) fn manifest(rel: &Path, text: &str, pack: &PackFiles<'_>, out: &mut F
                     Ctx::Meta,
                 );
             }
-            if let Some(Some(name)) = dep_table(&e.table) {
+            if let Some(Some(name)) = dep_table(e.table()) {
                 let d = deps.entry(unquote(name).to_string()).or_default();
                 d.line = e.line;
                 first_dep_line.get_or_insert(e.line);
             }
             continue;
         }
-        if e.table == "package" && e.key == "build" {
+        if e.table() == "package" && e.key == "build" {
             build = Some((e.line, e.value.trim() != "false"));
         }
-        if e.table == "lib" && (e.key == "proc-macro" || e.key == "proc_macro") && e.value == "true"
+        if e.table() == "lib"
+            && (e.key == "proc-macro" || e.key == "proc_macro")
+            && e.value == "true"
         {
             out.emit("dep_build_script", Severity::Warn, Some(e.line), Ctx::Meta);
         }
-        match dep_table(&e.table) {
+        match dep_table(e.table()) {
             Some(None) => {
                 first_dep_line.get_or_insert(dep_header.unwrap_or(e.line));
                 let name = e.key.split('.').next().unwrap_or(&e.key).to_string();
@@ -170,7 +172,7 @@ fn read_dep_value(d: &mut Dep, e: &Entry) {
 pub(super) fn lock(text: &str, out: &mut FileOut) {
     let mut elsewhere = 0;
     for e in entries(text) {
-        if e.header || e.table != "package" || e.key != "source" {
+        if e.header || e.table() != "package" || e.key != "source" {
             continue;
         }
         let source = unquote(&e.value);
@@ -200,10 +202,10 @@ pub(super) fn config(text: &str, out: &mut FileOut) {
     let mut hits = 0;
     for e in entries(text) {
         let flagged = if e.header {
-            e.table == "alias"
+            e.table() == "alias"
         } else {
             let last = e.key.rsplit('.').next().unwrap_or(&e.key);
-            EXEC_KEYS.contains(&last) || e.table == "alias" || e.key.starts_with("alias.")
+            EXEC_KEYS.contains(&last) || e.table() == "alias" || e.key.starts_with("alias.")
         };
         if flagged {
             out.emit("dep_pm_config", Severity::Warn, Some(e.line), Ctx::Meta);

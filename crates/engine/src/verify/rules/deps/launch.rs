@@ -69,6 +69,11 @@ pub fn floating(command: &str, args: &[&str]) -> Option<&'static str> {
             "uv" if next == "run" => py_with(&rest[1..]),
             "pipx" if next == "run" => py_runner(&rest[1..]),
             "docker" | "podman" if next == "run" => docker(&rest[1..]),
+            "docker" | "podman"
+                if next == "container" && rest.get(1).map(String::as_str) == Some("run") =>
+            {
+                docker(&rest[2..])
+            }
             "go" if next == "run" => rest.get(1).and_then(|s| go_spec(s)),
             _ => None,
         };
@@ -116,13 +121,18 @@ pub fn launch_line(cfg: &Value) -> Option<String> {
         .map(|u| format!("url {u}"))
 }
 
-/// The servers object of an MCP config: `mcpServers`, VS Code's `servers`, or (a plugin's
-/// `.mcp.json`) the top level itself when its values are server objects.
+/// The servers object of a project MCP config: `mcpServers` or VS Code's `servers` (the
+/// containers the project `.mcp.json` listing reads too).
+pub fn project_servers(json: &Value) -> Option<&serde_json::Map<String, Value>> {
+    json.get("mcpServers")
+        .and_then(Value::as_object)
+        .or_else(|| json.get("servers").and_then(Value::as_object))
+}
+
+/// [`project_servers`], or (a plugin's `.mcp.json`) the top level itself when its values are
+/// server objects.
 pub fn servers(json: &Value) -> Option<&serde_json::Map<String, Value>> {
-    if let Some(m) = json.get("mcpServers").and_then(Value::as_object) {
-        return Some(m);
-    }
-    if let Some(m) = json.get("servers").and_then(Value::as_object) {
+    if let Some(m) = project_servers(json) {
         return Some(m);
     }
     let top = json.as_object()?;
@@ -158,7 +168,19 @@ pub(super) fn scan_config(text: &str, out: &mut FileOut) {
 }
 
 /// Flags of npm runners that take a value (the value is not the package).
-const NPM_VALUE_FLAGS: &[&str] = &["--registry", "--cache", "--userconfig", "--node-options"];
+const NPM_VALUE_FLAGS: &[&str] = &[
+    "--registry",
+    "--cache",
+    "--userconfig",
+    "--globalconfig",
+    "--node-options",
+    "--prefix",
+    "-C",
+    "--workspace",
+    "-w",
+    "--shell",
+    "--loglevel",
+];
 
 /// `npx [flags] <spec>` / `npx -p <spec> <bin>`.
 fn npm_runner(rest: &[String]) -> Option<&'static str> {
@@ -410,6 +432,41 @@ const DOCKER_VALUE_FLAGS: &[&str] = &[
     "--volumes-from",
     "-a",
     "--attach",
+    "--health-cmd",
+    "--health-interval",
+    "--health-retries",
+    "--health-timeout",
+    "--health-start-period",
+    "--stop-signal",
+    "--stop-timeout",
+    "--cgroupns",
+    "--cgroup-parent",
+    "--uts",
+    "--userns",
+    "--isolation",
+    "--memory-swap",
+    "--memory-reservation",
+    "--cpu-shares",
+    "-c",
+    "--cpuset-cpus",
+    "--cpuset-mems",
+    "--cpu-period",
+    "--cpu-quota",
+    "--blkio-weight",
+    "--sysctl",
+    "--domainname",
+    "--mac-address",
+    "--ip",
+    "--ip6",
+    "--network-alias",
+    "--label-file",
+    "--annotation",
+    "--oom-score-adj",
+    "--pids-limit",
+    "--storage-opt",
+    "--dns-search",
+    "--dns-option",
+    "--device-cgroup-rule",
 ];
 
 /// `docker run [flags] <image> …`.
@@ -472,6 +529,8 @@ mod tests {
         assert_eq!(f("npx -y @scope/pkg@1.0.0-rc.1 --stdio"), None);
         assert_eq!(f("npx -y mcp-remote@0.1.0 https://x.invalid/mcp"), None);
         assert!(f("npx -p pkg bin").is_some());
+        assert!(f("npx --prefix /tmp/x pkg").is_some());
+        assert_eq!(f("npx --prefix /tmp/x pkg@1.0.0"), None);
         assert_eq!(f("npx -p pkg@1.0.0 bin"), None);
         assert!(f("pnpm dlx pkg").is_some());
         assert!(f("yarn dlx pkg@latest").is_some());
@@ -518,6 +577,10 @@ mod tests {
         assert!(f("docker run -i localhost:5000/mcp").is_some());
         assert_eq!(f("docker run --rm img@sha256:abcd"), None);
         assert!(f("podman run -v /a:/b img").is_some());
+        assert!(f("docker container run -i img").is_some());
+        assert_eq!(f("docker container run -i img:1.2"), None);
+        assert!(f("docker run --health-cmd true --stop-signal TERM --cgroupns host img").is_some());
+        assert_eq!(f("docker run --health-cmd true img:3"), None);
         assert!(f("go run github.com/o/mcp@latest").is_some());
         assert_eq!(f("go run github.com/o/mcp@v1.2.3"), None);
         assert_eq!(f("go run ./cmd/server"), None);

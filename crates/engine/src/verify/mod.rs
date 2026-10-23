@@ -1563,7 +1563,7 @@ fn sweep_within(
         let Some(entry) = st.packs.get_mut(&ev.key) else {
             continue;
         };
-        dep_pins.observe(&pack.canonical, entry);
+        dep_pins.observe(&pack.canonical, entry, Some(scan_until));
         if enforce::high_pending(entry, &env.trust) {
             high_denied.push(pack.display.clone());
         }

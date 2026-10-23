@@ -194,18 +194,19 @@ pub(super) fn pyproject(rel: &Path, text: &str, pack: &PackFiles<'_>, out: &mut 
         if e.header {
             continue;
         }
-        if e.table == "build-system" && e.key == "backend-path" {
+        if e.table() == "build-system" && e.key == "backend-path" {
             out.emit("dep_build_script", Severity::Warn, Some(e.line), Ctx::Meta);
             continue;
         }
-        let pep621 = (e.table == "project"
+        let pep621 = (e.table() == "project"
             && (e.key == "dependencies" || e.key == "optional-dependencies"))
-            || e.table == "project.optional-dependencies"
-            || e.table == "dependency-groups"
-            || (e.table == "tool.uv" && e.key == "dev-dependencies");
-        let poetry = e.table == "tool.poetry.dependencies"
-            || e.table == "tool.poetry.dev-dependencies"
-            || (e.table.starts_with("tool.poetry.group.") && e.table.ends_with(".dependencies"));
+            || e.table() == "project.optional-dependencies"
+            || e.table() == "dependency-groups"
+            || (e.table() == "tool.uv" && e.key == "dev-dependencies");
+        let poetry = e.table() == "tool.poetry.dependencies"
+            || e.table() == "tool.poetry.dev-dependencies"
+            || (e.table().starts_with("tool.poetry.group.")
+                && e.table().ends_with(".dependencies"));
         if pep621 {
             let items = array_items(&e.value);
             if !items.is_empty() {
@@ -272,7 +273,7 @@ pub(super) fn lock(text: &str, out: &mut FileOut) {
         if e.header {
             continue;
         }
-        let off_pypi = match (e.table.as_str(), e.key.as_str()) {
+        let off_pypi = match (e.table(), e.key.as_str()) {
             // poetry.lock `[package.source] type = "git" | "url" | "legacy"` (a custom index).
             ("package.source", "type") => {
                 matches!(unquote(&e.value), "git" | "url" | "legacy")

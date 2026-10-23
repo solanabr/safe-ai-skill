@@ -17,8 +17,13 @@
 //! Stored in the authenticated `deps.json` ([`crate::statefile`]). It is explanatory: a missing
 //! or tampered file is started afresh (no detail until the next pin), and drift still blocks
 //! through `state.json`. Offline, never follows symlinks (a linked dependency file is recorded
-//! by its target text), skips `node_modules/` and the pack-root `.git`, and is bounded by
-//! [`MAX_WALK`] entries, [`WALK_BUDGET`] and the deps family's per-file caps.
+//! by its target text), never opens anything but a regular file (a FIFO, socket or device is
+//! recorded by its type), skips `node_modules/` and the pack-root `.git`, and is bounded by
+//! [`MAX_WALK`] entries, the deps family's per-file caps and a deadline checked on every entry
+//! and every 64 KiB hashed: [`WALK_BUDGET`], within the sweep's own budget. A snapshot the
+//! deadline cuts records the pack as unscanned, like a scan the sweep's budget cuts
+//! (`scan_budget_exceeded`): denied below Off until a later sweep completes it. A sweep whose
+//! budget is already spent skips the snapshot and keeps the last one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -39,8 +44,12 @@ use crate::statefile::{self, Loaded};
 pub const DEPS_FILE: &str = "deps.json";
 /// Directory entries one snapshot walks before it stops (and is marked truncated).
 const MAX_WALK: usize = 50_000;
-/// Time one snapshot may take before it stops (and is marked truncated).
-const WALK_BUDGET: Duration = Duration::from_millis(750);
+/// Time one snapshot may take (the per-pack scan allowance); past it the pack is unscanned.
+const WALK_BUDGET: Duration = Duration::from_secs(2);
+/// Pack pins and project `.mcp.json` records kept, so `deps.json` stays far below the state
+/// file size limit.
+const MAX_PACK_PINS: usize = 1024;
+const MAX_MCP_PROJECTS: usize = 128;
 /// Files whose individual hashes a stored set keeps (the fingerprint covers up to
 /// [`deps::MAX_DEP_FILES`]).
 const MAX_STORED_FILES: usize = 128;
@@ -116,7 +125,16 @@ impl Pins {
     /// Record the dependency set of the pack at `canonical` (whose entry the sweep just
     /// evaluated) and, while its pin stands and the set differs from the pinned one, add the
     /// difference to the entry's one-off report note.
-    pub fn observe(&mut self, canonical: &Path, entry: &mut PackEntry) {
+    ///
+    /// The snapshot runs until [`WALK_BUDGET`] from now or `sweep_until`, whichever is first.
+    /// When the sweep's budget is already spent it is skipped (the last one is kept); when the
+    /// deadline cuts it, the pack is recorded unscanned (see the module docs).
+    pub fn observe(
+        &mut self,
+        canonical: &Path,
+        entry: &mut PackEntry,
+        sweep_until: Option<Instant>,
+    ) {
         let current = entry.last_scanned_hash.clone();
         if current.is_empty() {
             return;
@@ -126,7 +144,23 @@ impl Pins {
         let prev = self.data.packs.get(&key);
         let seen = match prev {
             Some(p) if p.seen_hash == current => p.seen.clone(),
-            _ => snapshot(canonical),
+            _ => {
+                let now = Instant::now();
+                if sweep_until.is_some_and(|d| now >= d) {
+                    return;
+                }
+                let mut deadline = now + WALK_BUDGET;
+                if let Some(d) = sweep_until {
+                    deadline = deadline.min(d);
+                }
+                match snapshot_until(canonical, deadline) {
+                    Some(set) => set,
+                    None => {
+                        mark_unscanned(entry);
+                        return;
+                    }
+                }
+            }
         };
         let mut next = prev.cloned().unwrap_or_default();
         if prev.map(|p| p.tree_pin.as_str()) != Some(entry.tree_hash.as_str()) {
@@ -159,18 +193,19 @@ impl Pins {
             .unwrap_or_else(|_| path.clone())
             .to_string_lossy()
             .into_owned();
+        let key = &key;
         let current = project_launches(&path);
-        let lines = match (self.data.mcp.get(&key), &current) {
+        let lines = match (self.data.mcp.get(key), &current) {
             (Some(prev), Some(now)) => launch_changes(prev, now),
             (Some(prev), None) if !prev.is_empty() => launch_changes(prev, &BTreeMap::new()),
             _ => Vec::new(),
         };
         match current {
-            Some(now) if self.data.mcp.get(&key) != Some(&now) => {
-                self.data.mcp.insert(key, now);
+            Some(now) if self.data.mcp.get(key) != Some(&now) => {
+                self.data.mcp.insert(key.clone(), now);
                 self.dirty = true;
             }
-            None if self.data.mcp.remove(&key).is_some() => self.dirty = true,
+            None if self.data.mcp.remove(key).is_some() => self.dirty = true,
             _ => {}
         }
         if !lines.is_empty() {
@@ -195,13 +230,35 @@ impl Pins {
             }
         }
         let observed = &self.observed;
-        let before = self.data.packs.len();
+        let before = (self.data.packs.len(), self.data.mcp.len());
         self.data
             .packs
             .retain(|k, _| observed.contains(k) || state::path_of(k).exists());
-        self.dirty |= self.data.packs.len() != before;
+        self.data.mcp.retain(|k, _| Path::new(k).exists());
+        // Past the caps, keep what this sweep saw and drop the rest (oldest keys first).
+        while self.data.packs.len() > MAX_PACK_PINS {
+            let Some(k) = self
+                .data
+                .packs
+                .keys()
+                .find(|k| !observed.contains(*k))
+                .cloned()
+            else {
+                break;
+            };
+            self.data.packs.remove(&k);
+        }
+        while self.data.mcp.len() > MAX_MCP_PROJECTS {
+            let Some(k) = self.data.mcp.keys().find(|k| *k != key).cloned() else {
+                break;
+            };
+            self.data.mcp.remove(&k);
+        }
+        self.dirty |= (self.data.packs.len(), self.data.mcp.len()) != before;
         if self.dirty {
-            let _ = statefile::store(dir, DEPS_FILE, &self.data);
+            if let Err(e) = statefile::store(dir, DEPS_FILE, &self.data) {
+                audit_store_failure(dir, &e.to_string());
+            }
         }
     }
 }
@@ -241,9 +298,65 @@ fn describe_change(pinned: &DepSet, now: &DepSet) -> String {
     text
 }
 
-/// The dependency files of the pack at `root` and their fingerprint (see the module docs).
+/// Record `entry` as unscanned, like the sweep records a pack its budget cut: `unreviewed`
+/// with a HIGH `scan_budget_exceeded` (a blocked pack stays blocked), and nothing cached, so
+/// the next sweep evaluates it again.
+fn mark_unscanned(entry: &mut PackEntry) {
+    use super::grading::{Ctx, Grade};
+    use state::{PackStatus, Reason, StoredFinding, StoredSev, SCAN_BUDGET_RULE};
+    if entry.state != PackStatus::Blocked {
+        entry.state = PackStatus::Unreviewed;
+        entry.reason = Some(Reason::Heuristic);
+        entry.grade = entry.grade.max(Grade::High);
+    }
+    if !entry.findings.iter().any(|f| f.rule == SCAN_BUDGET_RULE) {
+        entry.findings.insert(
+            0,
+            StoredFinding {
+                rule: SCAN_BUDGET_RULE.to_string(),
+                sev: StoredSev::High,
+                path: String::new(),
+                line: 0,
+                ctx: Ctx::Meta,
+            },
+        );
+        entry.findings.truncate(state::MAX_STORED_FINDINGS);
+    }
+    if !entry.flagged_rules.iter().any(|r| r == SCAN_BUDGET_RULE) {
+        entry.flagged_rules.push(SCAN_BUDGET_RULE.to_string());
+        entry.flagged_rules.sort();
+    }
+    entry.last_scanned_hash = String::new();
+    entry.fingerprint = String::new();
+}
+
+/// An audit line for a `deps.json` that could not be stored (the detail is lost, nothing else).
+fn audit_store_failure(dir: &DataDir, why: &str) {
+    let reason = format!("{DEPS_FILE} not stored: {why}");
+    let entry = crate::audit::AuditEntry::new(
+        String::new(),
+        "safe-ai-skill".to_string(),
+        "deps_pin_store_failed".to_string(),
+        "error".to_string(),
+        reason.clone(),
+        crate::audit::sha256_hex(reason.as_bytes()),
+    );
+    let _ = crate::audit::append(&entry, &dir.path);
+}
+
+/// The dependency files of the pack at `root` and their fingerprint, within [`WALK_BUDGET`].
+/// A snapshot the budget cuts has the fingerprint `unscanned` (and `truncated`).
 pub fn snapshot(root: &Path) -> DepSet {
-    let deadline = Instant::now() + WALK_BUDGET;
+    snapshot_until(root, Instant::now() + WALK_BUDGET).unwrap_or_else(|| DepSet {
+        fingerprint: "unscanned".to_string(),
+        files: BTreeMap::new(),
+        truncated: true,
+    })
+}
+
+/// [`snapshot`] against `deadline`, checked on every entry and every 64 KiB hashed; `None`
+/// when it passes first. `root` may be a single file (a one-file pack).
+pub fn snapshot_until(root: &Path, deadline: Instant) -> Option<DepSet> {
     let mut truncated = false;
     let mut found: Vec<(String, String)> = Vec::new();
     let walker = WalkDir::new(root)
@@ -256,7 +369,10 @@ pub fn snapshot(root: &Path) -> DepSet {
                 && !(e.file_type().is_dir() && name == "node_modules")
         });
     for (n, entry) in walker.flatten().enumerate() {
-        if n >= MAX_WALK || (n % 256 == 0 && Instant::now() >= deadline) {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if n >= MAX_WALK {
             truncated = true;
             break;
         }
@@ -264,10 +380,15 @@ pub fn snapshot(root: &Path) -> DepSet {
         if ft.is_dir() {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
+        let rel = match entry.path().strip_prefix(root) {
+            Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
+            // A single-file pack: the root itself is the file.
+            _ => match entry.path().file_name() {
+                Some(name) => std::path::PathBuf::from(name),
+                None => continue,
+            },
         };
-        if deps::kind_of(rel).is_none() {
+        if deps::kind_of(&rel).is_none() {
             continue;
         }
         if found.len() >= deps::MAX_DEP_FILES {
@@ -277,8 +398,11 @@ pub fn snapshot(root: &Path) -> DepSet {
         let hash = if ft.is_symlink() {
             let target = std::fs::read_link(entry.path()).unwrap_or_default();
             format!("link:{}", target.to_string_lossy())
+        } else if ft.is_file() {
+            file_hash(entry.path(), deadline)?
         } else {
-            file_hash(entry.path())
+            // A FIFO, socket or device: never opened (a FIFO would block).
+            "other".to_string()
         };
         found.push((rel.to_string_lossy().replace('\\', "/"), hash));
     }
@@ -297,30 +421,32 @@ pub fn snapshot(root: &Path) -> DepSet {
         set.fingerprint = hex(&h.finalize());
     }
     set.files = found.into_iter().take(MAX_STORED_FILES).collect();
-    set
+    Some(set)
 }
 
-/// SHA-256 of a file's first [`deps::MAX_DEP_BYTES`] plus its length; `unreadable` on error.
-fn file_hash(path: &Path) -> String {
-    let Ok(file) = std::fs::File::open(path) else {
-        return "unreadable".to_string();
+/// SHA-256 of a regular file's first [`deps::MAX_DEP_BYTES`] plus its full size (so a change
+/// past the cap that changes the size still shows); `unreadable` when it is not a regular file
+/// or cannot be read (see [`deps::open_regular`]). `None` when `deadline` passes mid-way.
+fn file_hash(path: &Path, deadline: Instant) -> Option<String> {
+    let Some(file) = deps::open_regular(path) else {
+        return Some("unreadable".to_string());
     };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut h = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     let mut reader = file.take(deps::MAX_DEP_BYTES);
-    let mut len = 0u64;
     loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
         match reader.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => {
-                len = len.saturating_add(n as u64);
-                h.update(&buf[..n]);
-            }
-            Err(_) => return "unreadable".to_string(),
+            Ok(n) => h.update(&buf[..n]),
+            Err(_) => return Some("unreadable".to_string()),
         }
     }
-    h.update(len.to_le_bytes());
-    hex(&h.finalize())
+    h.update(size.to_le_bytes());
+    Some(hex(&h.finalize()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -343,7 +469,7 @@ fn project_launches(path: &Path) -> Option<BTreeMap<String, String>> {
     let text = deps::read_capped(path, MAX_MCP_BYTES)?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let mut out = BTreeMap::new();
-    if let Some(map) = deps::launch::servers(&json) {
+    if let Some(map) = deps::launch::project_servers(&json) {
         for (name, cfg) in map.iter().take(MAX_MCP_SERVERS) {
             if let Some(mut line) = deps::launch::launch_line(cfg) {
                 if line.len() > MAX_LAUNCH_BYTES {
@@ -425,6 +551,74 @@ mod tests {
         assert_eq!(snapshot(&empty).fingerprint, "");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_a_dependency_file_is_recorded_not_opened() {
+        let d = tmp("fifo");
+        fs::write(d.join("SKILL.md"), "# x").unwrap();
+        crate::statefile::tests::mkfifo(&d.join("Cargo.lock"));
+        crate::statefile::tests::mkfifo(&d.join("package.json"));
+        let started = Instant::now();
+        let s = snapshot(&d);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(s.files.get("Cargo.lock").map(String::as_str), Some("other"));
+        assert_eq!(
+            s.files.get("package.json").map(String::as_str),
+            Some("other")
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_passed_deadline_leaves_the_snapshot_unscanned() {
+        let d = tmp("late");
+        fs::write(d.join("package.json"), "{}").unwrap();
+        assert_eq!(snapshot_until(&d, Instant::now()), None);
+        let mut entry = PackEntry {
+            kind: state::PackKind::Skill,
+            tree_hash: "h".into(),
+            head: None,
+            first_seen: 0,
+            last_scanned_hash: "h".into(),
+            grade: super::super::grading::Grade::Clean,
+            state: state::PackStatus::Clean,
+            findings: Vec::new(),
+            more_findings: 0,
+            flagged_rules: Vec::new(),
+            reason: None,
+            names: Vec::new(),
+            names_incomplete: false,
+            escaping: Vec::new(),
+            approved: false,
+            fingerprint: "f".into(),
+            hashed_sweep: 0,
+            quarantined_to: None,
+            note: None,
+        };
+        let mut pins = Pins {
+            data: DepPins::default(),
+            observed: BTreeSet::new(),
+            dirty: false,
+        };
+        // A spent sweep budget skips the snapshot and leaves the entry alone.
+        pins.observe(&d, &mut entry, Some(Instant::now()));
+        assert_eq!(entry.state, state::PackStatus::Clean);
+        assert!(pins.data.packs.is_empty());
+        mark_unscanned(&mut entry);
+        assert!(entry.unscanned());
+        assert!(entry.last_scanned_hash.is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_single_file_pack_is_inventoried() {
+        let d = tmp("single");
+        fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        let s = snapshot(&d.join("Cargo.toml"));
+        assert_eq!(s.files.keys().collect::<Vec<_>>(), vec!["Cargo.toml"]);
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

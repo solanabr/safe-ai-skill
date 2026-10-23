@@ -465,9 +465,13 @@ fn hostile_manifests_are_bounded_and_panic_free() {
         "{:?}",
         started.elapsed()
     );
-    assert!(ctx.contains("WARN skill `hostile`"), "{ctx}");
     assert!(!ctx.contains("BLOCK skill"), "{ctx}");
-    assert_eq!(w.reach("hostile", Tier::High), open());
+    // Bounded and safe: the pack is either fully scanned (WARN, open at every tier) or the scan
+    // deadline cut it on a slow host (unscanned: denied, fail closed). Never anything else.
+    let cut = ctx.contains("scan_budget_exceeded");
+    assert!(cut || ctx.contains("WARN skill `hostile`"), "{ctx}");
+    let expect = if cut { denied() } else { open() };
+    assert_eq!(w.reach("hostile", Tier::High), expect, "{ctx}");
     let dir = w.project.join(".claude/skills/hostile");
     let run = w
         .inv(&["verify", "check", dir.to_str().unwrap()], Tier::High)

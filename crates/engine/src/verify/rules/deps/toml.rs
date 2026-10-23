@@ -3,13 +3,20 @@
 //! with multi-line arrays, inline tables and multi-line strings gathered into one value.
 //!
 //! It never fails: a line it cannot read is skipped. Values are kept as raw text (callers look
-//! for what they need inside them). Bounded by [`MAX_ENTRIES`] entries and [`MAX_VALUE_BYTES`]
-//! per gathered value.
+//! for what they need inside them). Bounded by [`MAX_ENTRIES`] entries, [`MAX_VALUE_BYTES`]
+//! per gathered value, [`MAX_TABLE_BYTES`] per table name (shared by its entries, never copied
+//! per entry) and [`MAX_TOTAL_BYTES`] of keys and values per file.
+
+use std::rc::Rc;
 
 /// Entries read from one file before the rest is ignored.
 const MAX_ENTRIES: usize = 100_000;
 /// Bytes gathered into one multi-line value before the rest of it is skipped.
 const MAX_VALUE_BYTES: usize = 64 * 1024;
+/// Bytes of a table name kept (a longer header is truncated; no real table name comes close).
+const MAX_TABLE_BYTES: usize = 1024;
+/// Bytes of keys and values kept across one file before the rest is ignored.
+const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 /// One header or `key = value` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,14 +24,22 @@ pub(super) struct Entry {
     /// 1-based line of the header or key.
     pub(super) line: u32,
     /// The table the entry is in (the header's own name for a header), as written, without
-    /// brackets and with whitespace around dots removed.
-    pub(super) table: String,
+    /// brackets and with whitespace around dots removed; one allocation shared by the table's
+    /// entries.
+    table: Rc<str>,
     /// True for a `[table]` / `[[table]]` header line (`key` and `value` empty).
     pub(super) header: bool,
     /// The key, one layer of quotes removed (a dotted key stays dotted).
     pub(super) key: String,
     /// The raw value, comments removed; multi-line values joined with `\n`.
     pub(super) value: String,
+}
+
+impl Entry {
+    /// The table the entry is in (see the field docs).
+    pub(super) fn table(&self) -> &str {
+        &self.table
+    }
 }
 
 /// Track the bracket depth of `s` outside strings, and whether it ends inside a `"""`/`'''`
@@ -88,21 +103,27 @@ pub(super) fn unquote(s: &str) -> &str {
 }
 
 /// The table name of a header line body (`[a . b]` → `a.b`).
-fn table_name(inner: &str) -> String {
-    inner
+fn table_name(inner: &str) -> Rc<str> {
+    let cut = (0..=inner.len().min(MAX_TABLE_BYTES))
+        .rev()
+        .find(|&k| inner.is_char_boundary(k))
+        .unwrap_or(0);
+    let name = inner[..cut]
         .split('.')
         .map(str::trim)
         .collect::<Vec<_>>()
-        .join(".")
+        .join(".");
+    Rc::from(name)
 }
 
 /// Every header and entry of `text`, in order.
 pub(super) fn entries(text: &str) -> Vec<Entry> {
     let mut out = Vec::new();
-    let mut table = String::new();
+    let mut table: Rc<str> = Rc::from("");
+    let mut total = 0usize;
     let mut lines = text.lines().enumerate();
     while let Some((i, raw)) = lines.next() {
-        if out.len() >= MAX_ENTRIES {
+        if out.len() >= MAX_ENTRIES || total > MAX_TOTAL_BYTES {
             break;
         }
         let line = raw.trim();
@@ -115,7 +136,7 @@ pub(super) fn entries(text: &str) -> Vec<Entry> {
             table = table_name(inner);
             out.push(Entry {
                 line: line_no,
-                table: table.clone(),
+                table: Rc::clone(&table),
                 header: true,
                 key: String::new(),
                 value: String::new(),
@@ -137,9 +158,10 @@ pub(super) fn entries(text: &str) -> Vec<Entry> {
                 value.push_str(next[..keep].trim());
             }
         }
+        total = total.saturating_add(key.len()).saturating_add(value.len());
         out.push(Entry {
             line: line_no,
-            table: table.clone(),
+            table: Rc::clone(&table),
             header: false,
             key,
             value,
@@ -203,7 +225,7 @@ mod tests {
         let kv: Vec<(&str, &str, u32)> = e
             .iter()
             .filter(|e| !e.header)
-            .map(|e| (e.table.as_str(), e.key.as_str(), e.line))
+            .map(|e| (e.table(), e.key.as_str(), e.line))
             .collect();
         assert_eq!(
             kv,
@@ -229,6 +251,32 @@ mod tests {
         assert_eq!(inline_get(v, "tag"), None);
         assert_eq!(inline_get("{ registry-git = \"x\" }", "git"), None);
         assert_eq!(inline_get("\"1.0\"", "git"), None);
+    }
+
+    #[test]
+    fn a_long_header_is_shared_not_copied_per_entry() {
+        // The review's repro: a long header followed by many short entries.
+        let text = format!(
+            "[{}]\n{}",
+            "a".repeat(4 * 1024 * 1024),
+            "k=1\n".repeat(100_000)
+        );
+        let started = std::time::Instant::now();
+        let e = entries(&text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(e.len(), MAX_ENTRIES);
+        assert!(e[0].table().len() <= MAX_TABLE_BYTES);
+        // Every entry points at the one table name.
+        assert!(e.iter().all(|x| Rc::ptr_eq(&x.table, &e[0].table)));
+        let values = format!(
+            "k = \"{}\"
+",
+            "v".repeat(60_000)
+        )
+        .repeat(1000);
+        let e = entries(&values);
+        let kept: usize = e.iter().map(|x| x.value.len()).sum();
+        assert!(kept <= MAX_TOTAL_BYTES + 64 * 1024, "{kept}");
     }
 
     #[test]

@@ -163,9 +163,12 @@ Future work).
 | `dep_unanalysed` | WARN | A dependency file over 8 MiB, a lockfile that does not parse (including JSON nested past the parser's depth limit), or files past the 512-per-pack cap. |
 | `mcp_unpinned_launch` | WARN | A shipped MCP config (`.mcp.json`, `mcp.json`, `plugin.json`, `claude_desktop_config.json`) with a server whose launch floats: `npx` / `bunx` / `pnpm dlx` / `yarn dlx` / `npm exec` with no version, `@latest`, another dist-tag or a range, a git ref without a commit or a tarball URL; `uvx` / `uv tool run` / `uv run --with` / `pipx run` without an exact `==` (or `@`) version; `docker` / `podman run` with no tag or `:latest` and no `@sha256:` digest; `go run …@latest`; any `git+…` argument without a commit. Remote (`url`) servers are not judged. |
 
-Bounds: each dependency file is read once, capped at 8 MiB; at most 512 per pack; lockfile walks
-stop at 200,000 entries; the TOML reader keeps at most 100,000 entries and 64 KiB per gathered
-value; five findings per rule per file get a line. The pass shares the pack's scan deadline, so a
+Bounds: only regular files are opened, with `O_NOFOLLOW | O_NONBLOCK` and an `fstat` check, so a
+symlink swapped in after the walk, a FIFO, socket or device named like a dependency file is never
+read; each dependency file is read once, capped at 8 MiB; at most 512 per pack; lockfile walks stop
+at 200,000 entries; the TOML reader keeps at most 100,000 entries, 64 KiB per gathered value,
+1 KiB per table name (shared by the table's entries, never copied per entry) and 16 MiB of keys and
+values per file; five findings per rule per file get a line. The pass shares the pack's scan deadline, so a
 pack whose deadline passes mid-way is `scan_budget_exceeded` like any other cut scan.
 
 **Per tier.** Every rule here is a heuristic, so none is above WARN: at every tier the pack is
@@ -191,8 +194,13 @@ pin already covers every file, so a changed manifest or lockfile is drift and is
 like any drift. What the fingerprint adds is the reason: while the pin stands, the report for a
 drifted pack names the dependency files that moved ("dependency set differs from the pin: added
 Cargo.lock, changed package-lock.json"). The fingerprint is re-recorded whenever the pin is (first
-sight, `verify approve`, `verify trust`). `verify check <dir>` prints the inventory and its
-fingerprint under `dependencies`. The project's `.mcp.json` has no pin; its servers' launch lines
+sight, `verify approve`, `verify trust`). Each file is hashed by its first 8 MiB and its full size;
+a FIFO, socket or device is recorded by type and never opened. The snapshot runs within the
+per-pack allowance (2 s) and the sweep's own budget, checking the clock on every entry and every
+64 KiB hashed: a snapshot the deadline cuts records the pack as unscanned
+(`scan_budget_exceeded`, denied below Off until a later sweep completes it), and a sweep whose
+budget is already spent skips it and keeps the last one. `verify check <dir>` prints the inventory
+and its fingerprint under `dependencies` (a single-file pack included). The project's `.mcp.json` has no pin; its servers' launch lines
 are recorded each session and a launch that changed since the last session (`pkg@1.2.0` to
 `pkg@latest`, a new server, a removed one) is reported once as INFO. A missing or tampered
 `deps.json` starts afresh: the detail is lost until the next pin, and drift still blocks through
