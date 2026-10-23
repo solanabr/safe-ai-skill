@@ -400,6 +400,16 @@ fn blocked(reason: Reason, pin: String) -> Transition {
 /// The findings of `report` worth storing (WARN and above, combos as `block`), capped at
 /// [`MAX_STORED_FINDINGS`]; returns them and how many were left out.
 pub fn stored_findings(report: &grading::PackReport) -> (Vec<StoredFinding>, usize) {
+    let mut all = reported_findings(report, false);
+    let more = all.len().saturating_sub(MAX_STORED_FINDINGS);
+    all.truncate(MAX_STORED_FINDINGS);
+    (all, more)
+}
+
+/// Every finding of `report` a report lists (WARN and above, INFO too when `with_info`, combos
+/// as `block`), combos first, then worst first in walk order. Uncapped: `verify check` lists
+/// them all, INFO included.
+pub fn reported_findings(report: &grading::PackReport, with_info: bool) -> Vec<StoredFinding> {
     let mut all: Vec<StoredFinding> = report
         .combos
         .iter()
@@ -418,6 +428,7 @@ pub fn stored_findings(report: &grading::PackReport) -> (Vec<StoredFinding>, usi
             let sev = match f.effective_sev() {
                 grading::Severity::High => StoredSev::High,
                 grading::Severity::Warn => StoredSev::Warn,
+                grading::Severity::Info if with_info => StoredSev::Info,
                 grading::Severity::Info => return None,
             };
             Some(StoredFinding {
@@ -432,9 +443,7 @@ pub fn stored_findings(report: &grading::PackReport) -> (Vec<StoredFinding>, usi
     // Worst first, keeping walk order within a severity.
     singles.sort_by_key(|f| std::cmp::Reverse(f.sev));
     all.append(&mut singles);
-    let more = all.len().saturating_sub(MAX_STORED_FINDINGS);
-    all.truncate(MAX_STORED_FINDINGS);
-    (all, more)
+    all
 }
 
 /// The rules a trust entry must acknowledge for `report`: every combo and every HIGH.

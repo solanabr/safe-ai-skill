@@ -477,13 +477,13 @@ handled here. The tripwire denies Bash invocations of the hook subcommands and
 
 ### `verify`
 ```rust
-pub enum Severity { Low, Medium, High }            // v1 report severities (add / install / verify check)
+pub enum Severity { Low, Medium, High }            // provenance / osv.dev / .mcp.json report severities
 pub struct Finding { pub severity, pub kind, pub detail, pub path, pub line }
 pub struct Report { pub findings: Vec<Finding> }
 
 pub mod verify::rules;      // rule engine: scan_pack, scan_pack_until(deadline), grade, PackReport, ScanBudget
 pub mod verify::grading;    // re-exports the rules types the state machine reads
-pub mod verify::heuristics; // v1 compatibility view of rules (Report) for add / install / verify check
+pub mod verify::check;      // check_dir: one dir graded as the sweep's first sight + tier_action (verify check / add / install)
 pub mod verify::state;      // state v2: PackEntry, PackStatus {Clean, Warned, Unreviewed, Blocked}, tree_hash, stat_fingerprint
 pub mod verify::trust;      // trust.json by content hash
 pub mod verify::enforce;    // gate-time checks: skill_verdict, read_verdict, bash_verdict
@@ -553,7 +553,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 `gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `gate-skill` ·
 `gate-prompt-expansion` · `redact` · `prompt-guard` · `pending-notice` ·
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
-`install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
+`install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
 `tier [<name>] [--project] [--env-read deny|ask|tier] | --clear` (`mode` is a deprecated alias) · `revoke` · `status` · `--version`. `allow`, a tier lowering and
 `verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
@@ -569,7 +569,10 @@ installs each skill dir (a local tarball is extracted via `tar`); `--home <dir>`
 `SAFE_AI_SKILL_HOME` redirects the install root to `<dir>/.claude/skills` (sandboxable). With
 **no `--from`**, `install` runs **verify-in-place** over the current project's `.claude/skills`
 (scan + telemetry-neutralize + TOFU-pin, no copy) — the post-`install.sh` audit path. Never
-widens `settings.json`; a High finding holds the skill unless `--yes`.
+widens `settings.json`. Each skill dir goes through `verify::check::check_dir` (the sweep's
+first-sight grading at the current tier): clean is taken, warned (or unreviewed below High)
+needs `--yes`, and a pack the tier denies or any combination BLOCK (Off included) needs
+`--force`. A pack the project's `packs.lock` pins is not neutralized (`not_neutralized`).
 
 **`registry verify|list`.** Loads the project `skill-registry.json` (path from
 `policy.catalog.registry_path`) via `registry::Registry::load` and lists/audits entries with

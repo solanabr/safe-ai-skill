@@ -1,4 +1,4 @@
-//! Supply-chain verification: heuristics, provenance, osv.dev, state v2 and enforcement.
+//! Supply-chain verification: the rule engine, provenance, osv.dev, state v2 and enforcement.
 //!
 //! The intrinsic, registry-free pipeline. The SessionStart sweep ([`run_session`]) keys every
 //! pack by canonical path in [`state`], grades it through [`grading`], blocks on drift,
@@ -7,10 +7,10 @@
 //! Approvals and trust are prompt-nonce confirmed ([`request_approve`], [`request_trust`],
 //! [`apply_confirmed`]).
 
+pub mod check;
 pub mod enforce;
 pub mod gittracked;
 pub mod grading;
-pub mod heuristics;
 pub mod lockfile;
 pub mod osv;
 pub mod provenance;
@@ -110,8 +110,8 @@ impl Report {
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The pass/warn/block verdict the orchestrator derives from a [`Report`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The pass/warn/block verdict the orchestrator derives from a [`Report`], least strict first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verdict {
     /// No findings above Low — safe to pin and proceed.
     Pass,
@@ -139,19 +139,6 @@ pub fn verdict(report: &Report) -> Verdict {
         Some(Severity::Medium) => Verdict::Warn,
         _ => Verdict::Pass,
     }
-}
-
-/// Run the full intrinsic pipeline over an already-materialized skill/MCP directory.
-///
-/// Combines [`heuristics::scan`] over the directory with [`provenance::resolve`] of its
-/// `source` (when given). The osv.dev step is invoked by [`pipeline_npm`] for package
-/// sources; this directory pipeline is network-free and fully hermetic.
-pub fn pipeline_dir(dir: &Path, source: Option<&str>) -> Report {
-    let mut report = heuristics::scan(dir);
-    if let Some(src) = source {
-        report.merge(provenance::resolve(src));
-    }
-    report
 }
 
 /// Run the full intrinsic pipeline over an npm package source: provenance + osv.dev.
@@ -1361,6 +1348,8 @@ impl PackReportLine {
     fn label(&self) -> &'static str {
         match self.state {
             PackStatus::Blocked => "BLOCK",
+            // Only `verify check` lists a clean pack (for its INFO findings).
+            PackStatus::Clean => "INFO",
             _ => "WARN",
         }
     }
@@ -1386,6 +1375,38 @@ impl PackReportLine {
             Some(why) => format!("; not moved: {why}; denied in place"),
             None => String::new(),
         }
+    }
+
+    /// The pack's lines in the model's report: the pack, then up to `cap` findings at
+    /// `path:line` with their severity and context, then how many more there are.
+    fn model_lines(&self, cap: usize) -> Vec<String> {
+        let mut out = vec![format!(
+            " - {} {} `{}` ({}): {}{}",
+            self.label(),
+            self.kind.label(),
+            escape_for_report(&self.name),
+            escape_for_report(&self.display),
+            escape_detail(&self.why()),
+            self.move_note()
+        )];
+        for f in self.findings.iter().take(cap) {
+            out.push(format!(
+                "   - {} {} ({}, {})",
+                escape_for_report(&self.at(f)),
+                escape_for_report(&f.rule),
+                severity_word(f.sev),
+                ctx_word(f.ctx)
+            ));
+        }
+        let more = self
+            .findings
+            .len()
+            .saturating_sub(cap)
+            .saturating_add(self.more_findings);
+        if more > 0 {
+            out.push(format!("   - … {more} more"));
+        }
+        out
     }
 
     /// `<display>/<path>:<line>` of `finding`.
@@ -1685,32 +1706,7 @@ fn render_report(
         });
     }
     for l in lines {
-        let moved = l.move_note();
-        model.push(format!(
-            " - {} {} `{}` ({}): {}{moved}",
-            l.label(),
-            l.kind.label(),
-            escape_for_report(&l.name),
-            escape_for_report(&l.display),
-            escape_detail(&l.why())
-        ));
-        for f in l.findings.iter().take(MAX_FINDINGS_PER_PACK) {
-            model.push(format!(
-                "   - {} {} ({}, {})",
-                escape_for_report(&l.at(f)),
-                escape_for_report(&f.rule),
-                severity_word(f.sev),
-                ctx_word(f.ctx)
-            ));
-        }
-        let more = l
-            .findings
-            .len()
-            .saturating_sub(MAX_FINDINGS_PER_PACK)
-            .saturating_add(l.more_findings);
-        if more > 0 {
-            model.push(format!("   - … {more} more"));
-        }
+        model.extend(l.model_lines(MAX_FINDINGS_PER_PACK));
     }
     for m in mcp {
         model.push(format!(
@@ -4350,15 +4346,6 @@ mod orchestration_tests {
         apply_confirmed(&d, &confirm(&d, &req)).unwrap();
         let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
         assert_eq!(r.blocked, vec![".claude/skills/ext/cx".to_string()]);
-    }
-
-    #[test]
-    fn pipeline_dir_combines_heuristics_and_provenance() {
-        let dir = tempdir("pipe");
-        fs::write(dir.join("SKILL.md"), "# Clean skill\nNo danger.").unwrap();
-        let report = pipeline_dir(&dir, Some("https://github.com/acme/skill"));
-        assert!(report.findings.iter().any(|f| f.kind == "unpinned_ref"));
-        assert!(report.findings.iter().all(|f| f.severity != Severity::High));
     }
 
     #[test]

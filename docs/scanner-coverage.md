@@ -22,7 +22,8 @@ The pack grade (`rules::grade`) is decided as follows:
 * **warn**: the worst finding is WARN. **Findings in docs are capped at WARN**, because the runtime
   gates catch execution.
 * **high**: at least one code or meta finding at HIGH. A pack seen for the first time is recorded as
-  *unreviewed* and the user is warned. It is never blocked.
+  *unreviewed* and the user is warned. It is never a BLOCK, but tier `high` denies it until the
+  user trusts it.
 * **block**: only a combination rule fires. Drift against a pin or a committed `packs.lock` is
   decided by the verify state machine, not by the scanner.
 
@@ -104,7 +105,7 @@ The checklist from ai-kit's `docs/skill-packs.md` ("Non-official pack provenance
 | Invisible and bidirectional Unicode | `unicode_bidi`, `unicode_invisible` WARN / INFO; `unicode_tag` WARN. Emoji joiners, script joiners and a leading BOM are ignored. | Trojan Source review of flagged lines |
 | Symlinks (target, and whether it leaves the pack) | `symlink` INFO; combo `symlink_escape`. Links are never followed. | — |
 | Executables (`find -perm -u+x`, naming each) | `executable` INFO for each file with an exec bit; shebang and exec-bit files are scanned as code | **What each executable does** |
-| Every blob in full history | Not at SessionStart | **Manual**, or the hardened git reader planned for `verify add` |
+| Every blob in full history | Not at SessionStart | **Manual**, or the hardened git reader planned for `add` |
 | `hooks.json` | `harness_hooks` WARN (`hooks/`, `.claude-plugin/`, `.codex-plugin/`) | — |
 | `.claude/settings.json` | `harness_settings` WARN; combo `harness_bypass` | — |
 | `.mcp.json` | `mcp_config` INFO; `unpinned_npx` INFO for `@latest` / unpinned runners | Each connector's scope |
@@ -129,9 +130,22 @@ Beyond the checklist, the engine also covers:
 * **Unscanned tails:** `oversize_file`, HIGH for code past the 16 MiB scan cap.
 
 Lockfiles (by exact name, see [What is read](#what-is-read)) without an exec bit or shebang are
-dependency data. They are inventoried at `verify add|check`, not text-scanned.
-`build.rs`, proc-macro crates, `.cargo/config.toml`, `binding.gyp` and npm `hasInstallScript` are
-build-time execution, reported at `verify add|check`, not at SessionStart.
+dependency data and are skipped. Nothing inventories them yet, at SessionStart or in `verify
+check`, `add` or `install`. Build-time execution is not detected either: a `build.rs` or
+`.cargo/config.toml` inside the pack is text-scanned like any other file, but nothing flags it,
+proc-macro crates, `binding.gyp` or npm `hasInstallScript` as code that runs at build or install
+time. Only the pack's own `package.json` install hooks are flagged (`lifecycle_script`). Recording
+a pack's manifests and lockfiles and warning about build-time execution in its dependencies is
+planned for 1.2 (issue #11).
+
+`verify check <dir>`, `add <local dir>` and both `install` paths grade a directory the way the
+SessionStart sweep grades a pack it sees for the first time: the same rules and grade, the user's
+trust and the project's `packs.lock`, and the same action at the current tier (`verdict: block`
+only when the gates would deny the pack). They report every finding, INFO included, as `{rule,
+sev, path, line, ctx}` plus the sweep's report lines (the sweep itself lists WARN and above). A
+pack whose name walk passes the entry cap is unscanned for them too, and denied like a blocked
+one. `verify check` takes a directory, not a single file. Drift against a stored pin is the
+sweep's alone.
 
 ## Scan budget
 
@@ -176,8 +190,6 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
     verify check <dir>`" (`verify check` scans without a budget).
   * **Limit.** A pack whose hash or scan never fits its allowance stays unscanned, and so denied,
     until the user scans it with `verify check` and approves it (`verify approve`).
-  * The v1 compatibility view (`heuristics::scan_within`) reports a cut scan as incomplete rather
-    than as a finding.
 
 `tests/rules_perf.rs` replays the 23 performance probes from the round-2 review, at 16 MiB each in
 release builds and 256 KiB in debug builds. Each must return within the pack budget plus 3 s of
