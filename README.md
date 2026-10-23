@@ -260,10 +260,15 @@ then shows **you** a confirmation code in a hook message (right after the comman
 next prompt or session start) that is never put in the agent's context. The request takes
 effect only when your next prompt is exactly `safe-ai-skill confirm <code>`, on its own
 (within 10 minutes, once); Claude Code then shows what you approved. A confirm line inside
-pasted text is refused, and three wrong codes cancel every pending request. Nothing is announced or confirmed
-in a headless session (CI or a headless switch), in a non-interactive `claude -p`, or in a Claude Code
-session started from inside another one (an agent's nested `claude`): a code typed there changes nothing,
-and the request stays pending for your own interactive session. Raising the tier (or tightening `--env-read`) and `revoke` apply at
+pasted text is refused, and three wrong codes cancel the session's pending requests. A request belongs to
+one Claude Code session (the one whose agent ran the command, or, for a request made in your terminal, the
+first interactive session that shows its code): its code is shown and accepted only there (resuming keeps
+the session; `/clear` starts a new one). Nothing is announced or confirmed in a headless session (CI or a
+headless switch), in a non-interactive `claude -p`, in a Claude Code session started from inside another
+one (an agent's nested `claude`), or when the engine cannot read the process table to tell (a sandboxed
+process, native Windows): a code typed there changes nothing, you are told why, and the request stays
+pending for your own interactive terminal session. Hosts that run Claude Code in print mode (some desktop
+or IDE integrations) therefore cannot confirm; use a terminal session. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 
