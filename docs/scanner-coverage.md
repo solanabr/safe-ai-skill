@@ -129,9 +129,84 @@ Beyond the checklist, the engine also covers:
 * **Unscanned tails:** `oversize_file`, HIGH for code past the 16 MiB scan cap.
 
 Lockfiles (by exact name, see [What is read](#what-is-read)) without an exec bit or shebang are
-dependency data. They are inventoried at `verify add|check`, not text-scanned.
-`build.rs`, proc-macro crates, `.cargo/config.toml`, `binding.gyp` and npm `hasInstallScript` are
-build-time execution, reported at `verify add|check`, not at SessionStart.
+dependency data: they are not text-scanned, they are read by the dependency rules below.
+
+## Dependencies (issue #11)
+
+A pin says what the agent was handed. Building or installing a pack resolves a dependency graph
+nobody pinned, and installing a pack and *running* it are separate trust decisions. The `deps`
+rule family (`crates/engine/src/verify/rules/deps/`) reads the dependency files a pack ships and
+reports what they will cause a package manager to fetch and run. It runs on every pack scan:
+the SessionStart sweep, `verify check`, `add`, `install` and the on-the-spot scan at the Skill
+gate.
+
+**Boundary.** Static and offline. No network, no registry lookup, and no package manager is ever
+run (`cargo`, `npm`, `pip`, `uv`, `go` and `docker` never execute on a pack tree). The
+transitive graph is not resolved: a lockfile is read for what it records, not for what its
+packages contain, so a dependency's own `build.rs` or install script is visible only through
+what the lockfile says (`hasInstallScript`, `requiresBuild`). Nothing under `node_modules/` is
+analysed (it is installed output; its files are still text-scanned like any other). Advisory
+lookups (`osv-scanner`-style) and `cargo-vet` / `cargo-deny` audit records are not done (see
+Future work).
+
+| Rule | Severity | Fires on |
+|---|---|---|
+| `dep_manifest` | INFO | Each manifest or lockfile: `package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock(b)`, `Cargo.toml`, `Cargo.lock`, `requirements*.txt` / `constraints*.txt`, `pyproject.toml`, `setup.py`, `uv.lock`, `poetry.lock`, `go.mod`, `go.sum` and the other recognised lock names. |
+| `dep_build_script` | WARN | A `build.rs` next to a `Cargo.toml` with a `[package]` (or `package.build = "…"`, unless `build = false`); `[lib] proc-macro = true`; `binding.gyp`; `"gypfile": true`; a `setup.py` that does more than declare metadata (`cmdclass`, `ext_modules`, `subprocess`, `os.system`, network or decoder calls, `exec`/`eval`); an in-tree PEP 517 backend (`backend-path`). |
+| `dep_install_script` | WARN | npm lockfile entries with `hasInstallScript: true`, pnpm (≤ 8) `requiresBuild: true`, Yarn Berry `exec:` packages. The pack's own `package.json` lifecycle scripts stay `lifecycle_script` HIGH. |
+| `dep_install_scripts_unknown` | INFO | A lockfile format that does not record install scripts: Yarn (classic and Berry), pnpm 9, npm lockfile v1. |
+| `dep_lockfile_missing` | WARN | A manifest that declares dependencies with no lockfile in its directory or a parent directory inside the pack (workspaces): `package.json` without an npm, pnpm, Yarn or Bun lock; `Cargo.toml` without `Cargo.lock`; `pyproject.toml` without `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock` or `requirements.lock`; `go.mod` without `go.sum`. |
+| `dep_nonregistry_source` | WARN | Lockfile entries resolved from git, a tarball URL or a registry other than npmjs / yarnpkg, crates.io, PyPI; manifest dependencies on a URL or a commit-pinned git ref; Cargo `registry =`, `[patch]` / `[replace]`; pip `--index-url` / `--extra-index-url` / `--find-links` off PyPI and `--trusted-host`; Go `replace` to a non-local module. |
+| `dep_floating_source` | WARN | A git dependency with no full commit id: npm `github:o/r`, `o/r#main`, `git+…` without `#<sha>`; Cargo `git =` without `rev = <sha>`; pip / PEP 508 `git+…` without `@<sha>`; Poetry `{ git = … }` without a commit `rev`. |
+| `dep_unpinned` | WARN | A `requirements*.txt` line without an exact `==` / `===` pin. |
+| `dep_pm_config` | WARN | `.cargo/config(.toml)` keys that run another program or redirect sources (`rustc-wrapper`, `rustc-workspace-wrapper`, `rustc`, `rustdoc`, `linker`, `runner`, `replace-with`, `[alias]`); `.npmrc`, `.yarnrc(.yml)`, `pip.conf`, `.pypirc` keys such as `registry`, `@scope:registry`, `script-shell`, `node-options`, `yarnPath`, `plugins`, `index-url`. |
+| `dep_unanalysed` | WARN | A dependency file over 8 MiB, a lockfile that does not parse (including JSON nested past the parser's depth limit), or files past the 512-per-pack cap. |
+| `mcp_unpinned_launch` | WARN | A shipped MCP config (`.mcp.json`, `mcp.json`, `plugin.json`, `claude_desktop_config.json`) with a server whose launch floats: `npx` / `bunx` / `pnpm dlx` / `yarn dlx` / `npm exec` with no version, `@latest`, another dist-tag or a range, a git ref without a commit or a tarball URL; `uvx` / `uv tool run` / `uv run --with` / `pipx run` without an exact `==` (or `@`) version; `docker` / `podman run` with no tag or `:latest` and no `@sha256:` digest; `go run …@latest`; any `git+…` argument without a commit. Remote (`url`) servers are not judged. |
+
+Bounds: each dependency file is read once, capped at 8 MiB; at most 512 per pack; lockfile walks
+stop at 200,000 entries; the TOML reader keeps at most 100,000 entries and 64 KiB per gathered
+value; five findings per rule per file get a line. The pass shares the pack's scan deadline, so a
+pack whose deadline passes mid-way is `scan_budget_exceeded` like any other cut scan.
+
+**Per tier.** Every rule here is a heuristic, so none is above WARN: at every tier the pack is
+reported (SessionStart lists a newly warned pack once, `verify check` lists every finding) and
+nothing is denied or moved on these findings alone. Nothing denies at High either, on purpose:
+
+* Build- and install-time code is normal for real packs (`esbuild`, `sharp`, any crate with a
+  `build.rs`); denying it at High would deny most JavaScript and Rust packs without telling the
+  user anything a warning does not. The decision point is the build or install command, which is
+  where a future gate belongs (see Future work).
+* A floating MCP launch in a *shipped* config is inert while the pack sits in a skills dir, the
+  same as a shipped `hooks.json` (`harness_hooks`, WARN).
+* The project's own `.mcp.json` is launched by Claude Code before any hook runs, so a hook cannot
+  stop the fetch; denying the server's tool calls afterwards would only break the kit's servers,
+  which ai-kit keeps on `@latest` deliberately. Its floating launches are listed every session
+  (INFO, now including `uvx`, `pipx`, `docker` and git launches as well as `npx`) and a changed
+  launch is reported (below).
+
+**The dependency pin.** Next to each pack pin the sweep records a dependency fingerprint:
+SHA-256 over the pack's dependency files (the files above plus `build.rs`, package-manager and
+MCP configs) by path and content hash, in the authenticated `deps.json` in the data dir. The pack
+pin already covers every file, so a changed manifest or lockfile is drift and is denied below Off
+like any drift. What the fingerprint adds is the reason: while the pin stands, the report for a
+drifted pack names the dependency files that moved ("dependency set differs from the pin: added
+Cargo.lock, changed package-lock.json"). The fingerprint is re-recorded whenever the pin is (first
+sight, `verify approve`, `verify trust`). `verify check <dir>` prints the inventory and its
+fingerprint under `dependencies`. The project's `.mcp.json` has no pin; its servers' launch lines
+are recorded each session and a launch that changed since the last session (`pkg@1.2.0` to
+`pkg@latest`, a new server, a removed one) is reported once as INFO. A missing or tampered
+`deps.json` starts afresh: the detail is lost until the next pin, and drift still blocks through
+`state.json`.
+
+**Future work (not in this release).**
+
+* `verify deps --online`: an explicit, user-invoked mode that queries an advisory database
+  (osv.dev batch) for the lockfile's resolved versions. Out of scope for the offline engine.
+* Reading `~/.cargo/registry/src` for which crates in `Cargo.lock` have a `build.rs` or are
+  proc-macros, stored and warned on change (spec D7.2).
+* Detecting `cargo-vet` (`supply-chain/`) and `cargo-deny` (`deny.toml`) audit records.
+* A Bash-gate rule that treats `npm install` / `cargo build` / `pip install` run inside a pack
+  with build- or install-time findings as its own decision (ask at High).
 
 ## Scan budget
 

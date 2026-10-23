@@ -850,6 +850,7 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
                 "target": arg,
                 "verdict": verify::verdict(&report).label(),
                 "findings": report.findings,
+                "dependencies": verify::deppin::inventory_json(Path::new(arg)),
             }));
             ExitCode::SUCCESS
         }
