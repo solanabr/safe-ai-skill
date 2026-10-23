@@ -246,7 +246,7 @@ fn verify_check_lists_info_findings_and_errors_on_a_file() {
     std::fs::write(w.root.join(rel).join("SKILL.md"), "# mcp\n").unwrap();
     std::fs::write(
         w.root.join(rel).join(".mcp.json"),
-        r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@latest"]}}}"#,
+        r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@1.2.3"]}}}"#,
     )
     .unwrap();
     let v = w.check(rel, Tier::High);
@@ -260,7 +260,7 @@ fn verify_check_lists_info_findings_and_errors_on_a_file() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|f| f["sev"] == "info" && f["rule"] == "unpinned_npx"),
+            .any(|f| f["sev"] == "info" && f["rule"] == "mcp_config"),
         "{v}"
     );
     let run = Invocation::new(&["verify", "check", &format!("{rel}/SKILL.md")])
