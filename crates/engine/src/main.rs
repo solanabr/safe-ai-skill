@@ -941,7 +941,8 @@ fn grade_for_install(
     kept: &mut Vec<serde_json::Value>,
 ) -> Result<verify::check::Check, serde_json::Value> {
     let error = |e: String| serde_json::json!({ "skill": name, "error": e });
-    let pre = verify::check::check_dir(dir, name, ctx).map_err(error)?;
+    let history = verify::history::scan(dir);
+    let pre = verify::check::check_dir_with(dir, name, ctx, &history).map_err(error)?;
     flagged.extend(tagged_findings(name, &pre));
 
     let skill_md = dir.join("SKILL.md");
@@ -963,7 +964,7 @@ fn grade_for_install(
 
     // The verdict the install gate uses, on the neutralized content: a skill whose only danger
     // was the removed telemetry preamble installs cleanly.
-    let check = verify::check::check_dir(dir, name, ctx).map_err(error)?;
+    let check = verify::check::check_dir_with(dir, name, ctx, &history).map_err(error)?;
     if confirm.takes(&check) {
         return Ok(check);
     }

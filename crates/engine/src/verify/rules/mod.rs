@@ -34,6 +34,7 @@
 
 mod bang_cmd;
 mod binary_magic;
+mod blob;
 mod combo;
 mod context;
 mod description;
@@ -55,6 +56,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
+
+pub use blob::{is_code_path, scan_blob, BlobScan};
 
 use binary_magic::Content;
 use context::{Document, FileClass, Lang};
@@ -326,6 +329,9 @@ const RULES: &[RuleInfo] = &[
     RuleInfo { id: "frontmatter_anomaly", code: Severity::High, summary: "SKILL.md frontmatter that never closes or runs past 200 lines" },
     RuleInfo { id: "prompt_injection", code: Severity::Warn, summary: "prompt-injection phrasing (ignore previous instructions, hide from user)" },
     RuleInfo { id: "hidden_instruction", code: Severity::Warn, summary: "HTML comment carrying instructions or commands" },
+    // history (verify/history.rs, at `verify add|check`)
+    RuleInfo { id: "docs_commit_code", code: Severity::Warn, summary: "commit described as documentation that adds or changes executable files" },
+    RuleInfo { id: "history_unscanned", code: Severity::Warn, summary: "part of the pack's git history was not scanned (budget, size cap or unreadable objects)" },
 ];
 
 const COMBOS: &[(&str, &str)] = &[
@@ -373,6 +379,10 @@ const COMBOS: &[(&str, &str)] = &[
     (
         "registry_hijack",
         "rewrites a package registry to a non-default host",
+    ),
+    (
+        "docs_commit_sink",
+        "commit described as documentation that slips in code with an exec, network or secret signal",
     ),
 ];
 
@@ -872,10 +882,7 @@ fn scan_file(
     out.deadline = deadline;
     let executable = meta.map(is_executable).unwrap_or(false);
     let size = meta.map(|m| m.len()).unwrap_or(0);
-    if executable {
-        out.emit("executable", Severity::Info, None, Ctx::Meta);
-    }
-    let settings = harness_config::scan_path(rel, &mut out);
+    let settings = scan_name(rel, executable, &mut out);
 
     let mut file = match std::fs::File::open(abs) {
         Ok(f) => f,
@@ -900,7 +907,48 @@ fn scan_file(
     {
         return out;
     }
+    let body = FileBody {
+        buf,
+        content,
+        size,
+        cap,
+        executable,
+        settings,
+    };
+    scan_body(rel, &body, &mut out, facts);
+    out
+}
 
+/// Findings a file gets from its name and mode alone; true when it is a harness settings file.
+fn scan_name(rel: &Path, executable: bool, out: &mut FileOut) -> bool {
+    if executable {
+        out.emit("executable", Severity::Info, None, Ctx::Meta);
+    }
+    harness_config::scan_path(rel, out)
+}
+
+/// A text file's bytes, read after the sniff decided its content.
+struct FileBody<'a> {
+    /// Its first `cap` bytes.
+    buf: &'a [u8],
+    content: Content,
+    /// Its full length.
+    size: u64,
+    cap: u64,
+    executable: bool,
+    settings: bool,
+}
+
+/// Run the text rules over a file's bytes.
+fn scan_body(rel: &Path, body: &FileBody<'_>, out: &mut FileOut, facts: &mut PackFacts) {
+    let FileBody {
+        buf,
+        content,
+        size,
+        cap,
+        executable,
+        settings,
+    } = *body;
     let readings = decode(buf, content);
     let first_line = |text: &str| text.lines().next().unwrap_or("").to_string();
     let name = rel
@@ -910,7 +958,7 @@ fn scan_file(
     let shebang = readings.iter().any(|t| first_line(t).starts_with("#!"));
     if is_lockfile(&name) && !executable && !shebang {
         // Generated dependency data, never run. Not inventoried yet (issue #11, spec D7.2).
-        return out;
+        return;
     }
     for (k, text) in readings.iter().enumerate() {
         let class = context::classify(rel, &first_line(text), executable);
@@ -922,9 +970,8 @@ fn scan_file(
             }
         }
         let doc = Document::new(text, class);
-        scan_text(&doc, rel, settings, &mut out, facts);
+        scan_text(&doc, rel, settings, out, facts);
     }
-    out
 }
 
 /// Decode a text file into the readings to scan: UTF-8 (BOM dropped), NUL-stripped lossy UTF-8,

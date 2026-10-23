@@ -4,14 +4,15 @@
 //! The rule engine ([`grading::scan_pack`], no time budget) plus the sweep's symlink-escape
 //! combo and its unscanned marker (a name walk past its entry cap), then [`state::decide`] with
 //! no pin, the user's trust (by content hash) and the project's `packs.lock`, then
-//! [`super::tier_action`] at the resolved tier. The stored pin and drift stay the sweep's
-//! business: a check reports the content, not its history.
+//! [`super::tier_action`] at the resolved tier. The pack's own git history ([`history::scan`])
+//! is graded with the content here, never in the sweep. The stored pin and drift stay the
+//! sweep's business.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::state::{self, PackKind, PackStatus, Reason, StoredFinding};
-use super::{grading, trust, PackReportLine, Verdict};
+use super::{grading, history, trust, PackReportLine, Verdict};
 use crate::datadir::DataDir;
 use crate::gate;
 use crate::policy::tier::Tier;
@@ -68,8 +69,19 @@ pub struct Check {
     pub report: Vec<String>,
 }
 
-/// Grade the pack at `dir`, shown as `display`, at `ctx.tier`.
+/// Grade the pack at `dir`, shown as `display`, at `ctx.tier`, its git history included.
 pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check, String> {
+    check_dir_with(dir, display, ctx, &history::scan(dir))
+}
+
+/// [`check_dir`] with the history scan already made (`install` grades a directory twice, before
+/// and after neutralizing telemetry, and reads its history once).
+pub fn check_dir_with(
+    dir: &Path,
+    display: &str,
+    ctx: &CheckContext,
+    history: &history::HistoryReport,
+) -> Result<Check, String> {
     let canonical = dir
         .canonicalize()
         .map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -77,6 +89,7 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         return Err(format!("{} is not a skill pack directory", dir.display()));
     }
     let mut report = grading::scan_pack(&canonical);
+    merge_history(&mut report, history);
     let walked = state::skill_names_until(&canonical, None);
     let unscanned = walked.over_budget;
     if unscanned {
@@ -135,12 +148,7 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         display: display.to_string(),
         state: t.state,
         reason: t.reason,
-        note: unscanned.then(|| {
-            format!(
-                "not fully scanned: more than {} entries to walk",
-                state::MAX_NAME_WALK_ENTRIES
-            )
-        }),
+        note: note(unscanned, history),
         findings: findings.clone(),
         more_findings: 0,
         moved_to: None,
@@ -170,6 +178,39 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         findings,
         report: lines,
     })
+}
+
+/// Add the history findings to the checkout's report. `docs_commit_code` is report-only (INFO
+/// here: listed, never holding an install); `docs_commit_sink` is the blocking combo.
+fn merge_history(report: &mut grading::PackReport, history: &history::HistoryReport) {
+    report
+        .findings
+        .extend(history.report.findings.iter().cloned().map(|mut f| {
+            if f.rule == "docs_commit_code" {
+                f.sev = grading::Severity::Info;
+            }
+            f
+        }));
+    report.combos.extend(history.report.combos.iter().cloned());
+    report.capped.extend(history.report.capped.iter().cloned());
+}
+
+/// The report note: an over-budget name walk, and why part of the git history went unscanned.
+fn note(unscanned: bool, history: &history::HistoryReport) -> Option<String> {
+    let mut parts = Vec::new();
+    if unscanned {
+        parts.push(format!(
+            "not fully scanned: more than {} entries to walk",
+            state::MAX_NAME_WALK_ENTRIES
+        ));
+    }
+    if !history.unscanned.is_empty() {
+        parts.push(format!(
+            "git history not fully scanned: {}",
+            history.unscanned.join("; ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// An `ext/<name>` submodule or a skill dir, by the parent's name (labels only).
@@ -446,5 +487,44 @@ mod tests {
         let d = pack(&[("f.md", "x")]);
         assert!(check_dir(&d.0.join("nope"), "nope", &ctx(Tier::Medium)).is_err());
         assert!(check_dir(&d.0.join("f.md"), "f.md", &ctx(Tier::Medium)).is_err());
+    }
+
+    #[test]
+    fn history_findings_are_graded_with_the_content() {
+        let d = pack(&[("SKILL.md", "# x\n")]);
+        let finding = |rule: &'static str| grading::Finding {
+            rule,
+            sev: grading::Severity::Warn,
+            path: PathBuf::from("git:abc:x.ts"),
+            line: None,
+            ctx: grading::Ctx::Code,
+        };
+        let mut h = history::HistoryReport::default();
+        h.report.findings.push(finding("docs_commit_code"));
+        let c = check_dir_with(&d.0, "p", &ctx(Tier::High), &h).unwrap();
+        // Report-only: listed, never moves the pack off clean.
+        assert_eq!(c.state, PackStatus::Clean);
+        assert_eq!(c.verdict, Verdict::Pass);
+        assert!(c.findings.iter().any(|f| f.rule == "docs_commit_code"));
+
+        h.report.findings.push(finding("history_unscanned"));
+        h.unscanned.push("time budget spent".into());
+        let c = check_dir_with(&d.0, "p", &ctx(Tier::High), &h).unwrap();
+        assert_eq!(c.state, PackStatus::Warned);
+        assert!(
+            c.report.iter().any(|l| l.contains("time budget spent")),
+            "{:?}",
+            c.report
+        );
+
+        h.report.combos.push(grading::ComboHit {
+            rule: "docs_commit_sink",
+            path: PathBuf::from("git:abc:x.ts"),
+            line: None,
+            parts: vec!["docs_commit_code", "padding_sink"],
+        });
+        let c = check_dir_with(&d.0, "p", &ctx(Tier::Medium), &h).unwrap();
+        assert_eq!(c.state, PackStatus::Blocked);
+        assert_eq!(c.verdict, Verdict::Block);
     }
 }

@@ -23,8 +23,9 @@ All four must be green before a commit (`cargo clippy --all-targets -- -D warnin
 
 Dependencies (`Cargo.toml`): `serde 1`, `serde_json 1` (`float_roundtrip`), `serde_yaml 0.9`,
 `sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`), `rand_core
-0.6` (`getrandom`), `ureq 2` (`default-features = false, features = ["tls"]` → rustls), and
-`libc` on unix. No tokio, no async. A new dependency needs review (binary size, supply chain).
+0.6` (`getrandom`), `ureq 2` (`default-features = false, features = ["tls"]` → rustls),
+`miniz_oxide 0.8` (`with-alloc` only: zlib inflate for the git object reader), and `libc` on
+unix. No tokio, no async. A new dependency needs review (binary size, supply chain).
 
 ---
 
@@ -173,6 +174,7 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). A line joining two or more gated actions, or any hard-guard ask, is never grantable; a command over 256 KiB or with more than 2048 expansions asks unparsed. |
 | `gates/exfil.rs` | The call line for the naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`. Deferred (#19): it has no opinion in 1.1.0. Secret uploads by path are denied by `gates/secrets.rs` as reads. |
 | `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
+| `verify/gitobj.rs`, `verify/history.rs` | Read-only git object reader (loose objects, `.idx` v1/v2 + `.pack` v2/v3, OFS/REF deltas; no git process, `gitdir:`/`commondir` confined to the pack or its submodule dir, FIFO-safe opens) under a time/byte/object `Budget` that every tree walk charges, and the history scan `verify::check::check_dir` (`verify add|check`, `install`, once per directory via `check_dir_with`; never the sweep) runs over it: every blob through `rules::scan_blob` under each distinct name, docs-described commits that touch code (`docs_commit_code` report-only, combo `docs_commit_sink` on added lines), and `history_unscanned` for anything left unread. |
 
 **Invariants the tests pin:** every `deny` row holds at Off; no repo file, kit file or env variable lowers a tier or loosens `env_read`; a lowering is pending until a whole-prompt confirm; raising never prompts; High emits no `allow`; no tier emits `defer`; nothing moves by default; the exfil host list never shrinks below the shared file; the embedded lists equal `policy/shared/*` byte for byte; headless never yields `ask`; the kit's `.safe-ai-skill/policy.yaml` loads unchanged. The conformance corpus is `policy/shared/corpus/*.jsonl`, run by `tests/shared_corpus.rs` (plugin column under `--features test-hooks`; rows the shipped engine answers differently from the end state carry `interim.plugin` and a reason). `tests/tiers_matrix.rs` runs the per-tier brief rows through the `hooks.json` entries, and `tests/readme_tier_table.rs` pins the README table to `GATE_TABLE`.
 

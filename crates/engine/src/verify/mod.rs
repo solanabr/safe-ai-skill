@@ -9,8 +9,10 @@
 
 pub mod check;
 pub mod enforce;
+pub mod gitobj;
 pub mod gittracked;
 pub mod grading;
+pub mod history;
 pub mod lockfile;
 pub mod osv;
 pub mod provenance;
