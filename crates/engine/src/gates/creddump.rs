@@ -10,7 +10,7 @@
 //! 2. **Any word that names a credential path**, in any command, whatever the program: `vim
 //!    ~/.aws/credentials`, `gpg -d ~/.password-store/x.gpg`, `tar cz ~/.aws`, `python3 x.py
 //!    ~/.npmrc`, `ln ~/.aws/credentials k`. A word is a path candidate after `~`/`$HOME`/
-//!    `${HOME…}`/`$USERPROFILE` expansion, splitting at `=` and `:` (`--file=~/.npmrc`,
+//!    `${HOME…}`/`$USERPROFILE`/`$CLAUDE_CONFIG_DIR` expansion, splitting at `=` and `:` (`--file=~/.npmrc`,
 //!    `-v ~/.aws:/root/.aws`), brace expansion, and joining to every effective cwd (the hook's
 //!    and each `cd`/`pushd` target seen so far). It is judged lexically, as a shell pattern
 //!    ([`credpaths::is_credential_glob`]), and after symlink resolution where the file exists;
@@ -851,9 +851,11 @@ fn track_cd(cmd: &SimpleCommand, cwds: &mut Vec<PathBuf>) {
 }
 
 /// `~`, `$HOME`, `${HOME…}`, `$USERPROFILE`, `%USERPROFILE%` at the start of `word` or after
-/// `=`/`:` become the home directories; `None` entries of unknown variables drop the word.
+/// `=`/`:` become the home directories, `$CLAUDE_CONFIG_DIR` / `${CLAUDE_CONFIG_DIR…}` the
+/// hook's config dir ([`crate::gates::secretpath::expand_config_dir_var`]); a word with any other variable
+/// is dropped.
 fn expand_vars(word: &str) -> Vec<String> {
-    let mut text = word.to_string();
+    let mut text = crate::gates::secretpath::expand_config_dir_var(word);
     for name in ["HOME", "USERPROFILE"] {
         while let Some(i) = text.find(&format!("${{{name}")) {
             let Some(len) = text[i..].find('}') else {

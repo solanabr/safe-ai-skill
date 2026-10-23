@@ -475,9 +475,9 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     }
 
     let exclusion = if keep_env {
-        grep_exclusion_keeping_env(&real)
+        grep_exclusion_keeping_env(&real, &target)
     } else {
-        grep_exclusion(&real)
+        grep_exclusion_as(&real, &target)
     };
     let new_glob = if glob.trim().is_empty() {
         exclusion
@@ -492,7 +492,12 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
 /// The ` !{…}` negated brace group appended to a Grep's glob over `dir`
 /// ([`credpaths::grep_exclusions`]).
 pub fn grep_exclusion(dir: &Path) -> String {
-    let alts: Vec<String> = credpaths::grep_exclusions(dir)
+    grep_exclusion_as(dir, dir)
+}
+
+/// [`grep_exclusion`] for the canonical root `dir` named `given` in the Grep.
+fn grep_exclusion_as(dir: &Path, given: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions_as(dir, given)
         .iter()
         .map(|g| case_insensitive(g))
         .collect();
@@ -500,8 +505,8 @@ pub fn grep_exclusion(dir: &Path) -> String {
 }
 
 /// [`grep_exclusion`] without the env-file globs, for an opted-in env Grep.
-fn grep_exclusion_keeping_env(dir: &Path) -> String {
-    let alts: Vec<String> = credpaths::grep_exclusions(dir)
+fn grep_exclusion_keeping_env(dir: &Path, given: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions_as(dir, given)
         .iter()
         .filter(|g| {
             let last = g.rsplit('/').next().unwrap_or(g);
