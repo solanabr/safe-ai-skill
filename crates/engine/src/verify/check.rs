@@ -361,7 +361,7 @@ mod tests {
             ("SKILL.md", "# x\n"),
             (
                 ".mcp.json",
-                r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@latest"]}}}"#,
+                r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@1.2.3"]}}}"#,
             ),
         ]);
         let c = check_dir(&d.0, "p", &ctx(Tier::High)).unwrap();

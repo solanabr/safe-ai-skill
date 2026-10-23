@@ -8,6 +8,7 @@
 //! [`apply_confirmed`]).
 
 pub mod check;
+pub mod deppin;
 pub mod enforce;
 pub mod gitobj;
 pub mod gittracked;
@@ -334,7 +335,10 @@ fn unpinned_mcp_servers(body: &str) -> Vec<UnpinnedMcp> {
             }
         }
         let lower = joined.to_lowercase();
-        if lower.contains("@latest") || unpinned_npx_spec(&lower) {
+        if lower.contains("@latest")
+            || unpinned_npx_spec(&lower)
+            || rules::deps::launch::floating_cfg(cfg).is_some()
+        {
             let spec = joined.trim().to_string();
             let finding = Finding::new(
                 Severity::Low,
@@ -1496,6 +1500,7 @@ fn sweep_within(
     let mut swept_keys: Vec<String> = Vec::new();
 
     let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
+    let mut dep_pins = deppin::Pins::load(dir);
     let scan_until = std::time::Instant::now() + budget;
     st.sweeps = st.sweeps.saturating_add(1);
     // Fingerprint-matched packs, with the content hash their fingerprint vouches for and the
@@ -1589,6 +1594,7 @@ fn sweep_within(
         let Some(entry) = st.packs.get_mut(&ev.key) else {
             continue;
         };
+        dep_pins.observe(&pack.canonical, entry, Some(scan_until));
         if enforce::high_pending(entry, &env.trust) {
             high_denied.push(pack.display.clone());
         }
@@ -1659,6 +1665,7 @@ fn sweep_within(
             high_denied: &high_denied,
         },
     );
+    dep_pins.finish(dir, project_dir, &mut result);
     result
 }
 

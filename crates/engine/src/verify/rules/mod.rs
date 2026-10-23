@@ -37,6 +37,7 @@ mod binary_magic;
 mod blob;
 mod combo;
 mod context;
+pub mod deps;
 mod description;
 mod exec_sinks;
 mod harness_config;
@@ -248,6 +249,7 @@ pub fn grade(report: &PackReport) -> Grade {
 pub fn describe(id: &str) -> &'static str {
     RULES
         .iter()
+        .chain(deps::RULES)
         .find(|r| r.id == id)
         .map(|r| r.summary)
         .or_else(|| COMBOS.iter().find(|(c, _)| *c == id).map(|(_, s)| *s))
@@ -256,7 +258,11 @@ pub fn describe(id: &str) -> &'static str {
 
 /// Severity a rule carries in code/meta context (before any doc cap).
 pub(crate) fn code_severity(id: &str) -> Option<Severity> {
-    RULES.iter().find(|r| r.id == id).map(|r| r.code)
+    RULES
+        .iter()
+        .chain(deps::RULES)
+        .find(|r| r.id == id)
+        .map(|r| r.code)
 }
 
 /// Static description of one rule id.
@@ -812,6 +818,9 @@ fn scan_pack_inner(root: &Path, cap: u64, deadline: Option<Instant>) -> PackRepo
             }
         }
     }
+    if exceeded.is_none() {
+        exceeded = deps::scan(base, &facts.files, cap, deadline, &mut outs);
+    }
     if let Some(path) = exceeded {
         let mut out = FileOut::new(&path);
         out.emit("scan_budget_exceeded", Severity::High, None, Ctx::Meta);
@@ -957,7 +966,7 @@ fn scan_body(rel: &Path, body: &FileBody<'_>, out: &mut FileOut, facts: &mut Pac
         .unwrap_or_default();
     let shebang = readings.iter().any(|t| first_line(t).starts_with("#!"));
     if is_lockfile(&name) && !executable && !shebang {
-        // Generated dependency data, never run. Not inventoried yet (issue #11, spec D7.2).
+        // Generated dependency data: read by the `deps` family (spec D7.2), not text-scanned.
         return;
     }
     for (k, text) in readings.iter().enumerate() {
@@ -1572,7 +1581,9 @@ mod tests {
         );
         let r = pack.scan();
         assert!(
-            r.findings.iter().all(|f| f.path != Path::new("uv.lock")),
+            r.findings
+                .iter()
+                .all(|f| f.path != Path::new("uv.lock") || f.rule.starts_with("dep_")),
             "{r:?}"
         );
         assert!(has(&r, "download_and_run"), "{r:?}");

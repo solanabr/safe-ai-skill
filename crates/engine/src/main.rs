@@ -866,6 +866,7 @@ fn cmd_verify_check(target: &str) -> ExitCode {
                 "verdict": check.verdict.label(),
                 "findings": check.findings,
                 "report": check.report,
+                "dependencies": verify::deppin::inventory_json(Path::new(target)),
             }));
             ExitCode::SUCCESS
         }
