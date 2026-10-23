@@ -282,8 +282,8 @@ fn redact_clean_output_is_noop() {
 
 #[test]
 fn prompt_with_seed_phrase_blocks() {
-    let prompt = "here is my seed phrase: legal winner thank year wave sausage worth \
-                  useful legal winner thank yellow";
+    let prompt = "here is my seed phrase: session twin stem shop glass chat dune \
+                  switch upset such noble wave";
     let data = TempDir::new("pg-data");
     let body = serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
@@ -365,7 +365,7 @@ fn scanner_triggers() -> [(&'static str, String); 2] {
         ),
         (
             "prompt-guard",
-            r#""prompt":"here is my seed phrase: legal winner thank year wave sausage worth useful legal winner thank yellow""#
+            r#""prompt":"here is my seed phrase: session twin stem shop glass chat dune switch upset such noble wave""#
                 .to_string(),
         ),
     ]

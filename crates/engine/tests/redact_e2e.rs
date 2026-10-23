@@ -35,20 +35,24 @@ fn keypair_array() -> String {
 /// holding the shim and this build's engine, stamped like a release.
 struct World {
     root: TempDir,
+    env: Vec<(String, String)>,
 }
 
 impl World {
     fn new() -> Self {
+        Self::with_env(&format!("HELIUS_API_KEY={ENV_VALUE}\nCLUSTER=devnet\n"))
+    }
+
+    fn with_env(dotenv: &str) -> Self {
         let root = TempDir::new("redact-e2e");
         for d in ["proj", "home/.claude", "data", "plugin/bin"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-        std::fs::write(
-            root.join("proj/.env"),
-            format!("HELIUS_API_KEY={ENV_VALUE}\nCLUSTER=devnet\n"),
-        )
-        .unwrap();
-        let w = World { root };
+        std::fs::write(root.join("proj/.env"), dotenv).unwrap();
+        let w = World {
+            root,
+            env: Vec::new(),
+        };
         #[cfg(unix)]
         w.stage_shim();
         w
@@ -111,6 +115,7 @@ impl World {
             .env("HOME", &home)
             .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
             .env("CLAUDE_PLUGIN_DATA", self.root.join("data"))
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -136,17 +141,29 @@ impl World {
         (String::from_utf8(out.stdout).unwrap(), out.status.code())
     }
 
-    /// Run `payload` through the engine and (on unix) the shim; both must print `expected`
-    /// byte for byte and exit 0.
-    fn assert_redact(&self, payload: &Value, expected: &str) {
-        let mut programs = vec![PathBuf::from(bin())];
+    /// Run `payload` through the engine and (on unix) the shim: both exit 0 and print the
+    /// same bytes, which are returned.
+    fn output(&self, payload: &Value) -> String {
+        let (engine, code) = self.run(Path::new(bin()), payload);
+        assert_eq!(code, Some(0), "engine");
         if cfg!(unix) {
-            programs.push(self.root.join("plugin/bin/safe-ai-skill"));
+            let (shim, code) = self.run(&self.root.join("plugin/bin/safe-ai-skill"), payload);
+            assert_eq!(code, Some(0), "shim");
+            assert_eq!(shim, engine, "shim and engine differ");
         }
-        for program in programs {
-            let (stdout, code) = self.run(&program, payload);
-            assert_eq!(code, Some(0), "{}", program.display());
-            assert_eq!(stdout, expected, "{}", program.display());
+        engine
+    }
+
+    /// [`World::output`] parses to `expected` (`None`: no output, no change).
+    fn assert_redact(&self, payload: &Value, expected: Option<Value>) {
+        let out = self.output(payload);
+        match expected {
+            None => assert_eq!(out, "", "expected no change"),
+            Some(v) => {
+                let got: Value =
+                    serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+                assert_eq!(got, v);
+            }
         }
     }
 
@@ -167,9 +184,10 @@ impl World {
     }
 }
 
-fn updated(output: Value) -> String {
-    json!({ "hookSpecificOutput": { "hookEventName": "PostToolUse", "updatedToolOutput": output } })
-        .to_string()
+fn updated(output: Value) -> Option<Value> {
+    Some(
+        json!({ "hookSpecificOutput": { "hookEventName": "PostToolUse", "updatedToolOutput": output } }),
+    )
 }
 
 #[test]
@@ -184,9 +202,17 @@ fn bash_issue_payload_is_redacted_in_place() {
         json!({ "command": "env", "description": "Print environment" }),
         json!({ "stdout": stdout, "stderr": "", "interrupted": false, "isImage": false }),
     );
-    w.assert_redact(
-        &payload,
-        r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"interrupted":false,"isImage":false,"stderr":"","stdout":"PATH=/usr/bin\nPRIVATE_KEY=***REDACTED:base58_secret_key***\nHELIUS_API_KEY=***REDACTED:api_key***\n"}}}"#,
+    let expected = updated(json!({
+        "interrupted": false,
+        "isImage": false,
+        "stderr": "",
+        "stdout": "PATH=/usr/bin\nPRIVATE_KEY=***REDACTED:base58_secret_key***\nHELIUS_API_KEY=***REDACTED:api_key***\n"
+    }));
+    w.assert_redact(&payload, expected);
+    // The exact bytes too (one line of JSON; serde_json's default sorted keys).
+    assert_eq!(
+        w.output(&payload),
+        r#"{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":{"interrupted":false,"isImage":false,"stderr":"","stdout":"PATH=/usr/bin\nPRIVATE_KEY=***REDACTED:base58_secret_key***\nHELIUS_API_KEY=***REDACTED:api_key***\n"}}}"#
     );
 }
 
@@ -211,7 +237,7 @@ fn bash_every_pattern_class_and_env_value_in_stdout_and_stderr() {
     );
     w.assert_redact(
         &payload,
-        &updated(json!({
+        updated(json!({
             "interrupted": false,
             "isImage": false,
             "stderr": "warn: using «redacted:HELIUS_API_KEY»\n",
@@ -233,7 +259,7 @@ fn bash_image_result_keeps_stdout_and_scrubs_stderr() {
     );
     w.assert_redact(
         &payload,
-        &updated(json!({
+        updated(json!({
             "interrupted": false,
             "isImage": true,
             "stderr": "key «redacted:HELIUS_API_KEY»",
@@ -260,7 +286,7 @@ fn read_text_result_is_redacted_in_place() {
     );
     w.assert_redact(
         &payload,
-        &updated(json!({
+        updated(json!({
             "type": "text",
             "file": {
                 "filePath": file,
@@ -288,17 +314,17 @@ fn mcp_results_are_redacted_in_every_shape() {
     // Content blocks.
     w.assert_redact(
         &mcp(json!([{ "type": "text", "text": format!("api key {ENV_VALUE}, token {GHP}") }])),
-        &updated(json!([{ "type": "text", "text": "api key «redacted:HELIUS_API_KEY», token ***REDACTED:api_key***" }])),
+        updated(json!([{ "type": "text", "text": "api key «redacted:HELIUS_API_KEY», token ***REDACTED:api_key***" }])),
     );
     // Plain string.
     w.assert_redact(
         &mcp(json!(format!("secret {}", base58_secret()))),
-        &updated(json!("secret ***REDACTED:base58_secret_key***")),
+        updated(json!("secret ***REDACTED:base58_secret_key***")),
     );
     // Object with structured content.
     w.assert_redact(
         &mcp(json!({ "structuredContent": { "owner": "11111111111111111111111111111111", "jwt": JWT } })),
-        &updated(json!({ "structuredContent": { "owner": "11111111111111111111111111111111", "jwt": "***REDACTED:jwt***" } })),
+        updated(json!({ "structuredContent": { "owner": "11111111111111111111111111111111", "jwt": "***REDACTED:jwt***" } })),
     );
 }
 
@@ -311,14 +337,14 @@ fn clean_results_and_payloads_without_tool_response_print_nothing() {
             json!({ "command": "solana balance" }),
             json!({ "stdout": "1.5 SOL\n", "stderr": "", "interrupted": false, "isImage": false }),
         ),
-        "",
+        None,
     );
     // `tool_output` is not a Claude Code field (the hooks reference names only
     // `tool_response`): a payload carrying only it has nothing to redact.
     let mut legacy = w.payload("Bash", json!({ "command": "env" }), Value::Null);
     legacy.as_object_mut().unwrap().remove("tool_response");
     legacy["tool_output"] = json!(format!("HELIUS_API_KEY={UUID}"));
-    w.assert_redact(&legacy, "");
+    w.assert_redact(&legacy, None);
 }
 
 #[test]
@@ -336,7 +362,7 @@ fn bare_and_keygen_seed_phrases_are_redacted() {
     );
     w.assert_redact(
         &payload,
-        &updated(json!({
+        updated(json!({
             "interrupted": false,
             "isImage": false,
             "stderr": "***REDACTED:seed_phrase***",
@@ -344,4 +370,134 @@ fn bare_and_keygen_seed_phrases_are_redacted() {
                        Save this seed phrase to recover your new keypair:\n***REDACTED:seed_phrase***\n====\n"
         })),
     );
+}
+
+#[test]
+fn grep_content_result_is_redacted_in_place() {
+    let w = World::new();
+    let payload = w.payload(
+        "Grep",
+        json!({ "pattern": "KEY", "path": w.proj(), "output_mode": "content" }),
+        json!({
+            "mode": "content",
+            "numFiles": 2,
+            "filenames": [],
+            "content": format!("src/cfg.ts:3:const key = \"{ENV_VALUE}\"\nlog.txt:9:jwt {JWT}"),
+            "numLines": 2
+        }),
+    );
+    w.assert_redact(
+        &payload,
+        updated(json!({
+            "mode": "content",
+            "numFiles": 2,
+            "filenames": [],
+            "content": "src/cfg.ts:3:const key = \"«redacted:HELIUS_API_KEY»\"\nlog.txt:9:jwt ***REDACTED:jwt***",
+            "numLines": 2
+        })),
+    );
+}
+
+/// The opted-in raw `.env` Read (D8 v2 §2) comes back unchanged through the shim; without the
+/// opt-in the same response is value-scrubbed.
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[test]
+fn opted_in_env_read_is_not_rewritten_through_the_shim() {
+    use safe_ai_skill::policy::tier::{EnvRead, Tier};
+    let dotenv = format!("HELIUS_KEY={ENV_VALUE}\nCLUSTER=devnet\n");
+    let mut w = World::with_env(&dotenv);
+    let file = w.proj().join(".env").to_string_lossy().into_owned();
+    let payload = w.payload(
+        "Read",
+        json!({ "file_path": file }),
+        json!({
+            "type": "text",
+            "file": { "filePath": file, "content": dotenv, "numLines": 2, "startLine": 1, "totalLines": 2 }
+        }),
+    );
+    let scrubbed = updated(json!({
+        "type": "text",
+        "file": {
+            "filePath": file,
+            "content": "HELIUS_KEY=«redacted:HELIUS_KEY»\nCLUSTER=devnet\n",
+            "numLines": 2,
+            "startLine": 1,
+            "totalLines": 2
+        }
+    }));
+    w.assert_redact(&payload, scrubbed.clone());
+    let data = safe_ai_skill::datadir::DataDir {
+        path: w.root.join("data"),
+        trusted: true,
+    };
+    let change = safe_ai_skill::tierstate::Change {
+        project: None,
+        tier: Some(Tier::Relaxed),
+        env_read: Some(EnvRead::Tier),
+        clear: false,
+    };
+    safe_ai_skill::tierstate::apply(&data, &change, 0).unwrap();
+    w.env = vec![
+        (
+            safe_ai_skill::datadir::TEST_TRUST_ENV.to_string(),
+            "1".to_string(),
+        ),
+        (
+            safe_ai_skill::sandbox::TEST_OVERRIDE_ENV.to_string(),
+            "on".to_string(),
+        ),
+    ];
+    w.assert_redact(&payload, None);
+    // Sandbox off: the opt-in is suspended and the response is scrubbed again.
+    w.env[1].1 = "off".to_string();
+    w.assert_redact(&payload, scrubbed);
+}
+
+/// The PostToolUse `redact` matcher in hooks.json (a JavaScript regex: it holds `.`/`*`, per
+/// the hooks reference "Matcher patterns") matches every tool these payloads name.
+#[test]
+fn hooks_json_redact_matcher_covers_the_tested_tools() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/safe-ai-skill/hooks/hooks.json");
+    let hooks: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let entry = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["hooks"].as_array().unwrap().iter().any(|h| {
+                h["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(" redact")
+            })
+        })
+        .expect("a PostToolUse redact hook");
+    let matcher = entry["matcher"].as_str().unwrap();
+    // Alternatives of literal names and `prefix.*`: evaluate them as the unanchored regex does.
+    assert!(
+        matcher
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_|.*".contains(&b)),
+        "matcher {matcher} needs a real regex evaluator"
+    );
+    let matches = |tool: &str| {
+        matcher.split('|').any(|alt| match alt.strip_suffix(".*") {
+            Some(prefix) => tool.contains(prefix),
+            None => !alt.contains(['.', '*']) && tool.contains(alt),
+        })
+    };
+    for tool in [
+        "Bash",
+        "Read",
+        "Grep",
+        "mcp__helius__getAccountInfo",
+        "mcp__plugin_kit_ctx__run",
+    ] {
+        assert!(matches(tool), "{matcher} misses {tool}");
+    }
+    for h in entry["hooks"].as_array().unwrap() {
+        assert_eq!(h["onFailure"], "continue");
+        assert!(h["timeout"].as_u64().is_some_and(|t| t >= 10));
+    }
 }

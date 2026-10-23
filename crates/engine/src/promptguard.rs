@@ -6,9 +6,10 @@
 //! out of the model.
 //!
 //! The detectors are shared with [`crate::redact`] (the keypair-array, 64-byte base58
-//! secret-key, and seed-phrase scanners) per the no-new-shared-module constraint.
+//! secret-key, and seed-phrase scanners). The published BIP-39 test vectors
+//! ([`crate::bip39::TEST_VECTORS`]) are not blocked: they are public test data.
 
-use crate::redact;
+use crate::{bip39, redact};
 
 /// Inspect a user prompt for raw secrets.
 ///
@@ -24,7 +25,14 @@ pub fn check(prompt: &str) -> Option<String> {
         );
     }
 
-    if redact::find_seed_phrase(prompt).is_some() {
+    let phrase = redact::find_seed_phrases(prompt)
+        .into_iter()
+        .any(|(start, end)| {
+            prompt
+                .get(start..end)
+                .is_some_and(|p| !bip39::is_test_vector(p))
+        });
+    if phrase {
         return Some(
             "Prompt blocked: it contains what looks like a BIP-39 seed phrase. The secret \
              was kept out of the model context — never paste a recovery phrase."
@@ -64,11 +72,24 @@ mod tests {
 
     #[test]
     fn bare_checksum_valid_seed_phrase_blocks() {
-        let prompt =
-            "import scheme spot photo card baby mountain device kick cradle pact join borrow";
+        let prompt = "import session twin stem shop glass chat dune switch upset such noble wave";
         assert!(check(prompt).is_some());
-        let prompt = "import scheme spot photo card baby mountain device kick cradle pact join zoo";
+        let prompt = "import session twin stem shop glass chat dune switch upset such noble zoo";
         assert!(check(prompt).is_none(), "checksum fails, no keyword");
+    }
+
+    #[test]
+    fn published_test_vectors_are_not_blocked() {
+        for vector in crate::bip39::TEST_VECTORS {
+            assert!(check(vector).is_none(), "{vector}");
+            assert!(check(&format!("add a test with the mnemonic \"{vector}\"")).is_none());
+            assert!(check(&format!("seed phrase: {vector}")).is_none());
+        }
+        // One word changed, or extra words in the span: blocked.
+        let edited = crate::bip39::TEST_VECTORS[15].replace("borrow", "zoo");
+        assert!(check(&format!("seed phrase: {edited}")).is_some());
+        let longer = format!("seed phrase: {} sock", crate::bip39::TEST_VECTORS[1]);
+        assert!(check(&longer).is_some());
     }
 
     #[test]

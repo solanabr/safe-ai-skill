@@ -49,6 +49,7 @@ pub mod registry;
 pub mod relax;
 pub mod rugcheck;
 pub mod sandbox;
+pub mod seedphrase;
 pub mod session;
 pub mod spend;
 pub mod squads;

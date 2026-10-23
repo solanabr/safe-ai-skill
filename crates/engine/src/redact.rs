@@ -2,9 +2,8 @@
 //!
 //! Scans tool output for high-signal secrets and replaces each match with a
 //! `***REDACTED:<kind>***` marker. This module also hosts the shared secret
-//! *detectors* (`find_keypair_array`, `is_base58_secret_key`, `find_seed_phrase`)
-//! reused by [`crate::promptguard`] — kept here rather than in a separate module per
-//! the architecture's no-new-module constraint.
+//! *detectors* (`find_keypair_array`, `is_base58_secret_key`, `find_seed_phrases`, the last
+//! backed by [`crate::seedphrase`]) reused by [`crate::promptguard`].
 //!
 //! Everything is pure in-memory byte/char scanning with no compiled-regex dependency,
 //! so it stays cheap enough to run on every tool output.
@@ -25,12 +24,12 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::bip39;
 use crate::env::values::KnownValue;
 use crate::gates::read::{self, ReadVerdict};
 use crate::gates::secretpath::{self, Class};
 use crate::io::{Decision, HookInput};
 use crate::policy::Policy;
+use crate::seedphrase;
 
 /// Largest PostToolUse payload the redact hook parses (8 MiB). Larger payloads pass unscanned.
 pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -301,8 +300,8 @@ struct Span {
 /// text is unchanged (no `updatedToolOutput` is emitted). Detected classes:
 /// - Solana keypair JSON byte arrays (`[12,34,...]` of 32 or 64 ints in `0..=255`).
 /// - 64-byte base58 secret keys, plus `"secretKey"`/`"privateKey"` JSON field values.
-/// - BIP-39 seed phrases ([`find_seed_phrases`]: a checksum-valid run of wordlist words, or
-///   any run of 12+ wordlist words when a mnemonic/seed/phrase/recovery/secret keyword is near).
+/// - BIP-39 seed phrases ([`crate::seedphrase`]: checksum-valid runs of wordlist words, and
+///   phrase-shaped runs when a mnemonic/seed/phrase/recovery/secret keyword is in the string).
 /// - Common API-key shapes (`*_API_KEY=`, `PRIVATE_KEY=`, `sk-…`, `eyJ…` JWTs).
 /// - PEM / OpenSSH private-key blocks (`-----BEGIN … PRIVATE KEY-----` through its `END` line).
 /// - Vendor tokens ([`API_TOKEN_PREFIXES`]: GitHub, AWS, Slack, Google, Stripe, OpenAI).
@@ -388,132 +387,9 @@ pub(crate) fn is_base58_secret_key(s: &str) -> bool {
     matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 64)
 }
 
-/// Most BIP-39 checksums one text gets tested for. Past it, a run without a keyword in the
-/// text is left alone (bounded work on adversarial outputs of many short runs).
-const MAX_CHECKSUM_TESTS: usize = 65_536;
-
-/// Words that make any run of 12+ wordlist words a seed phrase, checksum or not.
-const SEED_KEYWORDS: [&str; 5] = ["mnemonic", "seed", "phrase", "recovery", "secret"];
-
-/// The first seed phrase [`find_seed_phrases`] finds in `text`, as a `[start, end)` byte range.
-pub(crate) fn find_seed_phrase(text: &str) -> Option<(usize, usize)> {
-    find_seed_phrases(text).into_iter().next()
-}
-
-/// Every BIP-39 seed phrase in `text`, as `[start, end)` byte ranges in order.
-///
-/// A word is a maximal run of ASCII letters that is in the BIP-39 English list, in any case;
-/// a run is consecutive words separated by whitespace only, as long as it goes. A run, or one
-/// line of a run, of exactly 12, 15, 18, 21 or 24 words whose BIP-39 checksum validates is a
-/// phrase. Windows inside a longer run are not tested: each has a 1/16 (12 words) to 1/256
-/// (24 words) chance of validating, so a long run of list words would almost always hold one. When `text` also contains a keyword ([`SEED_KEYWORDS`], any
-/// case), every run of 12 or more words is a phrase as a whole, checksum or not. At most
-/// [`MAX_CHECKSUM_TESTS`] checksums are tested per text.
+/// Every seed phrase in `text` ([`crate::seedphrase::find`]).
 pub(crate) fn find_seed_phrases(text: &str) -> Vec<(usize, usize)> {
-    let mut scan = SeedScan {
-        text: text.as_bytes(),
-        spans: Vec::new(),
-        positions: Vec::new(),
-        indices: Vec::new(),
-        budget: MAX_CHECKSUM_TESTS,
-        keyword: None,
-    };
-    let bytes = text.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii_alphabetic() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-            i += 1;
-        }
-        let joined = scan.positions.last().is_some_and(|&(_, end)| {
-            bytes
-                .get(end..start)
-                .is_some_and(|gap| gap.iter().all(u8::is_ascii_whitespace))
-        });
-        if !joined {
-            scan.flush();
-        }
-        match text.get(start..i).and_then(bip39::index) {
-            Some(idx) => {
-                scan.positions.push((start, i));
-                scan.indices.push(idx);
-            }
-            None => scan.flush(),
-        }
-    }
-    scan.flush();
-    scan.spans
-}
-
-struct SeedScan<'a> {
-    text: &'a [u8],
-    spans: Vec<(usize, usize)>,
-    /// The current run: byte range and wordlist index of each word.
-    positions: Vec<(usize, usize)>,
-    indices: Vec<u16>,
-    budget: usize,
-    keyword: Option<bool>,
-}
-
-impl SeedScan<'_> {
-    /// Judge the current run and start a new one.
-    fn flush(&mut self) {
-        let n = self.positions.len();
-        if n >= 12 {
-            if self.has_keyword() {
-                self.spans
-                    .push((self.positions[0].0, self.positions[n - 1].1));
-            } else {
-                self.checksum_windows();
-            }
-        }
-        self.positions.clear();
-        self.indices.clear();
-    }
-
-    /// Test the whole run, and each line of it when it spans lines, as one mnemonic.
-    fn checksum_windows(&mut self) {
-        let n = self.indices.len();
-        let mut candidates = vec![(0usize, n)];
-        let mut line_start = 0usize;
-        for j in 1..=n {
-            let breaks = j == n
-                || self
-                    .text
-                    .get(self.positions[j - 1].1..self.positions[j].0)
-                    .is_some_and(|gap| gap.contains(&b'\n'));
-            if breaks {
-                if (line_start, j) != (0, n) {
-                    candidates.push((line_start, j));
-                }
-                line_start = j;
-            }
-        }
-        for (from, to) in candidates {
-            if !bip39::LENGTHS.contains(&(to - from)) || self.budget == 0 {
-                continue;
-            }
-            self.budget -= 1;
-            if bip39::checksum_ok(&self.indices[from..to]) {
-                self.spans
-                    .push((self.positions[from].0, self.positions[to - 1].1));
-            }
-        }
-    }
-
-    fn has_keyword(&mut self) -> bool {
-        let text = self.text;
-        *self.keyword.get_or_insert_with(|| {
-            SEED_KEYWORDS.iter().any(|k| {
-                text.windows(k.len())
-                    .any(|w| w.eq_ignore_ascii_case(k.as_bytes()))
-            })
-        })
-    }
+    seedphrase::find(text)
 }
 
 /// Whether `text` holds key material: a keypair-style byte array, a base58-encoded 64-byte
@@ -1329,102 +1205,6 @@ mod tests {
         let out = scrub("HELIUS_API_KEY=abcdef123456 next").expect("api key should redact");
         assert!(out.contains("***REDACTED:api_key***"));
         assert!(!out.contains("abcdef123456"));
-    }
-
-    const PHRASE_12: &str =
-        "scheme spot photo card baby mountain device kick cradle pact join borrow";
-    const PHRASE_24: &str = "void come effort suffer camp survey warrior heavy shoot primary \
-                             clutch crush open amazing screen patrol group space point ten \
-                             exist slush involve unfold";
-
-    #[test]
-    fn bare_checksum_valid_phrases_are_redacted() {
-        let marker = "***REDACTED:seed_phrase***";
-        for phrase in [PHRASE_12, PHRASE_24] {
-            assert_eq!(scrub(phrase).as_deref(), Some(marker), "{phrase}");
-            let quoted = format!("words: \"{phrase}\".");
-            assert_eq!(
-                scrub(&quoted),
-                Some(format!("words: \"{marker}\".")),
-                "{phrase}"
-            );
-        }
-        let upper = PHRASE_12.to_ascii_uppercase();
-        assert_eq!(scrub(&upper).as_deref(), Some(marker));
-        // A 24-word phrase wrapped over two lines, and two phrases in one output.
-        let wrapped = PHRASE_24.replacen(" clutch", "\n  clutch", 1);
-        assert_eq!(scrub(&wrapped).as_deref(), Some(marker));
-        let two = format!("a: {PHRASE_12}\nb: {PHRASE_24}\n");
-        assert_eq!(scrub(&two), Some(format!("a: {marker}\nb: {marker}\n")));
-        // One phrase on its own line between other lines of list words.
-        let lines = format!("zoo zoo zoo\n{PHRASE_12}\nzoo zoo\n");
-        assert_eq!(
-            scrub(&lines),
-            Some(format!("zoo zoo zoo\n{marker}\nzoo zoo\n"))
-        );
-    }
-
-    #[test]
-    fn prose_of_list_words_is_not_redacted_without_checksum_or_keyword() {
-        // 12 list words whose checksum fails, and a 19-word run (no exact length) that holds
-        // a checksum-valid 15-word window: neither is a phrase without a keyword.
-        for prose in [
-            "review any major change before release because random network issue can cause",
-            "please review any major change before release because random network issue can \
-             cause total system crash during busy weekend",
-        ] {
-            assert!(
-                prose.split_whitespace().all(|w| bip39::index(w).is_some()),
-                "{prose}"
-            );
-            assert_eq!(scrub(prose), None, "{prose}");
-            assert_eq!(scrub(&format!("Note: {prose}.")), None, "{prose}");
-            let keyed = format!("recovery {prose}");
-            assert!(
-                scrub(&keyed).is_some_and(|o| o.contains("seed_phrase")),
-                "{keyed}"
-            );
-        }
-        // A checksum-valid run one word short of 12, or one word past it, stays.
-        let eleven: Vec<&str> = PHRASE_12.split(' ').take(11).collect();
-        assert_eq!(scrub(&eleven.join(" ")), None);
-        assert_eq!(scrub(&format!("{PHRASE_12} zoo")), None);
-    }
-
-    #[test]
-    fn solana_keygen_recovery_output_is_redacted() {
-        let out = format!(
-            "Generating a new keypair\n\nWrote new keypair to /tmp/k.json\n\
-             ================================================================================\n\
-             pubkey: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\n\
-             ================================================================================\n\
-             Save this seed phrase to recover your new keypair:\n{PHRASE_12}\n\
-             ================================================================================\n"
-        );
-        let scrubbed = scrub(&out).expect("redacted");
-        assert!(!scrubbed.contains("scheme spot"), "{scrubbed}");
-        assert!(scrubbed.contains("keypair:\n***REDACTED:seed_phrase***\n===="));
-        assert!(scrubbed.contains("pubkey: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"));
-        // The phrase line alone (no keyword anywhere) is caught by its checksum.
-        let line = format!("{PHRASE_24}\n");
-        assert_eq!(
-            scrub(&line).as_deref(),
-            Some("***REDACTED:seed_phrase***\n")
-        );
-    }
-
-    #[test]
-    fn seed_scan_work_is_bounded() {
-        // 8 MiB of list words in one run, and of exact 12-word lines (one checksum each, past
-        // the test budget): both finish without panicking.
-        let one_run = "zoo ".repeat(2 * 1024 * 1024);
-        assert_eq!(find_seed_phrases(&one_run), Vec::new());
-        let lines = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo\n".repeat(200_000);
-        assert_eq!(find_seed_phrases(&lines), Vec::new());
-        let keyed = format!("seed {lines}");
-        assert_eq!(find_seed_phrases(&keyed).len(), 1);
-        assert_eq!(find_seed_phrases(""), Vec::new());
-        assert_eq!(find_seed_phrases("\u{e9}t\u{e9} zoo \u{1F600}"), Vec::new());
     }
 
     #[test]

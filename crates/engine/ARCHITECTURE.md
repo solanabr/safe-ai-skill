@@ -412,8 +412,10 @@ pub fn redact::scrub_response(response: &Value, values: &[KnownValue]) -> Option
 pub fn promptguard::check(prompt: &str) -> Option<String>;
 ```
 
-Seed phrases (`redact::find_seed_phrases`, shared with `promptguard`) use `bip39` (the embedded
-official English wordlist, `src/bip39_english.txt`, and the mnemonic checksum).
+Seed phrases are found by `seedphrase::find` (behind `redact::find_seed_phrases`, shared with
+`promptguard`), which uses `bip39`: the embedded official English wordlist
+(`src/bip39_english.txt`), the mnemonic checksum, and the published test vectors that
+`promptguard` lets through.
 
 `cmd_redact` reads `tool_response` (up to `redact::MAX_SCAN_BYTES`, larger passes unchanged),
 scrubs literal values from the project's env files (`env::values`) and the pattern classes, and

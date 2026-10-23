@@ -285,7 +285,7 @@ fn an_unknown_nonce_is_reported_to_the_user() {
 fn a_secret_in_a_confirm_prompt_is_still_blocked() {
     let sb = Sandbox::new("relax-secret");
     let v = sb
-        .prompt("safe-ai-skill confirm 12345678 my seed phrase: legal winner thank year wave sausage worth useful legal winner thank yellow")
+        .prompt("safe-ai-skill confirm 12345678 my seed phrase: session twin stem shop glass chat dune switch upset such noble wave")
         .json();
     assert_eq!(v["decision"], "block");
 }

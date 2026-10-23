@@ -69,6 +69,52 @@ pub fn checksum_ok(indices: &[u16]) -> bool {
     })
 }
 
+/// The 24 English reference vectors published with the reference implementation
+/// (trezor/python-mnemonic `vectors.json`, git blob `d362a5d4eb1ba800a52aec30116915cd4576e1fd`),
+/// in file order. Public test data, so the prompt guard lets them through.
+pub const TEST_VECTORS: [&str; 24] = [
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
+    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon agent",
+    "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal will",
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter always",
+    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo when",
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
+    "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title",
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic bless",
+    "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
+    "ozone drill grab fiber curtain grace pudding thank cruise elder eight picnic",
+    "gravity machine north sort system female filter attitude volume fold club stay feature office ecology stable narrow fog",
+    "hamster diagram private dutch cause delay private meat slide toddler razor book happy fancy gospel tennis maple dilemma loan word shrug inflict delay length",
+    "scheme spot photo card baby mountain device kick cradle pact join borrow",
+    "horn tenant knee talent sponsor spell gate clip pulse soap slush warm silver nephew swap uncle crack brave",
+    "panda eyebrow bullet gorilla call smoke muffin taste mesh discover soft ostrich alcohol speed nation flash devote level hobby quick inner drive ghost inside",
+    "cat swing flag economy stadium alone churn speed unique patch report train",
+    "light rule cinnamon wrap drastic word pride squirrel upgrade then income fatal apart sustain crack supply proud access",
+    "all hour make first leader extend hole alien behind guard gospel lava path output census museum junior mass reopen famous sing advance salt reform",
+    "vessel ladder alter error federal sibling chat ability sun glass valve picture",
+    "scissors invite lock maple supreme raw rapid void congress muscle digital elegant little brisk hair mango congress clump",
+    "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold",
+];
+
+/// Whether the letter tokens of `text`, lowercased and joined by single spaces, are exactly
+/// one of [`TEST_VECTORS`].
+pub fn is_test_vector(text: &str) -> bool {
+    let mut normal = String::with_capacity(text.len());
+    for word in text
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+    {
+        if !normal.is_empty() {
+            normal.push(' ');
+        }
+        normal.push_str(&word.to_ascii_lowercase());
+    }
+    TEST_VECTORS.contains(&normal.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +168,78 @@ mod tests {
         ] {
             assert!(checksum_ok(&indices(phrase)), "{phrase}");
         }
+    }
+
+    /// Entropy column of the same `vectors.json`, in order: each vector must be the mnemonic
+    /// of its entropy (checks the embedded list, the checksum and the vector text together).
+    const VECTOR_ENTROPY: [&str; 24] = [
+        "00000000000000000000000000000000",
+        "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        "80808080808080808080808080808080",
+        "ffffffffffffffffffffffffffffffff",
+        "000000000000000000000000000000000000000000000000",
+        "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        "808080808080808080808080808080808080808080808080",
+        "ffffffffffffffffffffffffffffffffffffffffffffffff",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+        "8080808080808080808080808080808080808080808080808080808080808080",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "9e885d952ad362caeb4efe34a8e91bd2",
+        "6610b25967cdcca9d59875f5cb50b0ea75433311869e930b",
+        "68a79eaca2324873eacc50cb9c6eca8cc68ea5d936f98787c60c7ebc74e6ce7c",
+        "c0ba5a8e914111210f2bd131f3d5e08d",
+        "6d9be1ee6ebd27a258115aad99b7317b9c8d28b6d76431c3",
+        "9f6a2878b2520799a44ef18bc7df394e7061a224d2c33cd015b157d746869863",
+        "23db8160a31d3e0dca3688ed941adbf3",
+        "8197a4a47f0425faeaa69deebc05ca29c0a5b5cc76ceacc0",
+        "066dca1a2bb7e8a1db2832148ce9933eea0f3ac9548d793112d9a95c9407efad",
+        "f30f8c1da665478f49b001d94c5fc452",
+        "c10ec20dc3cd9f652c7fac2f1230f7a3c828389a14392f05",
+        "f585c11aec520db57dd353c69554b21a89b20fb0650966fa0a9d6f74fd989d8f",
+    ];
+
+    fn mnemonic_of(entropy_hex: &str) -> String {
+        let entropy: Vec<u8> = (0..entropy_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&entropy_hex[i..i + 2], 16).unwrap())
+            .collect();
+        let hash = Sha256::digest(&entropy);
+        let mut bits: Vec<bool> = entropy
+            .iter()
+            .flat_map(|b| (0..8).rev().map(move |i| b & (1 << i) != 0))
+            .collect();
+        let cs = entropy.len() * 8 / 32;
+        bits.extend((0..cs).map(|i| hash[0] & (0x80 >> i) != 0));
+        bits.chunks(11)
+            .map(|c| words()[c.iter().fold(0usize, |a, &b| a << 1 | usize::from(b))])
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn test_vectors_are_the_mnemonics_of_their_entropy() {
+        for (entropy, phrase) in VECTOR_ENTROPY.iter().zip(TEST_VECTORS) {
+            assert_eq!(mnemonic_of(entropy), phrase);
+            assert!(checksum_ok(&indices(phrase)), "{phrase}");
+        }
+    }
+
+    #[test]
+    fn is_test_vector_normalizes_but_matches_exactly() {
+        assert!(is_test_vector(
+            "Legal, winner \"thank\" year wave sausage worth useful legal winner thank yellow"
+        ));
+        assert!(is_test_vector("1. scheme 2. spot 3. photo 4. card 5. baby 6. mountain 7. device 8. kick 9. cradle 10. pact 11. join 12. borrow"));
+        assert!(!is_test_vector(
+            "legal winner thank year wave sausage worth useful legal winner thank"
+        ));
+        assert!(!is_test_vector(
+            "my legal winner thank year wave sausage worth useful legal winner thank yellow"
+        ));
+        assert!(!is_test_vector(
+            "session twin stem shop glass chat dune switch upset such noble wave"
+        ));
     }
 
     #[test]
