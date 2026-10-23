@@ -899,7 +899,9 @@ fn collect_prefixed_tokens(
         while end < bytes.len() && is_token_char(bytes[end]) {
             end += 1;
         }
-        if end - start >= min_len {
+        // A token starts a word: `desk-lamp-…` is prose, not an `sk-` key.
+        let word_start = start == 0 || !is_token_char(bytes[start - 1]);
+        if word_start && end - start >= min_len {
             spans.push(Span { start, end, kind });
         }
         from = end.max(start + 1);
@@ -1212,6 +1214,15 @@ mod tests {
         // A certificate or public key is not secret.
         let cert = format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----");
         assert_eq!(scrub(&cert), None);
+    }
+
+    #[test]
+    fn sk_prefix_needs_a_word_start() {
+        assert_eq!(scrub("desk-lamp-description-text-very-long"), None);
+        assert_eq!(
+            scrub("key sk-proj-abcdefghijklmnopqrstuvwxyz0123").unwrap(),
+            "key ***REDACTED:api_key***"
+        );
     }
 
     #[test]

@@ -314,13 +314,16 @@ fn decide_command(
         // `scp -i <key>` names the identity it authenticates with, not a file it copies.
         let mut skip_identity = false;
         let mut held = Decision::Defer;
-        // `mv` of an env file, and the destination of `cp`, are writes (the env-write tier
-        // rule in `creddump`), not reads.
-        let cp_dest = (program == "cp")
-            .then(|| tokens.iter().rposition(|t| !is_flag(t)).filter(|i| *i > 1))
-            .flatten();
+        // The destination of `cp`/`mv` is a write (the env-write tier rule in `creddump`),
+        // not a read; an env file as their source stays a read.
+        let dest = (matches!(program.as_str(), "cp" | "mv")
+            && !tokens
+                .iter()
+                .any(|t| t == "-t" || t.starts_with("--target-directory")))
+        .then(|| tokens.iter().rposition(|t| !is_flag(t)).filter(|i| *i > 1))
+        .flatten();
         for (index, arg) in tokens.iter().enumerate().skip(1) {
-            let write_side = program == "mv" || cp_dest == Some(index);
+            let write_side = dest == Some(index);
             if write_side && matches!(classify_arg(arg, policy), Some(ArgClass::Env)) {
                 continue;
             }

@@ -39,7 +39,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::context::shell::{self, SimpleCommand};
+use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
 use crate::gates::{credpaths, read};
 use crate::io::Decision;
@@ -108,7 +108,8 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     {
         return Some(Verdict::Deny(path_reason(&what)));
     }
-    match env_check(&parsed.commands, cwd, policy)? {
+    let stdin_free = !command.contains(['|', '<']);
+    match env_check(&parsed.commands, cwd, policy, stdin_free)? {
         EnvUse::Read(file) => {
             let hint = read::varlock_hint(cwd, &cwd.join(&file));
             match read::env_verdict(&file, policy, hint) {
@@ -130,123 +131,6 @@ enum EnvUse {
     Write(String),
 }
 
-/// Programs that write (remove or move) every env file they name.
-const ENV_WRITERS: &[&str] = &["rm", "unlink", "shred", "mv"];
-
-/// Words that print the environment or a file when they run a container's or a wrapper's
-/// command.
-const PRINTERS: &[&str] = &[
-    "env", "printenv", "cat", "echo", "printf", "set", "export", "declare", "sh", "bash", "zsh",
-    "dash", "ksh", "fish", "head", "tail", "less", "more", "od", "xxd", "strings",
-];
-
-/// Indices of the words naming an env file a program only loads into a process's environment
-/// (`node|bun --env-file`, `deno run --env-file`, `docker run|create|compose --env-file`,
-/// `podman run --env-file`, `dotenv -e <f> --`, `dotenvx run -f <f> --`): not a read, unless
-/// the same command can print what it loaded (`node -e|-p|--eval|--print`, `bun -e|--print`,
-/// or a container/wrapped command that is a printer, [`PRINTERS`]).
-fn env_file_loads(program: &str, words: &[&str]) -> Vec<usize> {
-    let sub = words.iter().skip(1).find(|w| !w.starts_with('-')).copied();
-    let (flags, prints): (&[&str], bool) = match program {
-        "node" | "bun" => {
-            let eval = words.iter().skip(1).any(|w| {
-                matches!(*w, "-e" | "-p" | "-pe" | "--eval" | "--print")
-                    || w.starts_with("--eval=")
-                    || w.starts_with("--print=")
-            });
-            (&["--env-file"], eval)
-        }
-        "deno" if sub == Some("run") => (&["--env-file", "--env"], false),
-        "docker" | "podman"
-            if matches!(sub, Some("run" | "create" | "compose"))
-                && (program == "docker" || sub == Some("run")) =>
-        {
-            (&["--env-file"], printer_after(words, 2))
-        }
-        "dotenv" => (&["-e"], printer_after_dashes(words)),
-        "dotenvx" if sub == Some("run") => (&["-f", "--env-file"], printer_after_dashes(words)),
-        _ => return Vec::new(),
-    };
-    if prints {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (i, w) in words.iter().enumerate().skip(1) {
-        if *w == "--" && matches!(program, "dotenv" | "dotenvx") {
-            break;
-        }
-        if flags.contains(w) {
-            out.push(i + 1);
-        } else if flags
-            .iter()
-            .any(|f| f.starts_with("--") && w.starts_with(&format!("{f}=")))
-        {
-            out.push(i);
-        }
-    }
-    out
-}
-
-/// Whether any word from index `from` on is a printer (a container's command).
-fn printer_after(words: &[&str], from: usize) -> bool {
-    words.iter().skip(from).any(|w| is_printer(w))
-}
-
-/// Whether the command after `--` prints: a printer, or `node`/`bun` with an eval/print flag.
-fn printer_after_dashes(words: &[&str]) -> bool {
-    let Some(i) = words.iter().position(|w| *w == "--") else {
-        return false;
-    };
-    let rest = &words[i + 1..];
-    match rest.first() {
-        None => false,
-        Some(first) if is_printer(first) => true,
-        Some(first) => {
-            let name = first.rsplit('/').next().unwrap_or(first);
-            matches!(name, "node" | "bun")
-                && rest
-                    .iter()
-                    .any(|w| matches!(*w, "-e" | "-p" | "-pe" | "--eval" | "--print"))
-        }
-    }
-}
-
-fn is_printer(word: &str) -> bool {
-    PRINTERS.contains(&word.rsplit('/').next().unwrap_or(word))
-}
-
-/// Indices of the env-file words of `cp` that are its destination (the last positional, or
-/// the `-t`/`--target-directory` value): an overwrite, not a read.
-fn cp_destinations(words: &[&str]) -> Vec<usize> {
-    let mut positional = Vec::new();
-    let mut out = Vec::new();
-    let mut i = 1;
-    while i < words.len() {
-        let w = words[i];
-        if w == "-t" || w == "--target-directory" {
-            out.push(i + 1);
-            i += 2;
-            continue;
-        }
-        if !w.starts_with('-') {
-            positional.push(i);
-        }
-        i += 1;
-    }
-    if out.is_empty() {
-        if let Some(last) = positional.last() {
-            if positional.len() >= 2 {
-                out.push(*last);
-            }
-        }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------------------
-// Project env files
-// ---------------------------------------------------------------------------------------
-
 /// Programs whose words naming an env file are not a raw read: the env CLI itself and
 /// varlock (the secrets gate decides varlock's printers).
 const ENV_TOOLS: &[&str] = &["safe-ai-skill", "varlock"];
@@ -262,12 +146,296 @@ const ENV_PROBES: &[&str] = &[
     "prod.env",
 ];
 
+/// Programs that remove every env file they name: a write.
+const ENV_REMOVERS: &[&str] = &["rm", "unlink", "shred"];
+
+/// Programs whose last positional (or `-t` value) is a destination and the rest are sources:
+/// an env file as the destination is a write, as a source a read (it relocates the secret to a
+/// name anything can read).
+const ENV_RELOCATORS: &[&str] = &["mv", "cp", "ln", "rsync", "install"];
+
+/// Build tools a `dotenv`/`dotenvx` wrapper may run with the loaded environment.
+const ENV_BUILD_TOOLS: &[&str] = &["pnpm", "yarn", "next", "vite", "anchor", "cargo"];
+
+/// Compose subcommands that never print interpolated values.
+const COMPOSE_SAFE: &[&str] = &[
+    "up", "start", "restart", "build", "pull", "down", "stop", "ps", "logs",
+];
+
+/// `docker run|create` flags that take no value.
+const DOCKER_BOOL_FLAGS: &[&str] = &[
+    "-d",
+    "--detach",
+    "--rm",
+    "-i",
+    "-t",
+    "-it",
+    "-ti",
+    "--interactive",
+    "--tty",
+    "--init",
+    "--privileged",
+    "-P",
+    "--publish-all",
+    "--read-only",
+    "-q",
+    "--quiet",
+];
+
+/// Compose global options that take a value.
+const COMPOSE_VALUE_FLAGS: &[&str] = &[
+    "-f",
+    "--file",
+    "-p",
+    "--project-name",
+    "--env-file",
+    "--profile",
+    "--project-directory",
+    "--ansi",
+    "--progress",
+    "--parallel",
+];
+
+/// Indices of the words naming an env file that an allow-listed loader only puts into a
+/// process's environment (not a read). Everything else naming an env file is a read.
+///
+/// - `node|bun --env-file[=]F <script>` and `deno run --env-file[=]F <script>`: a file-path
+///   script (not `-`, `data:` or `http(s):`), no inline-code/print/REPL flag;
+/// - `docker run|create --env-file[=]F <image>` with nothing after the image and no
+///   `--entrypoint`;
+/// - `docker compose|docker-compose --env-file[=]F <up|start|restart|build|pull|down|stop|ps|logs>`;
+/// - `dotenv -e F -- <cmd>` / `dotenvx run -f F -- <cmd>` when `<cmd>` passes these rules or is a
+///   build tool (`npm run`, `pnpm`, `yarn`, `next`, `vite`, `anchor`, `cargo`).
+///
+/// `stdin_free` is false when the command line pipes or redirects input anywhere (`|`, `<`,
+/// `<<`, `<<<`): no exemption then (stdin could feed the interpreter).
+fn env_file_loads(words: &[Word], stdin_free: bool) -> Vec<usize> {
+    if !stdin_free || words.iter().any(|w| w.dynamic) {
+        return Vec::new();
+    }
+    let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+    loads_in(&texts, 0)
+}
+
+fn loads_in(words: &[&str], depth: usize) -> Vec<usize> {
+    let Some(first) = words.first() else {
+        return Vec::new();
+    };
+    let program = first
+        .rsplit('/')
+        .next()
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    match program.as_str() {
+        "node" | "bun" => interpreter_loads(words, 1),
+        "deno" if words.get(1) == Some(&"run") => interpreter_loads(words, 2),
+        "docker" if matches!(words.get(1), Some(&"run" | &"create")) => docker_run_loads(words),
+        "docker" if words.get(1) == Some(&"compose") => compose_loads(words, 2),
+        "docker-compose" => compose_loads(words, 1),
+        "dotenv" if depth == 0 => wrapper_loads(words, 1, &["-e"]),
+        "dotenvx" if depth == 0 && words.get(1) == Some(&"run") => {
+            wrapper_loads(words, 2, &["-f", "--env-file"])
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The env-file value index of `flag F` or `flag=F` at `i`, and how many words it spans.
+fn env_flag_at(words: &[&str], i: usize, flags: &[&str]) -> Option<(usize, usize)> {
+    let w = words.get(i)?;
+    if flags.contains(w) {
+        return (i + 1 < words.len()).then_some((i + 1, 2));
+    }
+    flags
+        .iter()
+        .any(|f| f.starts_with("--") && w.starts_with(&format!("{f}=")))
+        .then_some((i, 1))
+}
+
+fn interpreter_loads(words: &[&str], from: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < words.len() {
+        if let Some((value, span)) = env_flag_at(words, i, &["--env-file", "--env"]) {
+            out.push(value);
+            i += span;
+            continue;
+        }
+        let w = words[i];
+        let inline = matches!(
+            w,
+            "-e" | "-p" | "-pe" | "-i" | "--eval" | "--print" | "--interactive" | "-"
+        ) || w.starts_with("--eval=")
+            || w.starts_with("--print=");
+        if inline {
+            return Vec::new();
+        }
+        if w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // The first positional is the script: a file path, not inline code.
+        let lower = w.to_ascii_lowercase();
+        let path_like = w.contains(['.', '/'])
+            && !lower.starts_with("data:")
+            && !lower.starts_with("http:")
+            && !lower.starts_with("https:");
+        return if path_like && !out.is_empty() {
+            out
+        } else {
+            Vec::new()
+        };
+    }
+    Vec::new()
+}
+
+fn docker_run_loads(words: &[&str]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 2;
+    while i < words.len() {
+        if let Some((value, span)) = env_flag_at(words, i, &["--env-file"]) {
+            out.push(value);
+            i += span;
+            continue;
+        }
+        let w = words[i];
+        if w == "--entrypoint" || w.starts_with("--entrypoint=") {
+            return Vec::new();
+        }
+        if w.starts_with('-') {
+            i += if DOCKER_BOOL_FLAGS.contains(&w) || w.contains('=') {
+                1
+            } else {
+                2
+            };
+            continue;
+        }
+        // The image: exempt only with no command after it.
+        return if i + 1 == words.len() {
+            out
+        } else {
+            Vec::new()
+        };
+    }
+    Vec::new()
+}
+
+fn compose_loads(words: &[&str], from: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < words.len() {
+        if let Some((value, span)) = env_flag_at(words, i, &["--env-file"]) {
+            out.push(value);
+            i += span;
+            continue;
+        }
+        let w = words[i];
+        if w.starts_with('-') {
+            i += if COMPOSE_VALUE_FLAGS.contains(&w) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return if COMPOSE_SAFE.contains(&w) {
+            out
+        } else {
+            Vec::new()
+        };
+    }
+    Vec::new()
+}
+
+fn wrapper_loads(words: &[&str], from: usize, flags: &[&str]) -> Vec<usize> {
+    let Some(dashes) = words.iter().position(|w| *w == "--") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = from;
+    while i < dashes {
+        match env_flag_at(&words[..dashes], i, flags) {
+            Some((value, span)) => {
+                out.push(value);
+                i += span;
+            }
+            None => i += 1,
+        }
+    }
+    let inner = &words[dashes + 1..];
+    let Some(first) = inner.first() else {
+        return Vec::new();
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let build_tool =
+        ENV_BUILD_TOOLS.contains(&name) || (name == "npm" && inner.get(1) == Some(&"run"));
+    let inner_loads = loads_in(inner, 1);
+    let inner_ok = build_tool || !inner_loads.is_empty() || plain_loader(inner);
+    if out.is_empty() || !inner_ok {
+        return Vec::new();
+    }
+    out.extend(inner_loads.into_iter().map(|j| j + dashes + 1));
+    out
+}
+
+/// A wrapped loader with no env file of its own (`dotenvx run -f .env -- node app.js`): the
+/// same allowlist with a dummy `--env-file` in front.
+fn plain_loader(inner: &[&str]) -> bool {
+    let mut with: Vec<&str> = Vec::with_capacity(inner.len() + 2);
+    with.push(inner[0]);
+    let at = match inner[0].rsplit('/').next().unwrap_or(inner[0]) {
+        "deno" if inner.get(1) == Some(&"run") => {
+            with.push("run");
+            2
+        }
+        "docker" if matches!(inner.get(1), Some(&"run" | &"create" | &"compose")) => {
+            with.push(inner[1]);
+            2
+        }
+        _ => 1,
+    };
+    with.push("--env-file=x");
+    with.extend_from_slice(&inner[at..]);
+    !loads_in(&with, 1).is_empty()
+}
+
+/// The indices of `words` that are a relocator's destination (the last positional, or the
+/// `-t`/`--target-directory` value) when it has a source too.
+fn relocation_destinations(words: &[&str]) -> Vec<usize> {
+    let mut positional = Vec::new();
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < words.len() {
+        let w = words[i];
+        if w == "-t" || w == "--target-directory" {
+            out.push(i + 1);
+            i += 2;
+            continue;
+        }
+        if !w.starts_with('-') {
+            positional.push(i);
+        }
+        i += 1;
+    }
+    if out.is_empty() && positional.len() >= 2 {
+        if let Some(last) = positional.last() {
+            out.push(*last);
+        }
+    }
+    out
+}
+
 /// The first word of a non-metadata command that names a project env file (the env gate's
 /// definition, [`read::is_env_file`]): any program, the word resolved like a credential path
 /// (pieces after `=`/`:`, braces, `~`, every cwd), a wildcard expanded against the filesystem
 /// (dotfiles only by a literal leading dot, as the shell does) and matched lexically against
 /// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
-fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Option<EnvUse> {
+fn env_check(
+    commands: &[SimpleCommand],
+    hook_cwd: &Path,
+    policy: &Policy,
+    stdin_free: bool,
+) -> Option<EnvUse> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
     let mut budget = MAX_WORDS;
@@ -297,10 +465,10 @@ fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Op
         let mut skip_pattern = pattern_first;
         let mut skip_value = false;
         let program_path = words.first().is_some_and(|w| w.contains(['/', '\\']));
-        let loads = env_file_loads(&program, &words);
-        let writes_all = ENV_WRITERS.contains(&program.as_str());
-        let cp_dest = if program == "cp" {
-            cp_destinations(&words)
+        let loads = env_file_loads(&cmd.words, stdin_free);
+        let removes = ENV_REMOVERS.contains(&program.as_str());
+        let dests = if ENV_RELOCATORS.contains(&program.as_str()) {
+            relocation_destinations(&words)
         } else {
             Vec::new()
         };
@@ -320,7 +488,7 @@ fn env_check(commands: &[SimpleCommand], hook_cwd: &Path, policy: &Policy) -> Op
                 continue;
             }
             if let Some(hit) = env_word_hit(word, &cwds, &homes, policy) {
-                if writes_all || cp_dest.contains(&i) {
+                if removes || dests.contains(&i) {
                     write.get_or_insert(hit);
                 } else {
                     return Some(EnvUse::Read(hit));
