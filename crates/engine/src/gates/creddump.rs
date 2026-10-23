@@ -103,13 +103,22 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     if matches!(known, crate::io::Decision::Deny { .. }) {
         return None;
     }
-    if let Some(what) =
-        path_check(&parsed.commands, cwd).or_else(|| assigned_hit(&parsed.assigned_values, cwd))
+    let stdin_literals = stdin_literals(&parsed.stdin_code);
+    if let Some(what) = path_check(&parsed.commands, cwd)
+        .or_else(|| assigned_hit(&parsed.assigned_values, cwd))
+        .or_else(|| file_hit("xargs -a", &parsed.arg_files, cwd))
+        .or_else(|| file_hit("stdin code", &stdin_literals, cwd))
     {
         return Some(Verdict::Deny(path_reason(&what)));
     }
     let stdin_free = !command.contains(['|', '<']);
-    match env_check(&parsed.commands, cwd, policy, stdin_free)? {
+    let named: Vec<String> = parsed
+        .arg_files
+        .iter()
+        .chain(&stdin_literals)
+        .cloned()
+        .collect();
+    match env_check(&parsed.commands, &named, cwd, policy, stdin_free)? {
         EnvUse::Read(file) => {
             let hint = read::varlock_hint(cwd, &cwd.join(&file));
             match read::env_verdict(&file, policy, hint) {
@@ -558,12 +567,20 @@ fn relocation_destinations(words: &[&str]) -> Vec<usize> {
 /// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
 fn env_check(
     commands: &[SimpleCommand],
+    named: &[String],
     hook_cwd: &Path,
     policy: &Policy,
     stdin_free: bool,
 ) -> Option<EnvUse> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
+    if let Some(hit) = named
+        .iter()
+        .take(MAX_WORDS)
+        .find_map(|f| env_word_hit(f, &cwds, &homes, policy))
+    {
+        return Some(EnvUse::Read(hit));
+    }
     let mut budget = MAX_WORDS;
     let mut write: Option<String> = None;
     for cmd in commands {
@@ -621,8 +638,78 @@ fn env_check(
                 }
             }
         }
+        for literal in code_literals(&program, &words) {
+            budget = budget.checked_sub(1)?;
+            if let Some(hit) = env_word_hit(&literal, &cwds, &homes, policy) {
+                return Some(EnvUse::Read(hit));
+            }
+        }
     }
     write.map(EnvUse::Write)
+}
+
+/// The string literals in an interpreter's inline code (`python3 -c "open('.env')"` →
+/// `.env`), which name the files the code opens. Shells are not listed: the parser reads
+/// their scripts as commands. A literal holding whitespace is prose, not a path.
+fn code_literals(program: &str, words: &[&str]) -> Vec<String> {
+    let name = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if !INTERPRETERS.contains(&name)
+        || matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish")
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for word in words.iter().skip(1) {
+        text_literals(word, &mut out);
+    }
+    out
+}
+
+/// Push the quoted literals of code `text` that hold no whitespace onto `out`.
+fn text_literals(text: &str, out: &mut Vec<String>) {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if !matches!(c, '\'' | '"' | '`') {
+            continue;
+        }
+        let mut literal = String::new();
+        let mut escaped = false;
+        for d in chars.by_ref() {
+            if escaped {
+                literal.push(d);
+                escaped = false;
+            } else if d == '\\' {
+                escaped = true;
+            } else if d == c {
+                break;
+            } else {
+                literal.push(d);
+            }
+        }
+        if !literal.is_empty() && !literal.contains(char::is_whitespace) {
+            out.push(literal);
+        }
+    }
+}
+
+/// The quoted literals of interpreter code fed on standard input.
+fn stdin_literals(code: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for text in code.iter().take(MAX_COMMANDS) {
+        text_literals(text, &mut out);
+    }
+    out
+}
+
+/// A credential path among `files`, which the command reads outside its words (`xargs -a F`,
+/// a literal in interpreter code on stdin).
+fn file_hit(what: &str, files: &[String], hook_cwd: &Path) -> Option<String> {
+    let cwds = [hook_cwd.to_path_buf()];
+    files
+        .iter()
+        .take(MAX_WORDS)
+        .find_map(|f| word_hit(f, &cwds, Exempt::None))
+        .map(|hit| format!("{what} {hit}"))
 }
 
 /// Whether `word` names a project env file; the file as written.
@@ -768,6 +855,13 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
         }
         if let Some(hit) = tree_hit(cmd, &program, &cwds) {
             return Some(format!("{program} {hit}"));
+        }
+        let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+        for literal in code_literals(&program, &words) {
+            budget = budget.checked_sub(1)?;
+            if let Some(hit) = word_hit(&literal, &cwds, Exempt::None) {
+                return Some(format!("{program} {hit}"));
+            }
         }
     }
     None
@@ -1568,5 +1662,18 @@ mod tests {
         ] {
             assert!(!decide_text(c), "{c}");
         }
+    }
+
+    #[test]
+    fn interpreter_code_literals_name_files() {
+        let lits = |words: &[&str]| code_literals(&shell::base_name(words[0]), words);
+        assert_eq!(
+            lits(&["python3", "-c", "print(open('.env').read())"]),
+            [".env"]
+        );
+        assert_eq!(lits(&["python3.12", "-c", "open(\"a b\", 'x')"]), ["x"]);
+        assert_eq!(lits(&["node", "-e", "f(`t`, 'it\\'s')"]), ["t", "it's"]);
+        assert!(lits(&["bash", "-c", "cat '.env'"]).is_empty());
+        assert!(lits(&["grep", "'.env'", "f"]).is_empty());
     }
 }

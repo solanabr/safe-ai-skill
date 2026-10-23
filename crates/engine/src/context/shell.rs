@@ -589,6 +589,12 @@ pub struct Parsed {
     /// The values of `NAME=value` prefix assignments, which [`SimpleCommand::words`] drops
     /// (`S=~/.ssh/id_ed25519; cat $S`): checked for credential paths.
     pub assigned_values: Vec<String>,
+    /// Files whose contents a wrapper turns into the command's arguments (`xargs -a F`), which
+    /// [`SimpleCommand::words`] drops: checked as reads.
+    pub arg_files: Vec<String>,
+    /// Interpreter code fed on standard input (`python3 - <<EOF`, `python3 <<< '…'`, `echo '…' |
+    /// node`), which no word carries: checked for the files it names.
+    pub stdin_code: Vec<String>,
 }
 
 /// Record that a command runs a file or stdin as code: after a family write, that is a
@@ -790,7 +796,10 @@ impl Lexer<'_> {
                         match line_reads {
                             Reads::Shell => parse_into(&body, self.depth + 1, true, self.out),
                             // Interpreter code the parser cannot read.
-                            Reads::Interpreter => opaque(self.out, &body),
+                            Reads::Interpreter => {
+                                opaque(self.out, &body);
+                                self.out.stdin_code.push(body);
+                            }
                             Reads::Data => {
                                 self.out.writes_family_text |=
                                     self.line_writes && script_runs_family(&body, self.depth);
@@ -1551,6 +1560,10 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 .any(|w| w.text.starts_with("-C") || w.text.starts_with("--chdir"));
         }
         let appends = program == "xargs";
+        if appends {
+            out.arg_files
+                .extend(xargs_arg_files(&words[..skip.min(words.len())]));
+        }
         words.drain(..skip.min(words.len()));
         if appends
             && words.first().is_some_and(|w| {
@@ -1564,6 +1577,13 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 out.opaque = true;
                 out.opaque_mention = true;
             }
+        }
+        if appends && piped_in {
+            // `echo .env | xargs cat`: the emitted words become arguments.
+            words.extend(upstream_emits.split_whitespace().map(|t| Word {
+                text: t.to_string(),
+                ..Word::default()
+            }));
         }
         if appends {
             // xargs appends arguments the command line does not show.
@@ -1706,7 +1726,12 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             // solana-family program).
             if piped_in {
                 opaque(out, &upstream);
+                if !upstream_emits.is_empty() {
+                    out.stdin_code.push(upstream_emits.clone());
+                }
             }
+            out.stdin_code
+                .extend(herestrings.iter().map(|w| w.text.clone()));
             if runs_code {
                 opaque(out, &code.join(" "));
             }
@@ -1825,6 +1850,34 @@ fn env_split_string(words: &[Word]) -> Option<String> {
 }
 
 /// Words a wrapper takes before its command (its own name included).
+/// The `-a F`, `-aF`, `--arg-file F` and `--arg-file=F` values among `xargs`'s own words.
+fn xargs_arg_files(words: &[Word]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = words.iter().skip(1).map(|w| w.text.as_str());
+    while let Some(text) = iter.next() {
+        if let Some(value) = text.strip_prefix("--arg-file=") {
+            out.push(value.to_string());
+        } else if text == "--arg-file" {
+            out.extend(iter.next().map(str::to_string));
+        } else if text.starts_with('-') && !text.starts_with("--") {
+            // A short cluster: the first value-taking short consumes the rest or the next word.
+            let cluster = &text[1..];
+            if let Some(pos) = cluster.find(|c| "ILnPsdEa".contains(c)) {
+                let value = &cluster[pos + 1..];
+                let value = if value.is_empty() {
+                    iter.next().unwrap_or_default()
+                } else {
+                    value
+                };
+                if cluster.as_bytes()[pos] == b'a' && !value.is_empty() {
+                    out.push(value.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 fn wrapper_len(words: &[Word], shorts: &str, longs: &[&str], positionals: usize) -> usize {
     let mut i = 1;
     while let Some(word) = words.get(i) {
@@ -2442,5 +2495,28 @@ mod tests {
         assert!(mentions_family("S\\PL-token transfer"));
         assert!(mentions_family("$'\\x73olana'"));
         assert!(!mentions_family("ls -la"));
+    }
+
+    #[test]
+    fn xargs_inputs_and_stdin_code_are_kept() {
+        assert_eq!(parse("xargs -a .env echo").arg_files, [".env"]);
+        assert_eq!(parse("xargs -0a.env echo").arg_files, [".env"]);
+        assert_eq!(parse("xargs --arg-file=f -n 1 echo").arg_files, ["f"]);
+        assert_eq!(parse("xargs -n 1 -a f echo").arg_files, ["f"]);
+        assert!(parse("xargs -n 1 echo").arg_files.is_empty());
+        let piped = parse("echo .env | xargs cat");
+        let words: Vec<&str> = piped.commands[1]
+            .words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(words, ["cat", ".env", "$XARGS"]);
+        assert_eq!(parse("python3 <<< 'open(1)'").stdin_code, ["open(1)"]);
+        assert_eq!(parse("echo 'open(1)' | node").stdin_code, ["open(1)"]);
+        assert_eq!(
+            parse("python3 - <<'EOF'\nopen(1)\nEOF").stdin_code,
+            ["open(1)\n"]
+        );
+        assert!(parse("cat <<< 'open(1)'").stdin_code.is_empty());
     }
 }
