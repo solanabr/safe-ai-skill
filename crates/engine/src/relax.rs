@@ -170,7 +170,7 @@ pub fn confirm_prompt_in(
         }
     }
     match confirm::confirm_attempt_in(dir, prompt, now, session.unwrap_or(""), reach) {
-        Attempt::NotThisSession if unknown.is_some() => Some(user_only(format!(
+        Attempt::NeedsInteractive => Some(user_only(format!(
             "safe-ai-skill: nothing confirmed: {}. A request made outside this Claude Code \
              session (from a terminal) needs that check; make the request from inside this \
              session instead, with `! safe-ai-skill tier …` (or `! safe-ai-skill allow …`), \

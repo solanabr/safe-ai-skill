@@ -13,6 +13,11 @@ Usage: live_checks.py --engine PATH [--trusted] [--kit DIR] [--only 1,2,...] [--
            UNPROVABLE instead.
 --kit      a checkout of the solana-ai-kit (read only): its .claude settings, hooks and skills
            are copied into the throwaway project as its installer would (Check 2 part B).
+--no-process-table
+           run every session as one whose engine cannot read the process table (native
+           Windows, a sandboxed hook); needs a test-hooks engine (--trusted). Without it the
+           machine decides: a run that cannot read the process table itself (a sandbox) is
+           modelled the same way.
 
 Each item ends PASS, FAIL, UNPROVABLE (the simulation cannot decide it: it depends on Claude
 Code behaviour the docs do not pin) or SKIP (a prerequisite is missing). Exit 1 on any FAIL.
@@ -62,9 +67,14 @@ class Ctx:
         self.trusted = args.trusted
         self.kit = args.kit
         self.keep = args.keep
+        self.forced_no_ps = args.no_process_table
+        # Whether the engine can tell an interactive session here: only then is a request made
+        # from a terminal (outside any session) announced and confirmable.
+        self.ancestry = ccsim.ps_available() and not self.forced_no_ps
 
     def sim(self, **kw):
         s = ccsim.Sim(self.engine, trust_override=self.trusted, keep=self.keep)
+        s.no_process_table = self.forced_no_ps
         for k, v in kw.items():
             setattr(s, k, v)
         return s
@@ -489,7 +499,8 @@ def check3_grant(c):
     try:
         fixtures(s)
         s.session_start("startup")
-        rc, out = s.cli("allow", "--scope", "deploy", "--for", "30m")
+        # Made in the session (`!`), so it holds with or without a process table.
+        rc, out = s.bang("safe-ai-skill allow --scope deploy --for 30m")
         o = s.user_prompt("hello")
         m = CODE_RE.search(o.user_text())
         if not m:
@@ -606,12 +617,13 @@ def check1(c):
         t = tier_of(s)
         expect(1, "A4c", o.decision == "deny" and "relaxed" in t,
                "tool payload: %s %r" % (o.decision, o.model_text()[:160]))
-        st = json.loads(s.cli("status")[1].splitlines()[0])
-        pend = [a for a in st.get("recent_audit", []) if a.get("decision") == "pending"]
-        expect(1, "A4d", "relaxed" in tier_of(s) and bool(pend),
-               "after A4 the tier is unchanged; `status` has no pending-request list (only "
-               "recent_audit shows the request as pending: %d line(s)); A5 proves it was not "
-               "consumed" % len(pend))
+        st_text = s.cli("status")[1]
+        st = json.loads(st_text.splitlines()[0])
+        pend = st.get("pending", [])
+        expect(1, "A4d", "relaxed" in tier_of(s) and len(pend) == 1 and code not in st_text
+               and pend[0].get("session") == s.session_id,
+               "after A4 the tier is unchanged and `status` lists the request (bound to this "
+               "session, no code): %r" % pend)
         # 1A.5 whole-prompt confirm
         o = s.user_prompt("safe-ai-skill confirm %s" % code)
         t = tier_of(s)
@@ -635,7 +647,8 @@ def check1(c):
     finally:
         s.cleanup()
 
-    # Route B: a terminal runs it; the next prompt shows the code; then resume.
+    # Route B: a terminal runs it; the next prompt shows the code; then resume. A request
+    # made outside any session needs a session the engine can show to be interactive.
     s = c.sim()
     try:
         s.session_start("startup")
@@ -644,8 +657,23 @@ def check1(c):
                "CLI output: %r" % out[:200])
         o = s.user_prompt("hello")
         m = CODE_RE.search(o.user_text())
-        if expect(1, "B2", bool(m) and m.group(1) not in o.model_text(),
-                  "UserPromptSubmit systemMessage shows the code"):
+        if not c.ancestry:
+            expect(1, "B2", not m, "process table unreadable: a terminal-made request is not "
+                   "announced: %r" % o.user_text()[:120])
+            o = s.user_prompt("safe-ai-skill confirm 12345678")
+            expect(1, "B4", "! safe-ai-skill" in o.user_text() and
+                   "! safe-ai-skill" not in o.model_text(),
+                   "the refusal tells the user to make it with `!` here: %r" %
+                   o.user_text()[:200])
+            rc, out = s.bang("safe-ai-skill tier off")
+            o = s.user_prompt("hello")
+            m = CODE_RE.search(o.user_text())
+            ok = bool(m) and "you confirmed" in s.user_prompt(
+                "safe-ai-skill confirm %s" % m.group(1)).user_text()
+            expect(1, "B5", ok, "`! safe-ai-skill tier off` in the session: shown and confirmed "
+                   "on the session binding")
+        elif expect(1, "B2", bool(m) and m.group(1) not in o.model_text(),
+                    "UserPromptSubmit systemMessage shows the code"):
             code = m.group(1)
             blind_test(c, s, code, "B2")
             o = s.session_start("resume")
@@ -664,16 +692,21 @@ def check1(c):
     s = c.sim()
     try:
         rc, out = s.cli("tier", "off")
-        item(1, "C0", "PASS" if rc != 0 and "no plugin data dir" in out else "FAIL",
-             "before any session the terminal CLI has no data dir: rc=%d %r" % (rc, out[:120]))
+        item(1, "C0", "PASS" if rc != 0 and "no data dir yet" in out and
+             "Start a Claude Code session" in out else "FAIL",
+             "before any session the terminal CLI says to start one: rc=%d %r" % (rc,
+                                                                                out[:160]))
         s.session_start("startup")
         rc, out = s.cli("tier", "off")
         o = s.session_start("startup")
         m = CODE_RE.search(o.user_text())
-        if expect(1, "C1", bool(m) and m.group(1) not in o.model_text() and
-                  CODE_LABEL not in o.model_text(),
-                  "SessionStart: code in systemMessage only; additionalContext %r" %
-                  o.model_text()[:200]):
+        if not c.ancestry:
+            expect(1, "C1", not m, "process table unreadable: SessionStart does not announce a "
+                   "terminal-made request: %r" % o.user_text()[:120])
+        elif expect(1, "C1", bool(m) and m.group(1) not in o.model_text() and
+                    CODE_LABEL not in o.model_text(),
+                    "SessionStart: code in systemMessage only; additionalContext %r" %
+                    o.model_text()[:200]):
             code = m.group(1)
             blind_test(c, s, code, "C2")
             o = s.user_prompt("safe-ai-skill confirm %s" % code)
@@ -682,20 +715,74 @@ def check1(c):
     finally:
         s.cleanup()
 
-    # Lockout.
+    # Lockout (a request made in the session, so it holds with or without a process table).
     s = c.sim()
     try:
         s.session_start("startup")
-        s.cli("tier", "off")
+        s.bang("safe-ai-skill tier off")
         o = s.user_prompt("hello")
         m = CODE_RE.search(o.user_text())
         code = m.group(1) if m else "99999999"
         wrong = "00000000" if code != "00000000" else "11111111"
         outs = [s.user_prompt("safe-ai-skill confirm " + wrong).user_text() for _ in range(3)]
         late = s.user_prompt("safe-ai-skill confirm " + code).user_text()
-        expect(1, "D", "too many wrong" in outs[2] and "nothing confirmed" in late and
-               "relaxed" in tier_of(s), "third: %r; real code after: %r" % (outs[2][:100],
-                                                                             late[:80]))
+        expect(1, "D", bool(m) and "too many wrong" in outs[2] and "nothing confirmed" in late
+               and "relaxed" in tier_of(s), "third: %r; real code after: %r" % (outs[2][:100],
+                                                                               late[:80]))
+    finally:
+        s.cleanup()
+
+
+# S: session binding and nested sessions (fix round 2) --------------------------------------
+
+def session_binding(c, s, tag):
+    """A request made in the session (its Bash tool) is shown and confirmed there; a nested
+    session (another session_id, as `claude -p` gets) neither sees nor uses the code."""
+    s.session_start("startup")
+    o = s.tool_call("Bash", {"command": "safe-ai-skill tier off"})
+    m = CODE_RE.search(o.user_text())
+    if not expect("S", tag + "1", bool(m), "made in the session: code shown to the user"):
+        return
+    code = m.group(1)
+    owner = s.session_id
+    s.session_id = "nested-" + owner  # a nested `claude -p` runs as another session
+    o = s.user_prompt("hello")
+    expect("S", tag + "2", code not in o.user_text() + o.model_text() and not
+           CODE_RE.search(o.user_text()), "the nested session is shown no code")
+    outs = [s.user_prompt("safe-ai-skill confirm %s" % code).user_text() for _ in range(4)]
+    expect("S", tag + "3", all("belongs to this" in t for t in outs) and "relaxed" in tier_of(s),
+           "the code does nothing in the nested session and counts nothing: %r" % outs[0][:160])
+    s.session_id = owner
+    o = s.user_prompt("safe-ai-skill confirm %s" % code)
+    expect("S", tag + "4", "you confirmed" in o.user_text(), "the owning session confirms: %r"
+           % o.user_text()[:120])
+
+
+def check_s(c):
+    s = c.sim(allowed_tools=["Bash(safe-ai-skill *)"])
+    try:
+        session_binding(c, s, "a" if c.ancestry else "u")
+    finally:
+        s.cleanup()
+    # The other process-table case, forced through the test-hooks switch.
+    if c.forced_no_ps or not c.ancestry:
+        return
+    if not c.trusted:
+        item("S", "u", "UNPROVABLE", "the process-table-unavailable case needs a test-hooks "
+             "engine (--trusted); this machine can read the process table")
+        return
+    s = c.sim(allowed_tools=["Bash(safe-ai-skill *)"])
+    s.no_process_table = True
+    try:
+        session_binding(c, s, "u")
+        s.cli("tier", "relaxed")  # raising applies at once; the next lowering is a request
+        rc, out = s.cli("tier", "off")
+        o = s.user_prompt("hello")
+        expect("S", "u5", not CODE_RE.search(o.user_text()), "no process table: a terminal-made "
+               "request is not announced")
+        o = s.user_prompt("safe-ai-skill confirm 12345678")
+        expect("S", "u6", "! safe-ai-skill" in o.user_text(), "and its refusal says to use `!`: "
+               "%r" % o.user_text()[:200])
     finally:
         s.cleanup()
 
@@ -789,7 +876,7 @@ def check_r2(c):
 
 
 CHECKS = {"8": check8, "5": check5, "7": check7, "6": check6, "2": check2, "3": check3,
-          "4": check4, "1": check1, "R": check_r, "R2": check_r2}
+          "4": check4, "1": check1, "R": check_r, "R2": check_r2, "S": check_s}
 
 
 def main():
@@ -800,9 +887,12 @@ def main():
     ap.add_argument("--only")
     ap.add_argument("--json")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--no-process-table", action="store_true")
     args = ap.parse_args()
     c = Ctx(args)
-    order = (args.only or "8,5,7,6,2,3,4,1,R,R2").split(",")
+    if args.no_process_table and not args.trusted:
+        ap.error("--no-process-table needs a test-hooks engine (--trusted)")
+    order = (args.only or "8,5,7,6,2,3,4,1,R,R2,S").split(",")
     for k in order:
         print("== check %s" % k)
         CHECKS[k](c)

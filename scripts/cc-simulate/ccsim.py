@@ -58,6 +58,21 @@ def plat_name():
     return {"Darwin": "darwin", "Linux": "linux"}.get(s, s.lower()) + "-" + arch
 
 
+def ps_available():
+    """Whether this machine lets a process read the process table the way the engine's
+    ancestry check does (`/proc`, or `/bin/ps`); a sandboxed run usually cannot."""
+    if os.path.exists("/proc/self/stat"):
+        return True
+    for ps in ("/bin/ps", "/usr/bin/ps"):
+        if os.path.isfile(ps):
+            try:
+                r = subprocess.run([ps, "-A", "-o", "pid="], capture_output=True, timeout=5)
+                return r.returncode == 0 and bool(r.stdout.strip())
+            except (OSError, subprocess.SubprocessError):
+                return False
+    return False
+
+
 def matcher_matches(matcher, value):
     """hooks "Matcher patterns": `*`, empty or omitted matches all; letters, digits, `_`, `-`,
     spaces, `,` and `|` only is an exact string or list; anything else is an unanchored
@@ -250,6 +265,9 @@ class Sim:
         self.transcript_path = os.path.join(self.cfg, "projects", "ccsim",
                                             self.session_id + ".jsonl")
         self.extra_env = {}
+        # Simulate a machine where the engine cannot read the process table (native Windows,
+        # a sandboxed hook): a test-hooks engine honours this switch; a release one ignores it.
+        self.no_process_table = False
         self.headless = False  # claude -p
         self.allowed_tools = []  # --allowedTools
         self.ask_answer = "no"  # what the simulated user answers in a permission dialog
@@ -283,6 +301,8 @@ class Sim:
         }
         if self.trust_override:
             env["SAFE_AI_SKILL_TEST_TRUST_DATA_DIR"] = "1"
+        if self.no_process_table:
+            env["SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE"] = "1"
         env.update(self.extra_env)
         return {k: v for k, v in env.items() if v is not None}
 
@@ -292,6 +312,9 @@ class Sim:
         hooks reference: settings hooks get CLAUDE_PROJECT_DIR."""
         env = self.base_env()
         env["CLAUDE_PROJECT_DIR"] = self.proj
+        # env-vars "CLAUDE_CODE_SESSION_ID": set in hook and Bash tool subprocesses, equal to
+        # the hook input's session_id (kept on resume, new on /clear).
+        env["CLAUDE_CODE_SESSION_ID"] = self.session_id
         if source.startswith("plugin:"):
             env["CLAUDE_PLUGIN_ROOT"] = self.root
             env["CLAUDE_PLUGIN_DATA"] = self.data
@@ -303,6 +326,7 @@ class Sim:
         variables are not in the Bash tool's environment."""
         env = self.base_env()
         env["PATH"] = os.path.join(self.root, "bin") + ":" + env["PATH"]
+        env["CLAUDE_CODE_SESSION_ID"] = self.session_id
         return env
 
     # hook selection
@@ -821,6 +845,14 @@ class Sim:
         e.update(env or {})
         p = subprocess.run([os.path.join(self.root, "bin", "safe-ai-skill")] + list(args),
                            cwd=self.proj, env=e, capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def bang(self, command):
+        """The user's `! <command>` in the prompt: runs in the session's shell with the Bash
+        tool's environment (so `CLAUDE_CODE_SESSION_ID` is this session's) and no tool hooks
+        (assumed: the docs do not say that `!` commands run PreToolUse hooks)."""
+        p = subprocess.run(["/bin/bash", "-c", command], cwd=self.proj, env=self.tool_env(),
+                           capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout + p.stderr
 
     def files_containing(self, needle, roots=None):

@@ -172,6 +172,9 @@ pub enum Attempt {
     LockedOut,
     /// No live request belongs to this session: refused, not counted, nothing consumed.
     NotThisSession,
+    /// With [`Reach::MadeHere`], only a request made from a terminal is pending for this
+    /// session: it needs an interactive check. Refused, not counted, nothing consumed.
+    NeedsInteractive,
 }
 
 /// The shape of a prompt, by one whitespace rule (tokens split on any whitespace).
@@ -478,7 +481,16 @@ pub fn confirm_attempt_in(
         is_session_id(session) && e.session.as_deref() == Some(session) && reach.covers(e, session)
     };
     if !pending.entries.iter().any(|e| mine(e) && is_live(e, now)) {
-        return Attempt::NotThisSession;
+        // A request this session could take, or holds, but not on the binding alone.
+        let terminal_made = reach == Reach::MadeHere
+            && pending.entries.iter().any(|e| {
+                !e.made_in_session && e.session.as_deref().is_none_or(|s| s == session)
+            });
+        return if terminal_made {
+            Attempt::NeedsInteractive
+        } else {
+            Attempt::NotThisSession
+        };
     }
     let hit = match (is_nonce(code), statefile::derived_key(dir, SALT_LABEL)) {
         (true, Ok(salt)) => pending.entries.iter().position(|e| {
