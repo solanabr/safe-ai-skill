@@ -1374,10 +1374,7 @@ impl PackReportLine {
             let approve = if self.reason == Some(Reason::Combo) {
                 String::new()
             } else {
-                format!(
-                    " or `safe-ai-skill verify approve {}`",
-                    escape_for_report(&self.display)
-                )
+                format!(" or `safe-ai-skill verify approve {}`", sh_quote(&origin))
             };
             return format!(
                 "; MOVED to {to} (origin {origin}); restore with `mv {} {}`{approve}",
@@ -1550,6 +1547,17 @@ fn sweep_within(
                 if let Some(to) = move_blocked(&dir.path, &pack) {
                     if let Some(e) = st.packs.get_mut(&ev.key) {
                         e.quarantined_to = Some(to.to_string_lossy().into_owned());
+                        let why = e.reason.map(Reason::label).unwrap_or("blocked");
+                        audit_event(
+                            dir,
+                            "verify_move",
+                            "moved",
+                            &format!(
+                                "from={} to={} reason={why}",
+                                pack.canonical.display(),
+                                to.display()
+                            ),
+                        );
                     }
                     let _ = state::store(dir, &st);
                 }
@@ -1958,7 +1966,8 @@ pub fn request_trust(dir: &DataDir, path: &Path) -> Result<PendingRequest, Engin
 ///
 /// A live pack named `target` (or at path `target`, relative to `cwd`) is approved in place,
 /// even when an earlier version also left a quarantined copy of that name. Otherwise a pack
-/// `on_block: move` moved is restored to its recorded origin, and a pack 1.0.0 moved into
+/// `on_block: move` moved is restored to its recorded origin (see [`moved_pack`] for how a bare
+/// name is resolved), and a pack 1.0.0 moved into
 /// `${DATA}/quarantine/<name>` is restored to its `.gitmodules` submodule path, else to
 /// `~/.claude/skills/<name>`. Creates a pending [`PendingKind::Approve`] entry; nothing changes
 /// until the user confirms it (see [`apply_confirmed`]).
@@ -1980,11 +1989,12 @@ fn request_approve_in(
     policy: &crate::policy::Policy,
 ) -> Result<PendingRequest, EngineError> {
     let project = project_root(cwd);
+    let project = project.canonicalize().unwrap_or(project);
     let st = state::load(dir).state;
     let v1 = lockfile::load(&dir.path);
     let live: Vec<Pack> = swept_packs(&project, user_skills, policy, &v1)
         .into_iter()
-        .filter(|p| pack_matches(p, target, cwd))
+        .filter(|p| pack_matches(p, target, cwd) || pack_matches(p, target, &project))
         .collect();
     let leftover = is_pack_name(target) && dir.path.join("quarantine").join(target).exists();
 
@@ -2024,6 +2034,22 @@ fn request_approve_in(
             }));
         }
         let mut summary = format!("approve in place: {}", lines.join("; "));
+        let moved_too: Vec<String> = st
+            .packs
+            .iter()
+            .filter(|(key, e)| {
+                e.quarantined_to.is_some()
+                    && is_pack_name(target)
+                    && dir_name(&state::path_of(key)).as_deref() == Some(target)
+            })
+            .map(|(key, _)| escape_for_report(key))
+            .collect();
+        if !moved_too.is_empty() {
+            summary.push_str(&format!(
+                ". Also moved under that name, left in quarantine (approve by path): {}",
+                moved_too.join(", ")
+            ));
+        }
         if leftover {
             summary.push_str(&format!(
                 ". A copy an earlier version quarantined at {} is left as it is",
@@ -2041,25 +2067,46 @@ fn request_approve_in(
     }
 
     // A pack `on_block: move` moved: its key is the origin.
-    let moved = st.packs.iter().find(|(key, e)| {
-        e.quarantined_to.is_some() && {
-            let origin = state::path_of(key);
-            dir_name(&origin).as_deref() == Some(target) || resolve_target(cwd, target) == origin
-        }
-    });
-    if let Some((key, e)) = moved {
+    let user_skills = user_skills
+        .canonicalize()
+        .unwrap_or_else(|_| enforce::lenient_canonical(user_skills));
+    let parents = restore_parents(&project, &user_skills, policy);
+    if let Some(Moved {
+        key,
+        entry: e,
+        shadowed,
+        by_path,
+    }) = moved_pack(&st, &project, &parents, cwd, target)?
+    {
         let from = PathBuf::from(e.quarantined_to.clone().unwrap_or_default());
         // A combination rule is never approved (spec D2.8), so moving the pack back would only
         // put blocked content where it runs: refuse now, before anything is restored.
         if e.reason == Some(state::Reason::Combo) || e.escapes() {
             return Err(Error::Other(format!(
-                "{} is blocked by a combination rule ({}), which approval never clears; it                  stays in quarantine at {}. Remove or fix it instead.",
+                "{} is blocked by a combination rule ({}), which approval never clears; it \
+                 stays in quarantine at {}. Remove or fix it instead.",
                 escape_for_report(target),
                 e.flagged_rules.join(", "),
                 escape_for_report(&from.display().to_string())
             )));
         }
-        return restore_request(dir, &from, &state::path_of(key), e.kind);
+        let note = (!shadowed.is_empty()).then(|| {
+            format!(
+                ". Also moved under that name, left in quarantine (approve by path): {}",
+                shadowed
+                    .iter()
+                    .map(|k| escape_for_report(k))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        let to = state::path_of(key);
+        let parents = if by_path && !to.starts_with(&project) {
+            restore_parents(&origin_project(&to), &user_skills, policy)
+        } else {
+            parents
+        };
+        return restore_request(dir, &from, &to, e.kind, &parents, note);
     }
 
     if leftover {
@@ -2068,13 +2115,255 @@ fn request_approve_in(
             Some(path) => (PackKind::Ext, path),
             None => (PackKind::Skill, user_skills.join(target)),
         };
-        return restore_request(dir, &from, &to, kind);
+        return restore_request(dir, &from, &to, kind, &parents, None);
     }
 
     Err(Error::Other(format!(
         "no swept, moved or quarantined skill pack matches `{}`",
         escape_for_report(target)
     )))
+}
+
+/// A moved pack [`moved_pack`] selected.
+struct Moved<'s> {
+    /// Its state key: the origin.
+    key: &'s String,
+    entry: &'s PackEntry,
+    /// Other moved packs of the same name a bare name passed over (origins).
+    shadowed: Vec<String>,
+    /// Named by its origin path rather than by a bare name.
+    by_path: bool,
+}
+
+/// The pack `on_block: move` moved that `target` names, with its state entry (keyed by its
+/// origin).
+///
+/// A path (relative to `cwd`, else to `project`) names exactly its origin. A bare name matches
+/// moved packs of that directory name: the user's own (in a swept root outside the project,
+/// such as `~/.claude/skills`) first, then the project's; those passed over are reported. A name
+/// matching more than one pack of the chosen scope (`foo` and `ext/foo`) is refused, and so is
+/// one matching only another project's pack, so a pack is never restored to the wrong slot.
+fn moved_pack<'s>(
+    st: &'s State,
+    project: &Path,
+    parents: &[PathBuf],
+    cwd: &Path,
+    target: &str,
+) -> Result<Option<Moved<'s>>, EngineError> {
+    let moved: Vec<(&String, &PackEntry)> = st
+        .packs
+        .iter()
+        .filter(|(_, e)| e.quarantined_to.is_some())
+        .collect();
+    for base in [cwd, project] {
+        let path = resolve_target(base, target);
+        if let Some((key, entry)) = moved.iter().find(|(key, _)| state::path_of(key) == path) {
+            return Ok(Some(Moved {
+                key,
+                entry,
+                shadowed: Vec::new(),
+                by_path: true,
+            }));
+        }
+    }
+    if !is_pack_name(target) {
+        return Ok(None);
+    }
+    let named: Vec<(&String, &PackEntry)> = moved
+        .into_iter()
+        .filter(|(key, _)| dir_name(&state::path_of(key)).as_deref() == Some(target))
+        .collect();
+    let local = |key: &str| state::path_of(key).starts_with(project);
+    let own = |key: &str| {
+        let origin = state::path_of(key);
+        !origin.starts_with(project)
+            && origin
+                .parent()
+                .is_some_and(|p| parents.iter().any(|r| r == p))
+    };
+    let (mine, rest): (Vec<_>, Vec<_>) = named.iter().copied().partition(|(k, _)| own(k));
+    let (here, elsewhere): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(k, _)| local(k));
+    let (candidates, shadowed) = if mine.is_empty() {
+        (here, Vec::new())
+    } else {
+        (mine, here)
+    };
+    match candidates.as_slice() {
+        [] => match elsewhere.as_slice() {
+            [] => Ok(None),
+            others => {
+                let origins: Vec<String> = others
+                    .iter()
+                    .map(|(key, _)| escape_for_report(key))
+                    .collect();
+                Err(Error::Other(format!(
+                    "`{}` matches only a pack moved out of another project ({}); run `verify \
+                     approve <origin path>` from that project; nothing was requested",
+                    escape_for_report(target),
+                    origins.join(", ")
+                )))
+            }
+        },
+        [(key, entry)] => Ok(Some(Moved {
+            key,
+            entry,
+            shadowed: shadowed.iter().map(|(k, _)| (*k).clone()).collect(),
+            by_path: false,
+        })),
+        many => {
+            let origins: Vec<String> = many.iter().map(|(key, _)| escape_for_report(key)).collect();
+            Err(Error::Other(format!(
+                "`{}` names more than one moved pack ({}); run `verify approve <path>` with the \
+                 origin path of the one to restore; nothing was requested",
+                escape_for_report(target),
+                origins.join(", ")
+            )))
+        }
+    }
+}
+
+/// The directories a restore may write a pack into: each swept root of `policy` that is safe
+/// to sweep (see [`confined_root`]) and its `ext/` dir, plus the user skills dir `user_skills`
+/// (canonical).
+fn restore_parents(
+    project: &Path,
+    user_skills: &Path,
+    policy: &crate::policy::Policy,
+) -> Vec<PathBuf> {
+    let ext = ext_component(&policy.supply_chain.ext_dir);
+    let mut parents = vec![user_skills.to_path_buf()];
+    for root in &policy.supply_chain.verify_skills_dirs {
+        let root_path = resolve_root(project, root);
+        let canon = if root_path.symlink_metadata().is_ok() {
+            confined_root(project, root, &root_path)
+        } else {
+            // A root that is gone (e.g. its only pack was moved) is held to the same bounds
+            // lexically; any symlink above it is refused by [`check_restore`].
+            let lexical = enforce::lenient_canonical(&root_path);
+            let relative = !root.starts_with('~') && !Path::new(root.as_str()).is_absolute();
+            let inside = lexical.starts_with(project) && lexical != project;
+            (!relative || inside).then_some(lexical)
+        };
+        if let Some(canon) = canon {
+            parents.push(canon.join(&ext));
+            parents.push(canon);
+        }
+    }
+    parents
+}
+
+/// The project a moved pack's `origin` belongs to: the repository root above its nearest
+/// existing ancestor, so an origin named by path is confined to its own project's roots from
+/// any working directory.
+fn origin_project(origin: &Path) -> PathBuf {
+    let anchor = origin
+        .ancestors()
+        .skip(1)
+        .find(|a| a.symlink_metadata().is_ok())
+        .unwrap_or(origin);
+    let root = project_root(anchor);
+    root.canonicalize().unwrap_or(root)
+}
+
+/// The first component of absolute `path` that is a symlink, if any (components past the
+/// first missing one cannot be links).
+fn symlink_component(path: &Path) -> Option<PathBuf> {
+    let mut at = PathBuf::new();
+    for c in path.components() {
+        at.push(c);
+        match at.symlink_metadata() {
+            Ok(m) if m.file_type().is_symlink() => return Some(at),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Refuse a restore of the quarantined `from` to `to` unless: the data dir is trusted (its
+/// state could otherwise be forged), `from` is an entry directly under `${DATA}/quarantine/`,
+/// `to` is a plain absolute path with no symlink in any component and nothing but an empty
+/// placeholder dir at it, and (when `parents` is given) `to` lies directly in one of them.
+/// Checked when the request is made and again right before the move.
+fn check_restore(
+    dir: &DataDir,
+    from: &Path,
+    to: &Path,
+    parents: Option<&[PathBuf]>,
+) -> Result<(), EngineError> {
+    let refuse = |why: String| {
+        Err(Error::Other(format!(
+            "not restored: {why}; the pack stays in quarantine at {}",
+            escape_for_report(&from.display().to_string())
+        )))
+    };
+    if !dir.trusted {
+        return refuse(
+            "restoring is refused for this plugin data dir (inside the project, or outside the \
+             Claude Code plugin data root), whose state could be forged; review the quarantined \
+             copy and move it back by hand"
+                .to_string(),
+        );
+    }
+    let quarantine = dir.path.join("quarantine").canonicalize().ok();
+    let from_ok = from
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_dir())
+        && from
+            .canonicalize()
+            .ok()
+            .and_then(|f| f.parent().map(Path::to_path_buf))
+            .is_some_and(|p| Some(p) == quarantine);
+    if !from_ok {
+        return refuse(format!(
+            "{} is not an entry of this data dir's quarantine",
+            escape_for_report(&from.display().to_string())
+        ));
+    }
+    let plain = to.is_absolute()
+        && to.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::Normal(_)
+            )
+        });
+    if !plain {
+        return refuse(format!(
+            "{} is not a plain absolute path",
+            escape_for_report(&to.display().to_string())
+        ));
+    }
+    if let Some(link) = symlink_component(to) {
+        return refuse(format!(
+            "{} is a symlink (it resolves to {}), so the origin {} is no longer where the pack \
+             was",
+            escape_for_report(&link.display().to_string()),
+            escape_for_report(&enforce::lenient_canonical(&link).display().to_string()),
+            escape_for_report(&to.display().to_string())
+        ));
+    }
+    if let Some(parents) = parents {
+        if !to.parent().is_some_and(|p| parents.iter().any(|r| r == p)) {
+            return refuse(format!(
+                "{} is outside the skill roots this project's policy sweeps; run `verify approve` \
+                 from the project the pack came from",
+                escape_for_report(&to.display().to_string())
+            ));
+        }
+    }
+    if let Ok(m) = to.symlink_metadata() {
+        let empty_dir =
+            m.file_type().is_dir() && std::fs::read_dir(to).is_ok_and(|mut d| d.next().is_none());
+        if !empty_dir {
+            return refuse(format!(
+                "{} already exists; move it aside first",
+                escape_for_report(&to.display().to_string())
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// True when `pack` is the one `target` names: its directory name, or its path (relative to
@@ -2090,11 +2379,12 @@ fn pack_matches(pack: &Pack, target: &str, cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `target` as a path: `~` expanded, relative to `cwd`.
+/// `target` as a path: `~` expanded, relative to `cwd`, canonical as far as it exists (a moved
+/// pack's origin is gone, but its parent still resolves through any symlink).
 fn resolve_target(cwd: &Path, target: &str) -> PathBuf {
     let p = expand_home(target);
     let joined = if p.is_absolute() { p } else { cwd.join(p) };
-    joined.canonicalize().unwrap_or(joined)
+    enforce::lenient_canonical(&joined)
 }
 
 /// A pending restore of the quarantined `from` to `to`.
@@ -2103,13 +2393,17 @@ fn restore_request(
     from: &Path,
     to: &Path,
     kind: PackKind,
+    parents: &[PathBuf],
+    note: Option<String>,
 ) -> Result<PendingRequest, EngineError> {
+    check_restore(dir, from, to, Some(parents))?;
     let hash = state::tree_hash(from);
     let report = grading::scan_pack(from);
     if !report.combos.is_empty() {
         let rules: Vec<&str> = report.combos.iter().map(|c| c.rule).collect();
         return Err(Error::Other(format!(
-            "the quarantined {} {} fires a combination rule ({}), which approval never clears;              it is not restored",
+            "the quarantined {} {} fires a combination rule ({}), which approval never clears; \
+             it is not restored",
             kind.label(),
             escape_for_report(&from.display().to_string()),
             rules.join(", ")
@@ -2117,7 +2411,7 @@ fn restore_request(
     }
     let flagged = state::flagged_rules(&report);
     let summary = format!(
-        "restore the quarantined {} {} to {} and approve it at content {}{}",
+        "restore the quarantined {} {} to {} and approve it at content {}{}{}",
         kind.label(),
         escape_for_report(&from.display().to_string()),
         escape_for_report(&to.display().to_string()),
@@ -2126,7 +2420,8 @@ fn restore_request(
             String::new()
         } else {
             format!("; acknowledges {}", flagged.join(", "))
-        }
+        },
+        note.unwrap_or_default()
     );
     let payload = serde_json::json!({
         "action": "restore",
@@ -2166,7 +2461,8 @@ fn pending_approve(
 ///   (clean) and records a hash-bound trust entry when the data dir is trusted. A pack that
 ///   changed since the request is skipped and reported.
 /// - Approve restore: moves the quarantined copy back to its origin (never overwriting) when
-///   its content still equals what was shown, then pins and trusts it the same way.
+///   its content still equals what was shown, says so in the returned text, then pins and
+///   trusts it the same way, under the kind (skill or ext) the request recorded.
 ///
 /// Every applied action is audited.
 pub fn apply_confirmed(dir: &DataDir, confirmed: &Confirmed) -> Result<String, EngineError> {
@@ -2200,11 +2496,15 @@ fn payload_rules(payload: &serde_json::Value) -> Vec<String> {
 }
 
 fn audit_verify(dir: &DataDir, classification: &str, reason: &str) {
+    audit_event(dir, classification, "confirmed", reason);
+}
+
+fn audit_event(dir: &DataDir, classification: &str, decision: &str, reason: &str) {
     let entry = crate::audit::AuditEntry::new(
         String::new(),
         "safe-ai-skill".to_string(),
         classification.to_string(),
-        "confirmed".to_string(),
+        decision.to_string(),
         reason.to_string(),
         crate::audit::sha256_hex(reason.as_bytes()),
     );
@@ -2262,6 +2562,7 @@ fn apply_approve(dir: &DataDir, payload: &serde_json::Value) -> Result<String, E
     let mut done: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut refused: Vec<String> = Vec::new();
+    let mut restored: Vec<String> = Vec::new();
     match payload_str(payload, "action")? {
         "in_place" => {
             let packs = payload
@@ -2301,7 +2602,18 @@ fn apply_approve(dir: &DataDir, payload: &serde_json::Value) -> Result<String, E
             if state::tree_hash(&from) != hash {
                 skipped.push(from.to_string_lossy().into_owned());
             } else {
+                check_restore(dir, &from, &to, None)?;
                 restore_quarantine(&from, &to).map_err(|e| Error::Other(e.to_string()))?;
+                restored.push(format!(
+                    "safe-ai-skill: restored {} to {}",
+                    escape_for_report(&from.to_string_lossy()),
+                    escape_for_report(&to.to_string_lossy())
+                ));
+                audit_verify(
+                    dir,
+                    "verify_restore",
+                    &format!("from={} to={}", from.display(), to.display()),
+                );
                 // A pack `on_block: move` moved keeps its origin key.
                 let key = st
                     .packs
@@ -2337,7 +2649,7 @@ fn apply_approve(dir: &DataDir, payload: &serde_json::Value) -> Result<String, E
     for path in &done {
         audit_verify(dir, "verify_approve", &format!("path={path}"));
     }
-    let mut msg = Vec::new();
+    let mut msg = restored;
     if !done.is_empty() {
         let shown: Vec<String> = done.iter().map(|d| escape_for_report(d)).collect();
         msg.push(format!("safe-ai-skill: approved {}", shown.join(", ")));
@@ -2418,6 +2730,12 @@ fn approve_entry(
         entry.more_findings = more_findings;
         entry.flagged_rules = state::flagged_rules(&report);
         entry.last_scanned_hash = hash.to_string();
+    }
+    entry.kind = kind;
+    if kind == PackKind::Ext {
+        if let Some(sha) = lockfile::resolve_git_sha(path) {
+            entry.head = Some(sha);
+        }
     }
     entry.names = walked.names;
     entry.names_incomplete = walked.unparseable;
@@ -2980,7 +3298,7 @@ mod orchestration_tests {
 
     #[test]
     fn on_block_move_restores_a_drifted_pack_on_approval() {
-        let d = data("move-drift", false);
+        let d = data("move-drift", true);
         let project = tempdir("move-drift-proj");
         let pack = seed_skill(&skills(&project), "tool", "# tool");
         let mut p = policy();
@@ -3166,7 +3484,7 @@ mod orchestration_tests {
 
     #[test]
     fn approve_restores_a_v1_quarantined_submodule_into_ext() {
-        let d = data("approve-ext", false);
+        let d = data("approve-ext", true);
         let project = tempdir("approve-ext-proj");
         fs::write(
             project.join(".gitmodules"),
@@ -3190,7 +3508,7 @@ mod orchestration_tests {
 
     #[test]
     fn approve_restores_to_user_skills_without_a_gitmodules_entry() {
-        let d = data("approve-user", false);
+        let d = data("approve-user", true);
         let project = tempdir("approve-user-proj");
         let user = tempdir("approve-user-home");
         seed_skill(&d.path.join("quarantine"), "helper", "# helper");
@@ -3497,6 +3815,541 @@ mod orchestration_tests {
         assert!(!st
             .packs
             .contains_key(&state::key_of(&skills(&project).join("ext"))));
+    }
+
+    // ---- issue #25: approve restores to the origin, pins by kind, and the approval sticks ----
+
+    /// [`sweep_policy`] over `roots` with `on_block: move`.
+    fn move_policy(roots: &[&str]) -> crate::policy::Policy {
+        let mut p = sweep_policy(roots, true);
+        p.supply_chain.on_block = "move".into();
+        p
+    }
+
+    /// Record `pack` with `p`, then change it so the next sweep moves it (drift).
+    fn drift_and_move(d: &DataDir, project: &Path, p: &crate::policy::Policy, pack: &Path) {
+        sweep(d, project, &no_user_skills(), p, combo_scanner);
+        fs::write(pack.join("drift.md"), "changed").unwrap();
+        let r = sweep(d, project, &no_user_skills(), p, combo_scanner);
+        assert!(!pack.exists(), "drift moved {}", pack.display());
+        assert!(
+            r.system_message.contains("MOVED to"),
+            "{}",
+            r.system_message
+        );
+    }
+
+    /// Request and confirm `verify approve <target>` from `cwd`; returns the request summary
+    /// and the applied message.
+    fn approve_with(
+        d: &DataDir,
+        cwd: &Path,
+        p: &crate::policy::Policy,
+        target: &str,
+    ) -> (String, String) {
+        let req = request_approve_in(d, cwd, &no_user_skills(), target, p).unwrap();
+        let msg = apply_confirmed(d, &confirm(d, &req)).unwrap();
+        (req.summary, msg)
+    }
+
+    #[test]
+    fn i25_moved_ext_pack_restores_into_ext_pins_as_ext_and_is_not_moved_again() {
+        for trusted in [false, true] {
+            let tag = if trusted { "i25-ext-t" } else { "i25-ext-u" };
+            let d = data(tag, trusted);
+            let project = tempdir(&format!("{tag}-proj"));
+            let pack = seed_skill(&skills(&project).join("ext"), "solana-dev", "# solana-dev");
+            fs::write(pack.join("run.sh"), HIGH_SCRIPT).unwrap();
+            let p = move_policy(&[".claude/skills"]);
+            drift_and_move(&d, &project, &p, &pack);
+            if !trusted {
+                // Untrusted state could be forged: no restore is even requested.
+                let err = request_approve_in(&d, &project, &no_user_skills(), "solana-dev", &p)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("refused for this plugin data dir"), "{err}");
+                assert!(!pack.exists());
+                assert!(!d.path.join(confirm::PENDING_FILE).exists());
+                continue;
+            }
+
+            let (summary, msg) = approve_with(&d, &project, &p, "solana-dev");
+
+            // Symptom 1: restored into its `ext/` slot, nowhere else, and the restore is printed.
+            let shown = pack.display().to_string();
+            assert!(
+                summary.contains("restore") && summary.contains(&shown),
+                "{summary}"
+            );
+            assert!(msg.contains("restored") && msg.contains(&shown), "{msg}");
+            assert!(pack.join("drift.md").exists());
+            assert!(!skills(&project).join("solana-dev").exists());
+            assert!(!no_user_skills().join("solana-dev").exists());
+            // Symptom 2: pinned as an ext pack at the approved content.
+            let st = state::load(&d).state;
+            let e = entry(&st, &pack);
+            assert_eq!((e.kind, e.state), (PackKind::Ext, PackStatus::Clean));
+            assert_eq!(e.tree_hash, state::tree_hash(&pack));
+            assert!(e.quarantined_to.is_none());
+            // Symptom 3: the next sweeps leave it where it is.
+            for _ in 0..2 {
+                let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+                assert!(r.blocked.is_empty(), "{r:?}");
+                assert!(!r.system_message.contains("MOVED"), "{}", r.system_message);
+                assert!(pack.join("run.sh").exists());
+            }
+            let st = state::load(&d).state;
+            assert_eq!(entry(&st, &pack).kind, PackKind::Ext);
+            assert_eq!(entry(&st, &pack).state, PackStatus::Clean);
+        }
+    }
+
+    #[test]
+    fn i25_moved_packs_of_an_external_root_restore_to_that_root() {
+        let d = data("i25-abs", true);
+        let project = tempdir("i25-abs-proj");
+        let root = tempdir("i25-abs-root");
+        let skill = seed_skill(&root, "helper", "# helper");
+        let ext = seed_skill(&root.join("ext"), "jup", "# jup");
+        let root_str = root.to_string_lossy().into_owned();
+        let p = move_policy(&[".claude/skills", root_str.as_str()]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        for pack in [&skill, &ext] {
+            fs::write(pack.join("drift.md"), "changed").unwrap();
+        }
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!skill.exists() && !ext.exists(), "{}", r.system_message);
+
+        for (pack, name, kind) in [
+            (&skill, "helper", PackKind::Skill),
+            (&ext, "jup", PackKind::Ext),
+        ] {
+            let (_, msg) = approve_with(&d, &project, &p, name);
+            assert!(msg.contains(&pack.display().to_string()), "{msg}");
+            assert!(pack.join("drift.md").exists());
+            assert!(!skills(&project).join(name).exists());
+            let st = state::load(&d).state;
+            assert_eq!(
+                (entry(&st, pack).kind, entry(&st, pack).state),
+                (kind, PackStatus::Clean)
+            );
+        }
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(r.blocked.is_empty() && r.hook_output().is_none(), "{r:?}");
+        assert!(skill.exists() && ext.exists());
+    }
+
+    #[test]
+    fn i25_a_name_shared_by_a_skill_and_an_ext_pack_is_never_restored_to_the_wrong_one() {
+        let d = data("i25-same", true);
+        let project = tempdir("i25-same-proj");
+        let top = seed_skill(&skills(&project), "foo", "# top foo");
+        let ext = seed_skill(&skills(&project).join("ext"), "foo", "# ext foo");
+        let p = move_policy(&[".claude/skills"]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        for pack in [&top, &ext] {
+            fs::write(pack.join("drift.md"), "changed").unwrap();
+        }
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!top.exists() && !ext.exists());
+        let q = d.path.join("quarantine");
+        assert!(
+            q.join("foo").exists() && q.join("foo-1").exists(),
+            "no shared slot"
+        );
+
+        // The bare name is ambiguous: refused, nothing requested or moved.
+        let err = request_approve_in(&d, &project, &no_user_skills(), "foo", &p).unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains(&top.display().to_string()) && err.contains(&ext.display().to_string()),
+            "{err}"
+        );
+        assert!(!top.exists() && !ext.exists());
+
+        // By path, each goes back to its own slot with its own content and kind.
+        approve_with(&d, &project, &p, ".claude/skills/ext/foo");
+        assert_eq!(
+            fs::read_to_string(ext.join("SKILL.md")).unwrap(),
+            "# ext foo"
+        );
+        assert!(!top.exists());
+        // The bare name now finds the live ext pack; the summary names the moved one.
+        let req = request_approve_in(&d, &project, &no_user_skills(), "foo", &p).unwrap();
+        assert!(
+            req.summary.contains("approve in place")
+                && req.summary.contains("left in quarantine")
+                && req.summary.contains(&top.display().to_string()),
+            "{}",
+            req.summary
+        );
+        approve_with(&d, &project, &p, ".claude/skills/foo");
+        assert_eq!(
+            fs::read_to_string(top.join("SKILL.md")).unwrap(),
+            "# top foo"
+        );
+        let st = state::load(&d).state;
+        assert_eq!(entry(&st, &ext).kind, PackKind::Ext);
+        assert_eq!(entry(&st, &top).kind, PackKind::Skill);
+        assert!(sweep(&d, &project, &no_user_skills(), &p, combo_scanner)
+            .blocked
+            .is_empty());
+    }
+
+    #[test]
+    fn i25_a_moved_pack_of_another_project_is_not_restored_by_bare_name() {
+        let d = data("i25-other", true);
+        let a = tempdir("i25-other-a");
+        fs::write(a.join(".gitmodules"), "").unwrap();
+        let b = tempdir("i25-other-b");
+        let pa = seed_skill(&skills(&a).join("ext"), "tool", "# a");
+        let pb = seed_skill(&skills(&b).join("ext"), "tool", "# b");
+        let p = move_policy(&[".claude/skills"]);
+        drift_and_move(&d, &a, &p, &pa);
+        drift_and_move(&d, &b, &p, &pb);
+
+        approve_with(&d, &b, &p, "tool");
+
+        assert_eq!(fs::read_to_string(pb.join("SKILL.md")).unwrap(), "# b");
+        assert!(!pa.exists(), "project a's pack stays in quarantine");
+
+        // From a third project, a lone match in another project is not taken by bare name.
+        let c = tempdir("i25-other-c");
+        let err = request_approve_in(&d, &c, &no_user_skills(), "tool", &p)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("another project") && err.contains(&pa.display().to_string()),
+            "{err}"
+        );
+        // Named by its origin path it is restored there, from any directory.
+        approve_with(&d, &c, &p, &pa.to_string_lossy());
+        assert_eq!(fs::read_to_string(pa.join("SKILL.md")).unwrap(), "# a");
+    }
+
+    /// The `audit.jsonl` lines of `d`.
+    fn audit_lines(d: &DataDir) -> Vec<serde_json::Value> {
+        fs::read_to_string(d.path.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn i25_moves_and_restores_are_audited_and_the_hint_is_absolute() {
+        let d = data("i25-audit", true);
+        let project = tempdir("i25-audit-proj");
+        fs::write(project.join(".gitmodules"), "").unwrap();
+        let pack = seed_skill(&skills(&project).join("ext"), "au", "# au");
+        let p = move_policy(&[".claude/skills"]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        fs::write(pack.join("drift.md"), "changed").unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        let origin = pack.display().to_string();
+        assert!(
+            r.system_message
+                .contains(&format!("verify approve {}", sh_quote(&origin))),
+            "{}",
+            r.system_message
+        );
+        let moved = audit_lines(&d)
+            .into_iter()
+            .find(|l| l["classification"] == "verify_move")
+            .expect("a verify_move line");
+        let reason = moved["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!("from={origin} ")) && reason.contains("reason=drift"),
+            "{reason}"
+        );
+        assert_eq!(moved["decision"], "moved");
+
+        // The absolute origin works from any directory.
+        let elsewhere = tempdir("i25-audit-cwd");
+        approve_with(&d, &elsewhere, &p, &origin);
+        assert!(pack.join("drift.md").exists());
+        let restored = audit_lines(&d)
+            .into_iter()
+            .find(|l| l["classification"] == "verify_restore")
+            .expect("a verify_restore line");
+        assert!(
+            restored["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!(" to={origin}")),
+            "{restored}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn i25_a_symlinked_origin_is_never_restored_through() {
+        let d = data("i25-link", true);
+        let project = tempdir("i25-link-proj");
+        let user = tempdir("i25-link-user");
+        let pack = seed_skill(&skills(&project).join("ext"), "foo", "# foo");
+        let p = move_policy(&[".claude/skills"]);
+        drift_and_move(&d, &project, &p, &pack);
+        let ext = skills(&project).join("ext");
+        fs::remove_dir(&ext).unwrap();
+        std::os::unix::fs::symlink(&user, &ext).unwrap();
+
+        // Refused when requested.
+        let err = request_approve_in(&d, &project, &user, "foo", &p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!user.join("foo").exists());
+
+        // And when the link appears between the request and the confirmation.
+        fs::remove_file(&ext).unwrap();
+        fs::create_dir(&ext).unwrap();
+        let req = request_approve_in(&d, &project, &user, "foo", &p).unwrap();
+        fs::remove_dir(&ext).unwrap();
+        std::os::unix::fs::symlink(&user, &ext).unwrap();
+        let err = apply_confirmed(&d, &confirm(&d, &req))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!user.join("foo").exists());
+        let st = state::load(&d).state;
+        let key = state::key_of(&pack);
+        assert!(
+            st.packs[&key].quarantined_to.is_some(),
+            "still in quarantine"
+        );
+        assert!(!audit_lines(&d)
+            .iter()
+            .any(|l| l["classification"] == "verify_restore"));
+    }
+
+    #[test]
+    fn i25_forged_origins_and_quarantine_paths_are_refused() {
+        let d = data("i25-forged", true);
+        let project = tempdir("i25-forged-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "fz", "# fz");
+        let p = move_policy(&[".claude/skills"]);
+        drift_and_move(&d, &project, &p, &pack);
+        let mut st = state::load(&d).state;
+        let key = state::key_of(&pack);
+        let entry = st.packs.remove(&key).unwrap();
+
+        // An origin outside every swept root.
+        let outside = tempdir("i25-forged-out").join("fz");
+        st.packs.insert(state::key_of(&outside), entry.clone());
+        state::store(&d, &st).unwrap();
+        let err = request_approve_in(&d, &project, &no_user_skills(), "fz", &p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another project"), "{err}");
+        let err = request_approve_in(
+            &d,
+            &project,
+            &no_user_skills(),
+            &outside.to_string_lossy(),
+            &p,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("outside the skill roots"), "{err}");
+        assert!(!outside.exists());
+
+        // A "quarantined" copy that is not in the quarantine.
+        let victim = seed_skill(&tempdir("i25-forged-victim"), "fz", "# victim");
+        let mut forged = entry;
+        forged.quarantined_to = Some(victim.to_string_lossy().into_owned());
+        st.packs.remove(&state::key_of(&outside));
+        st.packs.insert(key, forged);
+        state::store(&d, &st).unwrap();
+        let err = request_approve_in(&d, &project, &no_user_skills(), "fz", &p)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not an entry of this data dir's quarantine"),
+            "{err}"
+        );
+        assert!(victim.join("SKILL.md").exists() && !pack.exists());
+    }
+
+    #[test]
+    fn i25_an_occupied_origin_is_refused_when_requested() {
+        let d = data("i25-occupied", true);
+        let project = tempdir("i25-occupied-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "oc", "# oc");
+        let p = move_policy(&[".claude/skills"]);
+        drift_and_move(&d, &project, &p, &pack);
+        seed_skill(&skills(&project).join("ext"), "oc", "# reinstalled");
+        // The reinstalled pack is live, so approve it by name in place; the moved copy is only
+        // reachable by path, and that is refused before any confirmation.
+        let st = state::load(&d).state;
+        let from = PathBuf::from(
+            st.packs[&state::key_of(&pack)]
+                .quarantined_to
+                .clone()
+                .unwrap(),
+        );
+        let err = restore_request(
+            &d,
+            &from,
+            &pack,
+            PackKind::Ext,
+            &[skills(&project).join("ext")],
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(!d.path.join(confirm::PENDING_FILE).exists());
+        assert_eq!(
+            fs::read_to_string(pack.join("SKILL.md")).unwrap(),
+            "# reinstalled"
+        );
+    }
+
+    #[test]
+    fn i25_a_bare_name_prefers_the_users_own_moved_pack_and_names_the_shadowed_one() {
+        let d = data("i25-own", true);
+        let project = tempdir("i25-own-proj");
+        let user = tempdir("i25-own-user");
+        let own = seed_skill(&user, "helper", "# mine");
+        let local = seed_skill(&skills(&project), "helper", "# project");
+        let user_str = user.to_string_lossy().into_owned();
+        let p = move_policy(&[".claude/skills", user_str.as_str()]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        for pack in [&own, &local] {
+            fs::write(pack.join("drift.md"), "changed").unwrap();
+        }
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!own.exists() && !local.exists());
+
+        let (summary, _) = approve_with(&d, &project, &p, "helper");
+
+        assert!(
+            summary.contains(&own.display().to_string())
+                && summary.contains("left in quarantine")
+                && summary.contains(&local.display().to_string()),
+            "{summary}"
+        );
+        assert_eq!(fs::read_to_string(own.join("SKILL.md")).unwrap(), "# mine");
+        assert!(!local.exists());
+    }
+
+    #[test]
+    fn i25_approved_in_place_ext_pack_is_pinned_as_ext_with_its_commit() {
+        let d = data("i25-head", true);
+        let project = tempdir("i25-head-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "kit", "# kit");
+        fs::write(pack.join("run.sh"), HIGH_SCRIPT).unwrap();
+        // A submodule checkout: `.git` names its git dir, whose HEAD is the commit.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let gitdir = project.join(".git/modules/kit");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("HEAD"), format!("{sha}\n")).unwrap();
+        fs::write(pack.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let p = move_policy(&[".claude/skills"]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        fs::write(pack.join("drift.md"), "changed").unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(pack.exists(), "a submodule checkout is never moved");
+        assert!(
+            r.system_message.contains("not moved"),
+            "{}",
+            r.system_message
+        );
+
+        let (summary, _) = approve_with(&d, &project, &p, "kit");
+        assert!(summary.contains("approve in place"), "{summary}");
+
+        let st = state::load(&d).state;
+        let e = entry(&st, &pack);
+        assert_eq!((e.kind, e.state), (PackKind::Ext, PackStatus::Clean));
+        assert_eq!(e.head.as_deref(), Some(sha));
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(r.blocked.is_empty() && r.hook_output().is_none(), "{r:?}");
+    }
+
+    #[test]
+    fn i25_approving_a_never_swept_ext_pack_records_its_kind_and_commit() {
+        let d = data("i25-head-new", true);
+        let project = tempdir("i25-head-new-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "kit", "# kit");
+        let sha = "89abcdef0123456789abcdef0123456789abcdef";
+        let gitdir = project.join(".git/modules/kit");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("HEAD"), format!("{sha}\n")).unwrap();
+        fs::write(pack.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let p = move_policy(&[".claude/skills"]);
+
+        approve_with(&d, &project, &p, "kit");
+
+        let st = state::load(&d).state;
+        let e = entry(&st, &pack);
+        assert_eq!((e.kind, e.head.as_deref()), (PackKind::Ext, Some(sha)));
+    }
+
+    #[test]
+    fn i25_approval_sticks_over_a_packs_lock_mismatch_until_the_content_changes() {
+        let d = data("i25-lock", true);
+        let project = tempdir("i25-lock-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "pk", "# pk");
+        fs::create_dir_all(project.join(".safe-ai-skill")).unwrap();
+        fs::write(
+            project.join(state::PACKS_LOCK),
+            r#"{"packs":[{"path":".claude/skills/ext/pk","tree_hash":"00"}]}"#,
+        )
+        .unwrap();
+        let p = move_policy(&[".claude/skills"]);
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!pack.exists(), "{}", r.system_message);
+
+        approve_with(&d, &project, &p, "pk");
+        assert!(pack.exists());
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(r.blocked.is_empty() && pack.exists(), "{r:?}");
+
+        // Changed content is not covered by the approval: blocked and moved again, printed.
+        fs::write(pack.join("drift.md"), "changed").unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert!(!pack.exists());
+        assert!(
+            r.system_message.contains("MOVED to"),
+            "{}",
+            r.system_message
+        );
+    }
+
+    #[test]
+    fn i25_an_untrusted_data_dir_never_lets_an_approval_outrank_packs_lock() {
+        let d = data("i25-lock-u", false);
+        let project = tempdir("i25-lock-u-proj");
+        seed_skill(&skills(&project), "pk", "# pk");
+        fs::create_dir_all(project.join(".safe-ai-skill")).unwrap();
+        fs::write(
+            project.join(state::PACKS_LOCK),
+            r#"{"packs":[{"path":".claude/skills/pk","tree_hash":"00"}]}"#,
+        )
+        .unwrap();
+        let p = sweep_policy(&[".claude/skills"], true);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        approve_with(&d, &project, &p, "pk");
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert_eq!(r.blocked, vec![".claude/skills/pk".to_string()]);
+    }
+
+    #[test]
+    fn i25_a_combo_block_stays_blocked_after_an_in_place_approval_attempt() {
+        let d = data("i25-combo", true);
+        let project = tempdir("i25-combo-proj");
+        let pack = seed_skill(&skills(&project).join("ext"), "cx", "# cx");
+        // Tracked, so it is denied in place rather than moved.
+        fs::write(pack.join(".git"), "gitdir: /nonexistent\n").unwrap();
+        fs::write(pack.join("COMBO"), "x").unwrap();
+        let p = move_policy(&[".claude/skills"]);
+        sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        let req = request_approve_in(&d, &project, &no_user_skills(), "cx", &p).unwrap();
+        apply_confirmed(&d, &confirm(&d, &req)).unwrap();
+        let r = sweep(&d, &project, &no_user_skills(), &p, combo_scanner);
+        assert_eq!(r.blocked, vec![".claude/skills/ext/cx".to_string()]);
     }
 
     #[test]

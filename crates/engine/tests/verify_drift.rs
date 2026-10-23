@@ -110,12 +110,31 @@ fn seed_quarantined(data: &Path, name: &str) {
 
 /// Run `verify approve <name>` from `cwd` (as a user would in a terminal): a pending request.
 fn approve_from(cwd: &Path, home: &Path, data: &Path, name: &str) -> serde_json::Value {
-    let run = Invocation::new(&["verify", "approve", name])
+    approve_run(cwd, home, data, name, false)
+}
+
+/// [`approve_from`] with the data dir trusted (`test-hooks` builds only), as a restore needs.
+#[cfg(feature = "test-hooks")]
+fn approve_trusted_from(cwd: &Path, home: &Path, data: &Path, name: &str) -> serde_json::Value {
+    approve_run(cwd, home, data, name, true)
+}
+
+fn approve_run(
+    cwd: &Path,
+    home: &Path,
+    data: &Path,
+    name: &str,
+    trusted: bool,
+) -> serde_json::Value {
+    let mut inv = Invocation::new(&["verify", "approve", name])
         .plugin_data(data)
         .home(home)
         .cwd(cwd)
-        .stdin("{}")
-        .run();
+        .stdin("{}");
+    if trusted {
+        inv = inv.env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1");
+    }
+    let run = inv.run();
     let v = run.json();
     assert_eq!(v["status"], "pending", "approve failed: {}", run.stdout);
     // A request id only: the confirmation code never reaches the agent (WS-B).
@@ -441,6 +460,8 @@ fn user_scope_skills_swept_when_listed_in_policy() {
     );
 }
 
+// A restore needs a trusted data dir, which only a `test-hooks` build grants a temp dir.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn approve_of_a_quarantined_skill_requests_a_restore_to_user_skills() {
     // Without a `.gitmodules` entry, a pack an earlier version moved to quarantine/ would go back
@@ -450,7 +471,7 @@ fn approve_of_a_quarantined_skill_requests_a_restore_to_user_skills() {
     let data = TempDir::new("approve-data");
     seed_quarantined(data.path(), "pda-helper");
 
-    let v = approve(project.path(), home.path(), data.path(), "pda-helper");
+    let v = approve_trusted_from(project.path(), home.path(), data.path(), "pda-helper");
 
     let summary = v["summary"].as_str().unwrap_or_default();
     assert!(
@@ -462,6 +483,8 @@ fn approve_of_a_quarantined_skill_requests_a_restore_to_user_skills() {
     assert!(!home.path().join(".claude/skills/pda-helper").exists());
 }
 
+// A restore needs a trusted data dir, which only a `test-hooks` build grants a temp dir.
+#[cfg(feature = "test-hooks")]
 #[test]
 fn approve_of_a_quarantined_submodule_targets_its_gitmodules_path() {
     // A quarantined `ext/` submodule goes back to the path `.gitmodules` declares for it, even
@@ -481,7 +504,7 @@ fn approve_of_a_quarantined_submodule_targets_its_gitmodules_path() {
     std::fs::create_dir_all(&nested).unwrap();
     seed_quarantined(data.path(), "solana-dev");
 
-    let v = approve_from(&nested, home.path(), data.path(), "solana-dev");
+    let v = approve_trusted_from(&nested, home.path(), data.path(), "solana-dev");
 
     let summary = v["summary"].as_str().unwrap_or_default();
     assert!(
@@ -490,6 +513,33 @@ fn approve_of_a_quarantined_submodule_targets_its_gitmodules_path() {
         "{v}"
     );
     assert!(data.path().join("quarantine").join("solana-dev").exists());
+}
+
+#[test]
+fn approve_restore_is_refused_for_an_untrusted_data_dir() {
+    // A CLAUDE_PLUGIN_DATA outside the Claude Code plugin data root: its state could be forged,
+    // so nothing is restored from it (#25).
+    let project = TempDir::new("approve-untrusted-proj");
+    let home = TempDir::new("approve-untrusted-home");
+    let data = TempDir::new("approve-untrusted-data");
+    seed_quarantined(data.path(), "pda-helper");
+    let run = Invocation::new(&["verify", "approve", "pda-helper"])
+        .plugin_data(data.path())
+        .home(home.path())
+        .cwd(project.path())
+        .stdin("{}")
+        .run();
+    let v = run.json();
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("refused for this plugin data dir"),
+        "{v}"
+    );
+    assert!(data.path().join("quarantine").join("pda-helper").exists());
+    assert!(!home.path().join(".claude/skills/pda-helper").exists());
 }
 
 #[test]

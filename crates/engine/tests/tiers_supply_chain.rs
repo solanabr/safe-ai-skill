@@ -515,12 +515,13 @@ fn after_verify_trust_a_high_pack_has_no_opinion_even_at_high() {
         path: w.data.path().to_path_buf(),
         trusted: true,
     };
+    let canonical = pack.canonicalize().unwrap();
+    let req = verify::request_trust(&dir, &canonical).expect("a trust request");
+    // Read after the request exists: it is stamped with the clock at creation.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let canonical = pack.canonicalize().unwrap();
-    let req = verify::request_trust(&dir, &canonical).expect("a trust request");
     let code = confirm::announce_pending(&dir, now)
         .into_iter()
         .find(|a| a.id.as_str() == req.id)
