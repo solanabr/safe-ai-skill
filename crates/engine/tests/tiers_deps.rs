@@ -492,3 +492,51 @@ fn hostile_manifests_are_bounded_and_panic_free() {
         );
     }
 }
+
+#[test]
+fn upgrade_rehearsal_pinned_packs_without_deps_json_deny_nothing_and_get_recorded() {
+    let w = World::new("deps-upgrade");
+    let names = ["lockfiles", "crate", "plain"];
+    w.pack(
+        "lockfiles",
+        &[
+            ("package.json", "{\"dependencies\": {\"a\": \"1.0.0\"}}"),
+            (
+                "package-lock.json",
+                "{\"lockfileVersion\": 3, \"packages\": {}}",
+            ),
+        ],
+    );
+    w.pack(
+        "crate",
+        &[
+            ("Cargo.toml", "[package]\nname = \"c\"\n"),
+            ("Cargo.lock", ""),
+        ],
+    );
+    w.pack("plain", &[]);
+    // Pin every pack, then remove deps.json: the state a pre-#11 install upgrades from.
+    w.session(Tier::High);
+    let deps = w.data.join("deps.json");
+    assert!(deps.exists());
+    std::fs::remove_file(&deps).unwrap();
+    for tier in tiers() {
+        let (sys, ctx) = w.report(tier);
+        assert!(
+            !sys.contains("BLOCK skill") && !ctx.contains("scan_budget_exceeded"),
+            "{sys}"
+        );
+        assert!(!sys.contains("dependency set"), "{sys}");
+        for name in names {
+            assert_eq!(w.reach(name, tier), open(), "{name} at {tier:?}");
+        }
+        assert!(deps.exists(), "recorded afresh at {tier:?}");
+    }
+    // A tampered deps.json is the same: recorded afresh, nothing denied for unchanged packs.
+    std::fs::write(&deps, "{\"v\":1,\"gen\":1,\"mac\":\"00\",\"body\":{}}").unwrap();
+    let (sys, _) = w.report(Tier::High);
+    assert!(!sys.contains("BLOCK skill"), "{sys}");
+    for name in names {
+        assert_eq!(w.reach(name, Tier::High), open(), "{name}");
+    }
+}

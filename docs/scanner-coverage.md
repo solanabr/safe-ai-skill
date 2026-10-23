@@ -196,15 +196,17 @@ drifted pack names the dependency files that moved ("dependency set differs from
 Cargo.lock, changed package-lock.json"). The fingerprint is re-recorded whenever the pin is (first
 sight, `verify approve`, `verify trust`). Each file is hashed by its first 8 MiB and its full size;
 a FIFO, socket or device is recorded by type and never opened. The snapshot runs within the
-per-pack allowance (2 s) and the sweep's own budget, checking the clock on every entry and every
-64 KiB hashed: a snapshot the deadline cuts records the pack as unscanned
-(`scan_budget_exceeded`, denied below Off until a later sweep completes it), and a sweep whose
-budget is already spent skips it and keeps the last one. `verify check <dir>` prints the inventory
+scan's own per-pack allowance and the sweep's budget, checking the clock on every entry and every
+64 KiB hashed. A sweep whose budget is already spent skips it and keeps the last one. A snapshot
+the deadline cuts is retried next sweep: a pack whose content still matches its pin keeps its
+state (an approved, unchanged pack is never denied for it, including on the first sweep after an
+upgrade, when there is no `deps.json` yet); only a pack whose content changed since its pin is
+recorded unscanned (`scan_budget_exceeded`, denied below Off until a later sweep completes it). `verify check <dir>` prints the inventory
 and its fingerprint under `dependencies` (a single-file pack included). The project's `.mcp.json` has no pin; its servers' launch lines
 are recorded each session and a launch that changed since the last session (`pkg@1.2.0` to
 `pkg@latest`, a new server, a removed one) is reported once as INFO. A missing or tampered
-`deps.json` starts afresh: the detail is lost until the next pin, and drift still blocks through
-`state.json`.
+`deps.json` is recorded afresh with no finding: the detail is lost until the next pin, and drift
+still blocks through `state.json`.
 
 **Future work (not in this release).**
 

@@ -20,10 +20,14 @@
 //! by its target text), never opens anything but a regular file (a FIFO, socket or device is
 //! recorded by its type), skips `node_modules/` and the pack-root `.git`, and is bounded by
 //! [`MAX_WALK`] entries, the deps family's per-file caps and a deadline checked on every entry
-//! and every 64 KiB hashed: [`WALK_BUDGET`], within the sweep's own budget. A snapshot the
-//! deadline cuts records the pack as unscanned, like a scan the sweep's budget cuts
-//! (`scan_budget_exceeded`): denied below Off until a later sweep completes it. A sweep whose
-//! budget is already spent skips the snapshot and keeps the last one.
+//! and every 64 KiB hashed: [`WALK_BUDGET`] (the scan's own per-pack allowance), within the
+//! sweep's own budget. A sweep whose budget is already spent skips the snapshot and keeps the
+//! last one. A snapshot the deadline cuts is retried next sweep and changes nothing for a pack
+//! whose content still matches its pin (an approved, unchanged pack is never denied for it, so
+//! the first sweep after an upgrade, with no `deps.json`, denies nothing). Only a pack whose
+//! content changed since its pin is then recorded unscanned, like a scan the sweep's budget cuts
+//! (`scan_budget_exceeded`, denied below Off until a later sweep completes it). A missing or
+//! tampered `deps.json` is recorded afresh with no finding.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -44,8 +48,8 @@ use crate::statefile::{self, Loaded};
 pub const DEPS_FILE: &str = "deps.json";
 /// Directory entries one snapshot walks before it stops (and is marked truncated).
 const MAX_WALK: usize = 50_000;
-/// Time one snapshot may take (the per-pack scan allowance); past it the pack is unscanned.
-const WALK_BUDGET: Duration = Duration::from_secs(2);
+/// Time one snapshot may take: the scan's own per-pack allowance.
+const WALK_BUDGET: Duration = super::rules::PACK_BUDGET;
 /// Pack pins and project `.mcp.json` records kept, so `deps.json` stays far below the state
 /// file size limit.
 const MAX_PACK_PINS: usize = 1024;
@@ -135,6 +139,17 @@ impl Pins {
         entry: &mut PackEntry,
         sweep_until: Option<Instant>,
     ) {
+        self.observe_within(canonical, entry, sweep_until, WALK_BUDGET);
+    }
+
+    /// [`Self::observe`] with an explicit snapshot allowance (tests shrink it).
+    fn observe_within(
+        &mut self,
+        canonical: &Path,
+        entry: &mut PackEntry,
+        sweep_until: Option<Instant>,
+        budget: Duration,
+    ) {
         let current = entry.last_scanned_hash.clone();
         if current.is_empty() {
             return;
@@ -149,12 +164,14 @@ impl Pins {
                 if sweep_until.is_some_and(|d| now >= d) {
                     return;
                 }
-                let mut deadline = now + WALK_BUDGET;
+                let mut deadline = now + budget;
                 if let Some(d) = sweep_until {
                     deadline = deadline.min(d);
                 }
                 match snapshot_until(canonical, deadline) {
                     Some(set) => set,
+                    // Unchanged since its pin: keep its state, retry next sweep.
+                    None if entry.tree_hash == current => return,
                     None => {
                         mark_unscanned(entry);
                         return;
@@ -606,6 +623,17 @@ mod tests {
         pins.observe(&d, &mut entry, Some(Instant::now()));
         assert_eq!(entry.state, state::PackStatus::Clean);
         assert!(pins.data.packs.is_empty());
+        // A cut snapshot of a pack still at its pin changes nothing (retried next sweep).
+        entry.approved = true;
+        pins.observe_within(&d, &mut entry, None, Duration::ZERO);
+        assert_eq!(entry.state, state::PackStatus::Clean);
+        assert!(entry.approved && !entry.unscanned());
+        assert!(pins.data.packs.is_empty());
+        // A cut snapshot of a pack whose content changed since its pin fails closed.
+        let mut changed = entry.clone();
+        changed.last_scanned_hash = "h2".into();
+        pins.observe_within(&d, &mut changed, None, Duration::ZERO);
+        assert!(changed.unscanned());
         mark_unscanned(&mut entry);
         assert!(entry.unscanned());
         assert!(entry.last_scanned_hash.is_empty());
