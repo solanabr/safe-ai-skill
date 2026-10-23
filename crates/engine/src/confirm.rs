@@ -686,10 +686,10 @@ pub(crate) mod tests {
     #[test]
     fn a_request_is_shown_and_confirmed_only_in_its_session() {
         let dir = tmp_data("session-bind");
-        let now = now_secs();
         // Made from a terminal (no session): the first session to announce it takes it.
         let id =
             create_pending(&dir, PendingKind::Tier, "tier off", serde_json::json!({})).unwrap();
+        let now = now_secs();
         assert!(
             !has_unannounced(&dir, now, ""),
             "no session id, no announcement"
@@ -720,8 +720,8 @@ pub(crate) mod tests {
     #[test]
     fn a_request_bound_at_creation_is_never_shown_elsewhere() {
         let dir = tmp_data("session-created");
-        let now = now_secs();
         create_pending(&dir, PendingKind::Tier, "tier off", serde_json::json!({})).unwrap();
+        let now = now_secs();
         // Bind as the CLI does when run from a session's Bash tool.
         {
             let _lock = FileLock::acquire(&dir.path, LOCK_FILE).unwrap();
@@ -734,7 +734,9 @@ pub(crate) mod tests {
         assert_eq!(shown.len(), 1);
         // A lockout in its own session cancels only its own requests.
         create_pending(&dir, PendingKind::Tier, "other", serde_json::json!({})).unwrap();
-        announce_pending_for(&dir, now, "session-c");
+        // A fresh clock: the new entry may be stamped a second after `now`.
+        let now = now_secs();
+        assert_eq!(announce_pending_for(&dir, now, "session-c").len(), 1);
         for _ in 0..MAX_FAILURES {
             confirm_attempt_for(&dir, "safe-ai-skill confirm 00000000", now, "session-a");
         }
