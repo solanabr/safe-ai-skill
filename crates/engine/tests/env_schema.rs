@@ -275,12 +275,12 @@ fn missing_schema_has_no_opinion() {
 
 #[test]
 fn default_policy_allows_schema_and_aikit_overlay_keeps_it() {
-    let base = Policy::from_sources(DEFAULT_POLICY_YAML, None, None, None);
+    let base = Policy::from_sources(DEFAULT_POLICY_YAML, None);
     assert!(base
         .secrets
         .allow_read_globs
         .contains(&"**/.env.schema".to_string()));
-    let aikit = Policy::from_sources(DEFAULT_POLICY_YAML, Some(AIKIT_POLICY), None, None);
+    let aikit = Policy::from_sources(DEFAULT_POLICY_YAML, Some(AIKIT_POLICY));
     assert_eq!(
         aikit.secrets.allow_read_globs,
         base.secrets.allow_read_globs
@@ -290,7 +290,7 @@ fn default_policy_allows_schema_and_aikit_overlay_keeps_it() {
 #[test]
 fn repo_listing_only_env_example_removes_the_schema_allow() {
     let overlay = "secrets:\n  allow_read_globs: [\"**/.env.example\"]\n";
-    let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(overlay), None, None);
+    let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(overlay));
     assert_eq!(
         p.secrets.allow_read_globs,
         vec!["**/.env.example".to_string()]

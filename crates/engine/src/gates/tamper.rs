@@ -3,9 +3,10 @@
 //! Denies an agent-initiated tool call that would loosen safe-ai-skill from the inside:
 //!
 //! - **Bash** (checked first by [`crate::gates::secrets`], which runs on every Bash call): a
-//!   command that runs the `safe-ai-skill` binary with a mutating subcommand (`allow`, `grant`,
-//!   `revoke`, `confirm`, `mode <profile>`, `verify approve|trust`, `install`, `add`, and the hook-only
-//!   bare `verify` / `verify session`, which pin packs), including a binary computed
+//!   command that runs the `safe-ai-skill` binary with a mutating subcommand (`grant`,
+//!   `revoke`, `confirm`, `verify approve|trust`, `install`, `add`, the hook-only subcommands,
+//!   and bare `verify` / `verify session`, which pin packs; `allow`, `tier` and `mode` only park
+//!   a request the user alone can confirm), including a binary computed
 //!   by `$(which safe-ai-skill)`, or that references protected state.
 //! - **Write|Edit|MultiEdit|NotebookEdit** (the `gate-tamper` hook): a write whose target is
 //!   protected state, checked as given and with symlinks resolved.
@@ -169,9 +170,10 @@ const GLOB_OPTIONS: glob::MatchOptions = glob::MatchOptions {
     require_literal_leading_dot: true,
 };
 
-/// Subcommands only the user may run: `confirm` (and the 1.0 `grant` / `revoke`). `allow` and
-/// `mode` are not here: they only park a pending request, which the agent can never confirm
-/// (the code reaches the user alone, spec D4.1).
+/// Subcommands only the user may run: `confirm` (and the 1.0 `grant` / `revoke`). `allow`,
+/// `tier` and its `mode` alias are not here: raising applies at once, and anything that loosens
+/// only parks a pending request, which the agent can never confirm (the code reaches the user
+/// alone, spec D4.1).
 const MUTATING_SUBCOMMANDS: &[&str] = &["grant", "revoke", "confirm"];
 
 /// Hook-only subcommands: run through Bash they could replay a forged hook payload (a fake
@@ -201,6 +203,7 @@ const SUBCOMMANDS: &[&str] = &[
     "session",
     "status",
     "mode",
+    "tier",
     "env",
     "--version",
 ];
@@ -210,6 +213,8 @@ const SUBCOMMANDS: &[&str] = &[
 const STATE_NAMES: &[&str] = &[
     "grants.json",
     "mode.json",
+    "tier.json",
+    "tier.lock",
     "spend.json",
     "lockfile.json",
     "netcache.json",
@@ -245,7 +250,7 @@ impl Kind {
     fn describe(self) -> &'static str {
         match self {
             Kind::DataDir => {
-                "safe-ai-skill's plugin data dir (grants, mode, spend ledger, audit log)"
+                "safe-ai-skill's plugin data dir (grants, tier, spend ledger, audit log)"
             }
             Kind::HomeDataDir => "safe-ai-skill's ~/.safe-ai-skill data dir",
             Kind::Plugin => "the installed safe-ai-skill plugin",

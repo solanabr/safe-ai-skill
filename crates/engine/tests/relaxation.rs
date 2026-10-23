@@ -1,5 +1,5 @@
-//! Relaxation integrity, end to end (spec D4, D1.9–D1.11): prompt-nonce confirmation,
-//! authenticated state, profiles and the SessionStart loosenings notice.
+//! Relaxation integrity, end to end (spec D4, D1.9; D8 v2 §1.3): prompt-nonce confirmation,
+//! authenticated state, the tier CLI and the SessionStart notices.
 //!
 //! These runs use a sandboxed `CLAUDE_PLUGIN_DATA` under the temp dir, which is never a
 //! trusted data dir (spec D2.8), so a confirmed grant is stored but never relaxes anything
@@ -316,19 +316,69 @@ fn an_unknown_or_removed_scope_is_a_cli_error() {
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn a_looser_mode_needs_confirmation_and_a_stricter_one_does_not() {
-    let sb = Sandbox::new("relax-mode");
-    let run = sb.cli(&["mode", "autopilot"]);
+fn a_lower_tier_needs_confirmation_and_a_higher_one_does_not() {
+    let sb = Sandbox::new("relax-tier");
+    let run = sb.cli(&["tier", "off"]);
     assert_pending_without_code(&run);
-    assert!(sb.state("mode.json").is_none());
+    assert!(sb.state("tier.json").is_none());
+    let run = sb.cli(&["tier", "--env-read", "ask"]);
+    assert_pending_without_code(&run);
 
+    let run = sb.cli(&["tier", "high"]);
+    assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+    assert!(sb.state("tier.json").unwrap().contains("\"mac\""));
+    // Changes compare against the stored file (trusted or not): back down from high is a
+    // lowering again, and restating it changes nothing.
+    assert_pending_without_code(&sb.cli(&["tier", "relaxed"]));
+    assert_pending_without_code(&sb.cli(&["tier", "--clear"]));
+    assert_eq!(sb.cli(&["tier", "high"]).json()["status"], "unchanged");
+
+    for bad in [
+        &["tier", "disabled"][..],
+        &["tier", "--env-read", "allow"],
+        &["tier", "high", "--clear"],
+    ] {
+        let run = sb.cli(bad);
+        assert_ne!(run.code, Some(0), "{bad:?}");
+        assert_eq!(run.json()["status"], "error", "{bad:?}");
+    }
+}
+
+#[test]
+fn mode_is_a_deprecated_alias_of_tier() {
+    let sb = Sandbox::new("relax-mode");
+    // autopilot = relaxed = the default: nothing to do, nothing pending.
+    assert_eq!(sb.cli(&["mode", "autopilot"]).json()["status"], "unchanged");
     let run = sb.cli(&["mode", "paranoid"]);
     assert_eq!(run.json()["status"], "set", "{}", run.stdout);
-    assert!(sb.state("mode.json").unwrap().contains("\"mac\""));
-
-    let run = sb.cli(&["mode", "off"]);
+    assert!(run.stderr.contains("deprecated"), "{}", run.stderr);
+    assert!(sb.state("tier.json").is_some() && sb.state("mode.json").is_none());
+    assert_pending_without_code(&sb.cli(&["mode", "off"]));
+    let run = sb.cli(&["mode", "turbo"]);
     assert_ne!(run.code, Some(0));
     assert_eq!(run.json()["status"], "error");
+}
+
+#[test]
+fn tier_with_no_argument_shows_the_resolution() {
+    let sb = Sandbox::new("relax-tier-show");
+    let v = sb
+        .cli_env(&["tier"], &[("SAFE_AI_SKILL_TIER", "off")])
+        .json();
+    assert_eq!(v["tier"], "relaxed");
+    assert_eq!(v["source"], "default");
+    assert_eq!(v["env_read"], "deny");
+    assert!(v["line"]
+        .as_str()
+        .unwrap()
+        .starts_with("safe-ai-skill tier: relaxed"));
+    assert!(
+        v["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("SAFE_AI_SKILL_TIER"),
+        "{v}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -546,19 +596,20 @@ fn a_clean_session_start_stays_silent() {
 }
 
 // ---------------------------------------------------------------------------------------
-// B3: profiles
+// B3: tiers
 // ---------------------------------------------------------------------------------------
 
 #[test]
-fn paranoid_asks_for_every_solana_command() {
-    let sb = Sandbox::new("relax-paranoid");
-    let env = [("SAFE_AI_SKILL_PROFILE", "paranoid")];
-    assert_eq!(sb.bash(&devnet_transfer("0.5"), &env), "ask");
-    assert_eq!(
-        sb.bash("solana balance --url https://api.devnet.solana.com", &env),
-        "ask"
-    );
-    // Without it, the same calls are allowed / no opinion.
+fn high_never_allows_and_paranoid_is_its_alias() {
+    let sb = Sandbox::new("relax-high");
+    for env in [
+        ("SAFE_AI_SKILL_TIER", "high"),
+        ("SAFE_AI_SKILL_PROFILE", "paranoid"),
+    ] {
+        assert_eq!(sb.bash(&devnet_transfer("0.5"), &[env]), "", "{env:?}");
+        // Spec §2: Class C on mainnet denies at High.
+        assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[env]), "deny", "{env:?}");
+    }
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "allow");
     assert_eq!(
         sb.bash("solana balance --url https://api.devnet.solana.com", &[]),
@@ -567,16 +618,29 @@ fn paranoid_asks_for_every_solana_command() {
 }
 
 #[test]
-fn env_profile_is_listed_at_session_start() {
+fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
     let sb = Sandbox::new("relax-envnotice");
-    let run = sb.hook(
-        &["verify", "session"],
-        json!({"hook_event_name":"SessionStart","source":"startup","cwd": sb.proj.path()}),
-        &[("SAFE_AI_SKILL_PROFILE", "paranoid")],
-    );
-    let v = run.json();
-    assert!(v["systemMessage"]
-        .as_str()
-        .unwrap()
-        .contains("SAFE_AI_SKILL_PROFILE=paranoid"));
+    let session = |env: &[(&str, &str)]| {
+        sb.hook(
+            &["verify", "session"],
+            json!({"hook_event_name":"SessionStart","source":"startup","cwd": sb.proj.path()}),
+            env,
+        )
+        .json()
+    };
+    let v = session(&[("SAFE_AI_SKILL_PROFILE", "paranoid")]);
+    for field in [
+        &v["systemMessage"],
+        &v["hookSpecificOutput"]["additionalContext"],
+    ] {
+        let text = field.as_str().unwrap();
+        assert!(
+            text.starts_with("safe-ai-skill tier: high (hooks only) (env); sandbox:"),
+            "{text}"
+        );
+    }
+    let v = session(&[("SAFE_AI_SKILL_TIER", "off")]);
+    let text = v["systemMessage"].as_str().unwrap();
+    assert!(text.starts_with("safe-ai-skill tier: relaxed"), "{text}");
+    assert!(text.contains("SAFE_AI_SKILL_TIER: off` ignored"), "{text}");
 }

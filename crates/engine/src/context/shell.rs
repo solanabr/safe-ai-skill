@@ -586,6 +586,9 @@ pub struct Parsed {
     /// After such a write, runs a file or standard input as code (`bash x.sh`, `cat x.sh |
     /// bash`, `sh < x.sh`, `python3 x.py`, `source x`, `./x`, `xargs … sh -c`).
     pub write_then_run: bool,
+    /// The values of `NAME=value` prefix assignments, which [`SimpleCommand::words`] drops
+    /// (`S=~/.ssh/id_ed25519; cat $S`): checked for credential paths.
+    pub assigned_values: Vec<String>,
 }
 
 /// Record that a command runs a file or stdin as code: after a family write, that is a
@@ -1510,6 +1513,9 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             } else if let Some(name) = assignment_name(word) {
                 out.env_changed |= is_config_var(name);
                 out.assigns_family |= mentions_family(&word.text[name.len()..]);
+                if let Some((_, value)) = word.text.split_once('=') {
+                    out.assigned_values.push(value.to_string());
+                }
                 skip += 1;
             } else {
                 break;

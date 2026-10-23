@@ -1,4 +1,5 @@
-//! Irreversible-action and unknown-network guards for `gate-bash` (#13, spec D1.4–D1.7).
+//! Irreversible-action and unknown-network guards for `gate-bash` (#13, spec D1.4–D1.7, as
+//! amended by D8 v2 §3: Class U denies off positively identified localnet/devnet).
 //!
 //! Most tests drive `gates::bash::decide` in-process with a pinned network and assert on the
 //! `Decision` value; no opinion is `Decision::Defer`. The end-to-end tests drive the built binary
@@ -72,7 +73,9 @@ fn gate_bash(command: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// D1.6 irreversible actions: a hard-guard ask on every cluster, mainnet + `--final` denied.
+// D8 v2 §3.1 Class U: a hard-guard ask on identified localnet/devnet, a deny on mainnet,
+// testnet and unknown clusters (program and buffer closes included). Authority changes to a
+// new key are Class C.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -119,50 +122,85 @@ fn anchor_deploy_final_passthrough_on_mainnet_denies() {
 
 #[test]
 fn every_irreversible_command_asks_on_devnet_as_hard_guard() {
-    let cases = [
+    let class_u = [
         "solana program deploy --final ./p.so".to_string(),
         "solana program upgrade BUF PROG --final".to_string(),
         "solana program set-upgrade-authority PROG --final".to_string(),
-        format!("solana program set-upgrade-authority PROG --new-upgrade-authority {DEST}"),
-        "solana program close PROG".to_string(),
+        "solana program close PROG --bypass-warning".to_string(),
         format!("spl-token authorize {MINT} mint --disable"),
         format!("spl-token close {DEST}"),
         format!("spl-token close-mint {MINT}"),
+        format!("spl-token burn {DEST} 1"),
         "anchor idl erase-authority --program-id PROG".to_string(),
-        format!("anchor idl set-authority --program-id PROG --new-authority {DEST}"),
         "anchor idl close PROG".to_string(),
         "anchor legacy-idl erase-authority --program-id PROG".to_string(),
         format!("solana close-vote-account VOTE {DEST}"),
         "anchor program deploy --final".to_string(),
-        "anchor program close PROG".to_string(),
     ];
-    for cmd in &cases {
-        for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
+    for cmd in &class_u {
+        for network in [Network::Devnet, Network::Localnet] {
             let (d, meta) = decide(cmd, network);
             assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
             assert!(meta.hard_guard, "{cmd} on {network:?} must be a hard guard");
         }
+        // Testnet is not a positively identified localnet/devnet.
+        let (d, meta) = decide(cmd, Network::Testnet);
+        assert!(is_deny(&d), "{cmd} on testnet: {d:?}");
+        assert!(meta.hard_guard);
+    }
+    // Class C hard guards: an authority change to a new key asks on every cluster.
+    for cmd in [
+        format!("solana program set-upgrade-authority PROG --new-upgrade-authority {DEST}"),
+        format!("anchor idl set-authority --program-id PROG --new-authority {DEST}"),
+    ] {
+        for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
+            let (d, meta) = decide(&cmd, network);
+            assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
+            assert!(meta.hard_guard, "{cmd} on {network:?} must be a hard guard");
+        }
+    }
+    // A program or buffer close in any form is Class U: never grantable, a hard-guard ask
+    // on an identified devnet/localnet and a deny on testnet.
+    for cmd in [
+        "solana program close BUF",
+        "solana program close --buffers",
+        "anchor program close BUF",
+    ] {
+        for network in [Network::Devnet, Network::Localnet] {
+            let (d, meta) = decide(cmd, network);
+            assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
+            assert!(meta.hard_guard, "{cmd} on {network:?} is never grantable");
+            assert_eq!(meta.scope, Scope::Destructive);
+        }
+        let (d, meta) = decide(cmd, Network::Testnet);
+        assert!(
+            matches!(d, Decision::Deny { .. }),
+            "{cmd} on testnet: {d:?}"
+        );
+        assert!(meta.hard_guard);
     }
 }
 
 #[test]
-fn irreversible_without_final_asks_on_mainnet() {
-    // Only `--final` escalates to deny; other irreversible actions stay a hard-guard ask.
+fn irreversible_without_final_denies_on_mainnet() {
+    // D8 v2 §3.1: every Class U shape denies on mainnet, not only `--final`.
     for cmd in [
         format!("spl-token authorize {MINT} mint --disable"),
         format!("spl-token close-mint {MINT}"),
         "anchor idl erase-authority --program-id PROG".to_string(),
     ] {
         let (d, meta) = decide(&cmd, Network::Mainnet);
-        assert!(is_ask(&d), "{cmd}: {d:?}");
+        assert!(is_deny(&d), "{cmd}: {d:?}");
+        assert!(d.reason().contains("yourself"), "{d:?}");
         assert!(meta.hard_guard);
     }
 }
 
 #[test]
-fn final_on_unknown_network_asks() {
+fn final_on_unknown_network_denies() {
+    // D8 v2 §3.1: an unidentified cluster is not a positively identified localnet/devnet.
     let (d, meta) = decide("solana program deploy --final ./p.so", Network::Unknown);
-    assert!(is_ask(&d), "{d:?}");
+    assert!(is_deny(&d), "{d:?}");
     assert!(meta.hard_guard);
 }
 
@@ -214,10 +252,11 @@ fn custom_rpc_url_is_unknown_not_config_fallback() {
 }
 
 #[test]
-fn mainnet_deploy_is_hard_guard_ask() {
+fn mainnet_deploy_is_a_grantable_ask() {
+    // D8 v2 §2: Class C on mainnet asks below High, and a covering confirmed grant allows it.
     let (d, meta) = decide("solana program deploy ./p.so", Network::Mainnet);
     assert!(is_ask(&d), "{d:?}");
-    assert!(meta.hard_guard);
+    assert!(!meta.hard_guard);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -689,12 +728,13 @@ fn flag_value_reading_as_a_cluster_flag_never_allows() {
 
 #[test]
 fn final_after_a_value_flag_still_guards() {
-    // `--with-memo --final`: `--final` is the flag (the memo gets no value) or the memo.
+    // `--with-memo --final`: `--final` is the flag (the memo gets no value) or the memo. The
+    // value-less flag also leaves the cluster ambiguous: unknown, so Class U denies.
     let (d, meta) = decide(
         "solana program deploy ./p.so --with-memo --final",
         Network::Devnet,
     );
-    assert!(is_ask(&d), "{d:?}");
+    assert!(is_deny(&d), "{d:?}");
     assert!(meta.hard_guard);
     let (d, _) = decide(
         "solana program deploy ./p.so --with-memo --final -um",

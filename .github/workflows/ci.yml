@@ -58,6 +58,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets -- -D warnings
 
+      - name: cargo clippy --features test-hooks
+        run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets --features test-hooks -- -D warnings
+
+      - name: cargo clippy --features test-hooks,env-read-opt-in
+        run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets --features test-hooks,env-read-opt-in -- -D warnings
+
   # ── build + test matrix ──────────────────────────────────────────────────
   build-test:
     name: Build + test / ${{ matrix.name }}
@@ -98,6 +104,18 @@ jobs:
 
       - name: cargo test --verbose
         run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
+
+      # The test-only overrides (trusted data dir, sandbox state, crash trigger) exist only in
+      # these builds: the tier matrix, the shared corpus plugin column and the Off / env_read
+      # opt-in / grant rows that drive the binary run here. `test-hooks` alone is the shipped
+      # behaviour (the env-read opt-in inactive); with `env-read-opt-in` the opt-in rows reach
+      # their end state. A separate target dir keeps the release-shaped debug binary for the
+      # steps below.
+      - name: cargo test --features test-hooks
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --target-dir crates/engine/target/test-hooks
+
+      - name: cargo test --features test-hooks,env-read-opt-in
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks,env-read-opt-in --target-dir crates/engine/target/test-hooks
 
       # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
       # No network: we use the freshly built binary, not a release download.
@@ -425,6 +443,12 @@ jobs:
 
       - name: smoke-static-linux.sh logic (stubbed readelf + docker)
         run: sh scripts/test-smoke-static-linux.sh
+
+      - name: Shared lists (policy/shared lint, MANIFEST counts and hashes)
+        run: |
+          sh -n scripts/shared-manifest.sh
+          sh -n scripts/check-shared-lists.sh
+          sh scripts/check-shared-lists.sh
 
       - name: Version consistency across manifests
         run: sh scripts/check-versions.sh

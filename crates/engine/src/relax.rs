@@ -5,19 +5,17 @@
 //! every gate result before auditing and emitting. Hard guards
 //! ([`crate::gate::GateMeta::hard_guard`]) are NEVER relaxed.
 //!
-//! ## Profile vs grant split
+//! ## Tier vs grant split
 //!
-//! 1. **Profile half** — [`crate::policy::Policy::effective`] applies the active profile's
-//!    caps before the gate runs (`autopilot` raises the per-tx cap). `paranoid` sets
-//!    `ask_all`, which [`apply_verdict`] enforces here: no allow survives it, not even a
-//!    grant's.
-//! 2. **Grant half** — a time-boxed, budgeted [`crate::grants::Grant`] can upgrade a residual
-//!    `Ask` to `Allow` and debit its budget. Only authenticated grants in a trusted data dir
-//!    count ([`grants::live`]).
+//! 1. **High** — the engine never emits `allow` at High (D8 v2 spec §2): [`apply_verdict`]
+//!    turns an `Allow` into no opinion (Claude Code's own flow decides) and consults no grant.
+//! 2. **Grant half** — below High, a time-boxed, budgeted [`crate::grants::Grant`] can upgrade
+//!    a residual `Ask` to `Allow` and debit its budget. Only authenticated grants in a trusted
+//!    data dir count ([`grants::live`]).
 //!
 //! ## Confirmation (spec D4.1)
 //!
-//! `safe-ai-skill allow` and `mode <looser>` only park a pending entry, with no code
+//! `safe-ai-skill allow` and `tier <lower>` (alias `mode`) only park a pending entry, with no code
 //! ([`crate::confirm::create_pending`]). [`announce`] makes the code and returns it for a
 //! hook `systemMessage` (user only). [`confirm_prompt`] runs in the `UserPromptSubmit` hook:
 //! when the user's whole prompt is `safe-ai-skill confirm <code>`, it consumes the entry,
@@ -33,19 +31,15 @@ use crate::gate::{AllowReason, GateMeta, GrantId, Verdict};
 use crate::grants::{self, GrantRequest};
 use crate::io::Decision;
 use crate::mode;
+use crate::policy::tier::Tier;
 use crate::policy::Policy;
-
-/// The reason an allow becomes an ask under `paranoid`.
-pub const ASK_ALL_REASON: &str =
-    "safe-ai-skill paranoid profile: every Solana action asks — approve to proceed";
+use crate::tierstate;
 
 /// Apply the relaxation layer to a gate's natural decision; see [`apply_verdict`].
 pub fn apply(natural: Decision, meta: &GateMeta, policy: &Policy, dir: &DataDir) -> Decision {
     match natural {
         Decision::Ask { reason } => apply_verdict(Verdict::Ask(reason), meta, policy, dir).into(),
-        Decision::Allow if policy.active_overlay().ask_all => Decision::Ask {
-            reason: ASK_ALL_REASON.to_string(),
-        },
+        Decision::Allow if policy.tier() == Tier::High => Decision::Defer,
         other => other,
     }
 }
@@ -55,16 +49,16 @@ pub fn apply(natural: Decision, meta: &GateMeta, policy: &Policy, dir: &DataDir)
 /// place that mints a [`GrantId`].
 ///
 /// Contract:
-/// - `policy` is the EFFECTIVE policy. Under its `ask_all` (paranoid) every `Allow` becomes
-///   an `Ask` and no grant is consulted.
+/// - `policy` carries the effective tier ([`Policy::runtime`]). At High every `Allow`
+///   becomes no opinion and no grant is consulted.
 /// - Only an `Ask` is a relaxation candidate; `Deny`/`NoOpinion` pass through.
 /// - A hard guard is never relaxed.
 /// - Otherwise the first live grant ([`grants::live`]: authenticated, trusted dir) that
 ///   matches within budget / `max_tx_sol` is debited for `meta.amount_sol` and named.
 pub fn apply_verdict(natural: Verdict, meta: &GateMeta, policy: &Policy, dir: &DataDir) -> Verdict {
-    if policy.active_overlay().ask_all {
+    if policy.tier() == Tier::High {
         return match natural {
-            Verdict::Allow(_) => Verdict::Ask(ASK_ALL_REASON.to_string()),
+            Verdict::Allow(_) => Verdict::NoOpinion,
             other => other,
         };
     }
@@ -169,6 +163,7 @@ fn activate(dir: &DataDir, confirmed: &confirm::Confirmed, now: u64) -> ConfirmO
     let result = match kind {
         PendingKind::Grant => activate_grant(dir, payload, now),
         PendingKind::Mode => activate_mode(dir, payload, now),
+        PendingKind::Tier => activate_tier(dir, payload, now),
         // `verify trust` / `verify approve`: performed (and audited) by the supply-chain state.
         PendingKind::Trust | PendingKind::Approve => {
             crate::verify::apply_confirmed(dir, confirmed).map_err(|e| e.to_string())
@@ -210,20 +205,36 @@ fn activate_grant(dir: &DataDir, payload: &Value, now: u64) -> Result<String, St
     })
 }
 
+/// A legacy pending `mode` request: applied as the matching global tier.
 fn activate_mode(dir: &DataDir, payload: &Value, now: u64) -> Result<String, String> {
-    let profile = payload
+    let tier = payload
         .get("profile")
         .and_then(Value::as_str)
-        .filter(|p| mode::is_known_profile(p))
+        .and_then(mode::profile_tier)
         .ok_or_else(|| "the pending mode change is invalid".to_string())?;
-    mode::set(dir, profile, now).map_err(|e| format!("could not store it: {e}"))?;
-    Ok(format!("mode {profile}"))
+    let change = tierstate::Change {
+        project: None,
+        tier: Some(tier),
+        env_read: None,
+        clear: false,
+    };
+    store_tier(dir, &change, now)
+}
+
+fn activate_tier(dir: &DataDir, payload: &Value, now: u64) -> Result<String, String> {
+    let change = tierstate::from_payload(payload)?;
+    store_tier(dir, &change, now)
+}
+
+fn store_tier(dir: &DataDir, change: &tierstate::Change, now: u64) -> Result<String, String> {
+    tierstate::apply(dir, change, now).map_err(|e| format!("could not store it: {e}"))?;
+    Ok(tierstate::summary(change))
 }
 
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::Grant => "grant_create",
-        PendingKind::Mode => "mode_set",
+        PendingKind::Mode | PendingKind::Tier => "tier_set",
         PendingKind::Trust => "verify_trust",
         PendingKind::Approve => "verify_approve",
     }
@@ -249,17 +260,13 @@ mod tests {
     use crate::grants::Grants;
 
     fn effective_policy() -> Policy {
-        Policy::fail_closed().effective()
+        Policy::fail_closed()
     }
 
-    fn paranoid_policy() -> Policy {
-        crate::policy::Policy::from_sources(
-            crate::policy::DEFAULT_POLICY_YAML,
-            None,
-            Some("paranoid"),
-            None,
-        )
-        .effective()
+    fn high_policy() -> Policy {
+        let mut p = Policy::from_sources(crate::policy::DEFAULT_POLICY_YAML, None);
+        p.runtime.tier = Tier::High;
+        p
     }
 
     fn transfer_meta(amount: f64, hard_guard: bool) -> GateMeta {
@@ -433,16 +440,14 @@ mod tests {
     }
 
     #[test]
-    fn paranoid_turns_every_allow_into_an_ask_and_ignores_grants() {
-        let dir = tmp_data("relax_paranoid");
+    fn high_never_allows_and_ignores_grants() {
+        let dir = tmp_data("relax_high");
         write_transfer_grant(&dir, 5.0);
-        let policy = paranoid_policy();
+        let policy = high_policy();
         let meta = transfer_meta(0.5, false);
         assert_eq!(
             apply(Decision::Allow, &meta, &policy, &dir),
-            Decision::Ask {
-                reason: ASK_ALL_REASON.into()
-            }
+            Decision::Defer
         );
         assert_eq!(apply(ask(), &meta, &policy, &dir), ask());
         assert_eq!(
@@ -452,7 +457,7 @@ mod tests {
                 &policy,
                 &dir
             ),
-            Verdict::Ask(ASK_ALL_REASON.into())
+            Verdict::NoOpinion
         );
         assert_eq!(grants::live(&dir).grants[0].spent_sol, 0.0);
         let _ = std::fs::remove_dir_all(&dir.path);
@@ -654,13 +659,49 @@ mod tests {
     }
 
     #[test]
-    fn the_confirm_prompt_activates_a_mode_change() {
-        let dir = tmp_data("confirm_mode");
-        let nonce = pending(&dir, PendingKind::Mode, json!({"profile":"autopilot"}));
-        assert_eq!(mode::persisted(&dir), None);
+    fn the_confirm_prompt_activates_a_tier_change() {
+        let dir = tmp_data("confirm_tier");
+        let change = tierstate::Change {
+            project: None,
+            tier: Some(Tier::Off),
+            env_read: None,
+            clear: false,
+        };
+        let nonce = pending(&dir, PendingKind::Tier, tierstate::to_payload(&change));
+        let root = std::path::Path::new("/p");
+        assert_eq!(tierstate::user_choice(&dir, root).tier, None);
         let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {nonce}"), now()).unwrap();
-        assert!(out.system_message.contains("mode autopilot"));
-        assert_eq!(mode::persisted(&dir), Some("autopilot".into()));
+        assert!(
+            out.system_message.contains("tier off"),
+            "{}",
+            out.system_message
+        );
+        assert_eq!(
+            tierstate::user_choice(&dir, root).tier.map(|t| t.0),
+            Some(Tier::Off)
+        );
+        let audit = std::fs::read_to_string(dir.path.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("tier_set"), "{audit}");
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_legacy_pending_mode_request_becomes_its_tier() {
+        let dir = tmp_data("confirm_mode");
+        let nonce = pending(&dir, PendingKind::Mode, json!({"profile":"paranoid"}));
+        let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {nonce}"), now()).unwrap();
+        assert!(
+            out.system_message.contains("tier high"),
+            "{}",
+            out.system_message
+        );
+        let bad = pending(&dir, PendingKind::Mode, json!({"profile":"off"}));
+        let out = confirm_prompt(&dir, &format!("safe-ai-skill confirm {bad}"), now()).unwrap();
+        assert!(
+            out.system_message.contains("failed"),
+            "{}",
+            out.system_message
+        );
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

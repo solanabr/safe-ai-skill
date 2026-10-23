@@ -21,9 +21,15 @@
 //! parsed and passes unchanged. Claude Code already truncates Bash output and pages Read output
 //! well below that, so the bound only matters for unusually large MCP results.
 
+use std::path::Path;
+
 use serde_json::Value;
 
 use crate::env::values::KnownValue;
+use crate::gates::read::{self, ReadVerdict};
+use crate::gates::secretpath::{self, Class};
+use crate::io::{Decision, HookInput};
+use crate::policy::Policy;
 
 /// Largest PostToolUse payload the redact hook parses (8 MiB). Larger payloads pass unscanned.
 pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
@@ -31,6 +37,73 @@ pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 /// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
 /// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
 pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
+    scrub_value(response, values)
+}
+
+/// Whether `text` carries a redaction marker this module writes (`***REDACTED:` or
+/// `«redacted:`).
+pub fn contains_marker(text: &str) -> bool {
+    text.contains("***REDACTED:") || text.contains("«redacted:")
+}
+
+/// The PostToolUse redact decision for one hook payload: [`scrub_response`], except that the
+/// response of an opted-in raw env Read skips the value scrub (D8 v2 spec §2), since a
+/// value-scrubbed copy would be written back over the real values by the next Edit or Write.
+/// Pattern redaction (keys, seeds, PEM, vendor tokens) still applies to it at every tier; the
+/// write gate refuses to write a redaction marker back into an env file. The exemption is
+/// verified here, not inferred from the response having arrived: the tool is `Read`, both the
+/// requested file and the response's file are env class (by name or resolved target), and the
+/// read gate, re-run on the request with this `policy` (its runtime tier, `env_read` and
+/// sandbox), lets it through (no opinion, or an ask the user approved). When the read gate
+/// crashed or was bypassed on a read it would deny, the response is scrubbed.
+pub fn scrub_tool_response(
+    input: &HookInput,
+    response: &Value,
+    values: &[KnownValue],
+    cwd: &Path,
+    policy: &Policy,
+) -> Option<Value> {
+    if is_permitted_env_read(input, response, cwd, policy) {
+        return scrub_response(response, &[]);
+    }
+    scrub_response(response, values)
+}
+
+fn is_permitted_env_read(input: &HookInput, response: &Value, cwd: &Path, policy: &Policy) -> bool {
+    if input.tool_name.as_deref() != Some("Read")
+        || response.get("type").and_then(Value::as_str) != Some("text")
+    {
+        return false;
+    }
+    let requested = input
+        .tool_input
+        .as_ref()
+        .and_then(|i| i.get("file_path"))
+        .and_then(Value::as_str);
+    let served = response
+        .get("file")
+        .and_then(|f| f.get("filePath"))
+        .and_then(Value::as_str);
+    let (Some(requested), Some(served)) = (requested, served) else {
+        return false;
+    };
+    if !is_env_file(requested, cwd) || !is_env_file(served, cwd) {
+        return false;
+    }
+    matches!(
+        read::decide_tool("Read", input.tool_input.as_ref(), cwd, policy),
+        ReadVerdict::Decide(Decision::Defer | Decision::Ask { .. })
+    )
+}
+
+/// Whether `file` (absolute or relative to `cwd`) is env class by name or resolved target.
+fn is_env_file(file: &str, cwd: &Path) -> bool {
+    let is_env = |p: &str| secretpath::classify(p) == Class::Env;
+    is_env(file)
+        || std::fs::canonicalize(cwd.join(file)).is_ok_and(|r| is_env(&r.to_string_lossy()))
+}
+
+fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
     if is_binary_payload(response) {
         return None;
     }
@@ -46,7 +119,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
         }
         Value::Array(items) => {
             let scrubbed: Vec<Option<Value>> =
-                items.iter().map(|v| scrub_response(v, values)).collect();
+                items.iter().map(|v| scrub_value(v, values)).collect();
             if scrubbed.iter().all(Option::is_none) {
                 return None;
             }
@@ -62,7 +135,7 @@ pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> 
             let mut changed = false;
             let mut out = map.clone();
             for (key, value) in map {
-                if let Some(new) = scrub_response(value, values) {
+                if let Some(new) = scrub_value(value, values) {
                     out.insert(key.clone(), new);
                     changed = true;
                 }
@@ -225,6 +298,8 @@ struct Span {
 /// - 64-byte base58 secret keys, plus `"secretKey"`/`"privateKey"` JSON field values.
 /// - BIP-39 seed phrases (a run of 12/24 lowercase words near a mnemonic/seed hint).
 /// - Common API-key shapes (`*_API_KEY=`, `PRIVATE_KEY=`, `sk-…`, `eyJ…` JWTs).
+/// - PEM / OpenSSH private-key blocks (`-----BEGIN … PRIVATE KEY-----` through its `END` line).
+/// - Vendor tokens ([`API_TOKEN_PREFIXES`]: GitHub, AWS, Slack, Google, Stripe, OpenAI).
 ///
 /// Ordinary 32-byte base58 public keys are deliberately NOT redacted to avoid mangling
 /// normal output (addresses appear constantly in legitimate Solana tool output).
@@ -236,6 +311,8 @@ pub fn scrub(text: &str) -> Option<String> {
     collect_base58_secret_keys(text, &mut spans);
     collect_json_secret_fields(text, &mut spans);
     collect_api_keys(text, &mut spans);
+    collect_pem_blocks(text, &mut spans);
+    collect_vendor_tokens(text, &mut spans);
 
     if spans.is_empty() {
         return None;
@@ -580,6 +657,86 @@ fn collect_api_keys(text: &str, spans: &mut Vec<Span>) {
     collect_jwts(text, spans);
 }
 
+/// Longest PEM block searched for its `END` line.
+const MAX_PEM_BYTES: usize = 64 * 1024;
+
+/// Collect `-----BEGIN … PRIVATE KEY-----` blocks through the matching `-----END …-----`. An
+/// unterminated block runs over the base64 body that follows (base64 characters, whitespace
+/// and `\n` escapes), so a truncated key is still covered.
+fn collect_pem_blocks(text: &str, spans: &mut Vec<Span>) {
+    const BEGIN: &str = "-----BEGIN ";
+    const DASHES: &str = "-----";
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(BEGIN) {
+        let start = from + rel;
+        let label_from = start + BEGIN.len();
+        let Some(label_len) = text[label_from..].find(DASHES) else {
+            break;
+        };
+        let label = &text[label_from..label_from + label_len];
+        let header_end = label_from + label_len + DASHES.len();
+        let is_private = label.ends_with("PRIVATE KEY")
+            && label.len() <= 40
+            && label.bytes().all(|b| b.is_ascii_uppercase() || b == b' ');
+        if !is_private {
+            from = header_end;
+            continue;
+        }
+        let window_end = (header_end + MAX_PEM_BYTES).min(text.len());
+        let window = text.get(header_end..window_end).unwrap_or("");
+        let end = match window.find("-----END ") {
+            Some(rel_end) => {
+                let after = header_end + rel_end + "-----END ".len();
+                text[after..]
+                    .find(DASHES)
+                    .map_or(text.len(), |d| after + d + DASHES.len())
+            }
+            None => {
+                let mut end = header_end;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || matches!(bytes[end], b'+' | b'/' | b'=' | b'\\')
+                        || bytes[end].is_ascii_whitespace())
+                {
+                    end += 1;
+                }
+                end
+            }
+        };
+        spans.push(Span {
+            start,
+            end,
+            kind: "private_key",
+        });
+        from = end.max(start + 1);
+    }
+}
+
+/// Collect vendor-prefixed tokens ([`API_TOKEN_PREFIXES`]) that start a word and reach the
+/// prefix's minimum length.
+fn collect_vendor_tokens(text: &str, spans: &mut Vec<Span>) {
+    let bytes = text.as_bytes();
+    for (prefix, min) in API_TOKEN_PREFIXES {
+        let mut from = 0usize;
+        while let Some(rel) = text[from..].find(prefix) {
+            let start = from + rel;
+            let mut end = start + prefix.len();
+            while end < bytes.len() && is_token_char(bytes[end]) {
+                end += 1;
+            }
+            if (start == 0 || !is_token_char(bytes[start - 1])) && end - start >= *min {
+                spans.push(Span {
+                    start,
+                    end,
+                    kind: "api_key",
+                });
+            }
+            from = end.max(start + 1);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Low-level helpers
 // ---------------------------------------------------------------------------
@@ -742,7 +899,9 @@ fn collect_prefixed_tokens(
         while end < bytes.len() && is_token_char(bytes[end]) {
             end += 1;
         }
-        if end - start >= min_len {
+        // A token starts a word: `desk-lamp-…` is prose, not an `sk-` key.
+        let word_start = start == 0 || !is_token_char(bytes[start - 1]);
+        if word_start && end - start >= min_len {
             spans.push(Span { start, end, kind });
         }
         from = end.max(start + 1);
@@ -1034,6 +1193,53 @@ mod tests {
         // Real 32-byte mint address — must not be a false positive.
         let text = "mint So11111111111111111111111111111111111111112 balance 5";
         assert_eq!(scrub(text), None);
+    }
+
+    #[test]
+    fn pem_private_key_blocks_redacted() {
+        let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW";
+        let pem = format!(
+            "before\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n{body}\n-----END OPENSSH PRIVATE KEY-----\nafter"
+        );
+        let out = scrub(&pem).unwrap();
+        assert_eq!(out, "before\n***REDACTED:private_key***\nafter");
+        // Unterminated (truncated output): the body that follows is covered too.
+        let cut = format!("-----BEGIN RSA PRIVATE KEY-----\n{body}\n{body}");
+        let out = scrub(&cut).unwrap();
+        assert!(!out.contains(body), "{out}");
+        // A JSON-escaped block on one line.
+        let escaped =
+            format!("\"-----BEGIN PRIVATE KEY-----\\n{body}\\n-----END PRIVATE KEY-----\"");
+        assert!(!scrub(&escaped).unwrap().contains(body));
+        // A certificate or public key is not secret.
+        let cert = format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----");
+        assert_eq!(scrub(&cert), None);
+    }
+
+    #[test]
+    fn sk_prefix_needs_a_word_start() {
+        assert_eq!(scrub("desk-lamp-description-text-very-long"), None);
+        assert_eq!(
+            scrub("key sk-proj-abcdefghijklmnopqrstuvwxyz0123").unwrap(),
+            "key ***REDACTED:api_key***"
+        );
+    }
+
+    #[test]
+    fn vendor_tokens_redacted() {
+        for token in [
+            "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789",
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "AKIAIOSFODNN7EXAMPLE",
+            "xox\x62-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx",
+            "AIzaSyA1234567890abcdefghijklmnopqrstuv",
+        ] {
+            let out = scrub(&format!("token: {token} end")).unwrap_or_default();
+            assert_eq!(out, "token: ***REDACTED:api_key*** end", "{token}");
+        }
+        for prose in ["xAKIAIOSFODNN7EXAMPLE", "ghp_short", "the AIza prefix"] {
+            assert_eq!(scrub(prose), None, "{prose}");
+        }
     }
 
     #[test]

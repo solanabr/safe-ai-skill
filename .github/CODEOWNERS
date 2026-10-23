@@ -1,0 +1,12 @@
+# Shared contract files with solanabr/solana-ai-kit (policy/shared/, contract §1.2 and §1.4).
+# Owners: credentials.list joint (the sb column is the kit's), exfil-hosts.list the kit,
+# onchain-verbs.list and MANIFEST this repo; changing a corpus `expect` needs both owners, and
+# a MAJOR MANIFEST bump needs the kit's approval. Both repos are maintained by @kauenet today;
+# add the kit's team here when it has its own.
+/policy/shared/                      @kauenet
+/policy/shared/credentials.list      @kauenet
+/policy/shared/exfil-hosts.list      @kauenet
+/policy/shared/onchain-verbs.list    @kauenet
+/policy/shared/MANIFEST              @kauenet
+/scripts/shared-manifest.sh          @kauenet
+/scripts/check-shared-lists.sh       @kauenet

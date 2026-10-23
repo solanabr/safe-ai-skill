@@ -5,11 +5,16 @@
 //! once, at the first 1.1.0 SessionStart, and **never into live relaxation**:
 //!
 //! - each unexpired 1.0 grant in a grantable scope with valid addresses becomes a *pending*
-//!   grant request for its remaining time and budget; a 1.0 `autopilot` mode becomes a pending
-//!   mode request. The user sees their confirmation codes in that SessionStart's
-//!   `systemMessage` and keeps what they confirm. `paranoid` (stricter) is applied as is;
+//!   grant request for its remaining time and budget. The user sees their confirmation codes
+//!   in that SessionStart's `systemMessage` and keeps what they confirm;
+//! - a 1.0 mode becomes a tier (D8 v2 spec §9), never below `relaxed`: `strict` and
+//!   `autopilot` are `relaxed` (the notice names what changed, and `allow --scope transfer`
+//!   for autopilot users), `paranoid` is `tier.json` `high`;
 //! - a 1.0 spend ledger becomes an exhausted ledger for today (fresh tomorrow);
 //! - an unreadable file, and the removed `off` mode, are renamed to `<name>.v1-unmigrated`.
+//!
+//! [`mode_to_tier`] does the same, once, for an authenticated WS-B `mode.json` (1.1.0
+//! development builds), renaming it to `mode.json.migrated`.
 //!
 //! Each converted file is renamed to `<name>.v1-migrated`, each item is audited and listed in
 //! the SessionStart notice, and an authenticated marker [`MIGRATED_FILE`] is written.
@@ -27,9 +32,11 @@ use crate::confirm::{self, PendingKind, PENDING_FILE};
 use crate::datadir::DataDir;
 use crate::grants::{self, GrantRequest, Grants, GRANTABLE_SCOPES, GRANTS_FILE};
 use crate::mode::{self, ModeRecord, MODE_FILE};
+use crate::policy::tier::Tier;
 use crate::session::SESSIONS_FILE;
 use crate::spend::{self, SPEND_FILE};
-use crate::statefile::{self, KEY_FILE};
+use crate::statefile::{self, Loaded, KEY_FILE};
+use crate::tierstate::{self, TIER_FILE};
 
 /// Largest 1.0 state file read.
 const MAX_V1_BYTES: u64 = 1024 * 1024;
@@ -40,10 +47,15 @@ pub const MIGRATED_FILE: &str = "migrated.json";
 /// Longest a converted grant request may run (the grant limit).
 const MAX_GRANT_SECS: u64 = 30 * 86_400;
 
+/// The one-time line for users of the former default profile.
+pub const STRICT_LINE: &str = "profile strict is now tier relaxed: mainnet --final, program close \
+     and spl-token close/burn now deny";
+
 /// State files 1.1.0 writes as envelopes: one of them existing means 1.1.0 has run.
-const ENVELOPE_FILES: [&str; 8] = [
+const ENVELOPE_FILES: [&str; 9] = [
     GRANTS_FILE,
     MODE_FILE,
+    TIER_FILE,
     SPEND_FILE,
     PENDING_FILE,
     SESSIONS_FILE,
@@ -61,7 +73,11 @@ pub fn run(dir: &DataDir, now: u64) -> Vec<String> {
     let mut lines = Vec::new();
     migrate_spend(dir, &mut lines);
     migrate_grants(dir, now, &mut lines);
+    let had_mode = std::fs::symlink_metadata(dir.path.join(MODE_FILE)).is_ok();
     migrate_mode(dir, now, &mut lines);
+    if !had_mode && !lines.is_empty() {
+        lines.push(STRICT_LINE.to_string());
+    }
     let marker = serde_json::json!({ "at": now, "items": lines });
     let _ = statefile::store(dir, MIGRATED_FILE, &marker);
     for line in &lines {
@@ -174,34 +190,86 @@ fn migrate_mode(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
     };
     let record = serde_json::from_slice::<ModeRecord>(&bytes).ok();
     match record.as_ref().map(|r| r.profile.as_str()) {
-        Some(p) if mode::is_known_profile(p) => {
-            rename_to(&path, "v1-migrated");
-            if mode::is_looser(p, mode::DEFAULT_PROFILE) {
-                let payload = serde_json::json!({ "profile": p });
-                let summary = format!("mode {p} (kept from 1.0)");
-                if let Ok(id) = confirm::create_pending(dir, PendingKind::Mode, &summary, payload) {
-                    lines.push(format!(
-                        "1.0 mode {p} kept as pending request {id}; confirm it with the code \
-                         shown to you"
-                    ));
-                }
-            } else if p != mode::DEFAULT_PROFILE && mode::set(dir, p, now).is_ok() {
-                lines.push(format!("1.0 mode {p} applied"));
-            }
-        }
         Some("off") => {
             rename_to(&path, "v1-unmigrated");
-            lines.push(
-                "mode off from 1.0 was removed; not migrated (strict applies; to turn the hooks \
-                 off use SAFE_AI_SKILL_DISABLE)"
-                    .to_string(),
-            );
+            lines.push(OFF_LINE.to_string());
         }
-        _ => {
+        Some(p) => match mode::profile_tier(p) {
+            Some(tier) => {
+                rename_to(&path, "v1-migrated");
+                carry_profile(dir, p, tier, now, lines);
+            }
+            None => {
+                rename_to(&path, "v1-unmigrated");
+                lines.push("mode.json from 1.0 could not be read; not migrated".to_string());
+            }
+        },
+        None => {
             rename_to(&path, "v1-unmigrated");
             lines.push("mode.json from 1.0 could not be read; not migrated".to_string());
         }
     }
+}
+
+/// The line for a removed 1.0 `off` mode.
+const OFF_LINE: &str = "mode off from 1.0 was not migrated (relaxed applies): run `safe-ai-skill \
+     tier off` and confirm it, or set SAFE_AI_SKILL_DISABLE=1 to turn the hooks off";
+
+/// Carry a known profile over as its tier (spec §9): never below `relaxed`, so nothing is
+/// pending; `paranoid` raises `tier.json` to `high`.
+fn carry_profile(dir: &DataDir, profile: &str, tier: Tier, now: u64, lines: &mut Vec<String>) {
+    match profile {
+        "paranoid" => {
+            let change = tierstate::Change {
+                project: None,
+                tier: Some(tier),
+                env_read: None,
+                clear: false,
+            };
+            if tierstate::apply(dir, &change, now).is_ok() {
+                lines.push("profile paranoid is now tier high (applied)".to_string());
+            }
+        }
+        "autopilot" => lines.push(
+            "profile autopilot is now tier relaxed (no raised cap); to approve devnet transfers \
+             without prompts, run `safe-ai-skill allow --scope transfer --for <duration>` and \
+             confirm it"
+                .to_string(),
+        ),
+        _ => lines.push(STRICT_LINE.to_string()),
+    }
+}
+
+/// Carry an authenticated WS-B `mode.json` over to `tier.json`, once: it is renamed to
+/// `mode.json.migrated` (or `.unmigrated` when it fails authentication). Returns one line
+/// per item. A trusted data dir only: an untrusted one's state was never applied.
+pub fn mode_to_tier(dir: &DataDir, now: u64) -> Vec<String> {
+    let path = dir.path.join(MODE_FILE);
+    if dir.is_unresolved() || !dir.trusted || std::fs::symlink_metadata(&path).is_err() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    match mode::load(dir) {
+        Loaded::Valid(_) if std::fs::symlink_metadata(dir.path.join(TIER_FILE)).is_ok() => {
+            // tier.json is newer: the user already chose a tier.
+            rename_to(&path, "migrated");
+        }
+        Loaded::Valid(record) => {
+            rename_to(&path, "migrated");
+            match mode::profile_tier(&record.profile) {
+                Some(tier) => carry_profile(dir, &record.profile, tier, now, &mut lines),
+                None => lines.push(OFF_LINE.to_string()),
+            }
+        }
+        Loaded::Tampered => {
+            rename_to(&path, "unmigrated");
+            lines.push(
+                "mode.json failed authentication; not migrated (relaxed applies)".to_string(),
+            );
+        }
+        Loaded::Missing => {}
+    }
+    lines
 }
 
 /// Rename a 1.0 file to `<name>.<suffix>`.
@@ -226,7 +294,6 @@ mod tests {
     use super::*;
     use crate::grants::tests::{tmp_data, transfer_grant, ADDR};
     use crate::spend::SpendLedger;
-    use crate::statefile::Loaded;
 
     const NOW: u64 = 1_000_000;
 
@@ -269,7 +336,10 @@ mod tests {
             "{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("1.0 mode autopilot kept")),
+            lines
+                .iter()
+                .any(|l| l.contains("autopilot is now tier relaxed")
+                    && l.contains("allow --scope transfer")),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l.contains("exhausted")), "{lines:?}");
@@ -278,16 +348,16 @@ mod tests {
             "{lines:?}"
         );
 
-        // Nothing is live: no grant, no autopilot.
+        // Nothing is live: no grant, and no tier below relaxed.
         assert!(grants::live(&dir).grants.is_empty());
-        assert_eq!(mode::persisted(&dir), None);
+        assert_eq!(tierstate::user_choice(&dir, Path::new("/p")).tier, None);
         match statefile::load::<SpendLedger>(&dir, SPEND_FILE) {
             Loaded::Valid(l) => assert!(l.is_exhausted()),
             other => panic!("{other:?}"),
         }
         // The requests carry the remaining time and budget; the user confirms them.
         let shown = confirm::announce_pending(&dir, real_now());
-        assert_eq!(shown.len(), 2);
+        assert_eq!(shown.len(), 1);
         let grant = shown.iter().find(|a| a.kind == PendingKind::Grant).unwrap();
         assert!(grant.summary.contains("3 SOL budget") && grant.summary.contains("1h"));
         assert!(dir.path.join("grants.json.v1-migrated").exists());
@@ -315,7 +385,7 @@ mod tests {
     #[test]
     fn no_migration_when_the_key_or_an_envelope_exists() {
         let dir = tmp_data("migrate_keyed");
-        mode::set(&dir, "strict", 0).unwrap();
+        statefile::store(&dir, MODE_FILE, &ModeRecord::default()).unwrap();
         write(&dir, GRANTS_FILE, &v1_grants());
         assert!(run(&dir, NOW).is_empty());
         std::fs::remove_file(dir.path.join(KEY_FILE)).unwrap();
@@ -331,7 +401,7 @@ mod tests {
         write(&dir, MODE_FILE, r#"{"profile":"autopilot","set_at":5}"#);
         write(&dir, SPEND_FILE, r#"{"day":11,"total_sol":0.0}"#);
         assert!(!run(&dir, NOW).is_empty());
-        assert_eq!(mode::persisted(&dir), None);
+        assert_eq!(tierstate::user_choice(&dir, Path::new("/p")).tier, None);
         assert!(spend::SpendLedger::load(&dir.path).is_exhausted());
         let _ = std::fs::remove_dir_all(&dir.path);
     }
@@ -345,10 +415,12 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("grants.json from 1.0 could not be read")));
-        assert!(lines.iter().any(|l| l.contains("mode off")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("mode off") && l.contains("safe-ai-skill tier off")));
         assert!(dir.path.join("grants.json.v1-unmigrated").exists());
         assert!(dir.path.join("mode.json.v1-unmigrated").exists());
-        assert_eq!(mode::persisted(&dir), None);
+        assert_eq!(tierstate::user_choice(&dir, Path::new("/p")).tier, None);
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
@@ -357,11 +429,69 @@ mod tests {
         let dir = tmp_data("migrate_paranoid");
         write(&dir, MODE_FILE, r#"{"profile":"paranoid","set_at":5}"#);
         let lines = run(&dir, NOW);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("1.0 mode paranoid applied")));
-        assert_eq!(mode::persisted(&dir), Some("paranoid".into()));
+        assert!(lines.iter().any(|l| l.contains("tier high")), "{lines:?}");
+        assert_eq!(
+            tierstate::user_choice(&dir, Path::new("/p"))
+                .tier
+                .map(|t| t.0),
+            Some(Tier::High)
+        );
         let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn strict_gets_the_one_time_line() {
+        let dir = tmp_data("migrate_strict");
+        write(&dir, MODE_FILE, r#"{"profile":"strict","set_at":5}"#);
+        let lines = run(&dir, NOW);
+        assert_eq!(lines, vec![STRICT_LINE.to_string()]);
+        assert!(run(&dir, NOW).is_empty());
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn an_authenticated_ws_b_mode_json_becomes_a_tier_once() {
+        let dir = tmp_data("migrate_wsb");
+        let record = ModeRecord {
+            profile: "paranoid".into(),
+            set_at: 1,
+        };
+        statefile::store(&dir, MODE_FILE, &record).unwrap();
+        let lines = mode_to_tier(&dir, NOW);
+        assert!(lines.iter().any(|l| l.contains("tier high")), "{lines:?}");
+        assert!(dir.path.join("mode.json.migrated").exists());
+        assert!(mode_to_tier(&dir, NOW).is_empty());
+        assert_eq!(
+            tierstate::user_choice(&dir, Path::new("/p"))
+                .tier
+                .map(|t| t.0),
+            Some(Tier::High)
+        );
+
+        let auto = tmp_data("migrate_wsb_auto");
+        let record = ModeRecord {
+            profile: "autopilot".into(),
+            set_at: 1,
+        };
+        statefile::store(&auto, MODE_FILE, &record).unwrap();
+        let lines = mode_to_tier(&auto, NOW);
+        assert!(
+            lines.iter().any(|l| l.contains("allow --scope transfer")),
+            "{lines:?}"
+        );
+        assert_eq!(tierstate::user_choice(&auto, Path::new("/p")).tier, None);
+
+        let forged = tmp_data("migrate_wsb_forged");
+        write(&forged, MODE_FILE, r#"{"profile":"paranoid","set_at":5}"#);
+        statefile::store(&forged, "x.json", &ModeRecord::default()).unwrap();
+        let lines = mode_to_tier(&forged, NOW);
+        assert!(
+            lines.iter().any(|l| l.contains("failed authentication")),
+            "{lines:?}"
+        );
+        for d in [dir, auto, forged] {
+            let _ = std::fs::remove_dir_all(&d.path);
+        }
     }
 
     #[test]

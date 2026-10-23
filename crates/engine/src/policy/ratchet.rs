@@ -11,17 +11,11 @@ use std::path::{Component, Path};
 
 use serde_yaml::Value as Yaml;
 
-use super::{merge_yaml, Policy, PROFILE_ENV, REMOVED_TOP_LEVEL};
-use crate::mode::{DEFAULT_PROFILE, KNOWN_PROFILES};
+use super::tier::{EnvRead, RawHint, Tier};
+use super::{merge_yaml, Policy, PROFILES_REMOVED, REMOVED_TOP_LEVEL};
 
 /// A project's policy overlay, relative to the project root.
 pub(super) const PROJECT_POLICY: &str = ".safe-ai-skill/policy.yaml";
-
-/// Known profiles from loosest to strictest. [`PROFILE_ENV`] may only move right.
-const PROFILE_STRICTNESS: [&str; 3] = KNOWN_PROFILES;
-
-/// The profile that needs a confirmed `mode.json` (spec D1.11).
-const CONFIRMED_ONLY: &str = "autopilot";
 
 /// The skill scan dirs, and the note for project dirs that leave the project.
 const SCAN_DIRS: &str = "supply_chain.verify_skills_dirs";
@@ -47,17 +41,24 @@ pub(super) fn apply_project_overlay(policy: &mut Policy, base: &Yaml, text: &str
         }
     };
 
-    // Profile selection belongs to the user, never to the repo.
-    for key in ["active_profile", "profiles"] {
+    // The tier belongs to the user: a project's `tier` (or legacy `active_profile`) is a
+    // raise-only hint for the resolver (`tier::resolve`), never a policy field.
+    for (key, field) in [("tier", "tier"), ("active_profile", "active_profile")] {
         if let Some(asked) = overlay.remove(key) {
-            let current = base.get(key).cloned().unwrap_or(Yaml::Null);
-            if merge_yaml(current.clone(), asked) != current {
-                policy.ignored_overrides.push(format!(
-                    "{key}: a project may not select or define profiles"
-                ));
-            }
+            policy.repo_tier_hints.push(RawHint {
+                field,
+                tier: asked.as_str().and_then(Tier::parse),
+            });
         }
     }
+    if overlay.remove("profiles").is_some() {
+        policy.ignored_overrides.push(PROFILES_REMOVED.to_string());
+    }
+    policy.repo_env_read = overlay
+        .get("secrets")
+        .and_then(|s| s.get("env_read"))
+        .and_then(Yaml::as_str)
+        .and_then(EnvRead::parse);
 
     for key in REMOVED_TOP_LEVEL {
         if overlay.remove(key).is_some() {
@@ -84,7 +85,7 @@ pub(super) fn apply_project_overlay(policy: &mut Policy, base: &Yaml, text: &str
 }
 
 /// Tighten `policy` with every field of `asked` (the base deep-merged with the overlay)
-/// that tightens it. Returns a note per refused change. Profiles are handled by the caller.
+/// that tightens it. Returns a note per refused change. The tier is handled by the caller.
 fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
     let mut notes = Vec::new();
     let n = &mut notes;
@@ -102,30 +103,25 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         n,
     );
 
-    let (spend, caps) = (&mut policy.spend, &mut policy.project_caps);
-    for (path, cap, project, wanted) in [
+    let spend = &mut policy.spend;
+    for (path, cap, wanted) in [
         (
             "spend.per_tx_sol_max",
             &mut spend.per_tx_sol_max,
-            &mut caps.per_tx_sol_max,
             asked.spend.per_tx_sol_max,
         ),
         (
             "spend.hard_tx_sol_max",
             &mut spend.hard_tx_sol_max,
-            &mut caps.hard_tx_sol_max,
             asked.spend.hard_tx_sol_max,
         ),
         (
             "spend.daily_sol_max",
             &mut spend.daily_sol_max,
-            &mut caps.daily_sol_max,
             asked.spend.daily_sol_max,
         ),
     ] {
-        if keep_min(path, cap, wanted, n) {
-            *project = Some(wanted);
-        }
+        keep_min(path, cap, wanted, n);
     }
 
     keep_pattern(
@@ -168,6 +164,18 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         "secrets.deny_read_globs",
         &mut policy.secrets.deny_read_globs,
         &asked.secrets.deny_read_globs,
+        n,
+    );
+    keep_union(
+        "secrets.key_material_extra_globs",
+        &mut policy.secrets.key_material_extra_globs,
+        &asked.secrets.key_material_extra_globs,
+        n,
+    );
+    keep_union(
+        "secrets.exfil_hosts_extra",
+        &mut policy.secrets.exfil_hosts_extra,
+        &asked.secrets.exfil_hosts_extra,
         n,
     );
     keep_subset(
@@ -242,25 +250,19 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
     notes
 }
 
-/// Lower `current` to `asked` when that tightens it; returns whether it moved.
+/// Lower `current` to `asked` when that tightens it.
 fn keep_min<T: PartialOrd + Copy + Display>(
     path: &str,
     current: &mut T,
     asked: T,
     notes: &mut Vec<String>,
-) -> bool {
+) {
     match asked.partial_cmp(current) {
-        Some(Ordering::Less) => {
-            *current = asked;
-            true
-        }
-        Some(Ordering::Equal) => false,
-        _ => {
-            notes.push(format!(
-                "{path}: kept at {current} (a project may only lower it)"
-            ));
-            false
-        }
+        Some(Ordering::Less) => *current = asked,
+        Some(Ordering::Equal) => {}
+        _ => notes.push(format!(
+            "{path}: kept at {current} (a project may only lower it)"
+        )),
     }
 }
 
@@ -324,7 +326,7 @@ fn keep_subset(path: &str, current: &mut Vec<String>, asked: &[String], notes: &
 /// sweeping `~`, `/`, `..` or the project root itself would treat unrelated dirs as packs.
 /// The one exception is the user-scope [`USER_SKILLS_DIR`], which a project may opt in to.
 /// The project's order comes first, since `verify approve` restores into the first dir.
-/// Returns the added dirs; [`Policy::load_with_mode`] re-checks them on disk.
+/// Returns the added dirs; [`Policy::load`] re-checks them on disk.
 fn keep_scan_dirs(
     current: &mut Vec<String>,
     asked: &[String],
@@ -383,7 +385,7 @@ pub(super) fn is_user_skills(dir: &str) -> bool {
 }
 
 /// Whether `dir` is, as text, a relative path below the project root. Symlinks are checked
-/// on disk by [`Policy::load_with_mode`].
+/// on disk by [`Policy::load`].
 fn is_inside_project(dir: &str) -> bool {
     let components = || Path::new(dir).components();
     !dir.starts_with('~')
@@ -428,49 +430,4 @@ fn keep_fixed<T: PartialEq>(path: &str, current: &T, asked: &T, notes: &mut Vec<
     if asked != current {
         notes.push(format!("{path}: a project may not change it"));
     }
-}
-
-/// Pick the active profile: the user's `persisted` choice replaces `base`, then `env` (which
-/// a repo's `.claude/settings.json` can set) may only select a stricter profile. Returns the
-/// profile and a note per refusal.
-///
-/// `autopilot` is honoured only from `persisted` (a confirmed, authenticated `mode.json`);
-/// named by the base policy it falls back to strict. An unknown name is strict too.
-pub(super) fn resolve_profile(
-    base: &str,
-    persisted: Option<&str>,
-    env: Option<&str>,
-) -> (String, Vec<String>) {
-    let mut notes = Vec::new();
-    let persisted = persisted.map(str::trim).filter(|p| !p.is_empty());
-    let mut current = persisted.unwrap_or(base).to_string();
-    let rank = |profile: &str| PROFILE_STRICTNESS.iter().position(|p| *p == profile);
-    if rank(&current).is_none() {
-        let shown: String = current
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(20)
-            .collect();
-        notes.push(format!(
-            "active_profile: `{shown}` is not a profile; using {DEFAULT_PROFILE}"
-        ));
-        current = DEFAULT_PROFILE.to_string();
-    } else if current == CONFIRMED_ONLY && persisted != Some(CONFIRMED_ONLY) {
-        notes.push(format!(
-            "active_profile: `{CONFIRMED_ONLY}` applies only through a confirmed \
-             `safe-ai-skill mode {CONFIRMED_ONLY}`; using {DEFAULT_PROFILE}"
-        ));
-        current = DEFAULT_PROFILE.to_string();
-    }
-    let Some(env) = env.map(str::trim).filter(|e| !e.is_empty()) else {
-        return (current, notes);
-    };
-    match (rank(&current), rank(env)) {
-        (Some(floor), Some(asked)) if asked >= floor => return (env.to_string(), notes),
-        _ if env == current => {}
-        _ => notes.push(format!(
-            "{PROFILE_ENV}: kept profile `{current}` (it may only select a stricter one)"
-        )),
-    }
-    (current, notes)
 }

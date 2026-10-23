@@ -1,6 +1,7 @@
 //! Prompt-code confirmation for relaxing actions (spec D4.1, amended in WS-B fix round 1).
 //!
-//! `allow`, `mode <looser>`, `verify trust` and `verify approve` do not take effect when run:
+//! `allow`, `tier <lower>` (and its `mode` alias), `verify trust` and `verify approve` do not
+//! take effect when run:
 //! they call [`create_pending`], which stores a pending entry under a short request id
 //! ([`PendingId`]) in the authenticated `pending.json`. **No code exists yet**, and the CLI
 //! prints none: the agent that ran the command learns only the id.
@@ -71,8 +72,10 @@ const SALT_LABEL: &[u8] = b"safe-ai-skill/pending-code/v1";
 pub enum PendingKind {
     /// `safe-ai-skill allow …`: activate a grant.
     Grant,
-    /// `safe-ai-skill mode <looser profile>`.
+    /// A legacy `mode <looser profile>` request (activated as the matching tier).
     Mode,
+    /// `safe-ai-skill tier …` that lowers the tier or loosens `env_read`.
+    Tier,
     /// `safe-ai-skill verify trust …`.
     Trust,
     /// `safe-ai-skill verify approve …`.

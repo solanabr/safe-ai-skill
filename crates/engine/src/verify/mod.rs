@@ -8,6 +8,7 @@
 //! [`apply_confirmed`]).
 
 pub mod enforce;
+pub mod gittracked;
 pub mod grading;
 pub mod heuristics;
 pub mod lockfile;
@@ -459,6 +460,7 @@ use std::collections::BTreeMap;
 use crate::confirm::{self, Confirmed, PendingKind};
 use crate::datadir::DataDir;
 use crate::error::{EngineError, Error};
+use crate::policy::tier::Tier;
 use state::{PackEntry, PackKind, PackStatus, Reason, State};
 
 /// Current unix time in seconds (0 on clock error).
@@ -551,6 +553,27 @@ pub fn quarantined_packs(plugin_data: &Path, st: &State) -> Vec<String> {
         .filter(|p| !ours.contains(p))
         .filter_map(|p| dir_name(p))
         .collect()
+}
+
+/// What a pack verdict from [`enforce`] becomes at `tier` (D8 v2 spec §6).
+///
+/// `Deny` is a blocked or unscanned pack: denied in place at Relaxed, Medium and High, and only
+/// reported (at SessionStart) at Off. `Ask` is the marker for a first-seen HIGH heuristic
+/// finding nobody reviewed: denied at High, nothing below. Anything else passes through.
+/// Call line: `main::blocked_pack` (Read/Grep and Bash path access under a pack) and
+/// [`crate::gates::skill`] (the Skill tool and `/slash` expansion).
+pub fn tier_action(
+    verdict: crate::gate::Verdict,
+    tier: crate::policy::tier::Tier,
+) -> crate::gate::Verdict {
+    use crate::gate::Verdict;
+    use crate::policy::tier::Tier;
+    match (verdict, tier) {
+        (Verdict::Deny(_) | Verdict::Ask(_), Tier::Off) => Verdict::NoOpinion,
+        (Verdict::Ask(reason), Tier::High) => Verdict::Deny(reason),
+        (Verdict::Ask(_), _) => Verdict::NoOpinion,
+        (verdict, _) => verdict,
+    }
 }
 
 /// The repository root at or above `start`: the nearest directory holding `.git` or
@@ -1191,6 +1214,25 @@ fn migrate_v1(
     (Some(hash.to_string()), high, None)
 }
 
+/// Why `on_block: move` must leave `pack` where it is, or `None` when it may be moved: a
+/// symlinked pack directory (the rename would move the link, not the content, and the printed
+/// restore would be wrong), or a pack a repository tracks (read from the repository files; git
+/// never runs on the pack tree).
+fn not_moved_reason(pack: &Pack) -> Option<String> {
+    let is_link = pack
+        .dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true);
+    if is_link {
+        return Some("the pack directory is a symlink or cannot be inspected".to_string());
+    }
+    match gittracked::tracking_any(&[&pack.dir, &pack.canonical]) {
+        gittracked::Tracking::Tracked(why) => Some(format!("tracked by git ({why})")),
+        gittracked::Tracking::Untracked => None,
+    }
+}
+
 /// Move a blocked pack into `${DATA}/quarantine/` (`supply_chain.on_block: move`), never
 /// overwriting an existing entry: the name gets a `-<n>` suffix when taken. Returns where it went.
 fn move_blocked(plugin_data: &Path, pack: &Pack) -> Option<PathBuf> {
@@ -1265,11 +1307,17 @@ struct PackReportLine {
     findings: Vec<state::StoredFinding>,
     more_findings: usize,
     moved_to: Option<String>,
+    /// Where the pack lives (or lived, when moved).
+    origin: String,
+    /// `on_block: move` left it in place, for this reason.
+    not_moved: Option<String>,
 }
 
 impl PackReportLine {
     fn from_entry(pack: &Pack, e: &PackEntry) -> Self {
         PackReportLine {
+            origin: state::key_of(&pack.canonical),
+            not_moved: None,
             kind: pack.kind,
             name: pack.name.clone(),
             display: pack.display.clone(),
@@ -1314,6 +1362,32 @@ impl PackReportLine {
         match self.state {
             PackStatus::Blocked => "BLOCK",
             _ => "WARN",
+        }
+    }
+
+    /// What `on_block: move` did to the pack: where it went with its origin and the restore
+    /// command, or why it stayed.
+    fn move_note(&self) -> String {
+        if let Some(to) = &self.moved_to {
+            let (to, origin) = (escape_for_report(to), escape_for_report(&self.origin));
+            // A combination rule is never cleared by approval, so only `mv` restores it.
+            let approve = if self.reason == Some(Reason::Combo) {
+                String::new()
+            } else {
+                format!(
+                    " or `safe-ai-skill verify approve {}`",
+                    escape_for_report(&self.display)
+                )
+            };
+            return format!(
+                "; MOVED to {to} (origin {origin}); restore with `mv {} {}`{approve}",
+                sh_quote(&to),
+                sh_quote(&origin)
+            );
+        }
+        match &self.not_moved {
+            Some(why) => format!("; not moved: {why}; denied in place"),
+            None => String::new(),
         }
     }
 
@@ -1395,7 +1469,10 @@ fn sweep_within(
     let env = Env::new(dir, project_dir, user_skills, scanner);
     let mut lines: Vec<PackReportLine> = Vec::new();
     let mut result = SessionResult::default();
-    let move_on_block = policy.supply_chain.on_block == "move";
+    let tier = policy.tier();
+    // Off only reports, so it moves nothing either.
+    let move_on_block = policy.supply_chain.on_block == "move" && tier != Tier::Off;
+    let mut high_denied: Vec<String> = Vec::new();
     let mut swept_keys: Vec<String> = Vec::new();
 
     let targets = sweep_targets(project_dir, user_skills, policy, &env.v1);
@@ -1458,13 +1535,31 @@ fn sweep_within(
             continue;
         };
         swept_keys.push(ev.key.clone());
+        let wants_move = move_on_block
+            && st
+                .packs
+                .get(&ev.key)
+                .is_some_and(|e| e.state == PackStatus::Blocked && e.quarantined_to.is_none());
+        let mut not_moved = None;
+        if wants_move {
+            // The BLOCK is stored before the tracking check and the move, so a stall or a
+            // crash there never leaves the pack unrecorded (the gates read the stored state).
+            let _ = state::store(dir, &st);
+            not_moved = not_moved_reason(&pack);
+            if not_moved.is_none() {
+                if let Some(to) = move_blocked(&dir.path, &pack) {
+                    if let Some(e) = st.packs.get_mut(&ev.key) {
+                        e.quarantined_to = Some(to.to_string_lossy().into_owned());
+                    }
+                    let _ = state::store(dir, &st);
+                }
+            }
+        }
         let Some(entry) = st.packs.get_mut(&ev.key) else {
             continue;
         };
-        if move_on_block && entry.state == PackStatus::Blocked && entry.quarantined_to.is_none() {
-            if let Some(to) = move_blocked(&dir.path, &pack) {
-                entry.quarantined_to = Some(to.to_string_lossy().into_owned());
-            }
+        if enforce::high_pending(entry, &env.trust) {
+            high_denied.push(pack.display.clone());
         }
         let report = entry.state == PackStatus::Blocked
             || entry.note.is_some()
@@ -1475,7 +1570,9 @@ fn sweep_within(
         }
         if report {
             result.reported.push(pack.display.clone());
-            lines.push(PackReportLine::from_entry(&pack, entry));
+            let mut line = PackReportLine::from_entry(&pack, entry);
+            line.not_moved = not_moved;
+            lines.push(line);
         }
         entry.note = None;
         // Stored after each pack, so a sweep killed by the hook timeout keeps what it did.
@@ -1525,9 +1622,23 @@ fn sweep_within(
         &quarantined_packs(&dir.path, &st),
         &targets.skipped,
         &dir.path,
-        loaded.tampered,
+        &ReportExtras {
+            tampered: loaded.tampered,
+            tier,
+            high_denied: &high_denied,
+        },
     );
     result
+}
+
+/// What [`render_report`] says beyond the pack lines.
+struct ReportExtras<'a> {
+    /// `state.json` failed authentication and was discarded.
+    tampered: bool,
+    /// The tier the gates act at.
+    tier: Tier,
+    /// Packs (as displayed) with an unreviewed HIGH finding, which tier High denies.
+    high_denied: &'a [String],
 }
 
 /// Render the sweep into `result`'s two messages.
@@ -1544,24 +1655,29 @@ fn render_report(
     quarantined: &[String],
     unverified: &[String],
     plugin_data: &Path,
-    tampered: bool,
+    extras: &ReportExtras,
 ) {
+    let ReportExtras {
+        tampered,
+        tier,
+        high_denied,
+    } = *extras;
     let mut model: Vec<String> = Vec::new();
     let mut user: Vec<String> = Vec::new();
 
     if !lines.is_empty() || !mcp.is_empty() {
-        model.push(
+        model.push(if tier == Tier::Off {
+            "safe-ai-skill supply-chain sweep (tier off: these are reports only, nothing is \
+             denied):"
+                .to_string()
+        } else {
             "safe-ai-skill supply-chain sweep (BLOCK = denied by the gates until the user \
              approves it; WARN = report only):"
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     for l in lines {
-        let moved = l
-            .moved_to
-            .as_ref()
-            .map(|m| format!("; moved to {}", escape_for_report(m)))
-            .unwrap_or_default();
+        let moved = l.move_note();
         model.push(format!(
             " - {} {} `{}` ({}): {}{moved}",
             l.label(),
@@ -1605,9 +1721,13 @@ fn render_report(
             .filter(|l| l.state == PackStatus::Blocked)
             .count();
         user.push(format!(
-            "safe-ai-skill: {} skill pack(s) need review ({blocked} blocked: Skill, /command, \
-             Read and Bash access to them is denied until approved):",
-            for_user.len()
+            "safe-ai-skill: {} skill pack(s) need review ({blocked} blocked: {}):",
+            for_user.len(),
+            if tier == Tier::Off {
+                "reported only, the tier is off and nothing is denied"
+            } else {
+                "Skill, /command, Read and Bash access to them is denied until approved"
+            }
         ));
         for l in for_user.iter().take(MAX_PACKS_IN_MESSAGE) {
             let first = l
@@ -1621,14 +1741,18 @@ fn render_report(
                     )
                 })
                 .unwrap_or_default();
-            let approve = if l.state == PackStatus::Blocked {
-                format!(
+            let approve = match l.state {
+                PackStatus::Blocked => format!(
                     "; review it, then run `safe-ai-skill verify approve {}`",
                     escape_for_report(&l.display)
-                )
-            } else {
-                String::new()
+                ),
+                PackStatus::Unreviewed => format!(
+                    "; review it, then run `safe-ai-skill verify trust {}`",
+                    escape_for_report(&l.display)
+                ),
+                _ => String::new(),
             };
+            let approve = format!("{approve}{}", l.move_note());
             user.push(format!(
                 "{} {} {}: {}{first}{approve}",
                 l.label(),
@@ -1643,6 +1767,32 @@ fn render_report(
                 for_user.len() - MAX_PACKS_IN_MESSAGE
             ));
         }
+    }
+    if tier == Tier::High && !high_denied.is_empty() {
+        let shown: Vec<String> = high_denied
+            .iter()
+            .take(MAX_PACKS_IN_MESSAGE)
+            .map(|p| escape_for_report(p))
+            .collect();
+        let more = high_denied.len().saturating_sub(MAX_PACKS_IN_MESSAGE);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        let list = format!("{}{more}", shown.join(", "));
+        model.push(format!(
+            "safe-ai-skill: tier high denies Skill, /command, Read and Bash access to \
+             {} skill pack(s) with an unreviewed high-severity finding until the user trusts \
+             them: {list}",
+            high_denied.len()
+        ));
+        user.push(format!(
+            "safe-ai-skill: tier high denies {} skill pack(s) with an unreviewed high-severity \
+             finding until you trust them: {list}. Review each, then run `safe-ai-skill verify \
+             trust <pack dir>`.",
+            high_denied.len()
+        ));
     }
     if !mcp.is_empty() {
         let listed: Vec<String> = mcp
@@ -2023,7 +2173,7 @@ pub fn apply_confirmed(dir: &DataDir, confirmed: &Confirmed) -> Result<String, E
     match confirmed.kind {
         PendingKind::Trust => apply_trust(dir, &confirmed.payload),
         PendingKind::Approve => apply_approve(dir, &confirmed.payload),
-        PendingKind::Grant | PendingKind::Mode => {
+        PendingKind::Grant | PendingKind::Mode | PendingKind::Tier => {
             Err(Error::Other("not a verify confirmation".to_string()))
         }
     }
@@ -2307,6 +2457,11 @@ pub fn severity_label(s: Severity) -> &'static str {
 /// what the reader sees, or close the code span it is shown in.
 fn escape_for_report(text: &str) -> String {
     escape(text, false)
+}
+
+/// `text` as one single-quoted shell word.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// [`escape_for_report`] for engine-written text (finding details), whose backticks are its
@@ -3454,6 +3609,30 @@ mod enforce_tests {
         skill_budget(d, cwd, name, Duration::from_secs(5))
     }
 
+    #[test]
+    fn tier_action_table() {
+        let deny = || GateVerdict::Deny("d".into());
+        let ask = || GateVerdict::Ask("a".into());
+        for (tier, hard, high) in [
+            (Tier::Off, false, false),
+            (Tier::Relaxed, true, false),
+            (Tier::Medium, true, false),
+            (Tier::High, true, true),
+        ] {
+            assert_eq!(is_deny(&tier_action(deny(), tier)), hard, "{tier:?} hard");
+            assert_eq!(is_deny(&tier_action(ask(), tier)), high, "{tier:?} high");
+            assert_eq!(
+                tier_action(GateVerdict::NoOpinion, tier),
+                GateVerdict::NoOpinion
+            );
+        }
+        assert_eq!(
+            tier_action(ask(), Tier::High),
+            GateVerdict::Deny("a".into()),
+            "the reason is kept"
+        );
+    }
+
     fn is_deny(v: &GateVerdict) -> bool {
         matches!(v, GateVerdict::Deny(_))
     }
@@ -4555,6 +4734,35 @@ mod enforce_tests {
     }
 
     #[test]
+    fn a_read_naming_a_high_pack_first_and_a_hard_pack_second_is_denied_hard() {
+        let (d, project) = fresh_trusted("rr6-fields");
+        for n in ["aaa0", "aaa1", "aaa2", "aaa3", "zzz"] {
+            md(&skills_of(&project).join(n), n);
+            fs::write(skills_of(&project).join(n).join("run.sh"), "id").unwrap();
+        }
+        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(1));
+        let st = state::load(&d).state;
+        assert!(entry_of(&st, &skills_of(&project).join("zzz")).unscanned());
+        assert_eq!(
+            entry_of(&st, &skills_of(&project).join("aaa0")).state,
+            PackStatus::Unreviewed
+        );
+        let input = serde_json::json!({
+            "file_path": ".claude/skills/aaa0/run.sh",
+            "notebook_path": ".claude/skills/zzz/run.sh",
+        });
+        // The hard pack in the second field wins, so Relaxed and Medium still deny.
+        let v = enforce::read_verdict(&d, "Read", &input, &project);
+        assert!(is_deny(&v), "{v:?}");
+        assert!(is_deny(&tier_action(v, Tier::Relaxed)));
+        // Alone, the high-only pack is the `Ask` marker: n/o below High.
+        let only = serde_json::json!({"file_path": ".claude/skills/aaa0/run.sh"});
+        let v = enforce::read_verdict(&d, "Read", &only, &project);
+        assert!(matches!(v, GateVerdict::Ask(_)), "{v:?}");
+        assert_eq!(tier_action(v, Tier::Relaxed), GateVerdict::NoOpinion);
+    }
+
+    #[test]
     fn rr6_a_malicious_pack_pushed_past_the_budget_is_still_path_denied() {
         let (d, project) = fresh_trusted("rr6-aaa");
         for n in ["aaa0", "aaa1", "aaa2", "aaa3", "zzz"] {
@@ -4587,18 +4795,20 @@ mod enforce_tests {
             "Grep",
             serde_json::json!({"pattern": "x", "path": ".claude/skills/zzz"})
         )));
-        // A first-seen HIGH stays a warning.
-        assert_eq!(
+        // A first-seen HIGH stays a warning below tier High, and is denied at High.
+        let seen = [
             bash("cat .claude/skills/aaa0/run.sh"),
-            GateVerdict::NoOpinion
-        );
-        assert_eq!(
             read(
                 "Read",
-                serde_json::json!({"file_path": ".claude/skills/aaa0/run.sh"})
+                serde_json::json!({"file_path": ".claude/skills/aaa0/run.sh"}),
             ),
-            GateVerdict::NoOpinion
-        );
+        ];
+        for v in seen {
+            for tier in [Tier::Off, Tier::Relaxed, Tier::Medium] {
+                assert_eq!(tier_action(v.clone(), tier), GateVerdict::NoOpinion);
+            }
+            assert!(is_deny(&tier_action(v, Tier::High)));
+        }
         // Invoking it scans it on the spot: the combo blocks.
         let v = enforce::skill_verdict_in(
             &d,

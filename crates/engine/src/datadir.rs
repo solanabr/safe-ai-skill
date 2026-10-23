@@ -159,9 +159,25 @@ fn resolve(env: &Env, cwd: Option<&Path>) -> Result<DataDir, EngineError> {
         Some(dir) => dir.clone(),
         None => discover(&env.discovery_roots())?,
     };
-    let trusted = is_trusted(&path, env, cwd);
+    let trusted = is_trusted(&path, env, cwd) || test_trusted();
     Ok(DataDir { path, trusted })
 }
+
+/// Test-only: integration tests cannot place a data dir under the real passwd home, so a
+/// `test-hooks` build trusts the resolved dir when [`TEST_TRUST_ENV`] is `1`. Never in a
+/// release build (the feature is never enabled there).
+#[cfg(feature = "test-hooks")]
+fn test_trusted() -> bool {
+    std::env::var(TEST_TRUST_ENV).is_ok_and(|v| v == "1")
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_trusted() -> bool {
+    false
+}
+
+/// The `test-hooks` override read by [`test_trusted`].
+pub const TEST_TRUST_ENV: &str = "SAFE_AI_SKILL_TEST_TRUST_DATA_DIR";
 
 fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
     for root in roots {
@@ -248,7 +264,7 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
 
 /// The effective user's home from the OS user database (`getpwuid_r`).
 #[cfg(unix)]
-fn passwd_home() -> Option<PathBuf> {
+pub fn passwd_home() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -286,7 +302,7 @@ fn passwd_home() -> Option<PathBuf> {
 
 /// Windows has no user-database lookup here yet: `USERPROFILE` (repo-settable) stands in.
 #[cfg(not(unix))]
-fn passwd_home() -> Option<PathBuf> {
+pub fn passwd_home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

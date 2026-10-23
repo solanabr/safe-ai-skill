@@ -8,7 +8,7 @@
 //! 1. hard-deny class or key-material content: `deny`, never relaxed by any glob or setting;
 //! 2. `allow_read_globs` match: readable (a `.env.schema` still passes its content guard);
 //! 3. env class (`.env`, `.env.*`, templates and schemas not allow-listed, …): `deny` with the
-//!    `safe-ai-skill env` commands, or `ask` under `secrets.env_read: ask`;
+//!    `safe-ai-skill env` commands, or `ask` under the user's `safe-ai-skill tier --env-read ask`;
 //! 4. `deny_read_globs` match: `deny`;
 //! 5. `id.json` / `*.pem` / `*.key` that cannot be read (or a `*.pem`/`*.key` too large to scan):
 //!    `deny`;
@@ -17,7 +17,7 @@
 //! Grep is judged on `path` and `glob`, never on its regex `pattern`. A directory Grep gets an
 //! `updatedInput` that appends env/key exclusions to `glob` (no permission decision: Claude
 //! Code applies it without `allow`, research hooks-empirical-2.1.304 Q10). Glob is never gated.
-//! MCP tools get the path check on every whitespace-free string argument.
+//! MCP tools get the path check on every single-line string argument.
 
 use std::path::{Path, PathBuf};
 
@@ -27,33 +27,10 @@ use serde_json::Value;
 use crate::env::render::Shown;
 use crate::env::schema::{self, Schema, ValueKind};
 use crate::gates::secretpath::{self, Class, Sniffed, Suspect};
+use crate::gates::{credpaths, envread};
 use crate::io::Decision;
 use crate::policy::Policy;
 use crate::redact;
-
-/// Appended to a directory Grep's `glob`: env-class names, key files and the hard-deny trees,
-/// case-insensitive (`rg --glob` is case-sensitive). Template and schema files fall under
-/// `.env.*` too, so a directory Grep never searches `.env.example` or `.env.schema` (read them
-/// directly); re-including them would turn the glob list into a whitelist.
-const GREP_EXCLUDED: &[&str] = &[
-    "**/.env",
-    "**/.env.*",
-    "**/*.env",
-    "**/.envrc",
-    "**/.dev.vars",
-    "**/.dev.vars.*",
-    "**/.varlock-frozen-env",
-    "**/*-keypair.json",
-    "**/id.json",
-    "**/*.pem",
-    "**/*.key",
-    "**/.ssh/id_*",
-    "**/.config/solana/**",
-    "**/.superstack/**",
-    "**/.config/varlock/**",
-    "**/.varlock/**",
-    "**/.claude/projects/**",
-];
 
 /// Names a Grep `glob` is tried against: one that matches a secret probe and no benign probe
 /// is an explicit search of secret files.
@@ -76,8 +53,8 @@ const BENIGN_PROBES: &[&str] = &[
     "Cargo.toml",
 ];
 
-/// Most string arguments of one MCP call that are path-checked.
-const MAX_MCP_PATHS: usize = 64;
+/// Most string arguments of one MCP call that are path-checked; more asks.
+const MAX_MCP_PATHS: usize = 1024;
 /// Longest MCP string argument treated as a path.
 const MAX_MCP_PATH_LEN: usize = 4096;
 
@@ -161,6 +138,12 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
         return guard_env_schema(file);
     }
     Decision::Defer
+}
+
+/// Whether the absolute `candidate` names a project env file whose raw read the env gate
+/// decides: env class and not allow-listed (`.env.example`, `.env.schema` stay readable).
+pub(crate) fn is_env_file(candidate: &str, homes: &[String], policy: &Policy) -> bool {
+    name_verdict(candidate, homes, policy) == Verdict::Env
 }
 
 /// Name-level verdict for one candidate path.
@@ -308,19 +291,10 @@ fn hard_deny(what: &str) -> Decision {
     }
 }
 
-/// The verdict for a raw read of an env-class file: `deny` with the `safe-ai-skill env`
-/// commands, or `ask` under `secrets.env_read: ask`.
+/// The verdict for a raw read of an env-class file, by tier, `env_read` and sandbox
+/// ([`envread::verdict`]): `deny` with the `safe-ai-skill env` commands by default.
 pub fn env_verdict(file: &str, policy: &Policy, varlock: bool) -> Decision {
-    let reason = env_reason(file, varlock);
-    if policy.secrets.env_read == "ask" {
-        Decision::Ask {
-            reason: format!(
-                "Raw read of an env file (secrets.env_read: ask): approving shows its values to the model. {reason}"
-            ),
-        }
-    } else {
-        Decision::Deny { reason }
-    }
+    envread::decision(policy, env_reason(file, varlock))
 }
 
 /// The actionable env-class message (spec D3.3, D3.8.6). `varlock` adds the varlock hint.
@@ -478,28 +452,33 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     }
 
     let real = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
-    let in_hard_tree = [&target, &real]
-        .iter()
-        .any(|p| secretpath::is_hard_tree(&p.to_string_lossy(), &homes));
-    if in_hard_tree {
-        return ReadVerdict::Decide(hard_deny("search inside a key directory"));
+    if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
+        return ReadVerdict::Decide(verdict.into());
     }
-    // Grep passes `--hidden`: a search from $HOME, ~/.config or any ancestor reaches ~/.ssh and
-    // ~/.config/solana, and name exclusions cannot cover every key file name there.
-    if [&target, &real]
-        .iter()
-        .any(|p| contains_hard_tree(p, &homes))
-    {
-        return ReadVerdict::Decide(hard_deny(
-            "search over a directory that contains ~/.ssh or ~/.config/solana; pass a project path",
-        ));
+    if !credpaths::lists_available() {
+        return ReadVerdict::Decide(Decision::Ask {
+            reason: "safe-ai-skill: the credential lists failed to load, so this directory \
+                     search cannot exclude credential files — approve to proceed"
+                .into(),
+        });
     }
+    // An env glob the user's opt-in leaves open (no opinion) still gets the key-material
+    // exclusion, minus the env-file globs it opted into.
+    let mut keep_env = false;
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
-        return ReadVerdict::Decide(env_verdict(first, policy, varlock_hint(cwd, &real)));
+        let verdict = env_verdict(first, policy, varlock_hint(cwd, &real));
+        if !matches!(verdict, Decision::Defer) {
+            return ReadVerdict::Decide(verdict);
+        }
+        keep_env = true;
     }
 
-    let exclusion = grep_exclusion();
+    let exclusion = if keep_env {
+        grep_exclusion_keeping_env(&real)
+    } else {
+        grep_exclusion(&real)
+    };
     let new_glob = if glob.trim().is_empty() {
         exclusion
     } else {
@@ -510,33 +489,26 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     ReadVerdict::Rewrite(Value::Object(updated))
 }
 
-/// Whether `dir` is an ancestor of (or equal to) a home hard-deny tree.
-fn contains_hard_tree(dir: &Path, homes: &[String]) -> bool {
-    let dir = PathBuf::from(secretpath::normalize(&dir.to_string_lossy(), None));
-    homes.iter().any(|home| {
-        let home = secretpath::normalize(home, None);
-        [
-            ".ssh",
-            ".config/solana",
-            ".superstack",
-            ".config/varlock",
-            ".varlock",
-        ]
+/// The ` !{…}` negated brace group appended to a Grep's glob over `dir`
+/// ([`credpaths::grep_exclusions`]).
+pub fn grep_exclusion(dir: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions(dir)
         .iter()
-        .any(|tree| Path::new(&home).join(tree).starts_with(&dir))
-    }) || std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|x| !x.is_empty())
-        .is_some_and(|x| {
-            Path::new(&secretpath::normalize(&x, None))
-                .join("varlock")
-                .starts_with(&dir)
-        })
+        .map(|g| case_insensitive(g))
+        .collect();
+    format!("!{{{}}}", alts.join(","))
 }
 
-/// The ` !{…}` negated brace group appended to a directory Grep's glob.
-pub fn grep_exclusion() -> String {
-    let alts: Vec<String> = GREP_EXCLUDED.iter().map(|g| case_insensitive(g)).collect();
+/// [`grep_exclusion`] without the env-file globs, for an opted-in env Grep.
+fn grep_exclusion_keeping_env(dir: &Path) -> String {
+    let alts: Vec<String> = credpaths::grep_exclusions(dir)
+        .iter()
+        .filter(|g| {
+            let last = g.rsplit('/').next().unwrap_or(g);
+            secretpath::classify(last) != Class::Env
+        })
+        .map(|g| case_insensitive(g))
+        .collect();
     format!("!{{{}}}", alts.join(","))
 }
 
@@ -609,12 +581,15 @@ fn expand_braces(glob: &str, depth: usize) -> Vec<String> {
 // MCP
 // ---------------------------------------------------------------------------------------
 
-/// Run the read check on every path-like string argument of an MCP call (spec D3.2): strings
-/// without whitespace, up to [`MAX_MCP_PATHS`] of them. The first non-`Defer` verdict wins.
+/// Run the read check on every path-like string argument of an MCP call (spec D3.2): every
+/// single-line string up to [`MAX_MCP_PATH_LEN`] bytes, spaces included. The first non-`Defer`
+/// verdict wins. A payload with more strings than [`MAX_MCP_PATHS`], or nested deeper than
+/// [`MAX_MCP_DEPTH`], cannot be checked whole: a hard-guard ask (deny at High).
 pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> Decision {
     let mut strings = Vec::new();
+    let mut complete = true;
     if let Some(value) = input {
-        collect_path_strings(value, 0, &mut strings);
+        complete = collect_path_strings(value, 0, &mut strings);
     }
     for s in strings {
         let decision = decide_path(s, cwd, policy);
@@ -622,28 +597,52 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
             return decision;
         }
     }
-    Decision::Defer
+    if complete {
+        return Decision::Defer;
+    }
+    let reason = "safe-ai-skill: this MCP call has too many or too deeply nested arguments to \
+                  check for secret paths";
+    if policy.tier() == crate::policy::tier::Tier::High {
+        Decision::Deny {
+            reason: format!("{reason} — denied at tier high"),
+        }
+    } else {
+        Decision::Ask {
+            reason: format!("{reason} — approve to proceed"),
+        }
+    }
 }
 
-fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a str>) {
-    if depth > 16 || out.len() >= MAX_MCP_PATHS {
-        return;
+/// Deepest MCP argument nesting that is path-checked.
+const MAX_MCP_DEPTH: usize = 32;
+
+/// Collect the path candidates of `value` into `out`; `false` when a limit cut the walk short.
+fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a str>) -> bool {
+    if depth > MAX_MCP_DEPTH {
+        return false;
     }
     match value {
         Value::String(s) => {
+            // Multi-line text is code or prose, never a path (executor code is judged by
+            // `mcpexec`); a string longer than any path is not one either.
             let looks_like_path =
-                !s.is_empty() && s.len() <= MAX_MCP_PATH_LEN && !s.chars().any(char::is_whitespace);
-            if looks_like_path {
-                out.push(s);
+                !s.trim().is_empty() && s.len() <= MAX_MCP_PATH_LEN && !s.contains(['\n', '\r']);
+            if !looks_like_path {
+                return true;
             }
+            if out.len() >= MAX_MCP_PATHS {
+                return false;
+            }
+            out.push(s);
+            true
         }
         Value::Array(items) => items
             .iter()
-            .for_each(|v| collect_path_strings(v, depth + 1, out)),
+            .all(|v| collect_path_strings(v, depth + 1, out)),
         Value::Object(map) => map
             .values()
-            .for_each(|v| collect_path_strings(v, depth + 1, out)),
-        _ => {}
+            .all(|v| collect_path_strings(v, depth + 1, out)),
+        _ => true,
     }
 }
 
@@ -759,10 +758,12 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "env-read-opt-in")]
     #[test]
     fn env_read_ask_policy() {
         let mut p = policy();
-        p.secrets.env_read = "ask".into();
+        p.runtime.env_read = crate::policy::tier::EnvRead::Ask;
+        p.runtime.sandbox = crate::sandbox::SandboxState::On;
         assert!(matches!(
             decide_path(".env", &here(), &p),
             Decision::Ask { .. }
@@ -804,7 +805,7 @@ mod tests {
 
     #[test]
     fn exclusion_is_the_q10_recipe_extended() {
-        let ex = grep_exclusion();
+        let ex = grep_exclusion(Path::new("/"));
         assert!(
             ex.starts_with("!{**/.[eE][nN][vV],**/.[eE][nN][vV].*,"),
             "{ex}"
@@ -855,8 +856,57 @@ mod tests {
             "nested": {"list": ["a.txt", "b c"]},
         });
         let mut out = Vec::new();
-        collect_path_strings(&v, 0, &mut out);
+        assert!(collect_path_strings(&v, 0, &mut out));
         out.sort_unstable();
-        assert_eq!(out, vec![".env", "a.txt"]);
+        assert_eq!(out, vec![".env", "a.txt", "b c", "cat .env | head"]);
+    }
+
+    #[test]
+    fn mcp_paths_with_spaces_are_checked() {
+        let v = serde_json::json!({ "path": "my dir/.env" });
+        assert!(matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_args_past_the_limits_ask() {
+        let mut padded = serde_json::Map::new();
+        padded.insert(
+            "a".into(),
+            Value::Array(vec![Value::String("x".into()); MAX_MCP_PATHS + 1]),
+        );
+        padded.insert("z".into(), Value::String("notes.txt".into()));
+        let v = Value::Object(padded);
+        assert!(matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Ask { .. }
+        ));
+        // A secret path inside the checked part still denies.
+        let v = serde_json::json!({ "a": vec!["x"; MAX_MCP_PATHS + 1], "b": ".env" });
+        let first = serde_json::json!({ "0": ".env", "a": vec!["x"; MAX_MCP_PATHS + 1] });
+        assert!(matches!(
+            decide_mcp_args(Some(&first), &here(), &policy()),
+            Decision::Deny { .. }
+        ));
+        assert!(!matches!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Defer
+        ));
+        let mut deep = serde_json::json!(".env");
+        for _ in 0..=MAX_MCP_DEPTH + 1 {
+            deep = serde_json::json!([deep]);
+        }
+        assert!(matches!(
+            decide_mcp_args(Some(&deep), &here(), &policy()),
+            Decision::Ask { .. }
+        ));
+        let mut high = Policy::default();
+        high.runtime.tier = crate::policy::tier::Tier::High;
+        assert!(matches!(
+            decide_mcp_args(Some(&deep), &here(), &high),
+            Decision::Deny { .. }
+        ));
     }
 }

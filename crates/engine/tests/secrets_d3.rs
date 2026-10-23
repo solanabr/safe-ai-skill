@@ -19,6 +19,10 @@ struct Sandbox {
     root: Option<TempDir>,
     /// An empty dir used as `PATH`, so `varlock` is never found unless a test installs it.
     path: TempDir,
+    /// The user's confirmed `env_read` (`tier.json`), when a test needs one.
+    user_env_read: Option<common::EnvRead>,
+    /// The declared sandbox, when a test needs one.
+    sandbox: Option<common::SandboxMode>,
 }
 
 impl Sandbox {
@@ -29,7 +33,25 @@ impl Sandbox {
             data: TempDir::new("d3-data"),
             root: None,
             path: TempDir::new("d3-path"),
+            user_env_read: None,
+            sandbox: None,
         }
+    }
+
+    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`), with the
+    /// sandbox declared on (the opt-in applies only then, D8 v2 spec §1.4).
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+    fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
+        self.user_env_read = Some(env_read);
+        self.sandbox = Some(common::SandboxMode::On);
+        self
+    }
+
+    /// The declared sandbox (with `test-hooks`, the engine override).
+    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+    fn with_sandbox(mut self, mode: common::SandboxMode) -> Self {
+        self.sandbox = Some(mode);
+        self
     }
 
     /// Use the shipped default policy with `edit` applied to its text.
@@ -62,6 +84,12 @@ impl Sandbox {
             .stdin(payload.to_string());
         if let Some(root) = &self.root {
             inv = inv.env("CLAUDE_PLUGIN_ROOT", root.path().to_str().unwrap());
+        }
+        if let Some(env_read) = self.user_env_read {
+            inv = inv.env_read(env_read);
+        }
+        if let Some(mode) = self.sandbox {
+            inv = inv.cwd(self.project.path()).sandbox(mode);
         }
         inv.run()
     }
@@ -304,12 +332,34 @@ fn read_deny_message_mentions_varlock_only_with_a_schema() {
 }
 
 #[test]
-fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
+fn the_plugin_policy_cannot_loosen_env_read() {
+    // Pinned to deny: only the user's confirmed tier.json loosens it.
     let sb = Sandbox::new().with_policy(|p| p.replace("env_read: deny", "env_read: ask"));
+    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
+}
+
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[test]
+fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
+    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
     assert_eq!(sb.read(".env"), "ask");
     assert_eq!(sb.read("~/.config/solana/id.json"), "deny");
     sb.write("k.json", &keypair_json());
     assert_eq!(sb.read("k.json"), "deny");
+}
+
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[test]
+fn the_env_read_opt_in_is_suspended_without_the_sandbox() {
+    let sb = Sandbox::new()
+        .with_user_env_read(common::EnvRead::Ask)
+        .with_sandbox(common::SandboxMode::Off);
+    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
+    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "deny");
+    let why = reason(&sb.bash("cat .env"));
+    assert!(why.contains("opt-in suspended: sandbox not on"), "{why}");
 }
 
 #[test]
@@ -562,9 +612,10 @@ fn bash_varlock_safe_commands_have_no_opinion_or_ask() {
     }
 }
 
+#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
 fn bash_env_read_ask_applies_to_readers_and_varlock() {
-    let sb = Sandbox::new().with_policy(|p| p.replace("env_read: deny", "env_read: ask"));
+    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
     assert_eq!(decision_label(&sb.bash("cat .env")), "ask");
     assert_eq!(decision_label(&sb.bash("varlock printenv K")), "ask");
     assert_eq!(decision_label(&sb.bash("cat wallet-keypair.json")), "deny");
@@ -710,6 +761,27 @@ fn redact_mcp_shapes_golden() {
 }
 
 #[test]
+fn redact_pem_and_vendor_token_golden() {
+    let sb = Sandbox::new();
+    let body = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW";
+    let stdout = format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\n\
+         gh ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\naws AKIAIOSFODNN7EXAMPLE\n\
+         slack xox\x62-123456789012-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx\n\
+         google AIzaSyA1234567890abcdefghijklmnopqrstuv\n"
+    );
+    assert_eq!(
+        updated(&sb.redact("Bash", json!({ "stdout": stdout, "stderr": "" }))),
+        json!({
+            "stdout": "***REDACTED:private_key***\ngh ***REDACTED:api_key***\n\
+                       aws ***REDACTED:api_key***\nslack ***REDACTED:api_key***\n\
+                       google ***REDACTED:api_key***\n",
+            "stderr": ""
+        })
+    );
+}
+
+#[test]
 fn redact_patterns_still_apply_and_clean_output_is_silent() {
     let sb = Sandbox::new();
     let run = sb.redact(
@@ -840,12 +912,36 @@ fn redact_never_prints_values_on_stderr() {
 // Fix round 1
 // ---------------------------------------------------------------------------------------
 
+/// `**/.ssh/**` as `rg --glob` sees it: every letter a two-case class.
+fn two_case(glob: &str) -> String {
+    glob.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase())
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// D8 v2 spec §4: a Grep at or above `$HOME` is no longer denied; it runs with every
+/// credential glob excluded (the key trees included).
 #[test]
-fn grep_over_an_ancestor_of_a_key_tree_denies() {
+fn grep_over_an_ancestor_of_a_key_tree_excludes_every_credential_glob() {
     let sb = Sandbox::new();
     std::fs::create_dir_all(sb.home.join(".ssh")).unwrap();
     std::fs::create_dir_all(sb.home.join(".config/solana")).unwrap();
     let home = sb.home.path().to_str().unwrap().to_string();
+    let check = |run: Run, what: &str| {
+        let v = run.json();
+        let out = &v["hookSpecificOutput"];
+        assert!(out.get("permissionDecision").is_none(), "{what}: {v}");
+        let glob = out["updatedInput"]["glob"].as_str().unwrap();
+        for want in ["**/.ssh/**", "**/.config/solana/**", "**/.aws/**"] {
+            assert!(glob.contains(&two_case(want)), "{what}: {want} in {glob}");
+        }
+    };
     for path in [
         home.clone(),
         format!("{home}/.config"),
@@ -853,7 +949,7 @@ fn grep_over_an_ancestor_of_a_key_tree_denies() {
         "/".into(),
     ] {
         let run = sb.pre("gate-read", "Grep", json!({ "pattern": "x", "path": path }));
-        assert_eq!(decision_label(&run), "deny", "{path}");
+        check(run, &path);
     }
     // cwd = $HOME and no path.
     let run = sb.run(
@@ -865,7 +961,7 @@ fn grep_over_an_ancestor_of_a_key_tree_denies() {
             "tool_input": { "pattern": "x" },
         }),
     );
-    assert_eq!(decision_label(&run), "deny");
+    check(run, "cwd = $HOME");
 }
 
 #[test]

@@ -175,7 +175,9 @@ pub fn cli_network(cwd: &Path) -> Network {
 /// Anything naming mainnet is mainnet (the riskier reading is always safe). Otherwise only
 /// exact hosts count: `api.devnet.solana.com`/`devnet.helius-rpc.com` (devnet),
 /// `api.testnet.solana.com` (testnet), and `localhost`, `127.0.0.1`, `[::1]` or `0.0.0.0`
-/// with nothing after the host but a port (localnet). `devnet.attacker.example` is unknown.
+/// with nothing after the host but a port (localnet). `devnet.attacker.example` is unknown,
+/// and so is a host without an `http(s)://` / `ws(s)://` scheme (`devnet.helius-rpc.com`):
+/// the CLIs do not take it as that endpoint, so it identifies nothing.
 fn classify_url(raw: &str) -> Network {
     let s = raw
         .trim()
@@ -198,7 +200,10 @@ fn classify_url(raw: &str) -> Network {
     if s.contains('$') || s.contains('`') {
         return Network::Unknown;
     }
-    let rest = s.split_once("://").map_or(s.as_str(), |(_, rest)| rest);
+    let rest = match s.split_once("://") {
+        Some(("http" | "https" | "ws" | "wss", rest)) => rest,
+        _ => return Network::Unknown,
+    };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, after) = rest.split_at(end);
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
@@ -284,6 +289,9 @@ const BOOL_FLAGS: &[&str] = &[
     // Irreversible-action flags.
     "--final",
     "--disable",
+    // `solana program close` (Class U): a program's confirmation, and every buffer.
+    "--bypass-warning",
+    "--buffers",
 ];
 
 /// Short flags that take a value, with the long flag each stands for (`-p` differs by CLI).
@@ -1223,6 +1231,33 @@ mod tests {
     }
 
     #[test]
+    fn a_schemeless_host_identifies_nothing() {
+        for raw in [
+            "devnet.helius-rpc.com",
+            "api.devnet.solana.com",
+            "api.testnet.solana.com",
+            "127.0.0.1:8899",
+            "localhost:8899",
+            "ftp://api.devnet.solana.com",
+            "//api.devnet.solana.com",
+        ] {
+            assert_eq!(classify_url(raw), Network::Unknown, "{raw}");
+        }
+        // Naming mainnet is still mainnet, scheme or not (the riskier reading).
+        assert_eq!(classify_url("mainnet.helius-rpc.com"), Network::Mainnet);
+        assert_eq!(
+            network_from_flags("solana transfer X 1 -u devnet.helius-rpc.com"),
+            Some(Network::Unknown)
+        );
+        assert_eq!(
+            network_from_flags("solana transfer X 1 -u https://devnet.helius-rpc.com"),
+            Some(Network::Devnet)
+        );
+        assert_eq!(classify_url("wss://api.devnet.solana.com"), Network::Devnet);
+        assert_eq!(classify_url("http://localhost:8899"), Network::Localnet);
+    }
+
+    #[test]
     fn classify_url_matches_hosts_exactly() {
         for url in [
             "https://devnet.attacker.example",
@@ -1312,5 +1347,15 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_PLUGIN_DATA", v),
             None => std::env::remove_var("CLAUDE_PLUGIN_DATA"),
         }
+    }
+
+    #[test]
+    fn bypass_warning_is_boolean_and_leaves_the_cluster_flag_alone() {
+        let tokens = tokenize("solana program close P --bypass-warning -ud");
+        let argv = Argv::parse(&tokens);
+        assert!(argv.has_flag("--bypass-warning"));
+        assert_eq!(argv.network(), Some(Network::Devnet));
+        assert_eq!(argv.positionals, vec!["program", "close", "P"]);
+        assert_eq!(argv.uncertain_from, None);
     }
 }

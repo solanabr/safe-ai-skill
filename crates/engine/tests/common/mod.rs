@@ -15,6 +15,35 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use safe_ai_skill::policy::tier::{EnvRead, Tier};
+
+/// Whether these tests (and the binary under test) were built with `--features test-hooks`,
+/// which honours the trusted-data-dir and sandbox overrides [`Invocation`] sets.
+pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
+
+/// Env vars that make a session headless (contract §3.3): cleared from every run unless
+/// [`Invocation::headless`] asks for it.
+const HEADLESS_VARS: [&str; 7] = [
+    "SAFE_AI_SKILL_HEADLESS",
+    "KIT_FIREWALL_HEADLESS",
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "BUILDKITE",
+    "JENKINS_URL",
+];
+
+/// The declared Claude Code sandbox for [`Invocation::sandbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// `sandbox.enabled: true` (on a supported platform).
+    On,
+    /// `sandbox.enabled: false`.
+    Off,
+    /// Not declared anywhere.
+    Unset,
+}
+
 /// Absolute path to the built `safe-ai-skill` binary (Cargo-provided).
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_safe-ai-skill")
@@ -84,8 +113,22 @@ impl Run {
 ///
 /// Always sets `CLAUDE_PLUGIN_DATA` to an isolated dir so audit/spend/grants/lockfile writes
 /// never touch the real plugin-data dir. Optionally overrides `HOME` and `SAFE_AI_SKILL_HOME`
-/// and clears `SAFE_AI_SKILL_PROFILE`/`ANCHOR_PROVIDER_URL`/`CLAUDE_PLUGIN_DATA` inheritance
-/// to keep the run hermetic.
+/// and clears the tier, profile, headless and CI variables, `ANCHOR_PROVIDER_URL` and
+/// `CLAUDE_PLUGIN_DATA` inheritance to keep the run hermetic (not headless by default).
+///
+/// Tier setup (D8 v2):
+///
+/// - [`Invocation::tier`] / [`Invocation::env_read`] write an authenticated `tier.json` `global`
+///   entry in the plugin data dir (requires [`Invocation::plugin_data`]). With `test-hooks`
+///   the binary trusts that dir, so any tier and `env_read` apply as the user's choice.
+///   Without it the dir is untrusted: a tier at or above Relaxed is set through the raise-only
+///   `SAFE_AI_SKILL_TIER` instead, and `Tier::Off` or a loosened `env_read` panic (they need
+///   `--features test-hooks`).
+/// - [`Invocation::sandbox`] sets, with `test-hooks`, the engine's sandbox override; without it a
+///   `<cwd>/.claude/settings.local.json` (requires [`Invocation::cwd`] = the payload cwd; on
+///   Linux without a system `bwrap`, `On` reads as unknown).
+/// - [`Invocation::kit_security`] writes `<cwd>/.claude/security.json` (requires `cwd`).
+/// - [`Invocation::headless`] sets `SAFE_AI_SKILL_HEADLESS=1`.
 pub struct Invocation<'a> {
     args: Vec<String>,
     stdin: Option<String>,
@@ -93,6 +136,11 @@ pub struct Invocation<'a> {
     home: Option<&'a Path>,
     cwd: Option<&'a Path>,
     extra_env: Vec<(String, String)>,
+    tier: Option<Tier>,
+    env_read: Option<EnvRead>,
+    sandbox: Option<SandboxMode>,
+    kit_security: Option<String>,
+    headless: bool,
 }
 
 impl<'a> Invocation<'a> {
@@ -105,7 +153,108 @@ impl<'a> Invocation<'a> {
             home: None,
             cwd: None,
             extra_env: Vec::new(),
+            tier: None,
+            env_read: None,
+            sandbox: None,
+            kit_security: None,
+            headless: false,
         }
+    }
+
+    /// Select `tier` as the user's choice (see the type docs).
+    pub fn tier(mut self, tier: Tier) -> Self {
+        self.tier = Some(tier);
+        self
+    }
+
+    /// Select `env_read` as the user's choice (see the type docs).
+    pub fn env_read(mut self, env_read: EnvRead) -> Self {
+        self.env_read = Some(env_read);
+        self
+    }
+
+    /// Declare the Claude Code sandbox (see the type docs).
+    pub fn sandbox(mut self, mode: SandboxMode) -> Self {
+        self.sandbox = Some(mode);
+        self
+    }
+
+    /// Write `json` as the kit's `<cwd>/.claude/security.json`.
+    pub fn kit_security(mut self, json: impl Into<String>) -> Self {
+        self.kit_security = Some(json.into());
+        self
+    }
+
+    /// Run headless (`SAFE_AI_SKILL_HEADLESS=1`) or not (the default).
+    pub fn headless(mut self, on: bool) -> Self {
+        self.headless = on;
+        self
+    }
+
+    /// Materialise the tier setup: files written, env pairs to set.
+    fn tier_setup(&self) -> Vec<(String, String)> {
+        let mut env = Vec::new();
+        let user_choice = self.env_read.is_some() || self.tier.is_some();
+        if user_choice && TEST_HOOKS {
+            let data = self
+                .plugin_data
+                .expect(".tier/.env_read need .plugin_data(dir)");
+            let dir = safe_ai_skill::datadir::DataDir {
+                path: data.to_path_buf(),
+                trusted: true,
+            };
+            let change = safe_ai_skill::tierstate::Change {
+                project: None,
+                tier: Some(self.tier.unwrap_or(Tier::Relaxed)),
+                env_read: self.env_read,
+                clear: false,
+            };
+            safe_ai_skill::tierstate::apply(&dir, &change, 0).expect("write tier.json");
+            env.push((
+                safe_ai_skill::datadir::TEST_TRUST_ENV.to_string(),
+                "1".to_string(),
+            ));
+        } else if user_choice {
+            match self.tier {
+                Some(Tier::Off) => {
+                    panic!("Tier::Off through the binary needs --features test-hooks")
+                }
+                Some(t) if t > Tier::Relaxed => {
+                    env.push(("SAFE_AI_SKILL_TIER".into(), t.label().into()))
+                }
+                _ => {}
+            }
+            if self.env_read.is_some_and(|e| e != EnvRead::Deny) {
+                panic!("a loosened env_read through the binary needs --features test-hooks");
+            }
+        }
+        if let Some(mode) = self.sandbox {
+            if TEST_HOOKS {
+                let word = match mode {
+                    SandboxMode::On => "on",
+                    SandboxMode::Off | SandboxMode::Unset => "off",
+                };
+                env.push((
+                    safe_ai_skill::sandbox::TEST_OVERRIDE_ENV.to_string(),
+                    word.to_string(),
+                ));
+            } else if mode != SandboxMode::Unset {
+                let cwd = self.cwd.expect(".sandbox needs .cwd(project)");
+                std::fs::create_dir_all(cwd.join(".claude")).expect("create .claude");
+                let body = format!(r#"{{"sandbox":{{"enabled":{}}}}}"#, mode == SandboxMode::On);
+                std::fs::write(cwd.join(".claude/settings.local.json"), body)
+                    .expect("write settings.local.json");
+            }
+        }
+        if let Some(json) = &self.kit_security {
+            let cwd = self.cwd.expect(".kit_security needs .cwd(project)");
+            std::fs::create_dir_all(cwd.join(".claude")).expect("create .claude");
+            std::fs::write(cwd.join(".claude/security.json"), json).expect("write security.json");
+        }
+        if self.headless {
+            env.push(("SAFE_AI_SKILL_HEADLESS".into(), "1".into()));
+        }
+        env
     }
 
     /// Feed `body` to the process stdin.
@@ -152,6 +301,12 @@ impl<'a> Invocation<'a> {
 
         // Hermetic env: clear inherited knobs that could perturb a decision.
         cmd.env_remove("SAFE_AI_SKILL_PROFILE");
+        cmd.env_remove("SAFE_AI_SKILL_TIER");
+        cmd.env_remove(safe_ai_skill::datadir::TEST_TRUST_ENV);
+        cmd.env_remove(safe_ai_skill::sandbox::TEST_OVERRIDE_ENV);
+        for var in HEADLESS_VARS {
+            cmd.env_remove(var);
+        }
         cmd.env_remove("ANCHOR_PROVIDER_URL");
         cmd.env_remove("SAFE_AI_SKILL_HOME");
         // The CLI resolves the hooks' data dir from these and HOME: never the real one.
@@ -171,7 +326,7 @@ impl<'a> Invocation<'a> {
         // Data-dir discovery uses the OS user-database home, not HOME; `CLAUDE_CONFIG_DIR`
         // replaces it, so point that at the fake home too (an explicit `.env` overrides).
         cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
-        for (k, v) in &self.extra_env {
+        for (k, v) in self.tier_setup().iter().chain(&self.extra_env) {
             cmd.env(k, v);
         }
 

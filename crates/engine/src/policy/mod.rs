@@ -1,35 +1,38 @@
-//! Policy loading, project ratchet, profiles, and fail-closed behavior.
+//! Policy loading, project ratchet, tiers, and fail-closed behavior.
 //!
 //! The base policy mirrors `default.policy.yaml` and is embedded as
 //! [`DEFAULT_POLICY_YAML`] so the crate compiles standalone. [`Policy::load`] ratchets a
 //! project override over the default — it may only tighten it, see [`ratchet`] — and FAILS
 //! CLOSED on any unrecoverable parse error.
 //!
-//! The relaxation layer is configured here: [`Policy::active_profile`] selects a
-//! [`ProfileOverlay`] (spec D1.11): `strict` (default, no overlay), `paranoid` (`ask_all`:
-//! every allow becomes an ask, enforced by [`crate::relax`]) and `autopilot` (raised
-//! per-tx cap, honoured only when it comes from a confirmed `mode.json`). Hard guards are
-//! set by the gates themselves ([`crate::gate::GateMeta::hard_guard`]); no profile, grant
-//! or policy relaxes them. The removed knobs (`off`, `relax_transfer`, `relax_swap`,
-//! `disabled`, `gates`, `hard_guards`) are ignored where an old policy still has them, and
-//! listed in [`Policy::ignored_overrides`].
+//! The strictness the user picked is a [`tier::Tier`] (D8 v2): [`load_runtime`] resolves it
+//! ([`tier::resolve`]) together with the sandbox state and the headless rule into
+//! [`Policy::runtime`], which gates read. The base policy names the base tier (`tier`, or the
+//! legacy `active_profile` alias); a project's `tier`/`active_profile` and `secrets.env_read`
+//! are raise-only hints recorded here for the resolver. Hard guards are set by the gates
+//! themselves ([`crate::gate::GateMeta::hard_guard`]); no tier, grant or policy relaxes them.
+//! The removed knobs (`profiles` with `ask_all` and the autopilot cap, `gates`,
+//! `hard_guards`) are ignored where an old policy still has them, and listed in
+//! [`Policy::ignored_overrides`].
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
 use serde_yaml::Value as Yaml;
 
 mod ratchet;
+pub mod tier;
 
-use ratchet::{
-    apply_project_overlay, is_user_skills, resolve_profile, PROJECT_POLICY, SCAN_DIRS_OUTSIDE,
-};
+use ratchet::{apply_project_overlay, is_user_skills, PROJECT_POLICY, SCAN_DIRS_OUTSIDE};
+use tier::{EnvRead, RawHint, Tier, TierContext, PROFILE_ENV, TIER_ENV};
+
+use crate::datadir::DataDir;
+use crate::sandbox::SandboxState;
 
 /// Embedded default policy. Mirrors `plugins/safe-ai-skill/policy/default.policy.yaml`.
 pub const DEFAULT_POLICY_YAML: &str = r#"
 version: 1
-active_profile: strict
+tier: relaxed
 network:
   default: devnet
   mainnet: ask
@@ -51,6 +54,8 @@ secrets:
   deny_read_globs:
     - "**/*-keypair.json"
     - "~/.superstack/config.json"
+  key_material_extra_globs: []
+  exfil_hosts_extra: []
   allow_read_globs:
     - "**/.env.example"
     - "**/.env.sample"
@@ -98,23 +103,10 @@ supply_chain:
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask
   on_block: deny
-profiles:
-  strict: {}
-  autopilot:
-    per_tx_sol_max: 2.0
-  paranoid:
-    ask_all: true
 "#;
-
-/// Environment variable that may select a profile stricter than the active one; a looser or
-/// unknown value is ignored and noted (see [`Policy::load_with_mode`]).
-pub const PROFILE_ENV: &str = "SAFE_AI_SKILL_PROFILE";
 
 fn default_version() -> u32 {
     1
-}
-fn default_profile() -> String {
-    "strict".to_string()
 }
 
 /// Top-level policy.
@@ -124,9 +116,6 @@ pub struct Policy {
     /// Schema version.
     #[serde(default = "default_version")]
     pub version: u32,
-    /// Currently active profile name (overridable via env / `mode.json`).
-    #[serde(default = "default_profile")]
-    pub active_profile: String,
     /// Network gating policy.
     pub network: NetworkPolicy,
     /// Spend caps.
@@ -145,16 +134,25 @@ pub struct Policy {
     pub catalog: CatalogPolicy,
     /// Supply-chain verification settings.
     pub supply_chain: SupplyChainPolicy,
-    /// Named profile overlays.
-    pub profiles: BTreeMap<String, ProfileOverlay>,
-    /// Overrides that would have loosened the policy and were refused: project overlay fields
-    /// and a looser [`PROFILE_ENV`]. Listed by [`Policy::ignored_notice`] at SessionStart.
+    /// Overrides that would have loosened the policy and were refused (project overlay
+    /// fields) and removed settings. Listed by [`Policy::ignored_notice`] at SessionStart.
     #[serde(skip)]
     pub ignored_overrides: Vec<String>,
-    /// Spend caps the project overlay lowered, re-applied by [`Policy::effective`].
+    /// The base policy's tier (`tier`, else the legacy `active_profile` alias).
     #[serde(skip)]
-    project_caps: ProjectCaps,
-    /// Scan dirs the project overlay added, confined on disk by [`Policy::load_with_mode`].
+    pub base_tier: Tier,
+    /// The project overlay's `tier` / `active_profile` values: raise-only hints.
+    #[serde(skip)]
+    pub repo_tier_hints: Vec<RawHint>,
+    /// The project overlay's own `secrets.env_read`, when it names a known word (it may only
+    /// tighten the user's choice).
+    #[serde(skip)]
+    pub repo_env_read: Option<EnvRead>,
+    /// The resolved tier, `env_read`, sandbox state and headless flag ([`load_runtime`]); the
+    /// default (Relaxed, deny, sandbox unknown, interactive) until then.
+    #[serde(skip)]
+    pub runtime: TierContext,
+    /// Scan dirs the project overlay added, confined on disk by [`Policy::load`].
     #[serde(skip)]
     project_scan_dirs: Vec<String>,
 }
@@ -208,12 +206,18 @@ pub struct SwapPolicy {
 #[serde(default)]
 pub struct SecretsPolicy {
     /// Raw reads of env-class files (`.env`, `.env.*`, `*.env`, `.envrc`, …): `deny` (default,
-    /// served by `safe-ai-skill env`) or `ask` (opt-in, prompts). Hard-deny classes (keypairs,
-    /// private keys, the Solana config tree) are never affected.
+    /// served by `safe-ai-skill env`), `ask` or `tier`. Loosening it is the user's alone
+    /// (`safe-ai-skill tier --env-read`, [`tier::EnvRead`]); a project may only tighten it.
+    /// Hard-deny classes (keypairs, private keys, the Solana config tree) are never affected.
     pub env_read: String,
     /// Extra globs whose reads are denied, on top of the built-in classes
     /// (`gates::secretpath`).
     pub deny_read_globs: Vec<String>,
+    /// Extra key-material globs, added to the shared `credentials.list` (union only).
+    pub key_material_extra_globs: Vec<String>,
+    /// Extra exfil hosts, added to the shared `exfil-hosts.list` at every tier above Off
+    /// (union only: nothing removes a listed host).
+    pub exfil_hosts_extra: Vec<String>,
     /// Globs readable even though they match a deny glob or the env class (never a hard-deny
     /// class). Templates and `.env.schema` are readable only while listed here.
     pub allow_read_globs: Vec<String>,
@@ -302,45 +306,6 @@ fn default_on_block() -> String {
     "deny".to_string()
 }
 
-/// A profile overlay applied onto the base policy by [`Policy::effective`].
-///
-/// All fields are optional; only the set fields override the base.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct ProfileOverlay {
-    /// When `true`, no allow survives: every allow (within-cap transfer, grant) becomes an
-    /// `Ask`, and every Solana CLI command asks (paranoid).
-    pub ask_all: bool,
-    /// Optional per-transaction cap override for this profile.
-    pub per_tx_sol_max: Option<f64>,
-}
-
-/// Spend caps a project overlay lowered (`None` = untouched).
-///
-/// [`Policy::effective`] re-applies them after the profile overlay, so a profile may raise
-/// the trusted caps but never past a project's.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct ProjectCaps {
-    per_tx_sol_max: Option<f64>,
-    hard_tx_sol_max: Option<f64>,
-    daily_sol_max: Option<f64>,
-}
-
-impl ProjectCaps {
-    /// Lower each cap in `spend` to the project's, where it set one.
-    fn clamp(&self, spend: &mut SpendPolicy) {
-        for (cap, project) in [
-            (&mut spend.per_tx_sol_max, self.per_tx_sol_max),
-            (&mut spend.hard_tx_sol_max, self.hard_tx_sol_max),
-            (&mut spend.daily_sol_max, self.daily_sol_max),
-        ] {
-            if let Some(project) = project {
-                *cap = cap.min(project);
-            }
-        }
-    }
-}
-
 impl Default for NetworkPolicy {
     fn default() -> Self {
         NetworkPolicy {
@@ -389,6 +354,8 @@ impl Default for SecretsPolicy {
                 "**/*-keypair.json".into(),
                 "~/.superstack/config.json".into(),
             ],
+            key_material_extra_globs: Vec::new(),
+            exfil_hosts_extra: Vec::new(),
             allow_read_globs: vec![
                 "**/.env.example".into(),
                 "**/.env.sample".into(),
@@ -482,7 +449,6 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             version: 1,
-            active_profile: "strict".into(),
             network: NetworkPolicy::default(),
             spend: SpendPolicy::default(),
             mcp: McpPolicy::default(),
@@ -492,63 +458,61 @@ impl Default for Policy {
             audit: TogglePolicy::default(),
             catalog: CatalogPolicy::default(),
             supply_chain: SupplyChainPolicy::default(),
-            profiles: default_profiles(),
             ignored_overrides: Vec::new(),
-            project_caps: ProjectCaps::default(),
+            base_tier: Tier::Relaxed,
+            repo_tier_hints: Vec::new(),
+            repo_env_read: None,
+            runtime: TierContext::default(),
             project_scan_dirs: Vec::new(),
         }
     }
 }
 
-fn default_profiles() -> BTreeMap<String, ProfileOverlay> {
-    let mut m = BTreeMap::new();
-    m.insert("strict".to_string(), ProfileOverlay::default());
-    m.insert(
-        "autopilot".to_string(),
-        ProfileOverlay {
-            per_tx_sol_max: Some(2.0),
-            ..ProfileOverlay::default()
-        },
-    );
-    m.insert(
-        "paranoid".to_string(),
-        ProfileOverlay {
-            ask_all: true,
-            ..ProfileOverlay::default()
-        },
-    );
-    m
+/// Load the policy for a session rooted at `cwd` and resolve its runtime tier context: the
+/// tier and `env_read` ([`tier::resolve`], against the project root of `cwd`), with `sandbox`
+/// and `headless` as given. Returns the policy (with [`Policy::runtime`] set) and the
+/// resolution, whose notes SessionStart and `status` print.
+pub fn load_runtime(
+    cwd: &Path,
+    dir: &DataDir,
+    env: &dyn Fn(&str) -> Option<String>,
+    sandbox: SandboxState,
+    headless: bool,
+) -> (Policy, tier::Resolution) {
+    let mut policy = Policy::load(cwd);
+    let root = tier::project_root(cwd);
+    let resolution = tier::resolve(&root, dir, &policy, env);
+    policy.runtime = TierContext {
+        tier: resolution.tier,
+        source: resolution.source,
+        env_read: resolution.env_read,
+        sandbox,
+        headless,
+    };
+    (policy, resolution)
+}
+
+/// The base policy alone (the plugin's default policy file, else the embedded one), with no
+/// project overlay.
+pub fn base() -> Policy {
+    let src = plugin_default_src().unwrap_or_else(|| DEFAULT_POLICY_YAML.to_string());
+    Policy::from_sources(&src, None)
 }
 
 impl Policy {
-    /// [`Policy::load_with_mode`] with no persisted profile.
-    pub fn load(cwd: &Path) -> Policy {
-        Policy::load_with_mode(cwd, None)
-    }
-
-    /// Load the effective base policy for a project.
+    /// Load the base policy for a project.
     ///
     /// Order: parse `${CLAUDE_PLUGIN_ROOT}/policy/default.policy.yaml` if present, else the
     /// embedded [`DEFAULT_POLICY_YAML`]; then ratchet `<cwd>/.safe-ai-skill/policy.yaml` over
     /// it, which may only tighten it. An unparsable base → [`Policy::fail_closed`] (every
-    /// soft gate becomes `ask`). The active profile is `persisted_profile` (the user's
-    /// `safe-ai-skill mode` choice) when given, else the base one; the [`PROFILE_ENV`] env var
-    /// may then only select a stricter profile. Scan dirs the project added are kept only when
-    /// they resolve, on disk, to a directory strictly inside `cwd`.
-    ///
-    /// Note: this returns the *base* policy. Call [`Policy::effective`] to apply the active
-    /// profile overlay before gating.
-    pub fn load_with_mode(cwd: &Path, persisted_profile: Option<&str>) -> Policy {
+    /// soft gate becomes `ask`). Scan dirs the project added are kept only when they resolve,
+    /// on disk, to a directory strictly inside `cwd`. The tier is resolved separately
+    /// ([`load_runtime`]).
+    pub fn load(cwd: &Path) -> Policy {
         let base_src = plugin_default_src().unwrap_or_else(|| DEFAULT_POLICY_YAML.to_string());
         let project_src =
             std::fs::read_to_string(cwd.join(".safe-ai-skill").join("policy.yaml")).ok();
-        let env_profile = std::env::var(PROFILE_ENV).ok();
-        let mut policy = Policy::from_sources(
-            &base_src,
-            project_src.as_deref(),
-            persisted_profile,
-            env_profile.as_deref(),
-        );
+        let mut policy = Policy::from_sources(&base_src, project_src.as_deref());
         let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
         policy.confine_project_dirs(cwd, home.as_deref().map(Path::new));
         policy
@@ -605,16 +569,10 @@ impl Policy {
     /// Build a policy from its sources without touching the environment or the filesystem.
     ///
     /// `base_src` is the trusted default policy YAML; `project_src` a project's overlay, which
-    /// may only tighten it; `persisted_profile` and `env_profile` select the profile as in
-    /// [`Policy::load_with_mode`]. Every refused override is noted in
-    /// [`Policy::ignored_overrides`]. Scan dirs the project adds get only the text check here:
-    /// confining them on disk (symlinks) happens in [`Policy::load_with_mode`] alone.
-    pub fn from_sources(
-        base_src: &str,
-        project_src: Option<&str>,
-        persisted_profile: Option<&str>,
-        env_profile: Option<&str>,
-    ) -> Policy {
+    /// may only tighten it. Every refused override is noted in [`Policy::ignored_overrides`].
+    /// Scan dirs the project adds get only the text check here: confining them on disk
+    /// (symlinks) happens in [`Policy::load`] alone.
+    pub fn from_sources(base_src: &str, project_src: Option<&str>) -> Policy {
         let base: Yaml = match serde_yaml::from_str(base_src) {
             Ok(y) => y,
             Err(_) => return Policy::fail_closed(),
@@ -625,27 +583,22 @@ impl Policy {
         };
 
         policy.ignored_overrides.extend(removed_settings(&base));
+        policy.base_tier = base_tier(&base, &mut policy.ignored_overrides);
+        pin_base_env_read(&mut policy);
 
         if let Some(text) = project_src {
             apply_project_overlay(&mut policy, &base, text);
         }
-
-        let (profile, refused) =
-            resolve_profile(&policy.active_profile, persisted_profile, env_profile);
-        policy.active_profile = profile;
-        policy.ignored_overrides.extend(refused);
         policy
     }
 
     /// A conservative policy used when configuration cannot be trusted.
     ///
     /// Every soft-gated action resolves to `ask`: caps are tiny, mainnet is `ask`, and all
-    /// hard guards are present. Profiles cannot relax it because the active profile is
-    /// `strict` (an empty overlay).
+    /// hard guards are present.
     pub fn fail_closed() -> Policy {
         Policy {
             version: 1,
-            active_profile: "strict".into(),
             network: NetworkPolicy {
                 default: "devnet".into(),
                 mainnet: "ask".into(),
@@ -662,13 +615,11 @@ impl Policy {
             audit: TogglePolicy { enabled: true },
             catalog: CatalogPolicy::default(),
             supply_chain: SupplyChainPolicy::default(),
-            profiles: {
-                let mut m = BTreeMap::new();
-                m.insert("strict".to_string(), ProfileOverlay::default());
-                m
-            },
             ignored_overrides: Vec::new(),
-            project_caps: ProjectCaps::default(),
+            base_tier: Tier::Relaxed,
+            repo_tier_hints: Vec::new(),
+            repo_env_read: None,
+            runtime: TierContext::default(),
             project_scan_dirs: Vec::new(),
         }
     }
@@ -680,24 +631,9 @@ impl Policy {
             && self.spend.daily_sol_max == 0.0
     }
 
-    /// Apply the active profile overlay onto this base policy, producing the policy that
-    /// gates should evaluate against.
-    ///
-    /// `strict` (or an unknown profile name) is a no-op. `autopilot` may raise
-    /// `per_tx_sol_max`, never above a cap the project overlay lowered. `paranoid` sets
-    /// `ask_all`, which [`crate::relax`] enforces. Hard guards are unaffected.
-    pub fn effective(&self) -> Policy {
-        let mut out = self.clone();
-        // An unknown profile has no overlay → strict.
-        if let Some(cap) = self
-            .profiles
-            .get(&self.active_profile)
-            .and_then(|o| o.per_tx_sol_max)
-        {
-            out.spend.per_tx_sol_max = cap;
-        }
-        self.project_caps.clamp(&mut out.spend);
-        out
+    /// The effective tier ([`Policy::runtime`]).
+    pub fn tier(&self) -> Tier {
+        self.runtime.tier
     }
 
     /// The SessionStart notice listing [`Policy::ignored_overrides`]; `None` when there are
@@ -707,53 +643,63 @@ impl Policy {
             return None;
         }
         Some(format!(
-            "safe-ai-skill did not apply these policy settings ({PROJECT_POLICY} and \
-             {PROFILE_ENV} may only tighten the policy; removed settings are ignored):\n - {}",
+            "safe-ai-skill did not apply these policy settings ({PROJECT_POLICY}, \
+             {TIER_ENV} and {PROFILE_ENV} may only tighten; removed settings are ignored):\n - {}",
             self.ignored_overrides.join("\n - ")
         ))
     }
+}
 
-    /// The active profile overlay (empty/default when unknown).
-    pub fn active_overlay(&self) -> ProfileOverlay {
-        self.profiles
-            .get(&self.active_profile)
-            .cloned()
-            .unwrap_or_default()
+/// The base policy's tier: `tier`, else the legacy `active_profile` (an alias), else
+/// `relaxed`. A value that names no tier is noted and `relaxed` applies.
+fn base_tier(base: &Yaml, notes: &mut Vec<String>) -> Tier {
+    for key in ["tier", "active_profile"] {
+        if let Some(value) = base.get(key) {
+            return match value.as_str().and_then(Tier::parse) {
+                Some(t) if t < Tier::Relaxed => {
+                    notes.push(format!(
+                        "{key}: the plugin default policy may not go below relaxed (lowering is \
+                         `safe-ai-skill tier`, confirmed by you); relaxed applies"
+                    ));
+                    Tier::Relaxed
+                }
+                Some(t) => t,
+                None => {
+                    notes.push(format!(
+                        "{key}: not a tier name in the base policy; relaxed applies"
+                    ));
+                    Tier::Relaxed
+                }
+            };
+        }
+    }
+    Tier::Relaxed
+}
+
+/// The plugin default policy's `secrets.env_read` is pinned to `deny`: raw env reads loosen only
+/// through the user's confirmed `tier.json` (`safe-ai-skill tier --env-read`). Anything else
+/// is ignored with a note.
+fn pin_base_env_read(policy: &mut Policy) {
+    if EnvRead::parse(&policy.secrets.env_read) != Some(EnvRead::Deny) {
+        policy.ignored_overrides.push(
+            "secrets.env_read: the plugin default policy may only say deny (loosen it with \
+             `safe-ai-skill tier --env-read`, confirmed by you); deny applies"
+                .to_string(),
+        );
+        policy.secrets.env_read = "deny".to_string();
     }
 }
 
-/// Removed settings (spec D1.11) still present in the base policy `base`, one note each.
-/// They are ignored; the policy still loads.
+/// Removed settings still present in the base policy `base`, one note each. They are
+/// ignored; the policy still loads.
 fn removed_settings(base: &Yaml) -> Vec<String> {
-    let mut notes = Vec::new();
-    for key in REMOVED_TOP_LEVEL {
-        if base.get(key).is_some() {
-            notes.push(format!("{key}: removed in 1.1.0; ignored"));
-        }
-    }
-    let Some(Yaml::Mapping(profiles)) = base.get("profiles") else {
-        return notes;
-    };
-    for (name, overlay) in profiles {
-        let name: String = name
-            .as_str()
-            .unwrap_or("?")
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .take(20)
-            .collect();
-        if !crate::mode::is_known_profile(&name) {
-            notes.push(format!(
-                "profiles.{name}: removed in 1.1.0 (to turn the hooks off use \
-                 SAFE_AI_SKILL_DISABLE); ignored"
-            ));
-            continue;
-        }
-        for key in REMOVED_PROFILE_KEYS {
-            if overlay.get(key).is_some() {
-                notes.push(format!("profiles.{name}.{key}: removed in 1.1.0; ignored"));
-            }
-        }
+    let mut notes: Vec<String> = REMOVED_TOP_LEVEL
+        .iter()
+        .filter(|key| base.get(**key).is_some())
+        .map(|key| format!("{key}: removed in 1.1.0; ignored"))
+        .collect();
+    if base.get("profiles").is_some() {
+        notes.push(PROFILES_REMOVED.to_string());
     }
     notes
 }
@@ -761,8 +707,9 @@ fn removed_settings(base: &Yaml) -> Vec<String> {
 /// Top-level policy keys removed in 1.1.0 (never read before either).
 pub(crate) const REMOVED_TOP_LEVEL: [&str; 2] = ["gates", "hard_guards"];
 
-/// Profile overlay keys removed in 1.1.0.
-const REMOVED_PROFILE_KEYS: [&str; 3] = ["relax_transfer", "relax_swap", "disabled"];
+/// The note for a `profiles:` block (with `ask_all` and the autopilot cap).
+pub(crate) const PROFILES_REMOVED: &str = "profiles: removed in 1.1.0 (tiers replace \
+     profiles: `safe-ai-skill tier`; to turn the hooks off use SAFE_AI_SKILL_DISABLE); ignored";
 
 /// Read the plugin's on-disk default policy if `${CLAUDE_PLUGIN_ROOT}` points at one.
 fn plugin_default_src() -> Option<String> {
@@ -813,7 +760,6 @@ mod tests {
         let embedded: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
 
         assert_eq!(disk.version, embedded.version);
-        assert_eq!(disk.active_profile, embedded.active_profile);
         assert_eq!(disk.network.default, embedded.network.default);
         assert_eq!(disk.network.mainnet, embedded.network.mainnet);
         assert_eq!(disk.spend.per_tx_sol_max, embedded.spend.per_tx_sol_max);
@@ -875,26 +821,40 @@ mod tests {
             embedded.supply_chain.exec_install_scripts
         );
         assert_eq!(disk.supply_chain.on_block, embedded.supply_chain.on_block);
-        // Profiles parity.
         assert_eq!(
-            disk.profiles.keys().collect::<Vec<_>>(),
-            embedded.profiles.keys().collect::<Vec<_>>()
+            disk.secrets.key_material_extra_globs,
+            embedded.secrets.key_material_extra_globs
         );
-        assert_eq!(disk.effective().spend.per_tx_sol_max, 1.0);
+        assert_eq!(
+            disk.secrets.exfil_hosts_extra,
+            embedded.secrets.exfil_hosts_extra
+        );
+        // Base tier parity, through the loader (the field is not deserialized).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/safe-ai-skill/policy/default.policy.yaml");
+        let text = fs::read_to_string(path).unwrap();
+        let from_disk = Policy::from_sources(&text, None);
+        assert_eq!(from_disk.base_tier, Tier::Relaxed);
+        assert!(
+            from_disk.ignored_overrides.is_empty(),
+            "{:?}",
+            from_disk.ignored_overrides
+        );
     }
 
     #[test]
     fn embedded_default_parses() {
         let p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
         assert_eq!(p.version, 1);
-        assert_eq!(p.active_profile, "strict");
         assert_eq!(p.network.mainnet, "ask");
         assert_eq!(p.spend.per_tx_sol_max, 1.0);
         assert_eq!(p.spend.hard_tx_sol_max, 10.0);
         assert!(p.redact.enabled);
         assert!(p.audit.enabled);
-        assert!(p.profiles.contains_key("autopilot"));
-        assert!(!p.profiles.contains_key("off"));
+        assert_eq!(
+            Policy::from_sources(DEFAULT_POLICY_YAML, None).base_tier,
+            Tier::Relaxed
+        );
     }
 
     #[test]
@@ -986,74 +946,55 @@ mod tests {
         let p = Policy::fail_closed();
         assert!(p.is_fail_closed());
         assert_eq!(p.network.mainnet, "ask");
-        assert_eq!(p.active_profile, "strict");
-        assert!(!p.active_overlay().ask_all);
-    }
-
-    #[test]
-    fn effective_autopilot_raises_cap() {
-        let mut p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
-        p.active_profile = "autopilot".into();
-        let eff = p.effective();
-        assert_eq!(eff.spend.per_tx_sol_max, 2.0);
-        assert!(!eff.active_overlay().ask_all);
-    }
-
-    #[test]
-    fn paranoid_sets_ask_all() {
-        let p = Policy::from_sources(DEFAULT_POLICY_YAML, None, Some("paranoid"), None);
-        assert!(p.effective().active_overlay().ask_all);
+        assert_eq!(p.tier(), Tier::Relaxed);
     }
 
     #[test]
     fn the_shipped_policy_has_no_removed_settings() {
-        let p = Policy::from_sources(DEFAULT_POLICY_YAML, None, None, None);
+        let p = Policy::from_sources(DEFAULT_POLICY_YAML, None);
         assert!(p.ignored_overrides.is_empty(), "{:?}", p.ignored_overrides);
     }
 
     #[test]
     fn removed_settings_in_an_old_policy_are_listed_not_fatal() {
         let old = format!(
-            "{DEFAULT_POLICY_YAML}gates: [mainnet_deploy]\nhard_guards: [secret_read]\n"
-        )
-        .replace(
-            "  autopilot:\n    per_tx_sol_max: 2.0\n",
-            "  autopilot:\n    relax_transfer: true\n    relax_swap: true\n    per_tx_sol_max: 2.0\n  off:\n    disabled: true\n",
+            "{DEFAULT_POLICY_YAML}gates: [mainnet_deploy]\nhard_guards: [secret_read]\n\
+             profiles:\n  autopilot:\n    per_tx_sol_max: 2.0\n  paranoid:\n    ask_all: true\n"
         );
-        let p = Policy::from_sources(&old, None, None, None);
+        let p = Policy::from_sources(&old, None);
         assert!(!p.is_fail_closed());
         assert_eq!(p.spend.per_tx_sol_max, 1.0);
-        for note in [
-            "gates:",
-            "hard_guards:",
-            "profiles.autopilot.relax_transfer",
-            "profiles.autopilot.relax_swap",
-            "profiles.off",
-        ] {
+        for note in ["gates:", "hard_guards:", "profiles:"] {
             assert!(
                 p.ignored_overrides.iter().any(|n| n.starts_with(note)),
                 "{note}: {:?}",
                 p.ignored_overrides
             );
         }
-        // `off` is not a profile any more: selecting it is strict.
-        let off = Policy::from_sources(&old, None, Some("off"), None);
-        assert!(!off.effective().active_overlay().ask_all);
-        assert_eq!(off.effective().spend.per_tx_sol_max, 1.0);
     }
 
     #[test]
-    fn effective_strict_is_noop() {
-        let p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
-        let eff = p.effective();
-        assert_eq!(eff.spend.per_tx_sol_max, p.spend.per_tx_sol_max);
-    }
-
-    #[test]
-    fn unknown_profile_falls_back_to_base() {
-        let mut p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
-        p.active_profile = "does-not-exist".into();
-        let eff = p.effective();
-        assert_eq!(eff.spend.per_tx_sol_max, 1.0);
+    fn the_base_tier_reads_tier_then_the_legacy_profile_alias() {
+        let with = |line: &str| {
+            Policy::from_sources(&DEFAULT_POLICY_YAML.replace("tier: relaxed", line), None)
+        };
+        assert_eq!(with("tier: high").base_tier, Tier::High);
+        assert_eq!(with("active_profile: paranoid").base_tier, Tier::High);
+        assert_eq!(with("active_profile: strict").base_tier, Tier::Relaxed);
+        let off = with("tier: off");
+        assert_eq!(off.base_tier, Tier::Relaxed);
+        assert!(off.ignored_overrides.iter().any(|n| n.starts_with("tier:")));
+        let env = Policy::from_sources(
+            &DEFAULT_POLICY_YAML.replace("env_read: deny", "env_read: tier"),
+            None,
+        );
+        assert_eq!(env.secrets.env_read, "deny");
+        assert!(env
+            .ignored_overrides
+            .iter()
+            .any(|n| n.starts_with("secrets.env_read")));
+        let bad = with("tier: turbo");
+        assert_eq!(bad.base_tier, Tier::Relaxed);
+        assert!(bad.ignored_overrides.iter().any(|n| n.starts_with("tier:")));
     }
 }

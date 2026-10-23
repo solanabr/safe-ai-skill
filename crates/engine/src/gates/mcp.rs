@@ -61,6 +61,11 @@ pub fn decide(
 
     meta.amount_sol = amount;
     meta.destination = dest.clone();
+    // A value-moving call whose amount cannot be read (an unknown field, `transfer_all`, a
+    // non-numeric value) cannot be checked against a grant's caps: no grant covers it.
+    if amount.is_none() && matches!(scope, Scope::Transfer | Scope::Swap) {
+        meta.hard_guard = true;
+    }
 
     let short_tool = short_name(tool_name);
 
@@ -95,7 +100,7 @@ pub fn decide(
                 .unwrap_or_else(|| "unknown destination".to_string());
             let amt_str = amount
                 .map(|a| format!("{a} SOL"))
-                .unwrap_or_else(|| "unspecified amount".to_string());
+                .unwrap_or_else(|| "amount not readable, so no grant covers it".to_string());
             format!("MCP value transfer: {short_tool} → {dest_str} ({amt_str})")
         }
     };
@@ -336,6 +341,29 @@ mod tests {
         assert_eq!(m.scope, Scope::Transfer);
         assert_eq!(m.amount_sol, Some(2.0));
         assert!(m.destination.is_some());
+    }
+
+    #[test]
+    fn an_unreadable_transfer_amount_is_a_hard_guard() {
+        let to = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+        for (tool, payload) in [
+            ("mcp__w__transfer", json!({ "to": to, "value": "999" })),
+            ("mcp__w__transfer_all", json!({ "to": to })),
+            ("mcp__w__transfer", json!({ "to": to, "amount": "lots" })),
+            ("mcp__w__swap", json!({ "inputMint": to })),
+        ] {
+            let (d, m) = decide(tool, Some(&payload), &ctx(), &Policy::default());
+            assert!(matches!(d, Decision::Ask { .. }), "{tool} {payload}: {d:?}");
+            assert!(m.hard_guard, "{tool} {payload}: no grant may cover it");
+            assert_eq!(m.amount_sol, None);
+        }
+        let (_, m) = decide(
+            "mcp__w__transfer",
+            Some(&json!({ "to": to, "amount": "0.25" })),
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(!m.hard_guard, "a readable amount stays grantable");
     }
 
     #[test]
