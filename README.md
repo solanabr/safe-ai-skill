@@ -266,10 +266,11 @@ first interactive session that shows its code): its code is shown and accepted o
 the session; `/clear` starts a new one). Nothing is announced or confirmed in a headless session (CI or a
 headless switch), in a non-interactive `claude -p`, or in a Claude Code session started from inside
 another one (an agent's nested `claude`): a code typed there changes nothing, you are told why, and the
-request stays pending. Where the engine can't read the process table (native Windows, a sandboxed hook),
-only a request made inside that session (`! safe-ai-skill tier …`) can be confirmed there. Whether
+request stays pending. The same holds wherever the engine can't read the process table to tell: **on
+native Windows, confirmations (lowering the tier, loosening `env_read`, grants, `verify trust`/`approve`)
+are unavailable; raising the tier and everything else work, and WSL works for those actions.** Whether
 desktop or IDE hosts run Claude Code in print mode (which can't confirm) is unverified; a terminal
-session always works. Raising the tier (or tightening `--env-read`) and `revoke` apply at
+session on macOS, Linux or WSL works. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 
