@@ -1849,6 +1849,15 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 }
             }
         }
+        "awk" | "gawk" | "mawk" | "nawk" if awk_program_on_stdin(args) => {
+            // `awk -f - <<EOF`: the program comes on stdin; its text names files like code.
+            if piped_in && !upstream_emits.is_empty() {
+                out.stdin_code.push(upstream_emits.clone());
+            }
+            out.stdin_code
+                .extend(herestrings.iter().map(|w| w.text.clone()));
+            reads = Reads::Interpreter;
+        }
         p if LAUNCHERS.contains(&p) => launch(args, p, depth, out),
         _ => {}
     }
@@ -1892,6 +1901,24 @@ fn interpreter_reads_stdin(args: &[Word]) -> bool {
         None => true,
         Some(word) => is_stdin_path(&word.text),
     }
+}
+
+/// Whether an awk's `-f` program file is its standard input (`-f -`, `-f /dev/stdin`,
+/// `-f-`, `--file=-`).
+fn awk_program_on_stdin(args: &[Word]) -> bool {
+    let mut iter = args.iter().map(|w| w.text.as_str());
+    while let Some(text) = iter.next() {
+        let value = match text {
+            "-f" | "--file" => iter.next(),
+            _ => text
+                .strip_prefix("--file=")
+                .or_else(|| text.strip_prefix("-f").filter(|v| !v.is_empty())),
+        };
+        if value.is_some_and(is_stdin_path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What a shell invocation runs.

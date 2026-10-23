@@ -1787,6 +1787,27 @@ fn i22_input_redirects_behind_quoted_separators_deny_at_every_tier() {
 }
 
 #[test]
+fn i22_ansi_c_quotes_divisions_cd_and_awk_stdin_deny_at_every_tier() {
+    let w = i22_world("i22-r2");
+    w.put("apps/prod.env", "PROD_KEY=prod_secret_cccccccccccc\n");
+    for cmd in [
+        // ANSI-C quoting does not hide the next command from the secret-read check.
+        "echo $'it\\'s'; cat id.json",
+        "echo $'a\\'b' && cat .env",
+        // A string between two divisions is not a regex.
+        "perl -e '$x=1/2; open F, \"\\.env\"; print <F>; $y=3/4'",
+        "awk 'BEGIN{x=1/2; while((getline l < \"\\.env\")>0) print l; y=3/4}'",
+        // A bare name resolves against a `cd` target.
+        "cd apps && python3 -c \"print(open('prod.env').read())\"",
+        // An awk program on stdin.
+        "awk -f - .gitignore <<'EOF'\nBEGIN{while((getline l < \".env\")>0) print l}\nEOF",
+        "awk -f /dev/stdin <<< 'BEGIN{while((getline l < \".env\")>0) print l}'",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
 fn i22_code_over_the_inspection_limits_never_passes_quietly() {
     let w = i22_world("i22-limits");
     // Junk literals before the path are not judged (data literals cost nothing): the path is.

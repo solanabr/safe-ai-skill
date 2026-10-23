@@ -728,9 +728,18 @@ fn code_paths(parsed: &shell::Parsed, cwd: &Path) -> Result<Vec<String>, TooComp
     {
         return Ok(Vec::new());
     }
-    let cwd = &CwdNames::read(cwd);
+    // The effective cwds, as the word checks track them (`cd apps && python3 -c …`).
+    let mut dirs: Vec<PathBuf> = vec![cwd.to_path_buf()];
+    let mut listed: Vec<CwdNames> = vec![CwdNames::read(cwd)];
     for cmd in &parsed.commands {
         let first = cmd.program();
+        if matches!(first.as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut dirs);
+            for dir in dirs.iter().skip(listed.len()) {
+                listed.push(CwdNames::read(dir));
+            }
+        }
+        let cwd = listed.as_slice();
         let (start, patterns) = if AWKS.contains(&first.as_str()) {
             (1, true)
         } else if let Some(i) = shell::interpreter_at(&cmd.words) {
@@ -755,7 +764,7 @@ fn code_paths(parsed: &shell::Parsed, cwd: &Path) -> Result<Vec<String>, TooComp
         }
     }
     for text in &parsed.stdin_code {
-        scan_code(text, false, cwd, &mut seen)?;
+        scan_code(text, false, &listed, &mut seen)?;
     }
     Ok(seen.into_iter().collect())
 }
@@ -764,7 +773,7 @@ fn code_paths(parsed: &shell::Parsed, cwd: &Path) -> Result<Vec<String>, TooComp
 fn scan_code(
     text: &str,
     patterns: bool,
-    cwd: &CwdNames,
+    cwd: &[CwdNames],
     seen: &mut std::collections::BTreeSet<String>,
 ) -> Result<(), TooComplex> {
     let text = if patterns {
@@ -795,7 +804,7 @@ fn is_path_char(c: char) -> bool {
 /// Keep `token` for judging when it can name a file (see [`code_paths`]).
 fn keep_path(
     token: &str,
-    cwd: &CwdNames,
+    cwds: &[CwdNames],
     seen: &mut std::collections::BTreeSet<String>,
 ) -> Result<(), TooComplex> {
     if !token.chars().any(char::is_alphanumeric) {
@@ -806,17 +815,32 @@ fn keep_path(
         return Err(TooComplex);
     }
     let rooted = token.starts_with(['/', '~']);
-    let keep = if token.starts_with('$') {
-        token.contains('/')
-    } else if rooted || token.contains('/') {
-        true
+    let lower = token.to_ascii_lowercase();
+    let kept = if token.starts_with('$') {
+        token.contains('/').then_some(token)
+    } else if rooted
+        || token.contains('/')
+        || (token.starts_with('.') && (lower.contains("env") || lower.contains("vars")))
+    {
+        Some(token)
     } else {
-        let lower = token.to_ascii_lowercase();
-        (token.starts_with('.') && (lower.contains("env") || lower.contains("vars")))
-            || cwd.has(&token)
+        // A bare name counts where it exists: the hook's cwd as written, a later `cd` target
+        // as the joined path (the checks resolve against the hook's cwd).
+        cwds.iter()
+            .enumerate()
+            .find(|(_, c)| c.has(&token))
+            .map(|(i, c)| {
+                if i == 0 {
+                    token.clone()
+                } else {
+                    c.dir.join(&token).to_string_lossy().into_owned()
+                }
+            })
     };
-    if keep && seen.insert(token) && seen.len() > MAX_WORDS {
-        return Err(TooComplex);
+    if let Some(token) = kept {
+        if seen.insert(token) && seen.len() > MAX_WORDS {
+            return Err(TooComplex);
+        }
     }
     Ok(())
 }
@@ -951,78 +975,105 @@ fn join_literals(text: &str) -> String {
     let mut i = 0;
     while let Some(&c) = chars.get(i) {
         if matches!(c, '\'' | '"') {
-            let mut j = i + 1;
-            while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
-                j += 1;
-            }
+            let mut j = skip_blanks(&chars, i.saturating_add(1));
             if chars.get(j).is_some_and(|c| matches!(c, '+' | '.')) {
-                j += 1;
-                while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
-                    j += 1;
-                }
+                j = skip_blanks(&chars, j.saturating_add(1));
             }
             if chars.get(j) == Some(&c) {
-                i = j + 1;
+                i = j.saturating_add(1);
                 continue;
             }
         }
         out.push(c);
-        i += 1;
+        i = i.saturating_add(1);
     }
     out
 }
 
+/// The first index at or after `from` that is not a space or tab.
+fn skip_blanks(chars: &[char], from: usize) -> usize {
+    let mut j = from;
+    while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
+        j = j.saturating_add(1);
+    }
+    j
+}
+
+/// Words after which a Perl or awk `/` opens a regex, not a division.
+const REGEX_KEYWORDS: &[&str] = &[
+    "if", "unless", "and", "or", "not", "split", "grep", "return", "while", "until", "when",
+];
+
+/// Whether a `/` at `at` opens a regex literal: it starts the code or follows an operator that
+/// takes an operand (`(`, `,`, `!`, `&`, `|`, `{`, `;`, `=`, `~`) or a keyword such as `if`,
+/// ignoring blanks. After a value (`1/2`, `$x /`, `"a" /`) it divides.
+fn opens_regex(chars: &[char], at: usize) -> bool {
+    let back = |mut k: usize, take: fn(&char) -> bool| {
+        while let Some(p) = k.checked_sub(1) {
+            if !chars.get(p).is_some_and(take) {
+                break;
+            }
+            k = p;
+        }
+        k
+    };
+    let k = back(at, |c| *c == ' ' || *c == '\t');
+    let Some(prev) = k.checked_sub(1).and_then(|p| chars.get(p)) else {
+        return true;
+    };
+    if matches!(
+        prev,
+        '(' | ',' | '!' | '&' | '|' | '{' | ';' | '=' | '~' | '\n'
+    ) {
+        return true;
+    }
+    let start = back(k, char::is_ascii_alphabetic);
+    let word: String = chars.get(start..k).unwrap_or_default().iter().collect();
+    REGEX_KEYWORDS.contains(&word.as_str())
+}
+
 /// awk and Perl code with its match patterns blanked: the operand of `~`/`=~`/`!~` (a quoted
-/// string or `/…/`) and a `/…/` holding an escaped dot. `~/` (a home path) is not an operator.
+/// string or `/…/`) and a `/…/` regex literal ([`opens_regex`]). A `/` that divides, and `~/`
+/// (a home path), are left alone, so a string between two divisions stays visible.
 fn blank_patterns(text: &str) -> String {
     let mut chars: Vec<char> = text.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let operand = if c == '~' && chars.get(i + 1) != Some(&'/') {
-            let mut j = i + 1;
-            while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
-                j += 1;
-            }
+    while let Some(&c) = chars.get(i) {
+        let next = i.saturating_add(1);
+        let operand = if c == '~' && chars.get(next) != Some(&'/') {
+            let j = skip_blanks(&chars, next);
             chars
                 .get(j)
                 .filter(|d| matches!(d, '"' | '\'' | '/'))
                 .map(|_| j)
-        } else if c == '/' {
+        } else if c == '/' && opens_regex(&chars, i) {
             Some(i)
         } else {
             None
         };
         let Some(open) = operand else {
-            i += 1;
+            i = next;
             continue;
         };
-        let delim = chars[open];
-        let mut k = open + 1;
+        let delim = chars.get(open).copied().unwrap_or('/');
+        let mut k = open.saturating_add(1);
         while let Some(&d) = chars.get(k) {
             if d == '\\' {
-                k += 2;
+                k = k.saturating_add(2);
                 continue;
             }
             if d == delim || d == '\n' {
                 break;
             }
-            k += 1;
+            k = k.saturating_add(1);
         }
-        let end = k.min(chars.len().saturating_sub(1));
-        let closed = chars.get(k) == Some(&delim);
-        let body: String = chars
-            .get(open + 1..k.min(chars.len()))
-            .unwrap_or_default()
-            .iter()
-            .collect();
-        if closed && (c == '~' || body.contains("\\.")) {
-            for ch in chars.iter_mut().take(end + 1).skip(open) {
+        if chars.get(k) == Some(&delim) {
+            for ch in chars.iter_mut().take(k.saturating_add(1)).skip(open) {
                 *ch = ' ';
             }
-            i = end + 1;
+            i = k.saturating_add(1);
         } else {
-            i += 1;
+            i = next;
         }
     }
     chars.into_iter().collect()

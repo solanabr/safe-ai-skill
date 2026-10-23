@@ -1105,55 +1105,87 @@ fn is_flag(tok: &str) -> bool {
 }
 
 /// Split a command on top-level `&&`, `||`, `;`, `|` separators into segments. A separator
-/// inside quotes or after a backslash is text (`tr ';' x < .env` stays one segment).
+/// inside quotes (`'…'`, `"…"`, ANSI-C `$'…'` with its backslash escapes) or after a backslash
+/// is text (`tr ';' x < .env` stays one segment). When a quote is still open at the end, the
+/// quoting was misread or is broken: the naive split on every separator is added, so no
+/// command hides inside a phantom quote.
 fn split_segments(command: &str) -> Vec<&str> {
+    let (mut segments, balanced) = split_quoted(command);
+    if !balanced {
+        segments.extend(split_naive(command));
+    }
+    segments
+}
+
+/// Quote-aware split; `false` when a quote is left open.
+fn split_quoted(command: &str) -> (Vec<&str>, bool) {
     let mut segments = Vec::new();
     let bytes = command.as_bytes();
     let mut start = 0;
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = quote {
-            if c == b'\\' && q == b'"' {
-                i += 2;
+    let mut i: usize = 0;
+    // The open quote byte, and whether backslash escapes inside it (`"…"`, `$'…'`).
+    let mut quote: Option<(u8, bool)> = None;
+    while let Some(&c) = bytes.get(i) {
+        if let Some((q, escapes)) = quote {
+            if c == b'\\' && escapes {
+                i = i.saturating_add(2);
                 continue;
             }
             if c == q {
                 quote = None;
             }
-            i += 1;
+            i = i.saturating_add(1);
             continue;
         }
         match c {
-            b'\'' | b'"' => {
-                quote = Some(c);
-                i += 1;
+            b'$' if bytes.get(i.saturating_add(1)) == Some(&b'\'') => {
+                quote = Some((b'\'', true));
+                i = i.saturating_add(2);
+                continue;
+            }
+            b'\'' => {
+                quote = Some((c, false));
+                i = i.saturating_add(1);
+                continue;
+            }
+            b'"' => {
+                quote = Some((c, true));
+                i = i.saturating_add(1);
                 continue;
             }
             b'\\' => {
-                i += 2;
+                i = i.saturating_add(2);
                 continue;
             }
             _ => {}
         }
-        let two = bytes.get(i..i + 2);
-        if matches!(two, Some(b"&&")) || matches!(two, Some(b"||")) {
-            segments.push(command[start..i].trim());
-            i += 2;
+        let width = match bytes.get(i..i.saturating_add(2)) {
+            Some(b"&&") | Some(b"||") => 2,
+            _ if c == b';' || c == b'|' => 1,
+            _ => 0,
+        };
+        if width > 0 {
+            segments.push(command.get(start..i).unwrap_or_default().trim());
+            i = i.saturating_add(width);
             start = i;
             continue;
         }
-        if c == b';' || c == b'|' {
-            segments.push(command[start..i].trim());
-            i += 1;
-            start = i;
-            continue;
-        }
-        i += 1;
+        i = i.saturating_add(1);
     }
     segments.push(command.get(start..).unwrap_or_default().trim());
-    segments.into_iter().filter(|s| !s.is_empty()).collect()
+    let segments = segments.into_iter().filter(|s| !s.is_empty()).collect();
+    (segments, quote.is_none())
+}
+
+/// The split on every separator, quotes ignored (the 1.0.x behaviour).
+fn split_naive(command: &str) -> Vec<&str> {
+    command
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split([';', '|']))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Tokenize a segment on whitespace, respecting single/double quotes.
@@ -1191,6 +1223,21 @@ fn tokenize(segment: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_segments_reads_quotes_and_never_hides_a_command() {
+        assert_eq!(split_segments("tr ';' x < .env"), ["tr ';' x < .env"]);
+        assert_eq!(
+            split_segments("echo $'it\\'s'; cat id.json"),
+            ["echo $'it\\'s'", "cat id.json"]
+        );
+        assert_eq!(
+            split_segments("a \"x;y\" && b || c | d"),
+            ["a \"x;y\"", "b", "c", "d"]
+        );
+        // A quote left open: the naive split is added.
+        assert!(split_segments("echo 'x; cat id.json").contains(&"cat id.json"));
+    }
 
     fn policy() -> Policy {
         Policy::default()
