@@ -115,7 +115,7 @@ const HOOK_SHELLS: &[&str] = &[
 const MAX_DEPTH: usize = 64;
 
 /// Longest a `ps` run may take.
-const PS_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+const PS_DEADLINE: std::time::Duration = std::time::Duration::from_millis(3000);
 
 /// The verdict for process `pid` in `table`: from its parent, skip hook shells to the first
 /// other process. A Claude Code CLI there is refused when it has `-p`/`--print` or another
