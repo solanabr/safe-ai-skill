@@ -1396,18 +1396,15 @@ fn padding_the_hit_cap_hides_no_combo() {
     );
     assert_eq!(rules::grade(&ctl), Grade::Warn, "{ctl:?}");
     assert_eq!(rules::grade(&sat), rules::grade(&ctl), "{sat:?}");
-    // The v1 shim sees the combo as High.
-    let tmp = TempDir::new("v1-sat");
+    // The same padding in a code file stays a combo.
+    let tmp = TempDir::new("code-sat");
     std::fs::write(
         tmp.join("w.js"),
         format!("{}{lit}", "// eval(x)\n".repeat(50)),
     )
     .unwrap();
-    let v1 = safe_ai_skill::verify::heuristics::scan(tmp.path());
-    assert_eq!(
-        v1.max_severity(),
-        Some(safe_ai_skill::verify::Severity::High)
-    );
+    let code = rules::scan_pack(tmp.path());
+    assert!(rules::grade(&code) >= Grade::High, "{code:?}");
 }
 
 #[test]
@@ -1574,8 +1571,7 @@ fn a_combo_split_across_a_budget_cut_keeps_what_was_found() {
         )
     };
     let cut = |r: &PackReport| r.findings.iter().any(|f| f.rule == "scan_budget_exceeded");
-    // half-combo-across-cut: `eval` before the cut, the decoder after it — never clean, and the
-    // v1 view reports the scan as incomplete (the sweep keeps the pack unreviewed).
+    // half-combo-across-cut: `eval` before the cut, the decoder after it — never clean.
     let tmp = TempDir::new("half");
     std::fs::write(tmp.join("a.js"), "eval(x);\n").unwrap();
     std::fs::write(tmp.join("b.sh"), &dense).unwrap();
@@ -1583,8 +1579,6 @@ fn a_combo_split_across_a_budget_cut_keeps_what_was_found() {
     let r = rules::scan_pack_within(tmp.path(), &budget());
     assert!(cut(&r), "{r:?}");
     assert!(rules::grade(&r) >= Grade::High, "{r:?}");
-    let v1 = safe_ai_skill::verify::heuristics::scan_within(tmp.path(), &budget());
-    assert!(!v1.complete);
     // payload-after-cut-same-file: the cut lands inside the file before the payload.
     let tmp = TempDir::new("samefile");
     std::fs::write(tmp.join("a.js"), format!("{dense}{mal_js}")).unwrap();

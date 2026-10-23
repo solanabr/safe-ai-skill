@@ -129,7 +129,7 @@ solana-ai-kit, for example, ships 18 third-party `ext/` git submodules: third-pa
 
 **safe-ai-skill's response:** each submodule is walked individually by the `verify session` sweep at `SessionStart`. The git SHA is pinned on first seen (TOFU). On any subsequent session where the SHA has changed — whether from an explicit `resync.sh` update or a stealth mutation — the submodule is blocked in place (High findings at `path:line`) and its paths and skills are denied until the user reviews the changes, runs `safe-ai-skill verify approve <name>` and confirms it.
 
-**No special-casing:** some submodules carry known supply-chain risks — attacker-mutable telemetry endpoints, unsigned tarball installers, and global Bash/Read permission grant patterns. safe-ai-skill treats every `ext/` submodule identically: telemetry preambles and installer patterns are flagged and neutralized generically by `heuristics.rs`; no submodule is special-cased.
+**No special-casing:** some submodules carry known supply-chain risks — attacker-mutable telemetry endpoints, unsigned tarball installers, and global Bash/Read permission grant patterns. safe-ai-skill treats every `ext/` submodule identically: telemetry preambles and installer patterns are flagged generically by the rule engine (`crates/engine/src/verify/rules/`), and `install` neutralizes telemetry preambles; no submodule is special-cased.
 
 ### `@latest` MCP posture
 

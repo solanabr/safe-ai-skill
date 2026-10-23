@@ -477,13 +477,13 @@ handled here. The tripwire denies Bash invocations of the hook subcommands and
 
 ### `verify`
 ```rust
-pub enum Severity { Low, Medium, High }            // v1 report severities (add / install / verify check)
+pub enum Severity { Low, Medium, High }            // provenance / osv.dev / .mcp.json report severities
 pub struct Finding { pub severity, pub kind, pub detail, pub path, pub line }
 pub struct Report { pub findings: Vec<Finding> }
 
 pub mod verify::rules;      // rule engine: scan_pack, scan_pack_until(deadline), grade, PackReport, ScanBudget
 pub mod verify::grading;    // re-exports the rules types the state machine reads
-pub mod verify::heuristics; // v1 compatibility view of rules (Report) for add / install / verify check
+pub mod verify::check;      // check_dir: one dir graded as the sweep's first sight + tier_action (verify check / add / install)
 pub mod verify::state;      // state v2: PackEntry, PackStatus {Clean, Warned, Unreviewed, Blocked}, tree_hash, stat_fingerprint
 pub mod verify::trust;      // trust.json by content hash
 pub mod verify::enforce;    // gate-time checks: skill_verdict, read_verdict, bash_verdict

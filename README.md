@@ -238,7 +238,7 @@ safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
 safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
-safe-ai-skill verify check <dir>     # scan one skill directory and list every finding
+safe-ai-skill verify check <dir>     # grade one skill directory as the sweep would at your tier, listing every finding
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
 safe-ai-skill status                 # pins, tier, live grants, spend, recent decisions
 safe-ai-skill tier                   # show the tier, where it came from, and the sandbox state
