@@ -869,7 +869,7 @@ fn lexical(path: &Path) -> PathBuf {
 }
 
 /// [`lexical`] `path`, with its deepest existing ancestor canonicalized.
-fn lenient_canonical(path: &Path) -> PathBuf {
+pub(super) fn lenient_canonical(path: &Path) -> PathBuf {
     let path = lexical(path);
     let mut existing = path.clone();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
