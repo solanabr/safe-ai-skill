@@ -2064,6 +2064,7 @@ fn cmd_status() -> ExitCode {
         "tier_state": tier_state_label(&dir),
         "grants": grants_view,
         "spend": spend_view,
+        "pending": confirm::pending_list(&dir, now),
         "recent_audit": recent_audit_lines(&plugin_data, 5),
     }));
     ExitCode::SUCCESS

@@ -194,6 +194,12 @@ fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
         }
     }
     Err(Error::Other(match roots.first() {
+        Some(root) if plugin_installed_beside(root) => format!(
+            "safe-ai-skill is installed but has no data dir yet under {}: Claude Code creates it \
+             the first time a session runs the plugin's hooks. Start a Claude Code session once \
+             (any project), then run this again; or set CLAUDE_PLUGIN_DATA to the data dir",
+            root.display()
+        ),
         Some(root) => format!(
             "no plugin data dir under {} (is the plugin installed?); set CLAUDE_PLUGIN_DATA to \
              the plugin's data dir, usually ~/.claude/plugins/data/safe-ai-skill-<marketplace>",
@@ -203,6 +209,20 @@ fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
                  home; set CLAUDE_PLUGIN_DATA"
             .to_string(),
     }))
+}
+
+/// Whether the plugin is installed next to the data root `<config>/plugins/data`: some
+/// `<config>/plugins/cache/<marketplace>/safe-ai-skill` dir exists (Claude Code's plugin cache
+/// layout).
+fn plugin_installed_beside(data_root: &Path) -> bool {
+    let Some(cache) = data_root.parent().map(|p| p.join("cache")) else {
+        return false;
+    };
+    std::fs::read_dir(cache).is_ok_and(|entries| {
+        entries
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().join("safe-ai-skill").is_dir())
+    })
 }
 
 /// The install dir under `root`: a preferred name, else the only `safe-ai-skill-*` dir.

@@ -83,3 +83,74 @@ fn cli_without_any_data_dir_errors_with_guidance() {
     assert!(!home.join(".safe-ai-skill").exists());
     assert!(!cwd.join(".safe-ai-skill").exists());
 }
+
+#[test]
+fn cli_before_the_first_session_says_to_start_one() {
+    let home = TempDir::new("ddir-first");
+    std::fs::create_dir_all(home.join(".claude/plugins/cache/stbr/safe-ai-skill/1.1.0")).unwrap();
+    let run = Invocation::new(&["tier", "off"])
+        .home(home.path())
+        .cwd(home.path())
+        .run();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    let error = run.json()["error"].as_str().unwrap().to_string();
+    assert!(
+        error.contains("installed but has no data dir yet")
+            && error.contains("Start a Claude Code session"),
+        "{error}"
+    );
+    assert!(
+        !home.join(".claude/plugins/data").exists(),
+        "nothing is created"
+    );
+}
+
+#[test]
+fn status_lists_pending_requests_without_their_codes() {
+    let home = TempDir::new("ddir-pending");
+    let data = home.join(".claude/plugins/data/safe-ai-skill-stbr");
+    std::fs::create_dir_all(&data).unwrap();
+    let run = Invocation::new(&["tier", "off"])
+        .home(home.path())
+        .cwd(home.path())
+        .run();
+    let id = run.json()["request"].as_str().unwrap().to_string();
+    // A prompt announces the code (shown to the user only).
+    let shown = Invocation::new(&["prompt-guard"])
+        .home(home.path())
+        .cwd(home.path())
+        .plugin_data(&data)
+        .stdin(
+            serde_json::json!({"hook_event_name":"UserPromptSubmit","prompt":"hi",
+                               "cwd": home.path()})
+            .to_string(),
+        )
+        .run();
+    let msg = shown.json()["systemMessage"].as_str().unwrap().to_string();
+    let code: String = msg
+        .split("safe-ai-skill confirm ")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take(8)
+        .collect();
+    let status = Invocation::new(&["status"])
+        .home(home.path())
+        .cwd(home.path())
+        .run();
+    let v = status.json();
+    let pending = v["pending"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(pending.len(), 1, "{v}");
+    assert_eq!(pending[0]["request"], id.as_str());
+    assert_eq!(pending[0]["kind"], "tier");
+    assert!(pending[0]["created_at"].as_u64().unwrap() > 0);
+    assert_eq!(pending[0]["announced"], true);
+    assert!(pending[0]["how_to_confirm"]
+        .as_str()
+        .unwrap()
+        .contains("safe-ai-skill confirm <code>"));
+    assert!(
+        !status.stdout.contains(&code),
+        "the code must never be listed"
+    );
+}

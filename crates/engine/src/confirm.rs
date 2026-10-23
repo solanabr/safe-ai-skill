@@ -297,6 +297,40 @@ pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
     out
 }
 
+/// The live pending entries for `status`: request id, kind, summary, when it was created and
+/// (if) announced, when it lapses, and how to confirm it. Never a code or its hash. Empty when
+/// there is no valid `pending.json`.
+pub fn pending_list(dir: &DataDir, now: u64) -> Vec<Value> {
+    if dir.is_unresolved() {
+        return Vec::new();
+    }
+    let Loaded::Valid(p) = statefile::load::<Pending>(dir, PENDING_FILE) else {
+        return Vec::new();
+    };
+    p.entries
+        .iter()
+        .filter(|e| !is_expired(e, now))
+        .map(|e| {
+            let how = if e.announced_at.is_some() {
+                "type `safe-ai-skill confirm <code>` as your entire next prompt, with the code \
+                 safe-ai-skill showed you for this request (lost it? run the command again)"
+            } else {
+                "the code is shown to you at your next prompt or session start; then type \
+                 `safe-ai-skill confirm <code>` as your entire prompt"
+            };
+            serde_json::json!({
+                "request": e.id.as_str(),
+                "kind": e.kind,
+                "summary": e.summary,
+                "created_at": e.created_at,
+                "announced": e.announced_at.is_some(),
+                "expires_at": clock(e).saturating_add(TTL_SECS),
+                "how_to_confirm": how,
+            })
+        })
+        .collect()
+}
+
 /// Whether [`announce_pending`] would announce anything at `now` (read only, no lock).
 pub fn has_unannounced(dir: &DataDir, now: u64) -> bool {
     if dir.is_unresolved() || std::fs::symlink_metadata(dir.path.join(PENDING_FILE)).is_err() {

@@ -450,6 +450,12 @@ matrix() {
     expect_rc 0
     expect_notice INACTIVE
     expect_err_lines 1
+    case $sc in
+      exit127 | exit126)
+        t "$sc: SessionStart shows the start error to the user"
+        expect_json "'could not start (exit ${sc#exit}) (engine stderr)' in d['systemMessage']"
+        ;;
+    esac
     # CLI output is live, so only the status and the notice are checked.
     t "$sc: a CLI command exits 1"
     run status
