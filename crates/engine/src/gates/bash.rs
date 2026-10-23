@@ -13,7 +13,7 @@
 //! - **Class U** (the shared list's `irreversible net` rows, [`lists::irreversible`]): denied
 //!   with the command echoed on mainnet, testnet and any cluster not positively identified
 //!   (Unknown), a hard-guard ask on identified localnet/devnet; at every tier, never granted.
-//! - **Class C** (transfers, deploys, buffer closes, authority changes, withdraws): on mainnet
+//! - **Class C** (transfers, deploys, authority changes, withdraws): on mainnet
 //!   or Unknown an ask below High (a grantable one unless it is an authority change, an
 //!   account close or an unbudgetable amount) and a deny at High. `Allow` comes only from a
 //!   within-cap transfer on a positively identified devnet/testnet/localnet, and only when
@@ -978,10 +978,9 @@ fn joined_reason(mut asks: Vec<(u8, String)>) -> String {
 }
 
 /// Class U rows the shared list does not spell but this gate also treats as Class U (same
-/// argv grammar): `anchor program close` of a program, and `--final` on the other deploy
-/// commands. `anchor legacy-idl …` is read as `anchor idl …`.
+/// argv grammar): `--final` on the other deploy commands. `anchor legacy-idl …` is read as
+/// `anchor idl …`.
 const EXTRA_IRREVERSIBLE: &[&[&str]] = &[
-    &["anchor", "program", "close", "[--bypass-warning]"],
     &["anchor", "upgrade", "[--final]"],
     &["anchor", "migrate", "[--final]"],
 ];
@@ -1244,9 +1243,9 @@ fn classify_program(argv: &Argv, program: &str, ctx: &Context) -> (Decision, Gat
             "upgrade-authority change",
         ),
         "set-buffer-authority" => authority_decision(program, ctx, argv),
-        // `close --bypass-warning` (a program) is Class U, decided before this. Without it the
-        // CLI closes buffers only: lamports go to the recipient.
-        "close" => buffer_close_decision(program, ctx),
+        // `program close` in any form is Class U, decided before this (shared list); a hard
+        // guard here too in case the list is bypassed.
+        "close" => irreversible_decision(program, ctx, argv, Scope::Destructive, "program close"),
         // Read-only program subcommands.
         "show" | "dump" => readonly(program),
         _ => ask_unknown(program),
@@ -1442,27 +1441,6 @@ fn authority_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, G
     (
         Decision::Ask {
             reason: reason.to_string(),
-        },
-        meta,
-    )
-}
-
-/// A program buffer close (`program close` without `--bypass-warning`): Class C, a grantable
-/// ask on every cluster (spec §2: recoverable close asks; a covering grant allows below High).
-fn buffer_close_decision(program: &str, ctx: &Context) -> (Decision, GateMeta) {
-    let mut meta = GateMeta::new(Scope::Destructive, false);
-    meta.program = Some(program.to_string());
-    let net = if matches!(ctx.network, Network::Mainnet) {
-        "mainnet "
-    } else {
-        ""
-    };
-    (
-        Decision::Ask {
-            reason: format!(
-                "{program} {net}buffer close (recoverable: lamports go to the recipient) — \
-                 approve to proceed"
-            ),
         },
         meta,
     )

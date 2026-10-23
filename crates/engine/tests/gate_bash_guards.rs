@@ -74,7 +74,8 @@ fn gate_bash(command: &str) -> Option<String> {
 
 // ---------------------------------------------------------------------------------------
 // D8 v2 §3.1 Class U: a hard-guard ask on identified localnet/devnet, a deny on mainnet,
-// testnet and unknown clusters. Authority changes to a new key and buffer closes are Class C.
+// testnet and unknown clusters (program and buffer closes included). Authority changes to a
+// new key are Class C.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -158,14 +159,25 @@ fn every_irreversible_command_asks_on_devnet_as_hard_guard() {
             assert!(meta.hard_guard, "{cmd} on {network:?} must be a hard guard");
         }
     }
-    // A buffer close (no `--bypass-warning`) is a grantable Class C ask.
-    for cmd in ["solana program close BUF", "anchor program close BUF"] {
-        for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
+    // A program or buffer close in any form is Class U: never grantable, a hard-guard ask
+    // on an identified devnet/localnet and a deny on testnet.
+    for cmd in [
+        "solana program close BUF",
+        "solana program close --buffers",
+        "anchor program close BUF",
+    ] {
+        for network in [Network::Devnet, Network::Localnet] {
             let (d, meta) = decide(cmd, network);
             assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
-            assert!(!meta.hard_guard, "{cmd} on {network:?} is grantable");
+            assert!(meta.hard_guard, "{cmd} on {network:?} is never grantable");
             assert_eq!(meta.scope, Scope::Destructive);
         }
+        let (d, meta) = decide(cmd, Network::Testnet);
+        assert!(
+            matches!(d, Decision::Deny { .. }),
+            "{cmd} on testnet: {d:?}"
+        );
+        assert!(meta.hard_guard);
     }
 }
 

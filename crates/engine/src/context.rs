@@ -289,8 +289,9 @@ const BOOL_FLAGS: &[&str] = &[
     // Irreversible-action flags.
     "--final",
     "--disable",
-    // `solana program close <program-id>` confirmation (Class U).
+    // `solana program close` (Class U): a program's confirmation, and every buffer.
     "--bypass-warning",
+    "--buffers",
 ];
 
 /// Short flags that take a value, with the long flag each stands for (`-p` differs by CLI).

@@ -167,6 +167,10 @@ fn class_u_templates() -> Vec<String> {
         "solana program set-upgrade-authority P --final {c}".into(),
         "solana program-v4 finalize P {c}".into(),
         "solana program close P --bypass-warning {c}".into(),
+        "solana program close BUF {c}".into(),
+        "solana program close --buffers {c}".into(),
+        "solana program close BUF --bypass-warning {c}".into(),
+        "anchor program close BUF {c}".into(),
         format!("spl-token authorize {M} mint --disable {{c}}"),
         format!("spl-token close-mint {M} {{c}}"),
         format!("spl-token close {D} {{c}}"),
@@ -351,7 +355,6 @@ fn class_c_value_rows(cluster: &str) -> Vec<String> {
         format!("solana transfer {D} 0.5 {cluster}"),
         format!("spl-token transfer {M} 1 {D} {cluster}"),
         format!("solana program deploy x.so {cluster}"),
-        format!("solana program close BUF {cluster}"),
     ]
 }
 
@@ -988,7 +991,7 @@ fn a_grant_never_lifts_a_compound_holding_class_u_or_a_hard_guard() {
         format!("solana transfer {D} 0.5 -um && spl-token burn A 1 -ud"),
         format!("solana transfer {D} 0.5 -um && solana program close P --bypass-warning -ul"),
         "solana program deploy x.so -um && anchor idl close P --provider.cluster devnet".to_string(),
-        "solana program close BUF -um; spl-token close A -ud".to_string(),
+        "solana program deploy x.so -um; solana program close BUF -ud".to_string(),
         format!(
             "solana transfer {D} 0.5 -um && solana program set-upgrade-authority P --new-upgrade-authority {Q} -um"
         ),

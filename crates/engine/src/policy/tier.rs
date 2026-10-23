@@ -521,7 +521,7 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["allow", "allow", "allow", "n/o"],
     ),
     (
-        "Class C on identified test cluster: authority change, recoverable close",
+        "Class C on identified test cluster: authority change",
         ["ask", "ask", "ask", "ask"],
     ),
     (

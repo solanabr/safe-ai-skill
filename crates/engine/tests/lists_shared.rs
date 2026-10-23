@@ -24,7 +24,7 @@ fn lists_embedded_equal_policy_shared_byte_for_byte() {
 #[test]
 fn lists_every_file_parses_and_the_manifest_matches() {
     let all = lists::lists().expect("embedded lists parse and match MANIFEST");
-    assert_eq!(all.contract, "1.1.0");
+    assert_eq!(all.contract, "1.2.0");
     assert_eq!(all.manifest_sha256.len(), 64);
     assert_eq!(all.credentials.len(), 63);
     assert_eq!(all.exfil_hosts.len(), 84);

@@ -86,7 +86,7 @@ The axis is whether an action destroys a capability **even for its rightful owne
 Defined by the `irreversible` rows of `onchain-verbs.list`:
 
 - `--final` on `program deploy|write-buffer|upgrade|set-upgrade-authority` (`solana`, `anchor program`, `anchor deploy -- --final`), any `program-v4` subcommand with `--final`, `program-v4 finalize`;
-- `program close … --bypass-warning` (closing a program); without `--bypass-warning` the engine cannot tell a program from a buffer and treats the close as a buffer close (Class C);
+- `program close` in every form: a program (`--bypass-warning`) or a buffer (`<buffer>`, `--buffers`). The command line cannot tell a program from a buffer, so every close is Class U and no grant covers it;
 - `spl-token authorize … --disable` (any authority), `spl-token close-mint`, `close`, `burn`; `anchor idl erase-authority`, `anchor idl close`; `close-vote-account`.
 
 The verdict is keyed on the resolved cluster (flag, then a `-C` config file, then for `anchor` the nearest `Anchor.toml`, then the CLI config as `solana config get` reports it; `ANCHOR_PROVIDER_URL` can only make an anchor command riskier, and a command line that sets a variable the CLIs read their config through, or changes directory or the CLI config first, makes later commands Unknown). **Mainnet, Unknown, or any cluster not positively identified as localnet or devnet (testnet included) is a deny**, with the exact command echoed ("run it yourself"). **A positively identified localnet or devnet is a hard-guard ask.** Only exact hosts with an `http(s)://` or `ws(s)://` scheme count (`devnet.attacker.example` and a schemeless `devnet.helius-rpc.com` are Unknown). No grant, tier, repo setting or env variable relaxes either verdict, and Class U is not grantable.
@@ -95,12 +95,12 @@ The verdict is keyed on the resolved cluster (flag, then a `-C` config file, the
 
 ### Class C: value or capability to a counterparty
 
-Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, buffer close, `set-upgrade-authority` and `spl-token authorize` to a new key, `anchor idl set-authority`, stake/vote/nonce withdraws, `spl-token gc`.
+Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, `set-upgrade-authority` and `spl-token authorize` to a new key, `anchor idl set-authority`, stake/vote/nonce withdraws, `spl-token gc`.
 
 - On mainnet or an Unknown cluster: ask at Off, Relaxed and Medium; deny at High. A confirmed grant that covers it (grantable scopes only, a mainnet deploy included) allows below High and never at High. Policy `network.mainnet: deny` forces a deny at every tier.
 - A grant covers one action of its scope. A command line joining two or more gated on-chain actions, or holding any hard-guard ask, is never covered by a grant and asks (deny at High). A grant allows only a direct `solana …`/`spl-token …`/`anchor …` command; the same command behind a wrapper (`env FOO=1 …`) gets no allow from the plugin.
-- On an identified test cluster: deploy and upgrade have no opinion; a transfer within the spend caps is allowed below High (no opinion at High); an authority change or a recoverable close asks at every tier.
-- The hard guards `set_authority` and `account_close` stay unrelaxable. A buffer close is Class C, not `account_close`: a confirmed `destructive` grant can allow it below High.
+- On an identified test cluster: deploy and upgrade have no opinion; a transfer within the spend caps is allowed below High (no opinion at High); an authority change asks at every tier.
+- The hard guards `set_authority` and `account_close` stay unrelaxable. A program buffer close is Class U (see above), never grantable.
 
 A Solana command the parser can't read (a name inside `bash -c "solana $X"`, `eval`, a pipe into `sh`, a program spelled as an expansion) asks as a hard guard, and denies at High. A Bash command over 256 KiB, or with more than 2048 nested expansions, asks without being parsed (deny at High and headless). An MCP tool that moves value or signs asks, and denies at High (an MCP call names no cluster).
 

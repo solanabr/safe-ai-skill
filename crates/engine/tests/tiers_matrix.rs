@@ -702,6 +702,10 @@ fn class_u_templates() -> Vec<String> {
         "solana program set-upgrade-authority P --final {c}".into(),
         "solana program-v4 finalize P {c}".into(),
         "solana program close P --bypass-warning {c}".into(),
+        "solana program close BUF {c}".into(),
+        "solana program close --buffers {c}".into(),
+        "solana program close BUF --bypass-warning {c}".into(),
+        "anchor program close BUF {c}".into(),
         format!("spl-token authorize {M} mint --disable {{c}}"),
         format!("spl-token close-mint {M} {{c}}"),
         format!("spl-token close {D} {{c}}"),
@@ -819,7 +823,6 @@ fn f3_class_c_on_mainnet_or_unknown() {
             format!("solana transfer {D} 0.5 {cluster}"),
             format!("spl-token transfer {M} 1 {D} {cluster}"),
             format!("solana program deploy x.so {cluster}"),
-            format!("solana program close BUF {cluster}"),
         ] {
             let cmd = cmd.trim_end();
             check(cmd, w.x4("Bash", &bash(cmd)), ASK_HIGH_DENY);

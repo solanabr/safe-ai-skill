@@ -4,7 +4,7 @@ Security firewall and supply-chain verifier for Solana AI development in Claude
 Code. Its hooks read Solana CLI, SPL Token and Anchor commands and value-moving
 MCP calls before they run: mainnet deploys, authority changes and over-cap
 transfers ask for your approval, and irreversible actions (`--final`,
-`program close --bypass-warning`, `spl-token close|burn`, …) are denied on
+`program close` (program or buffer), `spl-token close|burn`, …) are denied on
 mainnet or any cluster not identified as localnet or devnet. Credential stores,
 keypairs and project `.env` files are read-denied. The firewall takes a tier
 (`off < relaxed < medium < high`) as an input. A supply-chain verifier runs at
