@@ -63,6 +63,15 @@ mod tests {
     }
 
     #[test]
+    fn bare_checksum_valid_seed_phrase_blocks() {
+        let prompt =
+            "import scheme spot photo card baby mountain device kick cradle pact join borrow";
+        assert!(check(prompt).is_some());
+        let prompt = "import scheme spot photo card baby mountain device kick cradle pact join zoo";
+        assert!(check(prompt).is_none(), "checksum fails, no keyword");
+    }
+
+    #[test]
     fn keypair_array_blocks() {
         let arr: Vec<String> = (0..64).map(|i| (i % 256).to_string()).collect();
         let prompt = format!("load this wallet [{}]", arr.join(","));

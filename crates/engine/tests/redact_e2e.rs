@@ -320,3 +320,28 @@ fn clean_results_and_payloads_without_tool_response_print_nothing() {
     legacy["tool_output"] = json!(format!("HELIUS_API_KEY={UUID}"));
     w.assert_redact(&legacy, "");
 }
+
+#[test]
+fn bare_and_keygen_seed_phrases_are_redacted() {
+    let w = World::new();
+    let phrase = "scheme spot photo card baby mountain device kick cradle pact join borrow";
+    let keygen = format!(
+        "Wrote new keypair to /tmp/k.json\n====\npubkey: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\n====\n\
+         Save this seed phrase to recover your new keypair:\n{phrase}\n====\n"
+    );
+    let payload = w.payload(
+        "Bash",
+        json!({ "command": "solana-keygen new --no-bip39-passphrase -o /tmp/k.json" }),
+        json!({ "stdout": keygen, "stderr": phrase, "interrupted": false, "isImage": false }),
+    );
+    w.assert_redact(
+        &payload,
+        &updated(json!({
+            "interrupted": false,
+            "isImage": false,
+            "stderr": "***REDACTED:seed_phrase***",
+            "stdout": "Wrote new keypair to /tmp/k.json\n====\npubkey: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\n====\n\
+                       Save this seed phrase to recover your new keypair:\n***REDACTED:seed_phrase***\n====\n"
+        })),
+    );
+}

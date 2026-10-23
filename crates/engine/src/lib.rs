@@ -25,6 +25,7 @@
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
 pub mod audit;
+pub mod bip39;
 pub mod confirm;
 pub mod context;
 pub mod datadir;
