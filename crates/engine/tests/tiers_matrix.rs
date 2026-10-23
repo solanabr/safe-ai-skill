@@ -1461,11 +1461,12 @@ fn f5_after_verify_trust_a_high_pack_has_no_opinion_but_a_trusted_combo_still_de
         path: w.data.path().to_path_buf(),
         trusted: true,
     };
+    let req = verify::request_trust(&dir, &pack.canonicalize().unwrap()).expect("request");
+    // Read after the request exists: it is stamped with the clock at creation.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let req = verify::request_trust(&dir, &pack.canonicalize().unwrap()).expect("request");
     let code = confirm::announce_pending(&dir, now)
         .into_iter()
         .find(|a| a.id.as_str() == req.id)
