@@ -264,11 +264,12 @@ pasted text is refused, and three wrong codes cancel the session's pending reque
 one Claude Code session (the one whose agent ran the command, or, for a request made in your terminal, the
 first interactive session that shows its code): its code is shown and accepted only there (resuming keeps
 the session; `/clear` starts a new one). Nothing is announced or confirmed in a headless session (CI or a
-headless switch), in a non-interactive `claude -p`, in a Claude Code session started from inside another
-one (an agent's nested `claude`), or when the engine cannot read the process table to tell (a sandboxed
-process, native Windows): a code typed there changes nothing, you are told why, and the request stays
-pending for your own interactive terminal session. Hosts that run Claude Code in print mode (some desktop
-or IDE integrations) therefore cannot confirm; use a terminal session. Raising the tier (or tightening `--env-read`) and `revoke` apply at
+headless switch), in a non-interactive `claude -p`, or in a Claude Code session started from inside
+another one (an agent's nested `claude`): a code typed there changes nothing, you are told why, and the
+request stays pending. Where the engine can't read the process table (native Windows, a sandboxed hook),
+only a request made inside that session (`! safe-ai-skill tier …`) can be confirmed there. Whether
+desktop or IDE hosts run Claude Code in print mode (which can't confirm) is unverified; a terminal
+session always works. Raising the tier (or tightening `--env-read`) and `revoke` apply at
 once. Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`; anything
 else is an error.
 
