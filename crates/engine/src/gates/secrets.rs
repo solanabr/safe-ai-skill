@@ -159,7 +159,8 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
     if matches!(nested, Decision::Deny { .. }) {
         return nested;
     }
-    let scanned = scan_segments(command, policy, Some(cwd), &mut budget);
+    let rpc_quiet = !names_http_redirect_env(command);
+    let scanned = scan_segments(command, policy, Some(cwd), rpc_quiet, &mut budget);
     match (tripwire, nested) {
         // Too complex for the tripwire: a secret read found anyway still denies.
         (ask @ Decision::Ask { .. }, _) | (_, ask @ Decision::Ask { .. })
@@ -176,6 +177,7 @@ fn scan_segments(
     command: &str,
     policy: &Policy,
     cwd: Option<&Path>,
+    rpc_quiet: bool,
     budget: &mut tamper::Budget,
 ) -> Decision {
     // Per-segment secret-read / exfil scan. A clear secret access or upload is a hard
@@ -183,7 +185,7 @@ fn scan_segments(
     // the strongest segment decision and short-circuit on a `Deny`.
     let mut segment_decision = Decision::Defer;
     for segment in split_segments(command) {
-        let Ok(decision) = decide_segment(segment, policy, cwd, budget) else {
+        let Ok(decision) = decide_segment(segment, policy, cwd, rpc_quiet, budget) else {
             return tamper::too_complex();
         };
         match decision {
@@ -209,7 +211,7 @@ fn scan_segments(
         if budget.spend(words.len()).is_err() {
             return tamper::too_complex();
         }
-        let Ok(decision) = decide_command(&words, policy, cwd, budget) else {
+        let Ok(decision) = decide_command(&words, policy, cwd, rpc_quiet, budget) else {
             return tamper::too_complex();
         };
         match decision {
@@ -314,6 +316,7 @@ fn decide_segment(
     segment: &str,
     policy: &Policy,
     cwd: Option<&Path>,
+    rpc_quiet: bool,
     budget: &mut tamper::Budget,
 ) -> Result<Decision, tamper::TooComplex> {
     let all: Vec<String> = tokenize(segment);
@@ -325,7 +328,7 @@ fn decide_segment(
     if matches!(redirect, Some(Decision::Deny { .. })) {
         return Ok(redirect.unwrap_or(Decision::Defer));
     }
-    let command = decide_command(&all, policy, cwd, budget)?;
+    let command = decide_command(&all, policy, cwd, rpc_quiet, budget)?;
     Ok(match redirect {
         Some(held) => stricter(held, command),
         None => command,
@@ -360,6 +363,7 @@ fn decide_command(
     all: &[String],
     policy: &Policy,
     cwd: Option<&Path>,
+    rpc_quiet: bool,
     budget: &mut tamper::Budget,
 ) -> Result<Decision, tamper::TooComplex> {
     let (assignments, tokens) = strip_wrappers(all);
@@ -369,7 +373,7 @@ fn decide_command(
 
     // `npx -c 'varlock printenv K'` / `--call`: the script is a command line of its own.
     if let Some(script) = runner_call_script(tokens) {
-        let inner = scan_segments(script, policy, cwd, budget);
+        let inner = scan_segments(script, policy, cwd, rpc_quiet, budget);
         if !matches!(inner, Decision::Defer) {
             return Ok(inner);
         }
@@ -474,7 +478,7 @@ fn decide_command(
         for tok in tokens {
             spend_matches(tok)?;
         }
-        return Ok(decide_http_exfil(tokens, policy));
+        return Ok(decide_http_exfil(tokens, policy, rpc_quiet));
     }
 
     Ok(Decision::Defer)
@@ -772,7 +776,7 @@ fn flag_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
 
 /// Decide a `curl`/`wget` segment: deny if it uploads a secret file, ask if it POSTs to a
 /// host that is not allowlisted.
-fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
+fn decide_http_exfil(tokens: &[String], policy: &Policy, rpc_quiet: bool) -> Decision {
     let mut posts = false;
 
     for (i, tok) in tokens.iter().enumerate() {
@@ -820,7 +824,7 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
         return Decision::Defer;
     }
 
-    if let Some(hosts) = solana_rpc_destinations(tokens) {
+    if let Some(hosts) = solana_rpc_destinations(tokens).filter(|_| rpc_quiet) {
         if hosts.iter().all(|h| host_allowlisted(h)) || policy.tier() < Tier::High {
             return Decision::Defer;
         }
@@ -850,6 +854,24 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
     }
 
     Decision::Defer
+}
+
+/// Whether `command` names an environment variable or config file that can send a curl/wget
+/// request through another host or read options from elsewhere (`https_proxy=`, `ALL_PROXY`,
+/// `HOME=`, `CURL_HOME`, `XDG_CONFIG_HOME`, `.curlrc`, `WGETRC`): the quiet Solana RPC rule
+/// then does not apply.
+fn names_http_redirect_env(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "proxy",
+        "home=",
+        "curlrc",
+        "wgetrc",
+        "curl_home",
+        "xdg_config",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
 }
 
 /// The destination hosts of a `curl`/`wget` POST when every one is a known Solana RPC host
@@ -1454,7 +1476,7 @@ mod tests {
     #[test]
     fn exhausted_budget_is_too_complex() {
         let mut budget = tamper::Budget::new(10, std::time::Duration::from_secs(60));
-        let scanned = decide_segment("cat a b c d e f", &policy(), None, &mut budget);
+        let scanned = decide_segment("cat a b c d e f", &policy(), None, true, &mut budget);
         assert_eq!(scanned, Err(tamper::TooComplex));
     }
 
