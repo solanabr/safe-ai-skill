@@ -1118,6 +1118,17 @@ fn only_allow_listed_loaders_may_name_an_env_file() {
         "dotenv -e .env -- cargo test",
         "dotenvx run -f .env -- node app.js",
         "dotenvx run -f .env -- pnpm dev",
+        "dotenv -e .env -- npm start",
+        "dotenv -e .env -- npm test",
+        "dotenv -e .env -- npm run build",
+        "dotenvx run -f .env -- npm start",
+        "dotenvx run --env-file=.env -- npm start",
+        "dotenvx run --env-file .env -- npm run dev",
+        "dotenvx run -f .env -- make",
+        "dotenv -e .env -- yarn dev",
+        "dotenv -e .env -- pnpm run dev",
+        "node --env-file=.env --import=./instrument.mjs server.js",
+        "node --env-file=.env -r ./setup.js server.js",
     ] {
         check(cmd, w.x4("Bash", &bash(cmd)), NO4);
     }
@@ -1154,6 +1165,25 @@ fn only_allow_listed_loaders_may_name_an_env_file() {
         "dotenv -e .env -- printenv",
         "dotenvx run -f .env -- node -e 'console.log(process.env)'",
         "dotenv -e .env node app.js",
+        // Package-manager spellings that run a printer or arbitrary code (R5).
+        "dotenv -e .env -- npm run env",
+        "dotenv -e .env -- npm env",
+        "dotenv -e .env -- pnpm exec printenv",
+        "dotenv -e .env -- pnpm dlx printenv",
+        "dotenv -e .env -- pnpm env",
+        "dotenv -e .env -- yarn exec env",
+        "dotenv -e .env -- yarn env",
+        "dotenv -e .env -- yarn run env",
+        "dotenv -e .env -- yarn node -e \"console.log(process.env)\"",
+        "dotenvx run -f .env -- pnpm exec node -e 'console.log(process.env)'",
+        "dotenvx run --env-file=.env -- npm exec -- printenv",
+        // Module flags carrying inline code (R6).
+        "node --env-file=.env --import=data:text/javascript,console.log(process.env) server.js",
+        "node --env-file=.env --import data:text/javascript,console.log(1) server.js",
+        "node --env-file=.env --loader=data:text/javascript,x server.js",
+        "node --env-file=.env --experimental-loader=https://x.io/l.mjs server.js",
+        "node --env-file=.env --require=data:x server.js",
+        "node --env-file=.env -r https://x.io/r.js server.js",
         // Stdin feeding the interpreter.
         "echo \"console.log(process.env)\" | node --env-file=.env -",
         "node --env-file=.env <<< 'console.log(process.env)'",

@@ -155,7 +155,7 @@ const ENV_REMOVERS: &[&str] = &["rm", "unlink", "shred"];
 const ENV_RELOCATORS: &[&str] = &["mv", "cp", "ln", "rsync", "install"];
 
 /// Build tools a `dotenv`/`dotenvx` wrapper may run with the loaded environment.
-const ENV_BUILD_TOOLS: &[&str] = &["pnpm", "yarn", "next", "vite", "anchor", "cargo"];
+const ENV_BUILD_TOOLS: &[&str] = &["next", "vite", "anchor", "cargo", "make"];
 
 /// Compose subcommands that never print interpolated values.
 const COMPOSE_SAFE: &[&str] = &[
@@ -270,6 +270,14 @@ fn interpreter_loads(words: &[&str], from: usize) -> Vec<usize> {
         if inline {
             return Vec::new();
         }
+        // Module preloads: a `data:` or `http(s):` value is inline code.
+        if let Some((value, span)) = module_flag_at(words, i) {
+            if is_inline_module(value) {
+                return Vec::new();
+            }
+            i += span;
+            continue;
+        }
         if w.starts_with('-') {
             i += 1;
             continue;
@@ -287,6 +295,126 @@ fn interpreter_loads(words: &[&str], from: usize) -> Vec<usize> {
         };
     }
     Vec::new()
+}
+
+/// Node/Bun/Deno flags that load a module before the script.
+const MODULE_FLAGS: &[&str] = &[
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--require",
+    "-r",
+    "--preload",
+];
+
+/// A module flag at `i`: its value and how many words it spans (`--import=v` or `--import v`).
+fn module_flag_at<'a>(words: &[&'a str], i: usize) -> Option<(&'a str, usize)> {
+    let w = words.get(i)?;
+    if MODULE_FLAGS.contains(w) {
+        return Some((words.get(i + 1).copied().unwrap_or(""), 2));
+    }
+    MODULE_FLAGS.iter().find_map(|f| {
+        w.strip_prefix(f)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(|v| (v, 1))
+    })
+}
+
+fn is_inline_module(value: &str) -> bool {
+    let lower = value.trim_matches(['"', '\'']).to_ascii_lowercase();
+    lower.starts_with("data:") || lower.starts_with("http:") || lower.starts_with("https:")
+}
+
+/// Programs that print the environment or a file.
+const PRINTERS: &[&str] = &[
+    "env", "printenv", "cat", "echo", "printf", "set", "export", "declare", "head", "tail", "less",
+    "more", "od", "xxd", "strings", "tee",
+];
+
+fn is_printer(word: &str) -> bool {
+    PRINTERS.contains(&word.rsplit('/').next().unwrap_or(word))
+}
+
+/// Interpreters whose inline-code flags make a wrapped command a printer.
+const INTERPRETERS: &[&str] = &[
+    "python",
+    "python2",
+    "python3",
+    "ruby",
+    "perl",
+    "node",
+    "deno",
+    "bun",
+    "php",
+    "lua",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "osascript",
+    "pwsh",
+];
+
+/// Inline-code flags of [`INTERPRETERS`].
+const INLINE_FLAGS: &[&str] = &[
+    "-c",
+    "-e",
+    "-E",
+    "-p",
+    "-pe",
+    "-r",
+    "--eval",
+    "--print",
+    "--command",
+    "-Command",
+];
+
+/// Subcommands of a package manager that run an arbitrary program or print the environment.
+const PM_RUNNERS: &[&str] = &["exec", "dlx", "x", "node", "env", "npx", "create"];
+
+/// Whether `inner` (the command a `dotenv`/`dotenvx` wrapper runs) is a build tool that is
+/// not asked to print the environment: `npm start|test|run <name>`, `pnpm`/`yarn` without
+/// `exec|dlx|node|env|run env`, `next`, `vite`, `anchor`, `cargo`, `make`; and no printer or
+/// interpreter-with-inline-code anywhere in its words.
+fn build_tool_ok(inner: &[&str]) -> bool {
+    let Some(first) = inner.first() else {
+        return false;
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let sub = inner.get(1).copied();
+    let tool_ok = match name {
+        "npm" => match sub {
+            Some("start" | "test" | "t") => true,
+            Some("run" | "run-script" | "rum" | "urn") => inner
+                .get(2)
+                .is_some_and(|n| !n.starts_with('-') && *n != "env"),
+            _ => false,
+        },
+        "pnpm" | "yarn" => match sub {
+            None => name == "yarn",
+            Some(s) if PM_RUNNERS.contains(&s) => false,
+            Some("run" | "run-script") => inner.get(2).is_some_and(|n| *n != "env"),
+            Some(_) => true,
+        },
+        _ => ENV_BUILD_TOOLS.contains(&name),
+    };
+    tool_ok && !runs_printer(&inner[1..])
+}
+
+/// Whether `words` name a printer, or an interpreter followed by an inline-code flag.
+fn runs_printer(words: &[&str]) -> bool {
+    words.iter().enumerate().any(|(i, w)| {
+        let name = w.rsplit('/').next().unwrap_or(w);
+        is_printer(w)
+            || (INTERPRETERS.contains(&name)
+                && words[i + 1..].iter().any(|f| INLINE_FLAGS.contains(f)))
+    })
 }
 
 fn docker_run_loads(words: &[&str]) -> Vec<usize> {
@@ -363,12 +491,10 @@ fn wrapper_loads(words: &[&str], from: usize, flags: &[&str]) -> Vec<usize> {
         }
     }
     let inner = &words[dashes + 1..];
-    let Some(first) = inner.first() else {
+    if inner.is_empty() {
         return Vec::new();
-    };
-    let name = first.rsplit('/').next().unwrap_or(first);
-    let build_tool =
-        ENV_BUILD_TOOLS.contains(&name) || (name == "npm" && inner.get(1) == Some(&"run"));
+    }
+    let build_tool = build_tool_ok(inner);
     let inner_loads = loads_in(inner, 1);
     let inner_ok = build_tool || !inner_loads.is_empty() || plain_loader(inner);
     if out.is_empty() || !inner_ok {
