@@ -30,6 +30,7 @@ Known holes, in short (the full table, with what closes each, is in [SECURITY.md
 - **Bash writes to `.env`** (`sed -i`, `perl -pi`): not covered at any tier.
 - **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
 - **Values already in context:** a secret that was read has reached the model provider and the transcripts; nothing recalls it.
+- **Failed tool calls are not redacted:** redaction applies to successful tool results only. When a Bash command exits non-zero (or an MCP or Read call errors), Claude Code gives the model the raw output and offers hooks no way to replace it; the plugin only warns you and the model when that output held a secret.
 - **Egress:** no exfil tripwire ships in 1.1.0 (planned, [#19](https://github.com/solanabr/safe-ai-skill/issues/19)). Sending a secret file by path (`curl -d @.env`, `-T`, `-F`, `scp`) is denied and an inline `curl`/`wget` POST to a non-localhost host asks (below High, not when it goes to a known Solana RPC host), but requests to request-bin, tunnel and paste hosts, IP literals, redirects, DNS and `WebFetch` URLs are not gated. The kit's sandbox `deniedDomains`, or Claude Code's own sandbox with the entries in [SECURITY.md](SECURITY.md#recommended-setup), closes the host list.
 - **Code run through an MCP executor** (for example context-mode's `ctx_execute`): shell code gets the same checks as a Bash call, but code in other languages gets only its string literals checked as paths and shell commands, and a Solana CLI named there asks. Anything built at runtime gets through, as in Bash.
 - **Directory search through Bash `grep`/`rg`:** only a pattern nudge applies there.
@@ -154,8 +155,8 @@ The plugin takes a tier as an input: `off < relaxed < medium < high`, default `r
 | `.env.schema` and templates (content guard applies) | n/o | n/o | n/o | n/o |
 | Write/Edit/MultiEdit to a project env file; agent `env set\|unset` | n/o | n/o | deny | deny |
 | `env keys` | n/o | n/o | n/o | n/o |
-| Pattern redaction (keys, seeds, PEM, vendor tokens) | on | on | on | on |
-| Value scrub of project env values in tool output, except an opted-in raw read | on | on | on | on |
+| Pattern redaction (keys, seeds, PEM, vendor tokens) in successful tool results | on | on | on | on |
+| Value scrub of project env values in successful tool results, except an opted-in raw read | on | on | on | on |
 | Irreversible on-chain action (`--final`, `program close` (program or buffer), `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
 | … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
 | Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |

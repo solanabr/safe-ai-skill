@@ -50,7 +50,7 @@ case $sub in
   # A fail-open Skill gate would let a blocked pack's `!cmd` run (spec D6.2 as amended).
   gate-skill) kind=skill ;;
   # Hooks on events other than PreToolUse, where `ask` means nothing.
-  gate-prompt-expansion | redact | prompt-guard | pending-notice) kind=other ;;
+  gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice) kind=other ;;
   gate-*) kind=broad ;;
   verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
   *) kind=cli ;;

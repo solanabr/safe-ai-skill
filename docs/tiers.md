@@ -75,7 +75,7 @@ The full table is in the [README](../README.md#firewall-tiers). It is the table 
 - **`.env.schema` and templates** (`.env.example|.sample|.template|.dist`) are readable, subject to the content guard: a schema holding key material, a literal credential, over 64 KiB or not a regular file is denied.
 - **Opt-in (ships disabled):** release builds of 1.1.0 do not honour it; it needs the `env-read-opt-in` cargo feature, which stays off until the exfil tripwire ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)) can deny an opted-in value sent to the network. In such a build: `safe-ai-skill tier --env-read ask|tier`, user scope only, only while the sandbox is `On`. `tier` follows the tier (no opinion at Off and Relaxed, deny at Medium and High); `ask` prompts at Off, Relaxed and Medium and denies at High. With the sandbox `Unknown`, `Off`, on Windows or on Linux without `bwrap` the opt-in is suspended and reads stay denied ("opt-in suspended: sandbox not on"). A repo's `policy.yaml` `env_read`, a kit file or an env variable can only tighten it. The response to an opted-in raw read isn't value-scrubbed.
 - **Writes:** Write, Edit and MultiEdit to a project env file, and an agent-run `env set|unset`, are allowed at Off and Relaxed and denied at Medium and High. A write through Bash (`sed -i`, `perl -pi`, `python3 -c`) is not covered at any tier (see [Known holes](#known-holes)). `env keys` is always open.
-- **Redaction** of key, seed, PEM and vendor-token patterns, and the **value scrub** (literal values from the project's env files replaced with `«redacted:KEY»`), run at every tier. The one exception is the response of an opted-in raw read, so a read-then-Edit round trip keeps the real values in the file.
+- **Redaction** of key, seed, PEM and vendor-token patterns, and the **value scrub** (literal values from the project's env files replaced with `«redacted:KEY»`), run at every tier on **successful** tool results. The one exception is the response of an opted-in raw read, so a read-then-Edit round trip keeps the real values in the file. A failed tool call (a Bash command that exits non-zero, a Read, Grep or MCP error) is not redacted: Claude Code fires `PostToolUseFailure` for it, which can add context but cannot replace the output, so the raw text reaches the model. The `failure-notice` hook then tells the model not to repeat or send it and warns you (key names only, never a value). See [Known holes](#known-holes).
 
 ## On-chain: unrecoverable vs counterparty
 
@@ -153,7 +153,7 @@ One rule, shared with the kit.
 
 ## Known holes
 
-The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
+The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). Specific to this plugin's redaction: failed tool results (non-zero Bash exits, tool errors) reach the model unredacted, because Claude Code lets a hook replace only a successful result. One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
 
 ## Migration from profiles
 

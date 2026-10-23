@@ -179,7 +179,7 @@ const MUTATING_SUBCOMMANDS: &[&str] = &["grant", "revoke", "confirm"];
 /// Hook-only subcommands: run through Bash they could replay a forged hook payload (a fake
 /// UserPromptSubmit to `prompt-guard`, a fake PostToolUse to `pending-notice`). Every `gate-*`
 /// subcommand is hook-only too.
-const HOOK_SUBCOMMANDS: &[&str] = &["pending-notice", "prompt-guard", "redact"];
+const HOOK_SUBCOMMANDS: &[&str] = &["pending-notice", "prompt-guard", "redact", "failure-notice"];
 
 /// Real subcommands: a cache-path word followed by one of these is the binary being run, not a
 /// path being written. Mutating ones are denied before this list is consulted.
@@ -192,6 +192,7 @@ const SUBCOMMANDS: &[&str] = &[
     "gate-skill",
     "gate-prompt-expansion",
     "redact",
+    "failure-notice",
     "prompt-guard",
     "pending-notice",
     "allow",

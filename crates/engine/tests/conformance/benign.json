@@ -509,6 +509,26 @@
         "exit": 0,
         "stdout": ""
       }
+    },
+    {
+      "name": "failure-notice: a failed command with no secret",
+      "args": [
+        "failure-notice"
+      ],
+      "stdin": {
+        "hook_event_name": "PostToolUseFailure",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "false"
+        },
+        "error": "Exit code 1"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
     }
   ]
 }

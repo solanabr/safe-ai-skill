@@ -26,6 +26,11 @@
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill pending-notice", "timeout": 10, "onFailure": "continue" }
       ]}
     ],
+    "PostToolUseFailure": [
+      { "matcher": "Bash|Read|Grep|mcp__.*", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill failure-notice", "timeout": 10, "onFailure": "continue" }
+      ]}
+    ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill prompt-guard", "timeout": 10, "onFailure": "continue" } ] },
       { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-prompt-expansion", "timeout": 10, "onFailure": "continue" } ] }

@@ -1113,3 +1113,51 @@ fn bash_npx_call_script_is_parsed() {
     }
     assert_silent(&sb.bash("npx -c 'varlock run -- node a.js'"), "run");
 }
+
+/// A failed tool call's output cannot be replaced (PostToolUseFailure takes only
+/// `additionalContext`): `failure-notice` warns the model and the user when it holds a secret,
+/// naming no value, and says nothing otherwise.
+#[test]
+fn failure_notice_warns_about_an_unredactable_failed_output() {
+    let sb = env_sandbox();
+    let failure = |error: &str| {
+        sb.run(
+            "failure-notice",
+            json!({
+                "hook_event_name": "PostToolUseFailure",
+                "cwd": sb.project.path(),
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat src/leak.txt; exit 1"},
+                "error": error,
+            }),
+        )
+    };
+    let run = failure(&format!("Exit code 1\ntoken={VALUE}\n"));
+    let v = run.json();
+    assert!(!run.stdout.contains(VALUE), "{v}");
+    assert_eq!(
+        v["hookSpecificOutput"]["hookEventName"],
+        "PostToolUseFailure"
+    );
+    assert!(v["hookSpecificOutput"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|k| k == "hookEventName" || k == "additionalContext"));
+    assert!(v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap()
+        .contains("could not be redacted"));
+    assert!(v["systemMessage"].as_str().unwrap().contains("unredacted"));
+    for quiet in ["Exit code 1\nno such file", ""] {
+        let run = failure(quiet);
+        assert_eq!(run.stdout.trim(), "", "{quiet:?}");
+    }
+    // Any other event gets nothing.
+    let run = sb.run(
+        "failure-notice",
+        json!({"hook_event_name": "PostToolUse", "cwd": sb.project.path(),
+               "error": format!("token={VALUE}")}),
+    );
+    assert_eq!(run.stdout.trim(), "");
+}

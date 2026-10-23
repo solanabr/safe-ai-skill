@@ -55,6 +55,8 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Event source (`startup`, `resume`, ...).
     pub source: Option<String>,
+    /// What went wrong (PostToolUseFailure); for Bash, `Exit code N` and the output.
+    pub error: Option<String>,
 }
 
 impl HookInput {

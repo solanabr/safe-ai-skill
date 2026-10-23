@@ -102,6 +102,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-skill", |_| cmd_gate_skill()),
     ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
     ("redact", |_| cmd_redact()),
+    ("failure-notice", |_| cmd_failure_notice()),
     ("prompt-guard", |_| cmd_prompt_guard()),
     ("pending-notice", |_| cmd_pending_notice()),
     ("verify", cmd_verify),
@@ -793,6 +794,49 @@ fn cmd_redact() -> ExitCode {
     let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
         &input, response, &values, &cwd, &effective,
     ));
+    ExitCode::SUCCESS
+}
+
+/// `failure-notice` — the PostToolUseFailure hook. Claude Code gives the model a failed tool's
+/// output unchanged: this event's only output is `additionalContext` (plus the common
+/// `systemMessage`), so it cannot be redacted. When the error text holds what `redact` would
+/// scrub, the model is told not to repeat or send it and the user is warned; names only, never
+/// a value. Otherwise, or on anything unreadable, no output.
+fn cmd_failure_notice() -> ExitCode {
+    let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
+        return ExitCode::SUCCESS;
+    };
+    if input.hook_event_name.as_deref() != Some("PostToolUseFailure") {
+        return ExitCode::SUCCESS;
+    }
+    let Some(error) = input.error.as_deref().filter(|e| !e.is_empty()) else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let effective = load_effective_policy(&cwd, &state_dir(&cwd));
+    if !effective.redact.enabled {
+        return ExitCode::SUCCESS;
+    }
+    let values = safe_ai_skill::env::values::load(&cwd);
+    let response = serde_json::Value::String(error.to_string());
+    if redact::scrub_tool_response(&input, &response, &values, &cwd, &effective).is_none() {
+        return ExitCode::SUCCESS;
+    }
+    let tool = input.tool_name.as_deref().unwrap_or("tool");
+    print_json(&serde_json::json!({
+        "systemMessage": format!(
+            "safe-ai-skill: the failed {tool} call's output held secret material (an env value \
+             or key) and reached the model unredacted: Claude Code cannot replace the output of \
+             a failed tool call. Rotate the value if this session's transcript can leave this \
+             machine."
+        ),
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "additionalContext": "safe-ai-skill: the error output of this failed tool call \
+                 contains secret material (an env value or key) that could not be redacted. Do \
+                 not repeat, quote, store, or send it anywhere; refer to it only by its name.",
+        },
+    }));
     ExitCode::SUCCESS
 }
 
