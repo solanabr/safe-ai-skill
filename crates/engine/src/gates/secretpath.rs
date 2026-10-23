@@ -249,7 +249,8 @@ pub fn expand_config_dir_var(word: &str) -> String {
         let braced = tail
             .strip_prefix("${")
             .filter(|t| t.starts_with(NAME))
-            .and_then(|t| t.find('}').map(|end| 2 + end + 1));
+            .and_then(|t| t.find('}'))
+            .and_then(|end| end.checked_add(3));
         let plain = tail
             .strip_prefix('$')
             .and_then(|t| t.strip_prefix(NAME))
@@ -326,6 +327,13 @@ pub fn is_transcript_tree(dir: &str, homes: &[String]) -> bool {
         format!("/{full}")
     };
     under_config_dir(full, "projects") || tree_rest(&rooted, ".claude/projects").is_some()
+}
+
+/// Whether `path` is Claude Code or safe-ai-skill secret state by path: inside a transcript
+/// tree ([`is_transcript_tree`]) or a data dir's state `key`.
+pub fn is_claude_secret(path: &str, homes: &[String]) -> bool {
+    is_transcript_tree(path, homes)
+        || classify_with_homes(path, homes) == Class::HardDeny("safe-ai-skill state key")
 }
 
 /// Where a directory stands relative to a safe-ai-skill data dir (whose `key` authenticates

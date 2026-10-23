@@ -121,7 +121,7 @@ fn status_lists_pending_requests_without_their_codes() {
         .cwd(home.path())
         .plugin_data(&data)
         .stdin(
-            serde_json::json!({"hook_event_name":"UserPromptSubmit","prompt":"hi",
+            serde_json::json!({"session_id":"it-ddir","hook_event_name":"UserPromptSubmit","prompt":"hi",
                                "cwd": home.path()})
             .to_string(),
         )

@@ -601,6 +601,12 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
         if !matches!(decision, Decision::Defer) {
             return decision;
         }
+        if holds_claude_state(s, cwd) {
+            return hard_deny(
+                "a directory holding Claude Code transcripts or safe-ai-skill state; an MCP \
+                 tool's directory search cannot be given exclusions",
+            );
+        }
     }
     if complete {
         return Decision::Defer;
@@ -616,6 +622,42 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
             reason: format!("{reason} — approve to proceed"),
         }
     }
+}
+
+/// Whether `arg` names a directory that is a Claude Code config dir (`<home>/.claude`,
+/// `$CLAUDE_CONFIG_DIR`), lies in a transcript tree, or is in, at or above a safe-ai-skill data
+/// dir (so `$HOME` and `/` too): an MCP tool searching there would reach transcripts or the
+/// state key, and unlike Grep it cannot be given exclusions.
+fn holds_claude_state(arg: &str, cwd: &Path) -> bool {
+    let homes = secretpath::homes_resolved();
+    let target = absolute(arg, cwd, &homes);
+    if !target.is_dir() {
+        return false;
+    }
+    let forms: Vec<String> = [Some(target.clone()), std::fs::canonicalize(&target).ok()]
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            secretpath::normalize(&p.to_string_lossy(), None)
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .collect();
+    let configs: Vec<String> = homes
+        .iter()
+        .map(|h| {
+            format!(
+                "{}/.claude",
+                secretpath::normalize(h, None).trim_end_matches('/')
+            )
+        })
+        .chain(secretpath::config_dirs())
+        .collect();
+    forms.iter().any(|f| {
+        configs.contains(f)
+            || secretpath::data_dir_reach(f, &homes).is_some()
+            || secretpath::is_transcript_tree(f, &homes)
+    })
 }
 
 /// Deepest MCP argument nesting that is path-checked.

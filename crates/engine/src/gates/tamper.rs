@@ -534,6 +534,8 @@ pub fn decide_nested_claude(command: &str) -> Decision {
     // `$(which claude)`: the substitution's output is the program, so `claude` stays the
     // command after its closing `)` or backquote.
     let (mut resolver, mut resolved) = (false, false);
+    // A wrapper flag's value (`exec -a NAME`, `env -u VAR`, `sudo -u USER`) is not a program.
+    let mut skip_value = false;
     for (w, before) in &words {
         if let Some(c) = before {
             if matches!(c, '<') && in_claude {
@@ -557,6 +559,9 @@ pub fn decide_nested_claude(command: &str) -> Decision {
         }
         let base = w.rsplit('/').next().unwrap_or(w).trim_end_matches(".exe");
         let base = base.split('@').next().unwrap_or(base);
+        if std::mem::replace(&mut skip_value, false) && cmd_pos {
+            continue;
+        }
         let at_cmd = std::mem::replace(&mut cmd_pos, false);
         let was_resolver = std::mem::replace(&mut resolver, false);
         if (at_cmd && (base == "claude" || base == "claude-code"))
@@ -570,7 +575,7 @@ pub fn decide_nested_claude(command: &str) -> Decision {
         } else if at_cmd && matches!(base, "which" | "type" | "whence" | "where") {
             resolver = true;
             cmd_pos = true;
-        } else if w == "-c"
+        } else if (w == "-c" && !in_claude)
             || (at_cmd
                 && (w.contains('=')
                     || matches!(
@@ -607,7 +612,17 @@ pub fn decide_nested_claude(command: &str) -> Decision {
             after_wrapper = w != "-c";
         } else if at_cmd && after_wrapper && (w.starts_with('-') || is_plain_value(w)) {
             cmd_pos = true;
-        } else if in_claude && (w == "-p" || w == "--print" || w.starts_with("--print=")) {
+            skip_value = WRAPPER_VALUE_FLAGS.contains(&w.as_str());
+        } else if in_claude
+            && (matches!(
+                w.as_str(),
+                "-p" | "--print" | "-c" | "--continue" | "-r" | "--resume" | "--session-id"
+            ) || w.starts_with("--print=")
+                || w.starts_with("--resume=")
+                || w.starts_with("--session-id="))
+        {
+            // Print mode, or a run that takes over an existing session (its id, so the
+            // session binding of a pending request does not tell it apart).
             print = true;
         }
     }
@@ -630,10 +645,15 @@ pub fn decide_nested_claude(command: &str) -> Decision {
     Decision::Defer
 }
 
+/// Wrapper flags that take a separate value (`exec -a NAME`, `env -u VAR`, `sudo -u USER`,
+/// `timeout -s SIG`, `nice -n 5`).
+const WRAPPER_VALUE_FLAGS: &[&str] = &["-a", "-u", "-g", "-C", "-D", "-S", "-s", "-k", "-n", "-U"];
+
 /// The `ask` reason for a nested, non-interactive Claude Code session.
 pub const NESTED_CLAUDE_REASON: &str = "safe-ai-skill: this runs a nested, non-interactive \
-     Claude Code session (`claude -p` or a prompt on its stdin), which acts with your hooks, \
-     state and permissions where you cannot see it; review it manually.";
+     Claude Code session (`claude -p`, a prompt on its stdin, or a resumed or continued \
+     session), which acts with your hooks, state and permissions where you cannot see it; \
+     review it manually.";
 
 /// A wrapper's value that is not a program: a number or duration (`5`, `1.5s`, `10m`).
 fn is_plain_value(word: &str) -> bool {
@@ -1881,6 +1901,12 @@ mod tests {
             "/opt/homebrew/bin/claude -p hi 2>&1",
             "c\\laude -p hi",
             "CLAUDE -P hi",
+            "exec -a bash claude -p hi",
+            "env -u FOO claude -p hi",
+            "sudo -u me claude --print hi",
+            "claude -c 'safe-ai-skill tier'",
+            "claude --resume abc hi",
+            "claude --session-id 550e8400-e29b-41d4-a716-446655440000 hi",
         ] {
             assert!(
                 matches!(decide_nested_claude(cmd), Decision::Ask { .. }),

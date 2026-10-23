@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
-use crate::gates::{credpaths, read};
+use crate::gates::{credpaths, read, secretpath};
 use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -1050,13 +1050,18 @@ impl Exempt {
     }
 }
 
-/// [`credpaths::is_credential`] of `path` and of its resolved form, each form unless exempt.
+/// [`credpaths::is_credential`] (or Claude Code transcripts and the state key,
+/// [`secretpath::is_claude_secret`]) of `path` and of its resolved form, each form unless
+/// exempt.
 fn literal_hit(path: &Path, exempt: Exempt) -> bool {
-    if !exempt.allows(path) && credpaths::is_credential(path) {
+    let secret = |p: &Path| {
+        credpaths::is_credential(p)
+            || secretpath::is_claude_secret(&p.to_string_lossy(), &secretpath::homes_resolved())
+    };
+    if !exempt.allows(path) && secret(path) {
         return true;
     }
-    std::fs::canonicalize(path)
-        .is_ok_and(|real| !exempt.allows(&real) && credpaths::is_credential(&real))
+    std::fs::canonicalize(path).is_ok_and(|real| !exempt.allows(&real) && secret(&real))
 }
 
 fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
@@ -1067,7 +1072,12 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
     let bare = is_bare(word);
     let judged = |path: &Path| -> bool {
         if wild {
-            !exempt.allows(path) && credpaths::is_credential_glob(path)
+            !exempt.allows(path)
+                && (credpaths::is_credential_glob(path)
+                    || secretpath::is_transcript_tree(
+                        &path.to_string_lossy(),
+                        &secretpath::homes_resolved(),
+                    ))
         } else {
             literal_hit(path, exempt)
         }

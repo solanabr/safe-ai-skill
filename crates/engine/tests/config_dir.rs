@@ -181,3 +181,57 @@ fn the_default_config_dir_stays_protected_beside_a_custom_one() {
     );
     assert_eq!(decision_label(&run), "deny");
 }
+
+#[cfg(unix)]
+#[test]
+fn bash_reads_through_cd_relative_paths_and_symlinks_deny() {
+    let w = World::new("cfgdir-rel");
+    let home = w.home.path().to_path_buf();
+    std::fs::create_dir_all(home.join(".claude/projects/p")).unwrap();
+    std::fs::write(home.join(".claude/projects/p/t.jsonl"), "x\n").unwrap();
+    std::os::unix::fs::symlink(w.cfg.path(), w.proj.join("link")).unwrap();
+    std::os::unix::fs::symlink(w.cfg.join("projects"), w.proj.join("plink")).unwrap();
+    std::os::unix::fs::symlink(home.join(".claude"), w.proj.join("hlink")).unwrap();
+    for command in [
+        "cd $CLAUDE_CONFIG_DIR; cat projects/p/t.jsonl",
+        "cd $CLAUDE_CONFIG_DIR && cat projects/p/t.jsonl",
+        "cat link/projects/p/t.jsonl",
+        "cat link/projects/p/*",
+        "grep -r x plink",
+        "cd ~/.claude && cat projects/p/t.jsonl",
+        "cd ~/.claude/projects/p && cat t.jsonl",
+        "cat hlink/projects/p/t.jsonl",
+    ] {
+        let run = w.run("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(decision_label(&run), "deny", "{command}: {}", run.stdout);
+    }
+    let run = w.run(
+        "gate-bash-secrets",
+        "Bash",
+        json!({"command": "cat link/settings.json"}),
+    );
+    assert_eq!(decision_label(&run), "", "{}", run.stdout);
+}
+
+#[test]
+fn mcp_directory_arguments_holding_claude_state_deny() {
+    let w = World::new("cfgdir-mcp");
+    std::fs::create_dir_all(w.home.join(".claude")).unwrap();
+    std::fs::create_dir_all(w.proj.join("src")).unwrap();
+    let home = w.home.path().to_str().unwrap().to_string();
+    for path in [w.cfg(""), format!("{home}/.claude"), home.clone()] {
+        let run = w.run(
+            "gate-mcp",
+            "mcp__filesystem__search_files",
+            json!({"path": path, "pattern": "confirm"}),
+        );
+        assert_eq!(decision_label(&run), "deny", "{path}: {}", run.stdout);
+    }
+    let src = w.proj.join("src").to_str().unwrap().to_string();
+    let run = w.run(
+        "gate-mcp",
+        "mcp__filesystem__search_files",
+        json!({"path": src, "pattern": "confirm"}),
+    );
+    assert_eq!(decision_label(&run), "", "{}", run.stdout);
+}

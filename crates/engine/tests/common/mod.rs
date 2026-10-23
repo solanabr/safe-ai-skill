@@ -314,6 +314,8 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("CLAUDE_CONFIG_DIR");
         cmd.env_remove("CLAUDE_CODE_VERSION");
         cmd.env_remove("CLAUDE_CODE_EXECPATH");
+        // The developer's own Claude Code session must not bind or see test requests.
+        cmd.env_remove("CLAUDE_CODE_SESSION_ID");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);

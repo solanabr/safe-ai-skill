@@ -421,9 +421,12 @@ pub fn reaches_store(dir: &Path) -> bool {
         return true;
     };
     let homes = secretpath::homes_resolved();
-    if secretpath::data_dir_reach(&dir.to_string_lossy(), &homes).is_some()
-        || secretpath::is_transcript_tree(&dir.to_string_lossy(), &homes)
-    {
+    let text = dir.to_string_lossy();
+    let real = canonical(&text);
+    let claude_state = |d: &str| {
+        secretpath::data_dir_reach(d, &homes).is_some() || secretpath::is_transcript_tree(d, &homes)
+    };
+    if claude_state(&text) || real.as_deref().is_some_and(claude_state) {
         return true;
     }
     let text = secretpath::normalize(&dir.to_string_lossy(), None);

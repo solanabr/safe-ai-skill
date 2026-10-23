@@ -803,8 +803,23 @@ fn cmd_redact() -> ExitCode {
 /// scrub, the model is told not to repeat or send it and the user is warned; names only, never
 /// a value. Otherwise, or on anything unreadable, no output.
 fn cmd_failure_notice() -> ExitCode {
-    let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
-        return ExitCode::SUCCESS;
+    let input = match io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 {
+        Ok(input) => input,
+        // Too large to scan: the model is told to treat it as possibly secret (this hook is
+        // wired to PostToolUseFailure only).
+        Err(Unreadable::Oversized) => {
+            print_json(&serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUseFailure",
+                    "additionalContext": "safe-ai-skill: the output of this failed tool call \
+                         was too large to check for secret material, and a failed call's output \
+                         cannot be redacted. Do not repeat, quote, store or send any key, token \
+                         or env value it may hold.",
+                },
+            }));
+            return ExitCode::SUCCESS;
+        }
+        Err(_) => return ExitCode::SUCCESS,
     };
     if input.hook_event_name.as_deref() != Some("PostToolUseFailure") {
         return ExitCode::SUCCESS;
@@ -857,10 +872,11 @@ fn cmd_prompt_guard() -> ExitCode {
     };
     let dir = state_dir(&cwd_of(&input));
     let now = now_secs();
-    let outcome = relax::confirm_prompt(&dir, user_prompt, now);
+    let session = hook_session(&input);
+    let outcome = relax::confirm_prompt(&dir, user_prompt, now, session.as_deref());
     // Codes for requests made outside a Bash tool call (a terminal, `!` mode): shown to the
     // user only, in the systemMessage.
-    let codes = relax::announce(&dir, now);
+    let codes = relax::announce(&dir, now, session.as_deref());
     let mut out = match (outcome, &codes) {
         (Some(o), _) => o.hook_output(),
         (None, Some(_)) => serde_json::json!({}),
@@ -875,6 +891,17 @@ fn cmd_prompt_guard() -> ExitCode {
     }
     print_json(&out);
     ExitCode::SUCCESS
+}
+
+/// The Claude Code session a hook runs in: the payload's `session_id`, else
+/// `CLAUDE_CODE_SESSION_ID` (Claude Code sets both to the same value for hooks).
+fn hook_session(input: &HookInput) -> Option<String> {
+    input
+        .session_id
+        .clone()
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// `pending-notice` — the PostToolUse (Bash) hook that shows the user the confirmation code
@@ -892,7 +919,7 @@ fn cmd_pending_notice() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let dir = state_dir(&cwd_of(&input));
-    if let Some(codes) = relax::announce(&dir, now_secs()) {
+    if let Some(codes) = relax::announce(&dir, now_secs(), hook_session(&input).as_deref()) {
         print_json(&serde_json::json!({ "systemMessage": codes }));
     }
     ExitCode::SUCCESS
@@ -996,7 +1023,7 @@ fn cmd_verify_session() -> ExitCode {
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
     // user's systemMessage only.
-    if let Some(codes) = relax::announce(&dir, now) {
+    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
         }
