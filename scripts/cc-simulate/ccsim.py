@@ -847,14 +847,6 @@ class Sim:
                            cwd=self.proj, env=e, capture_output=True, text=True, timeout=60)
         return p.returncode, p.stdout + p.stderr
 
-    def bang(self, command):
-        """The user's `! <command>` in the prompt: runs in the session's shell with the Bash
-        tool's environment (so `CLAUDE_CODE_SESSION_ID` is this session's) and no tool hooks
-        (assumed: the docs do not say that `!` commands run PreToolUse hooks)."""
-        p = subprocess.run(["/bin/bash", "-c", command], cwd=self.proj, env=self.tool_env(),
-                           capture_output=True, text=True, timeout=60)
-        return p.returncode, p.stdout + p.stderr
-
     def files_containing(self, needle, roots=None):
         hits = []
         for root in roots or (self.cfg, self.proj, self.home):

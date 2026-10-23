@@ -6,9 +6,9 @@
 //! effect and the trust-dependent items run; otherwise they report UNPROVABLE. Set
 //! `CCSIM_KIT_DIR` to a solana-ai-kit checkout to add the side-by-side kit rows.
 //! Whether the engine can read the process table is the machine's: in a sandbox that denies
-//! `ps` the simulated sessions are the "ancestry unknown" case (only requests made inside a
-//! session confirm), otherwise the interactive case, and check S forces the other one through
-//! the test-hooks switch.
+//! `ps` the simulated sessions are the "ancestry unknown" case (no code is shown or accepted),
+//! otherwise the interactive case, and check S forces the other one through the test-hooks
+//! switch.
 //! Unix only (the shim is POSIX sh); needs python3 and git, skips without them.
 #![cfg(unix)]
 
