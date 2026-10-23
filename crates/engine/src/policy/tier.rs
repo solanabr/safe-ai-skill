@@ -123,6 +123,8 @@ pub enum TierSource {
     Env,
     /// `tier.json` was deleted after a tier was set: High until the user sets one again.
     StateDeleted,
+    /// `tier.json` failed authentication: High until the user sets a tier again.
+    StateTampered,
 }
 
 impl TierSource {
@@ -136,6 +138,7 @@ impl TierSource {
             TierSource::RepoPolicy => "repo .safe-ai-skill/policy.yaml",
             TierSource::Env => "env",
             TierSource::StateDeleted => "tier.json deleted",
+            TierSource::StateTampered => "tier.json failed authentication",
         }
     }
 }
@@ -288,7 +291,9 @@ pub fn resolve_from(inputs: Inputs) -> Resolution {
     let mut notes = Vec::new();
     match inputs.user.status {
         UserStatus::Tampered => notes.push(
-            "tier.json failed authentication (MAC); ignored, so your tier setting does not apply"
+            "tier.json failed authentication (MAC mismatch, rolled back, or the state key is \
+             missing); tier high applies until you choose a tier again with \
+             `safe-ai-skill tier <off|relaxed|medium|high>`"
                 .to_string(),
         ),
         UserStatus::Untrusted => notes.push(

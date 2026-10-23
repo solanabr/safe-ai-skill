@@ -328,8 +328,10 @@ fn a_floor_beats_the_users_project_choice_and_siblings_get_the_base() {
 // Authenticated state
 // ---------------------------------------------------------------------------------------
 
+/// A `tier.json` that fails authentication (forged, edited, or its state key removed) is not a
+/// silent lowering: tier High applies, with a note naming the cause, until the user sets a tier.
 #[test]
-fn a_forged_or_edited_tier_json_is_ignored_with_a_mac_note() {
+fn a_forged_or_edited_tier_json_fails_closed_to_high_with_a_mac_note() {
     let w = World::new("tiers-forged");
     let dir = w.dir();
     std::fs::write(
@@ -338,18 +340,19 @@ fn a_forged_or_edited_tier_json_is_ignored_with_a_mac_note() {
     )
     .unwrap();
     let r = w.resolve(&[]);
-    assert_eq!(r.tier, Tier::Relaxed);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::StateTampered));
     assert!(noted(&r, "MAC"), "{:?}", r.notes);
+    assert!(noted(&r, "tier high applies"), "{:?}", r.notes);
 
     // A genuine file edited by hand afterwards.
     let _ = std::fs::remove_file(w.data.join("tier.json"));
-    let high = tierstate::Change {
+    let set = |tier| tierstate::Change {
         project: None,
-        tier: Some(Tier::High),
+        tier: Some(tier),
         env_read: None,
         clear: false,
     };
-    tierstate::apply(&dir, &high, 0).unwrap();
+    tierstate::apply(&dir, &set(Tier::High), 0).unwrap();
     let text = std::fs::read_to_string(w.data.join("tier.json")).unwrap();
     std::fs::write(
         w.data.join("tier.json"),
@@ -357,8 +360,78 @@ fn a_forged_or_edited_tier_json_is_ignored_with_a_mac_note() {
     )
     .unwrap();
     let r = w.resolve(&[]);
-    assert_eq!(r.tier, Tier::Relaxed);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::StateTampered));
     assert!(noted(&r, "MAC"), "{:?}", r.notes);
+
+    // Lowering from a tampered file needs the confirmation; `tier off` is not immediate.
+    assert_eq!(
+        tierstate::plan(&dir, &set(Tier::Off)),
+        tierstate::Plan::NeedsConfirm
+    );
+    // `tier high` replaces the file at once.
+    assert_eq!(
+        tierstate::plan(&dir, &set(Tier::High)),
+        tierstate::Plan::Immediate
+    );
+
+    // A genuine file whose state key was removed.
+    tierstate::apply(&dir, &set(Tier::Off), 0).unwrap();
+    assert_eq!(w.resolve(&[]).tier, Tier::Off);
+    std::fs::remove_file(w.data.join("key")).unwrap();
+    let r = w.resolve(&[]);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::StateTampered));
+    assert!(noted(&r, "key"), "{:?}", r.notes);
+}
+
+/// The binary: `status` and SessionStart name the cause; `tier high` clears it at once.
+#[test]
+fn a_tampered_tier_json_is_reported_by_status_and_session_start() {
+    if !common::TEST_HOOKS {
+        return;
+    }
+    let w = World::new("tiers-forged-bin");
+    std::fs::write(
+        w.data.join("tier.json"),
+        r#"{"v":1,"mac":"00","gen":1,"body":{"v":1,"global":{"tier":"off"},"projects":{}}}"#,
+    )
+    .unwrap();
+    let trusted = |args: &[&str]| {
+        Invocation::new(args)
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
+            .run()
+    };
+    let status = trusted(&["status"]).json();
+    assert_eq!(status["tier"], "high", "{status}");
+    assert_eq!(status["tier_state"], "failed authentication", "{status}");
+    let session = Invocation::new(&["verify", "session"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
+        .stdin(
+            json!({"hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
+                .to_string(),
+        )
+        .run();
+    assert!(
+        session.stdout.contains("tier.json failed authentication"),
+        "{}",
+        session.stdout
+    );
+    let run = trusted(&["tier", "relaxed"]);
+    assert_ne!(run.json()["status"], "set", "{}", run.stdout);
+    assert_eq!(trusted(&["status"]).json()["tier"], "high");
+    let run = trusted(&["tier", "high"]);
+    assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+    let status = trusted(&["status"]).json();
+    assert_eq!(
+        (status["tier"].as_str(), status["tier_state"].as_str()),
+        (Some("high"), Some("valid")),
+        "{status}"
+    );
 }
 
 #[test]
@@ -667,9 +740,9 @@ fn an_untrusted_data_dir_is_named_at_session_start_and_in_status() {
     );
 }
 
-/// Restoring an older, genuine tier.json (a lower tier) does not verify.
+/// Restoring an older, genuine tier.json (a lower tier) does not verify: tier High applies.
 #[test]
-fn a_replayed_tier_json_is_ignored() {
+fn a_replayed_tier_json_fails_closed_to_high() {
     let w = World::new("tiers-replay");
     let dir = w.dir();
     let set = |tier| tierstate::Change {
@@ -684,7 +757,7 @@ fn a_replayed_tier_json_is_ignored() {
     assert_eq!(w.resolve(&[]).tier, Tier::High);
     std::fs::write(w.data.join("tier.json"), old).unwrap();
     let r = w.resolve(&[]);
-    assert_eq!(r.tier, Tier::Relaxed);
+    assert_eq!((r.tier, r.source), (Tier::High, TierSource::StateTampered));
     assert!(noted(&r, "MAC"), "{:?}", r.notes);
 }
 

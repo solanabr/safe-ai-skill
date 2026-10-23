@@ -81,7 +81,8 @@ pub enum UserStatus {
     /// There is none.
     #[default]
     Missing,
-    /// It failed authentication.
+    /// It failed authentication (bad MAC or envelope, rolled-back generation, missing state
+    /// key) in a trusted data dir. Tier High applies until the user sets a tier again.
     Tampered,
     /// It exists, but the data dir is not trusted.
     Untrusted,
@@ -128,15 +129,26 @@ pub fn deleted(dir: &DataDir) -> bool {
     dir.trusted && matches!(load(dir), Loaded::Missing) && statefile::was_stored(dir, TIER_FILE)
 }
 
-/// The tier a deleted `tier.json` fails closed to.
-const DELETED_TIER: Tier = Tier::High;
+/// The tier a deleted or tampered `tier.json` fails closed to.
+const FAIL_CLOSED_TIER: Tier = Tier::High;
+
+/// Whether `tier.json` in a trusted data dir was deleted or fails authentication, so tier
+/// High applies until the user sets a tier again.
+pub fn fails_closed(dir: &DataDir) -> bool {
+    dir.trusted && (matches!(load(dir), Loaded::Tampered) || deleted(dir))
+}
 
 /// The user-scope choice for the project at `root`: `projects[root]`, else `global`.
 pub fn user_choice(dir: &DataDir, root: &Path) -> UserChoice {
     let (file, status) = usable(dir);
-    if status == UserStatus::Deleted {
+    let fail_closed = match status {
+        UserStatus::Deleted => Some(TierSource::StateDeleted),
+        UserStatus::Tampered => Some(TierSource::StateTampered),
+        _ => None,
+    };
+    if let Some(source) = fail_closed {
         return UserChoice {
-            tier: Some((DELETED_TIER.max(BASE), TierSource::StateDeleted)),
+            tier: Some((FAIL_CLOSED_TIER.max(BASE), source)),
             env_read: None,
             status,
         };
@@ -198,9 +210,9 @@ fn before_after(dir: &DataDir, change: &Change) -> ((Tier, EnvRead), (Tier, EnvR
         _ => TierFile::default(),
     };
     let global = file.global.as_ref();
-    // A deleted file counts as tier High: lowering from it needs a confirmation.
-    let floor = if deleted(dir) {
-        DELETED_TIER.max(BASE)
+    // A deleted or tampered file counts as tier High: lowering from it needs a confirmation.
+    let floor = if fails_closed(dir) {
+        FAIL_CLOSED_TIER.max(BASE)
     } else {
         BASE
     };
@@ -234,7 +246,7 @@ pub fn plan(dir: &DataDir, change: &Change) -> Plan {
     let (before, after) = before_after(dir, change);
     if (change.clear && clears_a_raise(dir, change)) || after.0 < before.0 || after.1 > before.1 {
         Plan::NeedsConfirm
-    } else if after == before && !change.clear && !deleted(dir) {
+    } else if after == before && !change.clear && !fails_closed(dir) {
         Plan::NoChange
     } else {
         Plan::Immediate
@@ -498,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_or_untrusted_file_selects_nothing() {
+    fn a_forged_file_fails_closed_to_high_and_an_untrusted_one_selects_nothing() {
         let mut dir = tmp_data("tierstate_forged");
         std::fs::create_dir_all(&dir.path).unwrap();
         std::fs::write(
@@ -507,7 +519,13 @@ mod tests {
         )
         .unwrap();
         let c = user_choice(&dir, Path::new("/x"));
-        assert_eq!((c.tier, c.status), (None, UserStatus::Tampered));
+        assert_eq!(
+            (c.tier, c.status),
+            (
+                Some((Tier::High, TierSource::StateTampered)),
+                UserStatus::Tampered
+            )
+        );
         let _ = std::fs::remove_file(dir.path.join(TIER_FILE));
         apply(&dir, &global(Some(Tier::Off), None), 1).unwrap();
         dir.trusted = false;

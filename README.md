@@ -275,8 +275,9 @@ alias for `tier`. The tier `off` keeps every `deny` row; to turn the hooks off e
 **State is authenticated.** Grants, the tier, the daily spend ledger and session metadata are
 signed with a per-install key in the plugin data directory, and each file carries a
 generation, so a hand-edited file or an older copy put back is ignored, a deleted or edited
-spend ledger counts as today's budget spent, and a deleted `tier.json` makes the tier High
-(with a SessionStart note) until you run `safe-ai-skill tier …` again. This is tamper-evident, not tamper-proof: code
+spend ledger counts as today's budget spent, and a deleted, hand-edited or replayed
+`tier.json` (or one whose key is gone) makes the tier High, with a SessionStart and `status`
+note naming the cause, until you run `safe-ai-skill tier …` again. This is tamper-evident, not tamper-proof: code
 running as you outside the Claude Code sandbox can read the key, run the hook commands itself
 or restore a snapshot of the whole directory. The sandbox is the hard boundary. At the first
 1.1.0 session, unexpired 1.0 grants become pending requests you can
