@@ -69,11 +69,35 @@ const MAX_SCRIPT_DEPTH: usize = 4;
 /// [`decide_bash`] for `text` (the whole `command`, or a dynamic `eval`/`-c` script in it,
 /// re-parsed with its expansions as dynamic words).
 fn decide_text(command: &str, text: &str, cwd: &Path, depth: usize) -> Option<Verdict> {
+    let wallet = Target {
+        load: &Wallets::load,
+        keygen: true,
+        extended: false,
+    };
+    scan(text, cwd, depth, &wallet).map(|what| deny(what, command))
+}
+
+/// What [`scan`] protects and which commands it reads.
+struct Target<'a> {
+    /// The protected files (loaded only when the line may touch a file).
+    load: &'a dyn Fn(&Homes) -> Wallets,
+    /// Read `solana-keygen --force` (the default wallet's own destroyer).
+    keygen: bool,
+    /// Also read `chmod`/`chown`, `find -delete|-exec` and work-tree-rewriting `git`
+    /// subcommands ([`extended_clobber`]).
+    extended: bool,
+}
+
+/// What in `text` deletes, moves or overwrites one of `target`'s files (or a directory holding
+/// one), if anything.
+fn scan(text: &str, cwd: &Path, depth: usize, target: &Target) -> Option<String> {
     let parsed = shell::parse(text);
     let redirects = text.contains('>');
     let relevant = |c: &SimpleCommand| {
         let p = c.program();
-        p == "solana-keygen" || is_file_clobber(&p)
+        (target.keygen && p == "solana-keygen")
+            || is_file_clobber(&p)
+            || (target.extended && EXTENDED.contains(&p.as_str()))
     };
     let scripts: Vec<String> = parsed
         .commands
@@ -84,27 +108,38 @@ fn decide_text(command: &str, text: &str, cwd: &Path, depth: usize) -> Option<Ve
         return None;
     }
     let homes = Homes::from_env();
-    let wallets = Wallets::load(&homes);
-    let keygen_rows = keygen_rows();
+    let wallets = (target.load)(&homes);
+    let keygen_rows = if target.keygen {
+        keygen_rows()
+    } else {
+        Vec::new()
+    };
     let mut dirs = Dirs::new(cwd, &parsed);
     for cmd in &parsed.commands {
         dirs.step(cmd, &homes);
         if !relevant(cmd) {
             continue;
         }
-        if let Some(reason) = keygen(cmd, &dirs, &homes, &wallets, &keygen_rows) {
-            return Some(deny(reason, command));
+        if target.keygen {
+            if let Some(reason) = keygen(cmd, &dirs, &homes, &wallets, &keygen_rows) {
+                return Some(reason);
+            }
         }
         if let Some(reason) = clobber(cmd, &dirs, &homes, &wallets) {
-            return Some(deny(reason, command));
+            return Some(reason);
+        }
+        if target.extended {
+            if let Some(reason) = extended_clobber(cmd, &dirs, &homes, &wallets) {
+                return Some(reason);
+            }
         }
         if let Some(reason) = xargs_clobber(cmd, text, &dirs, &homes, &wallets) {
-            return Some(deny(reason, command));
+            return Some(reason);
         }
     }
     if redirects {
-        if let Some(target) = redirect_target(text, &dirs, &homes, &wallets) {
-            return Some(deny(format!("a redirection overwrites {target}"), command));
+        if let Some(found) = redirect_target(text, &dirs, &homes, &wallets) {
+            return Some(format!("a redirection overwrites {found}"));
         }
     }
     if depth >= MAX_SCRIPT_DEPTH {
@@ -112,7 +147,126 @@ fn decide_text(command: &str, text: &str, cwd: &Path, depth: usize) -> Option<Ve
     }
     scripts
         .iter()
-        .find_map(|script| decide_text(command, script, cwd, depth + 1))
+        .find_map(|script| scan(script, cwd, depth + 1, target))
+}
+
+/// Programs [`extended_clobber`] reads.
+const EXTENDED: &[&str] = &["chmod", "chown", "chgrp", "chflags", "xattr", "find", "git"];
+
+/// `git` subcommands that rewrite, remove or move work-tree files.
+const GIT_REWRITES: &[&str] = &[
+    "checkout", "restore", "clean", "rm", "mv", "stash", "reset", "switch",
+];
+
+/// [`scan`] with the files to protect given (the Codex adapter's self-protection: the
+/// `safe-ai-skill` binary and wrapper, Codex hook config, Claude Code settings). On top of the
+/// wallet gate's deletes, moves, overwrites, globs, ancestors and `cd` tracking it reads
+/// `chmod`/`chown`, `find -delete|-exec` and work-tree-rewriting `git` subcommands.
+pub fn clobber_of(command: &str, cwd: &Path, files: &[PathBuf]) -> Option<String> {
+    let load = |_: &Homes| Wallets::from_files(files);
+    let target = Target {
+        load: &load,
+        keygen: false,
+        extended: true,
+    };
+    scan(command, cwd, 0, &target)
+}
+
+/// Why a `chmod`/`chown`, `find -delete|-exec` or work-tree-rewriting `git` command reaches a
+/// protected file (or a directory holding one), if it does.
+fn extended_clobber(
+    cmd: &SimpleCommand,
+    dirs: &Dirs,
+    homes: &Homes,
+    wallets: &Wallets,
+) -> Option<String> {
+    let program = cmd.program();
+    let words: Vec<&Word> = cmd.words.iter().skip(1).collect();
+    let hit = |w: &Word| match path_hit(&w.text, w.splits, dirs, homes, wallets, true) {
+        Some(Hit::Wallet(t)) => Some(t),
+        _ => None,
+    };
+    let operands = |from: &[&Word]| -> Vec<Word> {
+        let mut out = Vec::new();
+        let mut options = true;
+        for w in from {
+            if options && w.text == "--" {
+                options = false;
+                continue;
+            }
+            if options && w.text.starts_with('-') {
+                continue;
+            }
+            out.push((*w).clone());
+        }
+        out
+    };
+    match program.as_str() {
+        "find" => {
+            let acts = ["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+            if !words.iter().any(|w| acts.contains(&w.text.as_str())) {
+                return None;
+            }
+            let mut starts: Vec<Word> = words
+                .iter()
+                .take_while(|w| !w.text.starts_with(['-', '(', '!']))
+                .map(|w| (*w).clone())
+                .collect();
+            if let (true, Some(first)) = (starts.is_empty(), cmd.words.first()) {
+                let mut dot = first.clone();
+                dot.text = ".".into();
+                dot.dynamic = false;
+                dot.splits = false;
+                starts.push(dot);
+            }
+            starts
+                .iter()
+                .find_map(&hit)
+                .map(|t| format!("`find` deletes or runs a command on {t}"))
+        }
+        "git" => {
+            // Global options before the subcommand (`-C dir` moves where paths resolve).
+            let mut i = 0;
+            while let Some(w) = words.get(i) {
+                match w.text.as_str() {
+                    "-C" | "-c" | "--git-dir" | "--work-tree" => i += 2,
+                    t if t.starts_with('-') => i += 1,
+                    _ => break,
+                }
+            }
+            let sub = words.get(i)?.text.clone();
+            if !GIT_REWRITES.contains(&sub.as_str()) {
+                return None;
+            }
+            let rest = &words[i + 1..];
+            let paths = operands(rest);
+            if let Some(t) = paths.iter().find_map(hit) {
+                return Some(format!("`git {sub}` rewrites {t}"));
+            }
+            let untracked = sub == "clean"
+                || (sub == "stash"
+                    && rest.iter().any(|w| {
+                        matches!(
+                            w.text.as_str(),
+                            "-u" | "--include-untracked" | "-a" | "--all"
+                        )
+                    }));
+            if untracked && paths.is_empty() {
+                // A path-less clean or untracked stash sweeps the whole tree: deny when a
+                // protected file exists under a directory it may run in.
+                return dirs
+                    .known
+                    .iter()
+                    .find_map(|dir| wallets.existing_under(dir))
+                    .map(|t| format!("`git {sub}` may remove {t}"));
+            }
+            None
+        }
+        _ => operands(&words)
+            .iter()
+            .find_map(hit)
+            .map(|t| format!("`{program}` changes {t}")),
+    }
 }
 
 /// The directories a relative path may resolve against, as the command line goes.
@@ -280,6 +434,29 @@ impl Wallets {
             .filter_map(|p| std::fs::canonicalize(p).ok())
             .collect();
         Wallets { paths, canonical }
+    }
+
+    /// A set of given files (lexical keys plus the canonical forms of those that exist).
+    fn from_files(files: &[PathBuf]) -> Wallets {
+        Wallets {
+            paths: files
+                .iter()
+                .map(|p| (key(p), p.display().to_string()))
+                .collect(),
+            canonical: files
+                .iter()
+                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .collect(),
+        }
+    }
+
+    /// A protected file that exists below `dir`, if any.
+    fn existing_under(&self, dir: &Path) -> Option<String> {
+        let prefix = format!("{}/", key(dir));
+        self.paths
+            .iter()
+            .find(|(p, shown)| p.starts_with(&prefix) && Path::new(shown).exists())
+            .map(|(_, shown)| shown.clone())
     }
 
     /// The display form of the wallet `path` names, if it names one.

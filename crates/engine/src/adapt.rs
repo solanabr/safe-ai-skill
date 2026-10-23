@@ -220,6 +220,33 @@ impl CodexTargets {
         t
     }
 
+    /// The files the shell scan protects (with their ancestors): the engines; `hooks.json` and
+    /// `config.toml` in each Codex home; the Claude settings in each Claude dir; and, where
+    /// they exist, `.codex/` config and `.claude/` settings in `cwd` and every directory above.
+    pub fn files(&self, cwd: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self.engines.clone();
+        for home in &self.codex_homes {
+            files.extend(["hooks.json", "config.toml"].map(|f| home.join(f)));
+        }
+        for dir in &self.claude_dirs {
+            files.extend(["settings.json", "settings.local.json"].map(|f| dir.join(f)));
+        }
+        for dir in lexical(cwd).ancestors() {
+            for rel in [
+                ".codex/hooks.json",
+                ".codex/config.toml",
+                ".claude/settings.json",
+                ".claude/settings.local.json",
+            ] {
+                let file = dir.join(rel);
+                if file.exists() && !files.contains(&file) {
+                    files.push(file);
+                }
+            }
+        }
+        files
+    }
+
     fn push_codex_home(&mut self, dir: PathBuf) {
         push_spellings(&mut self.codex_homes, dir);
     }
@@ -434,10 +461,12 @@ const PREFIXES: &[&str] = &["sudo", "env", "exec", "nohup", "nice", "time", "bui
 #[derive(Debug, PartialEq)]
 enum Tok {
     Word(String),
-    /// A segment break (`;`, `|`, `&`, `(`, `)`, newline).
-    Break,
+    /// A segment break (`;`, `|`, `&`, `(`, `)`, newline); `true` for a pipe (`|`, `|&`).
+    Break(bool),
     /// An output redirection (`>`, `>>`, `>|`).
     Out,
+    /// An input redirection, here-document or here-string (`<`, `<<`, `<<<`).
+    In,
 }
 
 /// A rough shell tokenizer: quotes are removed (their content stays in the word), segment
@@ -462,9 +491,27 @@ fn tokenize(command: &str) -> Vec<Tok> {
                     word.push(next);
                 }
             }
-            (None, ';' | '|' | '&' | '(' | ')' | '\n' | '`') => {
+            (None, '|') => {
                 flush(&mut word, &mut toks);
-                toks.push(Tok::Break);
+                let pipe = chars.peek() != Some(&'|');
+                if !pipe {
+                    chars.next();
+                }
+                toks.push(Tok::Break(pipe));
+            }
+            (None, ';' | '&' | '(' | ')' | '\n' | '`') => {
+                flush(&mut word, &mut toks);
+                toks.push(Tok::Break(false));
+            }
+            (None, '<') => {
+                if word.chars().all(|d| d.is_ascii_digit()) {
+                    word.clear();
+                }
+                flush(&mut word, &mut toks);
+                while chars.peek() == Some(&'<') {
+                    chars.next();
+                }
+                toks.push(Tok::In);
             }
             (None, '>') => {
                 // `2>` / `&>` keep their fd prefix out of the next word.
@@ -488,8 +535,33 @@ fn tokenize(command: &str) -> Vec<Tok> {
 /// Why a Codex shell command may not run, judged on what it writes: a [`patch_target_reason`]
 /// target named as an output redirection, or as an argument of a command that is not
 /// read-only (bare names only for [`MUTATORS`]), or the binary by name for a mutator.
+///
+/// Deletes, moves and overwrites of a protected file or a directory holding it, globs, `cd`,
+/// `find -delete|-exec`, `chmod` and work-tree-rewriting `git` go through the wallet gate's
+/// scanner ([`crate::gates::wallet::clobber_of`]) over [`CodexTargets::files`]. Literal paths
+/// inside interpreter code (`python3 -c "os.remove('…')"`) are checked word by word.
 pub fn bash_reason(command: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    if let Some(what) = crate::gates::wallet::clobber_of(command, cwd, &targets.files(cwd)) {
+        return Some(format!(
+            "safe-ai-skill: {what}, which the Codex hooks need (the safe-ai-skill binary or \
+             wrapper, Codex hook config, or Claude Code settings); do it yourself, outside the \
+             agent."
+        ));
+    }
     bash_reason_depth(command, cwd, targets, 0)
+}
+
+/// The path-like pieces of interpreter code: split on quotes, brackets, separators and
+/// whitespace.
+fn code_paths(code: &str) -> impl Iterator<Item = &str> {
+    code.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '=' | '`'
+            )
+    })
+    .filter(|piece| piece.contains('/') || piece.starts_with('~'))
 }
 
 fn bash_reason_depth(
@@ -501,9 +573,10 @@ fn bash_reason_depth(
     let toks = tokenize(command);
     let mut leader: Option<String> = None;
     let mut after_out = false;
+    let mut after_code_flag = false;
     for tok in &toks {
         let word = match tok {
-            Tok::Break => {
+            Tok::Break(_) => {
                 leader = None;
                 after_out = false;
                 continue;
@@ -512,11 +585,29 @@ fn bash_reason_depth(
                 after_out = true;
                 continue;
             }
+            Tok::In => continue,
             Tok::Word(w) => w,
         };
-        // A quoted script (`sh -c '…'`) is scanned as a command of its own.
-        if depth < 2 && word.contains(char::is_whitespace) {
-            if let Some(reason) = bash_reason_depth(word, cwd, targets, depth + 1) {
+        let code = std::mem::replace(
+            &mut after_code_flag,
+            matches!(word.as_str(), "-c" | "-e" | "-E" | "--eval" | "-r"),
+        );
+        // A quoted script (`sh -c '…'`) is scanned as a command of its own, and literal paths
+        // in interpreter code are checked whatever command they sit in.
+        if code || word.contains(char::is_whitespace) {
+            if depth < 2 {
+                if let Some(reason) = bash_reason_depth(word, cwd, targets, depth + 1) {
+                    return Some(reason);
+                }
+            }
+            if let Some(reason) =
+                code_paths(word).find_map(|p| patch_target_reason(p, cwd, targets))
+            {
+                return Some(reason);
+            }
+        }
+        if depth > 0 && (word.contains('/') || word.starts_with('~')) {
+            if let Some(reason) = patch_target_reason(word, cwd, targets) {
                 return Some(reason);
             }
         }
@@ -541,6 +632,12 @@ fn bash_reason_depth(
         let mutator = MUTATORS.contains(&cmd);
         let path_like = word.contains('/') || word.starts_with('~');
         let name = word.rsplit('/').next().unwrap_or(word);
+        if mutator && (name == "hooks.json" || name == "config.toml") && !path_like {
+            return Some(format!(
+                "safe-ai-skill: `{word}` may be Codex hook config (a Codex command's working dir \
+                 is not known to the hook); change it yourself, outside the agent."
+            ));
+        }
         if mutator && ENGINE_NAMES.contains(&name) {
             return Some(format!(
                 "safe-ai-skill: `{word}` names the safe-ai-skill binary the Codex hooks run; \
@@ -552,6 +649,142 @@ fn bash_reason_depth(
                 return Some(reason);
             }
         }
+    }
+    None
+}
+
+/// Shells: with no `-c` script, no script file and no redirected or piped input, they read
+/// commands from a terminal the model can type into.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "tcsh", "csh", "busybox",
+];
+
+/// Interpreters with a REPL: no `-c`/`-e` code, no `-m` module and no script means a prompt.
+const REPLS: &[&str] = &[
+    "python", "python2", "python3", "node", "nodejs", "ruby", "perl", "php", "lua", "luajit",
+    "irb", "pry", "ghci", "julia", "tclsh", "R", "deno", "bun",
+];
+
+/// Database shells: interactive unless given a command or file.
+const DB_SHELLS: &[&str] = &[
+    "psql",
+    "mysql",
+    "mariadb",
+    "sqlite3",
+    "mongo",
+    "mongosh",
+    "redis-cli",
+];
+
+/// Why a Codex shell command may not run because it opens an interactive shell or REPL, or
+/// `None`. Codex's `write_stdin` feeds such a session input without running any hook, so every
+/// gate would be skipped for what is typed into it.
+pub fn interactive_reason(command: &str) -> Option<String> {
+    interactive_depth(command, 0)
+}
+
+fn interactive_depth(command: &str, depth: usize) -> Option<String> {
+    let toks = tokenize(command);
+    let mut segment: Vec<&str> = Vec::new();
+    let mut piped = false;
+    let mut input = false;
+    let mut next_piped = false;
+    let mut iter = toks.iter().peekable();
+    loop {
+        let tok = iter.next();
+        match tok {
+            Some(Tok::Word(w)) => {
+                segment.push(w);
+                continue;
+            }
+            Some(Tok::In) => {
+                input = true;
+                continue;
+            }
+            Some(Tok::Out) => {
+                // The redirection target is not an argument.
+                if let Some(Tok::Word(_)) = iter.peek() {
+                    iter.next();
+                }
+                continue;
+            }
+            Some(Tok::Break(pipe)) => next_piped = *pipe,
+            None => {}
+        }
+        if let Some(reason) = interactive_segment(&segment, piped, input, depth) {
+            return Some(reason);
+        }
+        segment.clear();
+        input = false;
+        piped = next_piped;
+        next_piped = false;
+        tok?;
+    }
+}
+
+fn interactive_segment(words: &[&str], piped: bool, input: bool, depth: usize) -> Option<String> {
+    let mut rest = words.iter().copied().skip_while(|w| {
+        let base = w.rsplit('/').next().unwrap_or(w);
+        (w.contains('=') && !w.starts_with('=')) || PREFIXES.contains(&base)
+    });
+    let program_word = rest.next()?;
+    let program = program_word.rsplit('/').next().unwrap_or(program_word);
+    let args: Vec<&str> = rest.collect();
+    let flag = |pred: &dyn Fn(&str) -> bool| args.iter().any(|a| a.starts_with('-') && pred(a));
+    let positional = args.iter().any(|a| !a.starts_with('-'));
+    let forced = flag(&|a| a == "-i" || a == "--interactive");
+    let fed = piped || input;
+    let deny = || {
+        Some(format!(
+            "safe-ai-skill: `{program}` would start an interactive session; Codex feeds it input \
+             through write_stdin without running any hook, so nothing typed into it would be \
+             checked. Run it with the commands as arguments (`-c`, a script file), or yourself."
+        ))
+    };
+    if SHELLS.contains(&program) {
+        let script_at = args
+            .iter()
+            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
+        if let Some(at) = script_at {
+            if depth < 2 {
+                if let Some(script) = args.get(at + 1) {
+                    return interactive_depth(script, depth + 1);
+                }
+            }
+            return None;
+        }
+        return ((!positional && !fed) || forced).then(deny).flatten();
+    }
+    if REPLS.contains(&program) {
+        if matches!(program, "deno" | "bun") {
+            let first = args.iter().find(|a| !a.starts_with('-'));
+            return (first.is_none() && !fed || first == Some(&"repl"))
+                .then(deny)
+                .flatten();
+        }
+        let code = flag(&|a| {
+            matches!(
+                a,
+                "-c" | "-e" | "-E" | "--eval" | "-m" | "-r" | "-p" | "--print"
+            )
+        });
+        return ((!code && !positional && !fed) || forced)
+            .then(deny)
+            .flatten();
+    }
+    if DB_SHELLS.contains(&program) {
+        let command = flag(&|a| {
+            matches!(a, "-c" | "-f" | "-e" | "--eval" | "--execute" | "--file")
+                || a.starts_with("--command")
+                || a.starts_with("--file=")
+                || a.starts_with("--execute=")
+        });
+        let sql_arg =
+            program == "sqlite3" && args.iter().filter(|a| !a.starts_with('-')).count() > 1;
+        let redis_cmd = program == "redis-cli" && positional;
+        return (!command && !sql_arg && !redis_cmd && !fed)
+            .then(deny)
+            .flatten();
     }
     None
 }
@@ -699,6 +932,61 @@ mod tests {
         ] {
             assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
         }
+    }
+
+    #[test]
+    fn interactive_sessions_are_recognized() {
+        for c in [
+            "bash",
+            "sh -i",
+            "zsh -l",
+            "python3",
+            "python3 -i script.py",
+            "node",
+            "irb",
+            "psql -h db mydb",
+            "sqlite3 my.db",
+            "env FOO=1 bash",
+            "cd x && python",
+            "bash -c 'bash'",
+            "deno",
+            "bun repl",
+        ] {
+            assert!(interactive_reason(c).is_some(), "{c}");
+        }
+        for c in [
+            "bash -c 'ls'",
+            "bash script.sh",
+            "sh -lc 'echo hi'",
+            "python3 script.py",
+            "python3 -c 'print(1)'",
+            "python3 -m pytest",
+            "echo ls | bash",
+            "bash < script.sh",
+            "python3 <<'EOF'\nprint(1)\nEOF",
+            "node -e 'console.log(1)'",
+            "psql -c 'select 1'",
+            "sqlite3 my.db 'select 1'",
+            "deno run x.ts",
+            "cargo test",
+            "ls > bash",
+        ] {
+            assert!(interactive_reason(c).is_none(), "{c}");
+        }
+    }
+
+    #[test]
+    fn literal_paths_in_interpreter_code_are_checked() {
+        let cwd = Path::new("/w/proj");
+        let t = targets();
+        for c in [
+            "python3 -c \"import os;os.remove(os.path.expanduser('~/.local/bin/safe-ai-skill'))\"",
+            "node -e \"require('fs').unlinkSync('/home/u/.codex/hooks.json')\"",
+            "perl -e 'unlink(\"/home/u/.claude/settings.json\")'",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_some(), "{c}");
+        }
+        assert!(bash_reason("python3 -c 'print(1)'", cwd, &t).is_none());
     }
 
     #[test]

@@ -32,9 +32,13 @@ hook payload. It answers only in forms Codex honours. Codex hooks run it through
 | `apply_patch` run through the shell (heredoc, quoted argument, `$'…'`, piped) | `gate-bash-secrets` | Codex intercepts these and applies them as patches, so they get the same per-file checks. |
 | `mcp__<server>__<tool>` | `gate-mcp` | Receives the raw MCP arguments. |
 
-Under Codex, these targets are also denied, through `apply_patch` and through shell writes (an
-output redirection, or an argument of a writing command such as `rm`, `mv`, `cp`, `tee`, `sed`,
-`truncate`):
+Under Codex, these targets are also denied, through `apply_patch` and through shell writes.
+Shell writes are read with the default-wallet gate's scanner: deletes, moves and overwrites of
+the file or of a directory holding it, globs, relative paths after `cd`, `find -delete|-exec`,
+`chmod`/`chown`, output redirections, and work-tree-rewriting `git` subcommands (`checkout`,
+`restore`, `rm`, `mv`, `reset`, `switch`, and `clean` / `stash -u` when a protected file exists
+in the tree). Literal paths inside interpreter code (`python3 -c "os.remove('…')"`) count too.
+The targets:
 
 - Codex hook config: `.codex/hooks.json`, `.codex/config.toml`, and `$CODEX_HOME/…`. Symlinks
   are resolved first.
@@ -48,6 +52,12 @@ output redirection, or an argument of a writing command such as `rm`, `mv`, `cp`
   `audit.jsonl`, `id.json`, …). Codex's `exec_command` can run in a `workdir` the hook payload
   does not carry, so the hook cannot tell where such a write lands.
 
+**Interactive sessions are denied.** A shell with no `-c` script, no script file and no
+redirected or piped input (`bash`, `sh -i`, `zsh`), a REPL (`python3`, `node`, `irb`, `deno`,
+`-i` anywhere), and a database shell without a command (`psql mydb`, `sqlite3 my.db`) are
+denied. Codex's `write_stdin` types into such a session without running any hook, so nothing
+typed there would be checked.
+
 **`ask` becomes `deny`.** Codex PreToolUse honours only `deny`. On `ask` or a bare `allow`, it
 logs an unsupported output and runs the call anyway. So every `ask` reaches Codex as a `deny`,
 and the reason says how to go ahead: run the command yourself, approve it in Claude Code, or
@@ -56,7 +66,8 @@ a grant you confirmed earlier still allows the call (below the High tier). Claud
 counts as off, because it does not wrap Codex.
 
 **Failures deny.** If the engine is missing, is not executable, exits non-zero, aborts or
-panics, or prints anything other than nothing or a deny, the wrapper prints a deny with exit 0.
+panics, or prints anything other than nothing or a single deny line, the wrapper prints a deny
+with exit 0.
 The engine also exits 0 after a panic under Codex.
 
 ## Not covered
@@ -70,12 +81,24 @@ The engine also exits 0 after a panic under Codex.
 - **`gate-read`, `gate-skill`.** Codex has no Read, Grep, Glob or Skill tool. Reads go through
   the shell, which `gate-bash-secrets` covers.
 - **Prompt guards and the SessionStart supply-chain sweep.** Not mapped yet.
-- **Hosted tools (web search) and `write_stdin`.** Codex does not run hooks for them.
-- **Shell writes are judged on words, not run.** A write hidden behind variables, `eval`,
-  generated scripts or an interpreter program (`python -c "open(...)"` with a computed path) is
-  not seen. Literal paths in a quoted `sh -c '…'` are.
-- **Heredoc bodies are read as commands.** A heredoc that writes text mentioning
-  `rm tier.json` can be denied by mistake.
+- **`write_stdin` into anything still running.** Codex runs no hook for `write_stdin`. Starting
+  an interactive shell or REPL is denied (above). But any long-running process the model
+  started can still be fed input with no gate seeing it: a program that reads commands from
+  stdin, a TUI, or an `ssh` session. Every Bash gate and all of the self-protection is skipped
+  for that input.
+- **Hosted tools (web search).** Codex does not run hooks for them.
+- **Shell writes are judged on their words; nothing is run.** These are not seen:
+  - a write whose path is computed (variables the gate cannot expand, string building in
+    interpreter code);
+  - a write behind `eval` of generated text;
+  - a script file the command runs;
+  - a path-less `git reset --hard`, `git stash` or `git checkout <branch>` that rewrites a
+    tracked protected file.
+
+  Literal paths in `sh -c '…'` and in `-c`/`-e` interpreter code are seen.
+- **False positives.** A heredoc body is read as commands, so a heredoc whose text mentions
+  `rm tier.json` can be denied. Bare `hooks.json`/`config.toml` given to a writing command are
+  denied wherever the command runs, because the working dir is unknown.
 - **Codex plugin hook files.** A plugin-bundled `hooks/hooks.json` is not protected.
 - **State.** Grants, the tier and the audit log come from the Claude Code plugin's data dir. If
   the plugin is not installed, nothing can be relaxed and nothing is audited. The gates still

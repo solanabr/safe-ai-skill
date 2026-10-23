@@ -403,3 +403,68 @@ fn a_panic_still_denies_with_exit_0() {
         .run();
     assert_eq!(codex_label(&run), "deny", "{}", run.stderr);
 }
+
+/// Re-review R1: directory, glob, `cd`, `find` and `git` writes reaching protected files.
+#[test]
+fn directory_glob_cd_find_and_git_writes_to_protected_files_deny() {
+    let w = World::new("adapt-r1");
+    std::fs::create_dir_all(w.home.join(".codex")).unwrap();
+    std::fs::write(w.home.join(".codex/hooks.json"), "{}").unwrap();
+    std::fs::create_dir_all(w.proj.join(".codex")).unwrap();
+    std::fs::write(w.proj.join(".codex/hooks.json"), "{}").unwrap();
+    let engine = std::path::Path::new(common::bin());
+    let bin_dir = engine.parent().unwrap().display().to_string();
+    for command in [
+        format!("mv {bin_dir} {bin_dir}.off"),
+        format!("rm -rf {bin_dir}"),
+        format!("rm {bin_dir}/safe-ai-*"),
+        format!("rm {bin_dir}/safe-ai-skil?"),
+        format!("find {bin_dir} -name 'safe*' -delete"),
+        format!("chmod -x {}", engine.display()),
+        "mv .codex .codex.off".to_string(),
+        "rm -rf .codex".to_string(),
+        "mv ~/.codex ~/.codex.bak".to_string(),
+        "rm .codex/*".to_string(),
+        "cd .codex && rm hooks.json".to_string(),
+        "git checkout -- .codex".to_string(),
+        "git clean -fdx".to_string(),
+        "find . -name hooks.json -exec rm {} +".to_string(),
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    for command in [
+        "rm -rf target",
+        "git status",
+        "find . -name '*.rs'",
+        "git stash",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "", "{command}: {}", run.stdout);
+    }
+}
+
+/// Re-review R2: an interactive shell or REPL would take `write_stdin` input unchecked.
+#[test]
+fn interactive_shells_and_repls_deny() {
+    let w = World::new("adapt-r2");
+    for command in ["bash", "sh -i", "python3", "node", "psql mydb"] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+        assert!(reason(&run).contains("write_stdin"), "{}", run.stdout);
+    }
+    for command in ["bash -c 'ls'", "python3 script.py", "echo ls | sh"] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "", "{command}");
+    }
+}
+
+/// Re-review R4: a literal protected path inside interpreter code.
+#[test]
+fn protected_paths_in_interpreter_code_deny() {
+    let w = World::new("adapt-r4");
+    let engine = common::bin();
+    let command = format!("python3 -c \"import os;os.remove('{engine}')\"");
+    let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+    assert_eq!(codex_label(&run), "deny");
+}

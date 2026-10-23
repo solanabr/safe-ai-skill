@@ -760,10 +760,14 @@ fn cmd_gate_prompt_expansion() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Codex-only Bash checks: an `apply_patch` the shell runs (Codex intercepts it) gets the
+/// Codex-only Bash checks: an interactive shell or REPL is denied (`write_stdin` would feed it
+/// unchecked), an `apply_patch` the shell runs (Codex intercepts it) gets the
 /// per-file patch checks, and writes to [`adapt::CodexTargets`] are denied. `Some` is the
 /// deny (or hard-guard ask) to emit.
 fn codex_bash_writes(command: &str, cwd: &Path, effective: &Policy) -> Option<Decision> {
+    if let Some(reason) = adapt::interactive_reason(command) {
+        return Some(Decision::Deny { reason });
+    }
     let targets = adapt::CodexTargets::from_env();
     if let Some(reason) = adapt::bash_reason(command, cwd, &targets) {
         return Some(Decision::Deny { reason });

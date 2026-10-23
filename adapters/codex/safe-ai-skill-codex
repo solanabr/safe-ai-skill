@@ -7,7 +7,7 @@
 # such outcome into a deny, printed as Codex's deny JSON with exit 0:
 #   - no engine (none next to this wrapper, none on PATH);
 #   - the engine exits non-zero (a crash, an abort, a usage error) or is killed by a signal;
-#   - the engine prints anything but nothing or a deny.
+#   - the engine prints anything but nothing or a single deny line.
 # Nothing printed by the engine (exit 0) is no opinion and passes through as nothing.
 # What it cannot cover: Codex's own hook timeout killing this wrapper (the engine bounds
 # itself at 8 s; keep the hook timeout above that).
@@ -41,6 +41,11 @@ out=$("$engine" adapt codex "$gate")
 status=$?
 [ "$status" -eq 0 ] || deny "safe-ai-skill-codex: the engine failed (exit $status) while inspecting this call; review this call manually."
 [ -n "$out" ] || exit 0
+# One line only: a second line (whatever it says) would make the JSON unparseable to Codex.
+case $out in
+  *'
+'*) deny "safe-ai-skill-codex: the engine gave an answer Codex cannot use; review this call manually." ;;
+esac
 case $out in
   '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",'*'}}')
     printf '%s' "$out"

@@ -98,6 +98,10 @@ fn engine_failures_become_a_deny_with_exit_0() {
                 .to_string(),
         ),
         ("notexec", "this is not a script".to_string()),
+        (
+            "two-lines",
+            format!("#!/bin/sh\nprintf '%s\\n%s' '{DENY_JSON}' '{{\"hookSpecificOutput\":{{\"permissionDecision\":\"allow\"}}}}'\n"),
+        ),
     ] {
         let (_dir, wrapper) = install(&format!("wrapper-{tag}"), Some(&body));
         assert_deny(&run(&wrapper, "gate-bash", "{}", &[]), tag);
