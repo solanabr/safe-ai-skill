@@ -23,7 +23,7 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, wallet};
+use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, tamper, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
 use safe_ai_skill::policy::{self, Policy};
@@ -532,9 +532,14 @@ fn cmd_gate_bash() -> ExitCode {
     let Some(command) = input.bash_command() else {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
-    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen
-    // or a wallet write → no opinion, before any policy, list or state is loaded.
-    if !safe_ai_skill::gates::bash::may_concern(command) {
+    // A nested non-interactive Claude Code session (`claude -p`, a prompt on its stdin) runs
+    // with the user's hooks and state where nobody sees it: decided here too, so this
+    // `onFailure: block` entry asks (denies at High or headless) on its own.
+    let nested = tamper::decide_nested_claude(command);
+    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen,
+    // a wallet write or a nested session → no opinion, before any policy, list or state is
+    // loaded.
+    if matches!(nested, Decision::Defer) && !safe_ai_skill::gates::bash::may_concern(command) {
         return ExitCode::SUCCESS;
     }
     let cwd = cwd_of(&input);
@@ -551,8 +556,21 @@ fn cmd_gate_bash() -> ExitCode {
     // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
     // entry as well as from `gate-bash-secrets`.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
-    let (decision, meta) = join_tier(strictest([wallet_verdict]), decision, meta);
+    let nested_verdict = nested_claude_verdict(nested, effective.tier());
+    let (decision, meta) = join_tier(strictest([wallet_verdict, nested_verdict]), decision, meta);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// [`tamper::decide_nested_claude`] as a tier verdict: its `ask` is a deny at High.
+fn nested_claude_verdict(decision: Decision, tier: Tier) -> Option<Verdict> {
+    match decision {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } if tier == Tier::High => {
+            Some(Verdict::Deny(format!("{reason} Denied at tier high.")))
+        }
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    }
 }
 
 fn cmd_gate_bash_secrets() -> ExitCode {

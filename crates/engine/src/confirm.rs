@@ -25,9 +25,13 @@
 //! Code running as the user outside the Claude Code sandbox can do anything: run the hook
 //! subcommands itself (`pending-notice`, `prompt-guard`), read the key, rewrite state. The
 //! tripwire hook denies Bash calls that invoke the hook subcommands or `confirm`, which stops
-//! the direct forms; obfuscated ones, and a nested `claude -p` session, remain. The sandbox is
-//! the hard boundary. When Claude Code cannot show a `systemMessage` (headless `claude -p`), a
-//! relaxation simply cannot be confirmed.
+//! the direct forms; the Bash gates also ask about (deny at High or headless) any
+//! non-interactive `claude` they can see. A session that is headless, runs non-interactively
+//! or was started from inside another Claude Code session
+//! ([`crate::headless::confirmation_refused`]) neither announces codes nor confirms: a code
+//! typed there is refused without consuming anything, and the user is told so. Obfuscated
+//! nested sessions whose ancestry the engine cannot follow remain; the sandbox is the hard
+//! boundary.
 //!
 //! Live entries are capped at [`MAX_PENDING`]; an announced entry is confirmable for
 //! [`TTL_SECS`] after its announcement, an unannounced one is dropped [`TTL_SECS`] after
@@ -291,6 +295,20 @@ pub fn announce_pending(dir: &DataDir, now: u64) -> Vec<Announcement> {
         return Vec::new();
     }
     out
+}
+
+/// Whether [`announce_pending`] would announce anything at `now` (read only, no lock).
+pub fn has_unannounced(dir: &DataDir, now: u64) -> bool {
+    if dir.is_unresolved() || std::fs::symlink_metadata(dir.path.join(PENDING_FILE)).is_err() {
+        return false;
+    }
+    match statefile::load::<Pending>(dir, PENDING_FILE) {
+        Loaded::Valid(p) => p
+            .entries
+            .iter()
+            .any(|e| e.announced_at.is_none() && e.created_at <= now && !is_expired(e, now)),
+        _ => false,
+    }
 }
 
 /// Check a user prompt against the announced entries.

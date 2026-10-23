@@ -96,6 +96,9 @@ impl ConfirmOutcome {
     /// The hook JSON: `systemMessage` plus `hookSpecificOutput.additionalContext`. The prompt
     /// itself is not blocked.
     pub fn hook_output(&self) -> Value {
+        if self.additional_context.is_empty() {
+            return json!({ "systemMessage": self.system_message });
+        }
         json!({
             "systemMessage": self.system_message,
             "hookSpecificOutput": {
@@ -123,6 +126,30 @@ impl ConfirmOutcome {
 /// anything. Wrong codes count toward the lockout ([`confirm::MAX_FAILURES`]), which cancels
 /// every pending request and is audited as a tamper event. The outcome never contains a code.
 pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOutcome> {
+    confirm_prompt_in(dir, prompt, now, crate::headless::confirmation_refused)
+}
+
+/// [`confirm_prompt`] with the session check given: when `refused` names a reason, a
+/// confirmation line changes nothing (no entry consumed, no wrong code counted) and only the
+/// user is told.
+pub fn confirm_prompt_in(
+    dir: &DataDir,
+    prompt: &str,
+    now: u64,
+    refused: impl FnOnce() -> Option<&'static str>,
+) -> Option<ConfirmOutcome> {
+    if matches!(confirm::classify(prompt), confirm::PromptForm::Line(_)) {
+        if let Some(why) = refused() {
+            return Some(ConfirmOutcome {
+                system_message: format!(
+                    "safe-ai-skill: nothing confirmed: {why}. Confirmation codes are accepted \
+                     only in an interactive Claude Code session you started yourself; the \
+                     request is still pending there."
+                ),
+                additional_context: String::new(),
+            });
+        }
+    }
     match confirm::confirm_attempt(dir, prompt, now) {
         Attempt::NotAnAttempt => None,
         Attempt::Embedded => Some(ConfirmOutcome::note(
@@ -153,7 +180,13 @@ pub fn confirm_prompt(dir: &DataDir, prompt: &str, now: u64) -> Option<ConfirmOu
 }
 
 /// The `systemMessage` announcing new confirmation codes, if any (user only).
+/// Nothing is announced in a session that could not confirm it
+/// ([`crate::headless::confirmation_refused`]): a code shown there could reach an agent, and
+/// the request stays unannounced for the user's next interactive session.
 pub fn announce(dir: &DataDir, now: u64) -> Option<String> {
+    if !confirm::has_unannounced(dir, now) || crate::headless::confirmation_refused().is_some() {
+        return None;
+    }
     confirm::announcement_message(&confirm::announce_pending(dir, now))
 }
 
@@ -302,6 +335,32 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_refused_session_confirms_nothing_and_counts_no_wrong_code() {
+        let dir = tmp_data("relax_refused");
+        let code = crate::confirm::tests::announced(
+            &dir,
+            PendingKind::Tier,
+            serde_json::json!({"tier": "off"}),
+        );
+        let line = format!("safe-ai-skill confirm {}", code.as_str());
+        let refused = || Some("this Claude Code session runs non-interactively (`claude -p`)");
+        for _ in 0..4 {
+            let out = confirm_prompt_in(&dir, &line, now(), refused).unwrap();
+            assert!(out.system_message.contains("nothing confirmed"), "{out:?}");
+            assert!(out.additional_context.is_empty());
+            let hook = out.hook_output();
+            assert!(hook.get("hookSpecificOutput").is_none(), "{hook}");
+            assert!(!hook.to_string().contains(code.as_str()));
+        }
+        // Still pending and confirmable once the session is interactive (no lockout counted).
+        let ok = confirm_prompt_in(&dir, &line, now(), || None).unwrap();
+        assert!(ok.system_message.contains("you confirmed"), "{ok:?}");
+        // A non-confirm prompt is not answered at all in a refused session.
+        assert!(confirm_prompt_in(&dir, "hello", now(), refused).is_none());
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]

@@ -644,3 +644,47 @@ fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
     assert!(text.starts_with("safe-ai-skill tier: relaxed"), "{text}");
     assert!(text.contains("SAFE_AI_SKILL_TIER: off` ignored"), "{text}");
 }
+
+// ---------------------------------------------------------------------------------------
+// No confirmation or announcement in a headless session (nested `claude -p`)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_headless_session_neither_announces_nor_confirms() {
+    let sb = Sandbox::new("relax-headless");
+    allow_transfer(&sb);
+    let headless = [("SAFE_AI_SKILL_HEADLESS", "1")];
+    // No code is shown there, and the request stays unannounced.
+    let notice = sb.hook(
+        &["pending-notice"],
+        json!({"hook_event_name":"PostToolUse","tool_name":"Bash","cwd": sb.proj.path()}),
+        &headless,
+    );
+    assert_eq!(notice.stdout.trim(), "");
+    let code = sb.code_shown();
+    let pending_before = sb.state("pending.json");
+    let payload = json!({"session_id":"it-relax","cwd": sb.proj.path(),
+                         "hook_event_name":"UserPromptSubmit",
+                         "prompt": format!("safe-ai-skill confirm {code}")});
+    for env in [&headless[..], &[("CI", "true")][..]] {
+        for _ in 0..4 {
+            let v = sb.hook(&["prompt-guard"], payload.clone(), env).json();
+            let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+            assert!(
+                msg.contains("nothing confirmed") && msg.contains("headless"),
+                "{msg}"
+            );
+            assert!(!msg.contains(&code), "{msg}");
+            // Told to the user only: nothing for the model.
+            assert!(v.get("hookSpecificOutput").is_none(), "{v}");
+        }
+    }
+    // No state change: nothing consumed, no wrong code counted.
+    assert_eq!(sb.state("pending.json"), pending_before);
+    assert!(sb.state("grants.json").is_none());
+    let ok = sb.prompt(&format!("safe-ai-skill confirm {code}")).json();
+    assert!(ok["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("you confirmed"));
+}
