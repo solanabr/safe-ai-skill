@@ -16,14 +16,14 @@
 //! probe would make every interactive session headless. It is switched on once the live check
 //! confirms what hook processes see.
 //!
-//! [`confirmation_refused`] is a separate, wider test used only where a pending relaxation is
+//! [`session_check`] is a separate, wider test used only where a pending relaxation is
 //! announced or confirmed: besides the variables above, it walks the hook's process ancestry
 //! (through the shells between Claude Code and the engine) to the Claude Code CLI that ran the
 //! hook, and refuses when that process runs non-interactively (`-p`, `--print`) or was itself
 //! started from another Claude Code CLI (an agent's nested `claude`). Neither can be seen in
 //! the hook payload or in a variable Claude Code documents. When the ancestry cannot be
-//! determined (no process table, `ps` denied or too slow, a missing parent, the depth cap) the
-//! session is refused too. Processes are recognised by their argument words, which a nested
+//! determined (no process table, as on native Windows; `ps` denied or too slow; a missing
+//! parent; the depth cap) only requests made inside the same session can be confirmed. Processes are recognised by their argument words, which a nested
 //! session's launcher controls (`exec -a`): that residual is why `confirm` also binds each
 //! request to one Claude Code session.
 
@@ -64,26 +64,39 @@ pub fn detect() -> bool {
     is_headless(&|k| std::env::var(k).ok(), None)
 }
 
-/// Why a confirmation (or a code announcement) cannot happen in this session, if it can't:
-/// a headless signal ([`detect`]), the Claude Code process running this hook is
-/// non-interactive or nested ([`ancestry_verdict`]), or the process ancestry cannot be
-/// determined at all, which is refused too: a nested `claude` started from a sandboxed Bash
-/// tool is exactly a process that cannot read the process table.
-pub fn confirmation_refused() -> Option<String> {
+/// Whether this session may announce and confirm codes: refused on a headless signal
+/// ([`detect`]) or when the Claude Code CLI running this hook is non-interactive or nested
+/// ([`ancestry_verdict`]); [`SessionCheck::Unknown`] when the ancestry cannot be determined.
+pub fn session_check() -> SessionCheck {
     if detect() {
-        return Some("this is a headless session (CI or a headless switch is set)".into());
+        return SessionCheck::Refused(
+            "this is a headless session (CI or a headless switch is set)".into(),
+        );
     }
     let verdict = match process_table() {
         Ok(table) => ancestry_verdict(std::process::id(), &table),
         Err(why) => Ancestry::Unknown(why),
     };
     match verdict {
-        Ancestry::Interactive => None,
-        Ancestry::Refused(why) => Some(why.into()),
-        Ancestry::Unknown(why) => Some(format!(
+        Ancestry::Interactive => SessionCheck::Interactive,
+        Ancestry::Refused(why) => SessionCheck::Refused(why.into()),
+        Ancestry::Unknown(why) => SessionCheck::Unknown(format!(
             "could not determine whether this Claude Code session is interactive ({why})"
         )),
     }
+}
+
+/// [`session_check`]'s verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCheck {
+    /// Interactive, not nested.
+    Interactive,
+    /// Headless, non-interactive or nested: nothing is announced or confirmed.
+    Refused(String),
+    /// The ancestry could not be determined (no process table by design on native Windows, a
+    /// denied or slow `ps`): only requests made inside this very session are announced and
+    /// confirmed, on the session binding alone.
+    Unknown(String),
 }
 
 /// One process: its parent and its argument words.
