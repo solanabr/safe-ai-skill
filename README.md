@@ -238,7 +238,7 @@ safe-ai-skill registry verify        # audit installed entries against registry
 safe-ai-skill add skill <name|url>   # catalog entry or any GitHub URL, verified before install
 safe-ai-skill add mcp <id|pkg|url>   # any MCP; verified before writing .mcp.json
 safe-ai-skill verify                 # on-demand audit of all installed skills and MCPs
-safe-ai-skill verify check <dir>     # grade one skill directory as the sweep would at your tier, listing every finding
+safe-ai-skill verify check <dir>     # grade one skill directory as the sweep would at your tier, listing every finding (INFO included)
 safe-ai-skill verify approve <name>  # re-pin a drifted pack after you reviewed it
 safe-ai-skill status                 # pins, tier, live grants, spend, recent decisions
 safe-ai-skill tier                   # show the tier, where it came from, and the sandbox state
@@ -298,7 +298,7 @@ safe-ai-skill install --from <dir|tarball>   # verified install from a local ski
 safe-ai-skill install --home ~               # install into <dir>/.claude/skills (default: ~)
 ```
 
-`install` never downloads anything: `--from` takes a local directory or tarball, so fetch a hub yourself (for example `git clone`) and point `--from` at it. It runs the verification pipeline on every skill, neutralizes telemetry preambles, pins each pack, and holds a skill with a High finding, always. A skill with only Medium findings is held unless you pass `--yes`. With no `--from` it verifies the current project's `.claude/skills` in place, and rewrites a `SKILL.md` there to remove a telemetry preamble it finds. It does not auto-widen `~/.claude/settings.json` permissions.
+`install` never downloads anything: `--from` takes a local directory or tarball, so fetch a hub yourself (for example `git clone`) and point `--from` at it. It grades every skill the way the SessionStart sweep would at your tier, neutralizes telemetry preambles and pins each pack it takes. A clean skill is taken. A skill with warnings, or with an unreviewed HIGH finding below tier `high`, is held unless you pass `--yes` (it is pinned as unreviewed, so the sweep keeps reporting it). A skill the tier denies (a combination BLOCK, a `packs.lock` mismatch, an unreviewed HIGH at tier `high`, a pack too large to scan) and a combination BLOCK at any tier, Off included, are held unless you pass `--force`; the gates still deny such a pack in place once it is swept. `add` follows the same rules for a local directory. With no `--from` it verifies the current project's `.claude/skills` in place, and rewrites a `SKILL.md` there to remove a telemetry preamble it finds, unless the project's `.safe-ai-skill/packs.lock` pins that pack (the output lists it under `not_neutralized`). It does not auto-widen `~/.claude/settings.json` permissions.
 
 ## Registry-free verification model
 

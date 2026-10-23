@@ -909,7 +909,7 @@ fn scan_file(
         .unwrap_or_default();
     let shebang = readings.iter().any(|t| first_line(t).starts_with("#!"));
     if is_lockfile(&name) && !executable && !shebang {
-        // Generated dependency data: inventoried at `verify add|check` (spec D7.2), never run.
+        // Generated dependency data, never run. Not inventoried yet (issue #11, spec D7.2).
         return out;
     }
     for (k, text) in readings.iter().enumerate() {

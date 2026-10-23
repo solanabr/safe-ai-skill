@@ -862,6 +862,7 @@ fn cmd_verify_check(target: &str) -> ExitCode {
                 "target": target,
                 "tier": ctx.tier.label(),
                 "state": check.state.label(),
+                "reason": reason_json(check.reason),
                 "verdict": check.verdict.label(),
                 "findings": check.findings,
                 "report": check.report,
@@ -886,6 +887,94 @@ fn check_context() -> verify::check::CheckContext {
     let dir = state_dir(&cwd);
     let (effective, _) = load_runtime(&cwd, &dir);
     verify::check::CheckContext::load(&dir, &verify::project_root(&cwd), effective.tier())
+}
+
+/// The `add` / `install` confirmation flags.
+#[derive(Clone, Copy)]
+struct Confirm {
+    /// `--yes` or `--force`: take a pack with warnings.
+    yes: bool,
+    /// `--force`: also take a pack the tier denies, or a combination BLOCK at any tier.
+    force: bool,
+}
+
+impl Confirm {
+    fn from_args(rest: &[String]) -> Self {
+        let force = rest.iter().any(|a| a == "--force");
+        Confirm {
+            yes: force || rest.iter().any(|a| a == "--yes"),
+            force,
+        }
+    }
+
+    /// Whether `add` / `install` take a pack graded `check`: a clean one always, one with
+    /// warnings with `--yes`, and one the tier denies or a blocked one (a combination rule,
+    /// whatever the tier, Off included) only with `--force`.
+    fn takes(self, check: &verify::check::Check) -> bool {
+        if check.verdict == verify::Verdict::Block
+            || check.state == verify::state::PackStatus::Blocked
+        {
+            return self.force;
+        }
+        match check.verdict {
+            verify::Verdict::Pass => true,
+            _ => self.yes,
+        }
+    }
+}
+
+/// A `reason` label for JSON (`null` when there is none).
+fn reason_json(reason: Option<verify::state::Reason>) -> serde_json::Value {
+    reason.map_or(serde_json::Value::Null, |r| serde_json::json!(r.label()))
+}
+
+/// Grade one skill dir for `install`: the original content is listed in `flagged`, the telemetry
+/// preamble of its `SKILL.md` neutralized (unless the project's `packs.lock` pins the pack, which
+/// the edit would break: then it is left as is and listed in `kept`), and the result graded
+/// again. `Ok` with the final check when the pack is taken, `Err` with its `held` entry.
+fn grade_for_install(
+    dir: &Path,
+    name: &str,
+    ctx: &verify::check::CheckContext,
+    confirm: Confirm,
+    flagged: &mut Vec<serde_json::Value>,
+    kept: &mut Vec<serde_json::Value>,
+) -> Result<verify::check::Check, serde_json::Value> {
+    let error = |e: String| serde_json::json!({ "skill": name, "error": e });
+    let pre = verify::check::check_dir(dir, name, ctx).map_err(error)?;
+    flagged.extend(tagged_findings(name, &pre));
+
+    let skill_md = dir.join("SKILL.md");
+    if let Ok(body) = std::fs::read_to_string(&skill_md) {
+        let (cleaned, changed) = verify::neutralize_telemetry(&body);
+        if changed && ctx.lock_pinned(dir) {
+            kept.push(serde_json::json!({
+                "skill": name,
+                "reason": format!(
+                    "its telemetry preamble was left in place: {} pins this content, and \
+                     editing it would break that pin",
+                    verify::state::PACKS_LOCK
+                ),
+            }));
+        } else if changed {
+            let _ = std::fs::write(&skill_md, cleaned);
+        }
+    }
+
+    // The verdict the install gate uses, on the neutralized content: a skill whose only danger
+    // was the removed telemetry preamble installs cleanly.
+    let check = verify::check::check_dir(dir, name, ctx).map_err(error)?;
+    if confirm.takes(&check) {
+        return Ok(check);
+    }
+    Err(serde_json::json!({
+        "skill": name,
+        "state": check.state.label(),
+        "reason": reason_json(check.reason),
+        "verdict": check.verdict.label(),
+        "findings": check.findings.len(),
+        "report": check.report,
+    }))
 }
 
 /// `check`'s findings as `install` lists them, each tagged with its skill.
@@ -1084,7 +1173,8 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // `add` is a user-invoked install, so the (otherwise isolated) network steps are allowed:
     // an `--online` flag (default on for `add`) lets provenance hit the npm/osv registries.
     let online = !rest.iter().any(|a| a == "--offline");
-    let force = rest.iter().any(|a| a == "--yes" || a == "--force");
+    let confirm = Confirm::from_args(rest);
+    let force = confirm.yes;
 
     if source.is_empty() {
         print_json(&serde_json::json!({
@@ -1140,22 +1230,32 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // mcp → npm package provenance (+ osv); a local skill/repo dir → the sweep's rule engine at
     // the current tier, plus the provenance of its source; any other source → provenance only.
     let local = verify::expand_home(source);
+    let add_error = |e: String| {
+        print_json(&serde_json::json!({
+            "command": "add",
+            "kind": kind,
+            "source": source,
+            "status": "error",
+            "error": e,
+        }));
+        ExitCode::FAILURE
+    };
+    let looks_local = ["./", "../", "/", "~"]
+        .iter()
+        .any(|p| source.starts_with(p))
+        || source == "."
+        || source == "..";
+    if kind != "mcp" && looks_local && !local.is_dir() {
+        return add_error(format!("{source}: no such local directory"));
+    }
     let mut checked: Option<verify::check::Check> = None;
     let report = match kind {
         "mcp" => verify::pipeline_npm(source, online),
         _ if local.is_dir() => {
-            match verify::check::check_dir(&local, source, &check_context()) {
+            let ctx = check_context().for_install();
+            match verify::check::check_dir(&local, source, &ctx) {
                 Ok(check) => checked = Some(check),
-                Err(e) => {
-                    print_json(&serde_json::json!({
-                        "command": "add",
-                        "kind": kind,
-                        "source": source,
-                        "status": "error",
-                        "error": e,
-                    }));
-                    return ExitCode::SUCCESS;
-                }
+                Err(e) => return add_error(e),
             }
             verify::provenance::resolve(source)
         }
@@ -1181,18 +1281,31 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // The underlying install command emitted on pass (or warn + confirm).
     let install_cmd = underlying_install_cmd(kind, source);
 
-    let (status, proceed) = match verdict {
-        verify::Verdict::Block => ("blocked", false),
-        // Warn proceeds only with an explicit confirm flag; default is the safe refusal.
-        verify::Verdict::Warn => {
+    // A pack the tier denies, or a combination BLOCK at any tier, proceeds only with `--force`.
+    let pack_blocked = checked
+        .as_ref()
+        .is_some_and(|c| c.state == verify::state::PackStatus::Blocked);
+    // A provenance BLOCK (or an npm/URL source's) is never overridden.
+    let source_blocked = verify::verdict(&report) == verify::Verdict::Block;
+    let (status, proceed) =
+        if verdict == verify::Verdict::Block && (source_blocked || checked.is_none()) {
+            ("blocked", false)
+        } else if pack_blocked || verdict == verify::Verdict::Block {
+            if confirm.force {
+                ("force_proceed", true)
+            } else {
+                ("blocked", false)
+            }
+        } else if verdict == verify::Verdict::Warn {
+            // Warn proceeds only with an explicit confirm flag; default is the safe refusal.
             if force {
                 ("warn_proceed", true)
             } else {
                 ("warn_hold", false)
             }
-        }
-        verify::Verdict::Pass => ("pass", true),
-    };
+        } else {
+            ("pass", true)
+        };
 
     if proceed {
         audit_event(
@@ -1217,6 +1330,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
             // The pack: the sweep's state, findings and report; the source: its provenance.
             Some(check) => {
                 map.insert("state".into(), serde_json::json!(check.state.label()));
+                map.insert("reason".into(), reason_json(check.reason));
                 map.insert("findings".into(), serde_json::json!(check.findings));
                 map.insert("report".into(), serde_json::json!(check.report));
                 map.insert("provenance".into(), serde_json::json!(provenance));
@@ -1328,7 +1442,7 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 /// Never widens `settings.json`. A skill the tier would deny is held; one with warnings (a HIGH
 /// below tier high included) is held unless `--yes`.
 fn cmd_install(rest: &[String]) -> ExitCode {
-    let force = rest.iter().any(|a| a == "--yes" || a == "--force");
+    let confirm = Confirm::from_args(rest);
     let Some(plugin_data) = cli_data_dir("install") else {
         return ExitCode::FAILURE;
     };
@@ -1341,7 +1455,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
 
     // No `--from`: verify the current project's `.claude/skills` in place (no download/copy).
     if from.is_none() {
-        return install_verify_in_place(&plugin_data, force);
+        return install_verify_in_place(&plugin_data, confirm);
     }
 
     // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
@@ -1401,7 +1515,8 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     let mut installed: Vec<String> = Vec::new();
     let mut held: Vec<serde_json::Value> = Vec::new();
     let mut flagged: Vec<serde_json::Value> = Vec::new();
-    let ctx = check_context();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let ctx = check_context().for_install();
 
     for dir in skill_dirs_under(&extract_dir) {
         let name = match dir.file_name().and_then(|n| n.to_str()) {
@@ -1409,52 +1524,16 @@ fn cmd_install(rest: &[String]) -> ExitCode {
             None => continue,
         };
 
-        // Scan the ORIGINAL (pre-neutralization) content first so the telemetry curl and
-        // any other danger are reported to the user. Then neutralize the telemetry preamble
-        // in SKILL.md before the installed copy is written.
-        match verify::check::check_dir(&dir, &name, &ctx) {
-            Ok(pre) => flagged.extend(tagged_findings(&name, &pre)),
-            Err(e) => {
-                held.push(serde_json::json!({ "skill": name, "error": e }));
-                continue;
-            }
-        }
-
-        // Neutralize telemetry in SKILL.md before scanning/installing.
-        let skill_md = dir.join("SKILL.md");
-        if let Ok(body) = std::fs::read_to_string(&skill_md) {
-            let (cleaned, changed) = verify::neutralize_telemetry(&body);
-            if changed {
-                let _ = std::fs::write(&skill_md, cleaned);
-            }
-        }
-
-        // Re-scan the neutralized content: this is the verdict the install gate uses, so a
-        // skill whose ONLY danger was the (now-removed) telemetry preamble installs cleanly.
-        let check = match verify::check::check_dir(&dir, &name, &ctx) {
+        // The original content's findings are listed, then its telemetry preamble is
+        // neutralized before the installed copy is written.
+        let check = match grade_for_install(&dir, &name, &ctx, confirm, &mut flagged, &mut kept) {
             Ok(check) => check,
-            Err(e) => {
-                held.push(serde_json::json!({ "skill": name, "error": e }));
+            Err(entry) => {
+                held.push(entry);
                 continue;
             }
         };
         let verdict = check.verdict;
-
-        let proceed = match verdict {
-            verify::Verdict::Pass => true,
-            verify::Verdict::Warn => force,
-            verify::Verdict::Block => false,
-        };
-
-        if !proceed {
-            held.push(serde_json::json!({
-                "skill": name,
-                "state": check.state.label(),
-                "verdict": verdict.label(),
-                "findings": check.findings.len(),
-            }));
-            continue;
-        }
 
         let dest = install_root.join(&name);
         if dest.exists() {
@@ -1507,6 +1586,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
         "installed": installed,
         "held": held,
         "flagged": flagged,
+        "not_neutralized": kept,
         "install_root": install_root.display().to_string(),
     }));
     ExitCode::SUCCESS
@@ -1528,7 +1608,7 @@ fn install_err(msg: &str) -> ExitCode {
 /// scanned (and its telemetry preamble neutralized in place), then pinned (TOFU) in the
 /// lockfile. A skill the tier would deny is held; one with warnings is held unless `--yes`.
 /// This is the post-`install.sh` audit path for the kit's project layout.
-fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
+fn install_verify_in_place(plugin_data: &Path, confirm: Confirm) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let skills_root = cwd.join(".claude").join("skills");
     if !skills_root.is_dir() {
@@ -1542,7 +1622,8 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
     let mut verified: Vec<String> = Vec::new();
     let mut held: Vec<serde_json::Value> = Vec::new();
     let mut flagged: Vec<serde_json::Value> = Vec::new();
-    let ctx = check_context();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let ctx = check_context().for_install();
 
     for dir in skill_dirs_under(&skills_root) {
         let name = match dir.file_name().and_then(|n| n.to_str()) {
@@ -1550,44 +1631,13 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
             None => continue,
         };
 
-        match verify::check::check_dir(&dir, &name, &ctx) {
-            Ok(pre) => flagged.extend(tagged_findings(&name, &pre)),
-            Err(e) => {
-                held.push(serde_json::json!({ "skill": name, "error": e }));
-                continue;
-            }
-        }
-
-        let skill_md = dir.join("SKILL.md");
-        if let Ok(body) = std::fs::read_to_string(&skill_md) {
-            let (cleaned, changed) = verify::neutralize_telemetry(&body);
-            if changed {
-                let _ = std::fs::write(&skill_md, cleaned);
-            }
-        }
-
-        let check = match verify::check::check_dir(&dir, &name, &ctx) {
+        let check = match grade_for_install(&dir, &name, &ctx, confirm, &mut flagged, &mut kept) {
             Ok(check) => check,
-            Err(e) => {
-                held.push(serde_json::json!({ "skill": name, "error": e }));
+            Err(entry) => {
+                held.push(entry);
                 continue;
             }
         };
-        let verdict = check.verdict;
-        let proceed = match verdict {
-            verify::Verdict::Pass => true,
-            verify::Verdict::Warn => force,
-            verify::Verdict::Block => false,
-        };
-        if !proceed {
-            held.push(serde_json::json!({
-                "skill": name,
-                "state": check.state.label(),
-                "verdict": verdict.label(),
-                "findings": check.findings.len(),
-            }));
-            continue;
-        }
 
         let hash = verify::lockfile::hash_tree(&dir);
         lock.pin_skill(
@@ -1618,6 +1668,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
         "verified": verified,
         "held": held,
         "flagged": flagged,
+        "not_neutralized": kept,
         "skills_root": skills_root.display().to_string(),
     }));
     ExitCode::SUCCESS

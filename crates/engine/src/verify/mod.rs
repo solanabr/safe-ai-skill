@@ -1348,6 +1348,8 @@ impl PackReportLine {
     fn label(&self) -> &'static str {
         match self.state {
             PackStatus::Blocked => "BLOCK",
+            // Only `verify check` lists a clean pack (for its INFO findings).
+            PackStatus::Clean => "INFO",
             _ => "WARN",
         }
     }

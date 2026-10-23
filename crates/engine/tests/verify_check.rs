@@ -145,8 +145,9 @@ fn the_issue10_stealer_is_blocked_and_denied_at_every_tier_but_off() {
         if tier == Tier::Off {
             assert!(text.contains("nothing is denied"), "{text}");
         } else {
+            // Approval never clears a combination rule, so no approve hint.
             assert!(
-                text.contains(&format!("safe-ai-skill verify approve {rel}")),
+                text.contains("fix or remove the pack") && !text.contains("verify approve"),
                 "{text}"
             );
         }
@@ -195,16 +196,79 @@ fn add_follows_the_same_grading() {
             .json();
         assert_eq!(v["state"], "warned", "{tier:?}: {v}");
         assert_eq!(v["proceed"], true, "{tier:?}: {v}");
-        let v = w.run(&["add", "skill", stealer, "--offline"], tier).json();
-        assert_eq!(v["state"], "blocked", "{tier:?}: {v}");
-        let want = if tier == Tier::Off {
-            "warn_hold"
-        } else {
-            "blocked"
-        };
-        assert_eq!(v["status"], want, "{tier:?}: {v}");
-        assert_eq!(v["proceed"], false, "{tier:?}: {v}");
+        // A combination BLOCK needs `--force` at every tier, Off included.
+        for flags in [&["--offline"][..], &["--offline", "--yes"][..]] {
+            let mut args = vec!["add", "skill", stealer];
+            args.extend_from_slice(flags);
+            let v = w.run(&args, tier).json();
+            assert_eq!(v["state"], "blocked", "{tier:?}: {v}");
+            assert_eq!(v["reason"], "combo", "{tier:?}: {v}");
+            assert_eq!(v["status"], "blocked", "{tier:?} {flags:?}: {v}");
+            assert_eq!(v["proceed"], false, "{tier:?}: {v}");
+        }
+        let v = w
+            .run(&["add", "skill", stealer, "--offline", "--force"], tier)
+            .json();
+        assert_eq!(v["status"], "force_proceed", "{tier:?}: {v}");
+        let v = w
+            .run(&["add", "repo", docs, "--offline", "--yes"], tier)
+            .json();
+        assert_eq!(
+            (&v["state"], &v["status"]),
+            (
+                &serde_json::json!("warned"),
+                &serde_json::json!("warn_proceed")
+            ),
+            "{v}"
+        );
     }
+}
+
+#[test]
+fn add_of_a_missing_local_path_is_an_error() {
+    let w = World::new("chk-add-missing");
+    let run = Invocation::new(&["add", "skill", "./typo", "--offline"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.root.path())
+        .run();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    let v = run.json();
+    assert_eq!(v["status"], "error", "{v}");
+    assert!(v["run"].is_null(), "{v}");
+}
+
+#[test]
+fn verify_check_lists_info_findings_and_errors_on_a_file() {
+    let w = World::new("chk-info");
+    let rel = "demo/.claude/skills/mcp";
+    std::fs::create_dir_all(w.root.join(rel)).unwrap();
+    std::fs::write(w.root.join(rel).join("SKILL.md"), "# mcp\n").unwrap();
+    std::fs::write(
+        w.root.join(rel).join(".mcp.json"),
+        r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@latest"]}}}"#,
+    )
+    .unwrap();
+    let v = w.check(rel, Tier::High);
+    assert_eq!(
+        (&v["state"], &v["verdict"]),
+        (&serde_json::json!("clean"), &serde_json::json!("pass"))
+    );
+    assert!(v["reason"].is_null(), "{v}");
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["sev"] == "info" && f["rule"] == "unpinned_npx"),
+        "{v}"
+    );
+    let run = Invocation::new(&["verify", "check", &format!("{rel}/SKILL.md")])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.root.path())
+        .run();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
 }
 
 #[test]
@@ -237,13 +301,36 @@ fn install_installs_the_docs_only_pack_and_holds_the_stealer() {
                 .any(|s| s == "docs-only"),
             "{tier:?}: {v}"
         );
-        let stealer_installed = v["installed"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s == "stealer");
-        // At Off a combo is reported only, so `--yes` installs it (the sweep still reports it).
-        assert_eq!(stealer_installed, tier == Tier::Off, "{tier:?}: {v}");
+        // A combination BLOCK is held at every tier, Off included, unless `--force`.
+        let held = v["held"].as_array().unwrap();
+        assert!(
+            held.iter().any(|h| h["skill"] == "stealer"
+                && h["state"] == "blocked"
+                && h["reason"] == "combo"
+                && h["report"].as_array().is_some_and(|r| !r.is_empty())),
+            "{tier:?}: {v}"
+        );
+        let forced = w
+            .run(
+                &[
+                    "install",
+                    "--from",
+                    from.to_str().unwrap(),
+                    "--home",
+                    into.to_str().unwrap(),
+                    "--force",
+                ],
+                tier,
+            )
+            .json();
+        assert!(
+            forced["installed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s == "stealer"),
+            "{tier:?}: {forced}"
+        );
         assert!(
             v["flagged"]
                 .as_array()
@@ -253,4 +340,81 @@ fn install_installs_the_docs_only_pack_and_holds_the_stealer() {
             "{v}"
         );
     }
+}
+
+/// A project whose `.claude/skills/<name>` holds `skill_md`.
+fn in_place_project(w: &World, name: &str, skill_md: &str) -> std::path::PathBuf {
+    let pack = w.root.join("proj/.claude/skills").join(name);
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(pack.join("SKILL.md"), skill_md).unwrap();
+    pack
+}
+
+fn in_place(w: &World, flags: &[&str], tier: Tier) -> serde_json::Value {
+    let mut args = vec!["install"];
+    args.extend_from_slice(flags);
+    let run = Invocation::new(&args)
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(&w.root.join("proj"))
+        .tier(tier)
+        .stdin("{}")
+        .run();
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    run.json()
+}
+
+#[test]
+fn in_place_install_holds_a_warned_pack_until_yes() {
+    for tier in tiers() {
+        let w = World::new("chk-inplace");
+        in_place_project(&w, "docs-only", ISSUE5_DOC);
+        let v = in_place(&w, &[], tier);
+        assert!(
+            v["held"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["skill"] == "docs-only" && h["state"] == "warned"),
+            "{tier:?}: {v}"
+        );
+        let v = in_place(&w, &["--yes"], tier);
+        assert_eq!(
+            v["verified"],
+            serde_json::json!(["docs-only"]),
+            "{tier:?}: {v}"
+        );
+    }
+}
+
+#[test]
+fn in_place_install_leaves_a_lock_pinned_pack_unedited() {
+    let w = World::new("chk-inplace-lock");
+    let body = "---\nname: tele\ntelemetryTier: full\n---\n\n```bash\ncurl -s -X POST \"https://x.convex.cloud/api/mutation\" -d '{\"path\":\"telemetry:record\"}'\n```\n";
+    let pack = in_place_project(&w, "tele", body);
+    let hash = safe_ai_skill::verify::state::tree_hash(&pack.canonicalize().unwrap());
+    std::fs::create_dir_all(w.root.join("proj/.safe-ai-skill")).unwrap();
+    std::fs::write(
+        w.root.join("proj/.safe-ai-skill/packs.lock"),
+        format!(r#"{{"packs":[{{"path":".claude/skills/tele","tree_hash":"{hash}"}}]}}"#),
+    )
+    .unwrap();
+    let v = in_place(&w, &["--yes"], Tier::Relaxed);
+    assert_eq!(
+        std::fs::read_to_string(pack.join("SKILL.md")).unwrap(),
+        body,
+        "edited despite the lock pin: {v}"
+    );
+    assert!(
+        v["not_neutralized"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["skill"] == "tele"
+                && n["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("packs.lock"))),
+        "{v}"
+    );
+    assert_eq!(v["verified"], serde_json::json!(["tele"]), "{v}");
 }

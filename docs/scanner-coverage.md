@@ -22,7 +22,8 @@ The pack grade (`rules::grade`) is decided as follows:
 * **warn**: the worst finding is WARN. **Findings in docs are capped at WARN**, because the runtime
   gates catch execution.
 * **high**: at least one code or meta finding at HIGH. A pack seen for the first time is recorded as
-  *unreviewed* and the user is warned. It is never blocked.
+  *unreviewed* and the user is warned. It is never a BLOCK, but tier `high` denies it until the
+  user trusts it.
 * **block**: only a combination rule fires. Drift against a pin or a committed `packs.lock` is
   decided by the verify state machine, not by the scanner.
 
@@ -140,8 +141,11 @@ planned for 1.2 (issue #11).
 `verify check <dir>`, `add <local dir>` and both `install` paths grade a directory the way the
 SessionStart sweep grades a pack it sees for the first time: the same rules and grade, the user's
 trust and the project's `packs.lock`, and the same action at the current tier (`verdict: block`
-only when the gates would deny the pack). They report every finding as `{rule, sev, path, line,
-ctx}` plus the sweep's report lines. Drift against a stored pin is the sweep's alone.
+only when the gates would deny the pack). They report every finding, INFO included, as `{rule,
+sev, path, line, ctx}` plus the sweep's report lines (the sweep itself lists WARN and above). A
+pack whose name walk passes the entry cap is unscanned for them too, and denied like a blocked
+one. `verify check` takes a directory, not a single file. Drift against a stored pin is the
+sweep's alone.
 
 ## Scan budget
 

@@ -2,9 +2,10 @@
 //! `verify check`, `add <local dir>` and both `install` paths.
 //!
 //! The rule engine ([`grading::scan_pack`], no time budget) plus the sweep's symlink-escape
-//! combo, then [`state::decide`] with no pin, the user's trust (by content hash) and the
-//! project's `packs.lock`, then [`super::tier_action`] at the resolved tier. The stored pin and
-//! drift stay the sweep's business: a check reports the content, not its history.
+//! combo and its unscanned marker (a name walk past its entry cap), then [`state::decide`] with
+//! no pin, the user's trust (by content hash) and the project's `packs.lock`, then
+//! [`super::tier_action`] at the resolved tier. The stored pin and drift stay the sweep's
+//! business: a check reports the content, not its history.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use crate::policy::tier::Tier;
 pub struct CheckContext {
     /// The tier the gates act at.
     pub tier: Tier,
+    /// The check is for `add` / `install` (the pack is not swept yet), not `verify check`.
+    installing: bool,
     trust: trust::TrustStore,
     lock_pins: BTreeMap<String, String>,
 }
@@ -28,9 +31,22 @@ impl CheckContext {
     pub fn load(dir: &DataDir, project_root: &Path, tier: Tier) -> Self {
         CheckContext {
             tier,
+            installing: false,
             trust: trust::load_honoured(dir),
             lock_pins: state::packs_lock(project_root),
         }
+    }
+
+    /// The same context, worded for `add` / `install`.
+    pub fn for_install(mut self) -> Self {
+        self.installing = true;
+        self
+    }
+
+    /// The project's `packs.lock` pins the pack at `dir` (so editing it breaks the pin).
+    pub fn lock_pinned(&self, dir: &Path) -> bool {
+        dir.canonicalize()
+            .is_ok_and(|c| self.lock_pins.contains_key(&state::key_of(&c)))
     }
 }
 
@@ -41,10 +57,12 @@ pub struct Check {
     pub state: PackStatus,
     /// Why.
     pub reason: Option<Reason>,
+    /// Not fully scanned (its name walk ran past the entry cap): denied like a blocked pack.
+    pub unscanned: bool,
     /// What the tier does with it: `Block` when the gates deny the pack, `Warn` when it is only
     /// reported, `Pass` when there is nothing to report.
     pub verdict: Verdict,
-    /// Every WARN-and-above finding and combo, uncapped.
+    /// Every finding and combo, INFO included, uncapped.
     pub findings: Vec<StoredFinding>,
     /// The sweep's report lines for the pack (every finding), then what the tier does.
     pub report: Vec<String>,
@@ -60,6 +78,16 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
     }
     let mut report = grading::scan_pack(&canonical);
     let walked = state::skill_names_until(&canonical, None);
+    let unscanned = walked.over_budget;
+    if unscanned {
+        report.findings.push(grading::Finding {
+            rule: state::SCAN_BUDGET_RULE,
+            sev: grading::Severity::High,
+            path: PathBuf::new(),
+            line: None,
+            ctx: grading::Ctx::Meta,
+        });
+    }
     for name in &walked.escaping {
         report.combos.push(grading::ComboHit {
             rule: state::SYMLINK_ESCAPE_RULE,
@@ -79,11 +107,18 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         hash,
         grade: grading::grade(&report),
     };
-    let t = state::decide(None, &obs, None);
-    let findings = state::reported_findings(&report);
+    let mut t = state::decide(None, &obs, None);
+    // The sweep records an unscanned pack `unreviewed` whatever it trusts, and denies it like a
+    // blocked one.
+    if unscanned && t.state < PackStatus::Unreviewed {
+        t.state = PackStatus::Unreviewed;
+        t.reason = Some(Reason::Heuristic);
+    }
+    let findings = state::reported_findings(&report, true);
 
     let marker = match t.state {
         PackStatus::Blocked => gate::Verdict::Deny(String::new()),
+        PackStatus::Unreviewed if unscanned => gate::Verdict::Deny(String::new()),
         PackStatus::Unreviewed => gate::Verdict::Ask(String::new()),
         PackStatus::Warned | PackStatus::Clean => gate::Verdict::NoOpinion,
     };
@@ -100,7 +135,12 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         display: display.to_string(),
         state: t.state,
         reason: t.reason,
-        note: None,
+        note: unscanned.then(|| {
+            format!(
+                "not fully scanned: more than {} entries to walk",
+                state::MAX_NAME_WALK_ENTRIES
+            )
+        }),
         findings: findings.clone(),
         more_findings: 0,
         moved_to: None,
@@ -108,13 +148,24 @@ pub fn check_dir(dir: &Path, display: &str, ctx: &CheckContext) -> Result<Check,
         not_moved: None,
     };
     let mut lines = Vec::new();
-    if t.state != PackStatus::Clean {
+    if t.state != PackStatus::Clean || !findings.is_empty() {
         lines = line.model_lines(usize::MAX);
-        lines.push(action_line(t.state, denied, ctx.tier, display));
+    }
+    if t.state != PackStatus::Clean {
+        lines.push(action_line(&Action {
+            state: t.state,
+            reason: t.reason,
+            unscanned,
+            denied,
+            tier: ctx.tier,
+            installing: ctx.installing,
+            display,
+        }));
     }
     Ok(Check {
         state: t.state,
         reason: t.reason,
+        unscanned,
         verdict,
         findings,
         report: lines,
@@ -129,19 +180,41 @@ fn kind_of(canonical: &Path) -> PackKind {
     }
 }
 
+/// What [`action_line`] words.
+struct Action<'a> {
+    state: PackStatus,
+    reason: Option<Reason>,
+    unscanned: bool,
+    denied: bool,
+    tier: Tier,
+    installing: bool,
+    display: &'a str,
+}
+
 /// What the tier does with a reported pack, in the sweep's words.
-fn action_line(state: PackStatus, denied: bool, tier: Tier, display: &str) -> String {
-    let shown = super::escape_for_report(display);
-    let what = match (state, denied) {
+fn action_line(a: &Action) -> String {
+    let shown = super::escape_for_report(a.display);
+    let gates = if a.installing {
+        "once swept, the gates would deny Skill, /command, Read and Bash access to it"
+    } else {
+        "Skill, /command, Read and Bash access to it is denied"
+    };
+    let what = match (a.state, a.denied) {
+        // Approval never clears a combination rule.
+        (PackStatus::Blocked, true) if a.reason == Some(Reason::Combo) => format!(
+            "{gates}: a combination rule fires, which neither approval nor trust clears; fix or \
+             remove the pack"
+        ),
         (PackStatus::Blocked, true) => format!(
-            "Skill, /command, Read and Bash access to it is denied until approved; review it, \
-             then run `safe-ai-skill verify approve {shown}`"
+            "{gates} until approved; review it, then run `safe-ai-skill verify approve {shown}`"
         ),
+        (PackStatus::Unreviewed, true) if a.unscanned => {
+            format!("{gates} until a sweep scans it in full, which a pack this large never fits")
+        }
         (PackStatus::Unreviewed, true) => format!(
-            "Skill, /command, Read and Bash access to it is denied until trusted; review it, \
-             then run `safe-ai-skill verify trust {shown}`"
+            "{gates} until trusted; review it, then run `safe-ai-skill verify trust {shown}`"
         ),
-        (_, true) => "denied".to_string(),
+        (_, true) => gates.to_string(),
         (PackStatus::Blocked, false) => {
             "reported only, the tier is off and nothing is denied".to_string()
         }
@@ -151,7 +224,7 @@ fn action_line(state: PackStatus, denied: bool, tier: Tier, display: &str) -> St
         ),
         _ => "reported only".to_string(),
     };
-    format!(" - tier {}: {what}", tier.label())
+    format!(" - tier {}: {what}", a.tier.label())
 }
 
 #[cfg(test)]
@@ -161,47 +234,50 @@ mod tests {
     fn ctx(tier: Tier) -> CheckContext {
         CheckContext {
             tier,
+            installing: false,
             trust: trust::TrustStore::new(),
             lock_pins: BTreeMap::new(),
         }
     }
 
-    fn pack(files: &[(&str, &str)]) -> tempfile_dir::Dir {
-        let d = tempfile_dir::Dir::new();
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "ssai-check-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Dir(p.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pack(files: &[(&str, &str)]) -> Dir {
+        let d = Dir::new();
         for (name, body) in files {
             std::fs::write(d.0.join(name), body).unwrap();
         }
         d
     }
 
-    mod tempfile_dir {
-        pub struct Dir(pub std::path::PathBuf);
-        impl Dir {
-            pub fn new() -> Self {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static N: AtomicU32 = AtomicU32::new(0);
-                let p = std::env::temp_dir().join(format!(
-                    "ssai-check-{}-{}",
-                    std::process::id(),
-                    N.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::create_dir_all(&p).unwrap();
-                Dir(p)
-            }
-        }
-        impl Drop for Dir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-    }
-
     const ISSUE5_DOC: &str = "Load the payer with signerFromFile(\"~/.config/solana/id.json\").\n";
+    const KEYPAIR_SCRIPT: &str = "#!/bin/sh\n\ncat ~/.config/solana/id.json\n";
+    const ALL: [Tier; 4] = [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High];
 
     #[test]
     fn a_docs_only_keypair_mention_warns_and_never_blocks() {
         let d = pack(&[("SKILL.md", ISSUE5_DOC)]);
-        for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+        for tier in ALL {
             let c = check_dir(&d.0, "docs-only", &ctx(tier)).unwrap();
             assert_eq!(c.state, PackStatus::Warned, "{tier:?}");
             assert_eq!(c.verdict, Verdict::Warn, "{tier:?}");
@@ -217,10 +293,7 @@ mod tests {
 
     #[test]
     fn a_code_high_is_denied_at_high_only() {
-        let d = pack(&[
-            ("SKILL.md", "# x\n"),
-            ("load.sh", "#!/bin/sh\n\ncat ~/.config/solana/id.json\n"),
-        ]);
+        let d = pack(&[("SKILL.md", "# x\n"), ("load.sh", KEYPAIR_SCRIPT)]);
         for (tier, want) in [
             (Tier::Off, Verdict::Warn),
             (Tier::Relaxed, Verdict::Warn),
@@ -242,8 +315,136 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_dir_is_an_error() {
-        let d = tempfile_dir::Dir::new();
+    fn info_findings_are_listed_and_change_nothing() {
+        let d = pack(&[
+            ("SKILL.md", "# x\n"),
+            (
+                ".mcp.json",
+                r#"{"mcpServers":{"h":{"command":"npx","args":["-y","h-mcp@latest"]}}}"#,
+            ),
+        ]);
+        let c = check_dir(&d.0, "p", &ctx(Tier::High)).unwrap();
+        assert_eq!((c.state, c.verdict), (PackStatus::Clean, Verdict::Pass));
+        assert!(
+            c.findings.iter().any(|f| f.sev == state::StoredSev::Info),
+            "{:?}",
+            c.findings
+        );
+        assert!(c.report[0].starts_with(" - INFO skill"), "{:?}", c.report);
+        assert!(
+            c.report.iter().any(|l| l.contains("(info, ")),
+            "{:?}",
+            c.report
+        );
+    }
+
+    #[test]
+    fn a_walk_past_the_entry_cap_is_unscanned_and_denied_like_a_block() {
+        let d = pack(&[("SKILL.md", "# x\n")]);
+        for i in 0..8 {
+            std::fs::create_dir_all(d.0.join(format!("d{i}"))).unwrap();
+        }
+        state::NAME_CAP.with(|c| c.set(4));
+        let checks: Vec<Check> = ALL
+            .iter()
+            .map(|t| check_dir(&d.0, "p", &ctx(*t)).unwrap())
+            .collect();
+        state::NAME_CAP.with(|c| c.set(state::MAX_NAME_WALK_ENTRIES));
+        for (tier, c) in ALL.iter().zip(&checks) {
+            assert!(c.unscanned, "{tier:?}");
+            assert_eq!(c.state, PackStatus::Unreviewed, "{tier:?}");
+            let want = if *tier == Tier::Off {
+                Verdict::Warn
+            } else {
+                Verdict::Block
+            };
+            assert_eq!(c.verdict, want, "{tier:?}");
+            assert!(
+                c.findings.iter().any(|f| f.rule == state::SCAN_BUDGET_RULE),
+                "{:?}",
+                c.findings
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_the_pack_is_a_combo_block() {
+        let outside = pack(&[("SKILL.md", "---\nname: other\n---\n")]);
+        let d = pack(&[("SKILL.md", "# x\n")]);
+        std::os::unix::fs::symlink(&outside.0, d.0.join("sub")).unwrap();
+        let c = check_dir(&d.0, "p", &ctx(Tier::Relaxed)).unwrap();
+        assert_eq!(
+            (c.state, c.reason),
+            (PackStatus::Blocked, Some(Reason::Combo))
+        );
+        assert_eq!(c.verdict, Verdict::Block);
+        assert!(
+            c.report.iter().any(|l| l.contains("fix or remove")),
+            "{:?}",
+            c.report
+        );
+        assert!(!c.report.iter().any(|l| l.contains("verify approve")));
+    }
+
+    #[test]
+    fn trust_clears_a_high_and_packs_lock_pins_the_content() {
+        let d = pack(&[("SKILL.md", "# x\n"), ("load.sh", KEYPAIR_SCRIPT)]);
+        let hash = state::tree_hash(&d.0);
+        let mut trusted = ctx(Tier::High);
+        trusted.trust.insert(
+            hash.clone(),
+            trust::TrustEntry {
+                acked_rules: vec!["secret_read".to_string()],
+                confirmed_via: trust::CONFIRMED_VIA.to_string(),
+                at: 0,
+                path_hint: String::new(),
+            },
+        );
+        let c = check_dir(&d.0, "p", &trusted).unwrap();
+        assert_eq!((c.state, c.verdict), (PackStatus::Clean, Verdict::Pass));
+
+        // A matching lock entry keeps a HIGH a warning, even at High.
+        let mut locked = ctx(Tier::High);
+        locked.lock_pins.insert(state::key_of(&d.0), hash);
+        assert!(locked.lock_pinned(&d.0));
+        let c = check_dir(&d.0, "p", &locked).unwrap();
+        assert_eq!((c.state, c.verdict), (PackStatus::Warned, Verdict::Warn));
+
+        // A mismatching one blocks, with approval as the way out.
+        let mut stale = ctx(Tier::Relaxed);
+        stale.lock_pins.insert(state::key_of(&d.0), "0".repeat(64));
+        let c = check_dir(&d.0, "p", &stale).unwrap();
+        assert_eq!(
+            (c.state, c.reason, c.verdict),
+            (
+                PackStatus::Blocked,
+                Some(Reason::LockMismatch),
+                Verdict::Block
+            )
+        );
+        assert!(
+            c.report.iter().any(|l| l.contains("verify approve p")),
+            "{:?}",
+            c.report
+        );
+    }
+
+    #[test]
+    fn install_wording_says_would_be_denied() {
+        let d = pack(&[("SKILL.md", "# x\n"), ("load.sh", KEYPAIR_SCRIPT)]);
+        let c = check_dir(&d.0, "p", &ctx(Tier::High).for_install()).unwrap();
+        assert!(
+            c.report.iter().any(|l| l.contains("the gates would deny")),
+            "{:?}",
+            c.report
+        );
+    }
+
+    #[test]
+    fn a_missing_dir_or_a_file_is_an_error() {
+        let d = pack(&[("f.md", "x")]);
         assert!(check_dir(&d.0.join("nope"), "nope", &ctx(Tier::Medium)).is_err());
+        assert!(check_dir(&d.0.join("f.md"), "f.md", &ctx(Tier::Medium)).is_err());
     }
 }
