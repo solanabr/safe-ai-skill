@@ -43,6 +43,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # OS CSPRNG (`OsRng`) for confirmation nonces and the state MAC key. Already in the tree via
 # ed25519-dalek; the `getrandom` feature reuses the getrandom crate rustls/ring already build.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# zlib inflate for the read-only git object reader (`verify/gitobj.rs`, #10). Pure Rust, no
+# unsafe in the inflate path; already in Rust std's own dependency tree (backtrace symbolization).
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
 [target.'cfg(unix)'.dependencies]
 # getpwuid_r (trusted home), geteuid, O_NOFOLLOW and flock. Already in the tree via getrandom.

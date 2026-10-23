@@ -8,9 +8,11 @@
 //! [`apply_confirmed`]).
 
 pub mod enforce;
+pub mod gitobj;
 pub mod gittracked;
 pub mod grading;
 pub mod heuristics;
+pub mod history;
 pub mod lockfile;
 pub mod osv;
 pub mod provenance;
@@ -143,11 +145,13 @@ pub fn verdict(report: &Report) -> Verdict {
 
 /// Run the full intrinsic pipeline over an already-materialized skill/MCP directory.
 ///
-/// Combines [`heuristics::scan`] over the directory with [`provenance::resolve`] of its
-/// `source` (when given). The osv.dev step is invoked by [`pipeline_npm`] for package
-/// sources; this directory pipeline is network-free and fully hermetic.
+/// Combines [`heuristics::scan`] over the directory, [`history::scan`] of its own git history
+/// (when `dir` holds a `.git`), and [`provenance::resolve`] of its `source` (when given). The
+/// osv.dev step is invoked by [`pipeline_npm`] for package sources; this directory pipeline is
+/// network-free, runs no process, and is fully hermetic.
 pub fn pipeline_dir(dir: &Path, source: Option<&str>) -> Report {
     let mut report = heuristics::scan(dir);
+    report.merge(history::scan(dir).legacy());
     if let Some(src) = source {
         report.merge(provenance::resolve(src));
     }

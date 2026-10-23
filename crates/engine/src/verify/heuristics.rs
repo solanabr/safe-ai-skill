@@ -55,7 +55,8 @@ pub fn scan_until(path: &Path, deadline: Option<std::time::Instant>) -> Budgeted
     }
 }
 
-fn legacy_report(pack: &rules::PackReport) -> Report {
+/// The v1 view of a rule-engine report (see the module docs for the mapping).
+pub(crate) fn legacy_report(pack: &rules::PackReport) -> Report {
     let mut report = Report::default();
     for f in &pack.findings {
         report.findings.push(legacy(
