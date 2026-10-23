@@ -1365,9 +1365,14 @@ fn e2e_xargs_fed_wallet_paths_deny() {
             "gate-bash: {cmd}"
         );
     }
-    for cmd in ["ls build | xargs rm -rf", "echo id.json | xargs cat"] {
-        assert_eq!(w.bash(cmd, Tier::Relaxed), "", "{cmd}");
-    }
+    assert_eq!(w.bash("ls build | xargs rm -rf", Tier::Relaxed), "");
+    // Not the wallet, but the emitted name is `cat`'s argument: `cat id.json` is a secret read.
+    let cmd = "echo id.json | xargs cat";
+    assert_eq!(
+        decision_label(&w.run("gate-bash", cmd, Tier::Relaxed, &[])),
+        ""
+    );
+    assert_eq!(w.bash(cmd, Tier::Relaxed), "deny");
 }
 
 #[test]

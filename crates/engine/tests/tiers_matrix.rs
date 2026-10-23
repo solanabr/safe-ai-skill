@@ -1572,3 +1572,333 @@ fn an_inline_post_to_a_solana_rpc_host_is_quiet_below_high() {
         check(cmd, w.x4("Bash", &bash(cmd)), ["ask", "ask", "ask", "ask"]);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// #21: the on-chain gate finds the command word behind keywords, groups, substitutions,
+// wrappers and `VAR=` prefixes (1.0.x deferred on all of these).
+// ---------------------------------------------------------------------------------------
+
+/// Every spelling of #21 and its siblings around command `{c}`.
+const I21_SPELLINGS: &[&str] = &[
+    "{c}",
+    "true && {c}",
+    "if true; then {c}; fi",
+    "if false; then :; elif true; then {c}; else :; fi",
+    "! {c}",
+    "for i in 1; do {c}; done",
+    "while true; do {c}; break; done",
+    "until false; do {c}; break; done",
+    "case x in x) {c};; esac",
+    "{ {c}; }",
+    "({c})",
+    "echo $({c})",
+    "echo `{c}`",
+    "timeout 600 {c}",
+    "timeout -s KILL 600 {c}",
+    "timeout --signal=KILL 600 {c}",
+    "nice {c}",
+    "nice -n 5 {c}",
+    "RUST_LOG=info {c}",
+    "A=1 B=2 {c}",
+    "env RUST_LOG=info {c}",
+    "env -i PATH=/usr/bin {c}",
+    "env -u HOME {c}",
+    "time {c}",
+    "command {c}",
+    "exec {c}",
+    "nohup {c} &",
+    "sudo {c}",
+    "sudo -u deployer {c}",
+    "stdbuf -oL {c}",
+    "echo x | xargs {c}",
+    "xargs -n 1 {c} < list.txt",
+];
+
+fn i21_rows(tag: &str, commands: &[&str], want: [&str; 4]) {
+    let w = World::new(tag);
+    for cmd in commands {
+        for spelling in I21_SPELLINGS {
+            if want == NO4 && spelling.contains("xargs") {
+                // xargs may append a cluster flag the line does not show: never quiet.
+                continue;
+            }
+            let row = spelling.replace("{c}", cmd);
+            check(&row, w.x4("Bash", &bash(&row)), want);
+        }
+    }
+}
+
+#[test]
+fn i21_mainnet_deploy_spellings_ask_below_high_and_deny_at_high() {
+    i21_rows(
+        "i21-c-m",
+        &[
+            "solana program deploy --url mainnet-beta ./t.so",
+            "anchor deploy --provider.cluster mainnet",
+        ],
+        ASK_HIGH_DENY,
+    );
+    let w = World::new("i21-c-cont");
+    let row = "solana program deploy ./t.so \\\n  --url mainnet-beta";
+    check(row, w.x4("Bash", &bash(row)), ASK_HIGH_DENY);
+}
+
+#[test]
+fn i21_unknown_cluster_deploy_spellings_ask_below_high_and_deny_at_high() {
+    // Empty PATH and no Anchor.toml: the cluster is unknown.
+    i21_rows(
+        "i21-c-u",
+        &["solana program deploy ./t.so", "anchor deploy"],
+        ASK_HIGH_DENY,
+    );
+}
+
+#[test]
+fn i21_final_authority_spellings_deny_at_every_tier() {
+    i21_rows(
+        "i21-u",
+        &[
+            "solana program set-upgrade-authority PID --final --url mainnet-beta",
+            "solana program set-upgrade-authority PID --final",
+        ],
+        DENY4,
+    );
+}
+
+#[test]
+fn i21_localnet_and_read_only_spellings_have_no_opinion() {
+    // The keyword and wrapper handling classifies the command; it does not ask on every one.
+    i21_rows(
+        "i21-no",
+        &["solana program deploy -ul ./t.so", "solana balance -ud"],
+        NO4,
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// #22: a shell read of a project env file denies whatever the program (1.0.x denied only
+// `cat` and `head`).
+// ---------------------------------------------------------------------------------------
+
+fn i22_world(tag: &str) -> World {
+    let w = env_world(tag);
+    w.put(".env.example", "HELIUS_KEY=\n");
+    w.put(
+        ".env.schema",
+        "# @defaultSensitive=true\n# ---\nHELIUS_KEY=\n",
+    );
+    w
+}
+
+#[test]
+fn i22_issue_table_reads_deny_at_every_tier() {
+    let w = i22_world("i22-table");
+    for cmd in [
+        "cat .env",
+        "head -5 .env",
+        "grep KEY .env",
+        "awk 1 .env",
+        "sed -n p .env",
+        "python3 -c \"print(open('.env').read())\"",
+        "node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "source .env",
+        "while read l; do echo $l; done < .env",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn i22_interpreter_code_naming_an_env_file_denies_at_every_tier() {
+    let w = i22_world("i22-code");
+    for cmd in [
+        "ruby -e \"puts File.read('.env')\"",
+        "perl -e 'open F, \".env\"; print <F>'",
+        "perl -lne 'BEGIN{open F, \".env\"} print <F>'",
+        "php -r \"echo file_get_contents('.env');\"",
+        "deno eval \"console.log(Deno.readTextFileSync('.env'))\"",
+        "bun -e \"console.log(await Bun.file('.env').text())\"",
+        "python3.12 -c \"print(open('apps/web/.env.local').read())\"",
+        "awk 'BEGIN{while((getline l < \".env\")>0) print l}'",
+        "bash -c 'cat .env'",
+        "sh -c \"grep KEY .env\"",
+        // Code on standard input.
+        "python3 - <<'PY'\nprint(open('.env').read())\nPY",
+        "python3 <<< \"print(open('.env').read())\"",
+        "echo \"print(open('.env').read())\" | python3",
+        "bash <<< 'cat .env'",
+        // A credential store named the same ways.
+        "python3 -c \"print(open('~/.aws/credentials').read())\"",
+        "node - <<'JS'\nrequire('fs').readFileSync('~/.ssh/id_ed25519')\nJS",
+        // An apostrophe outside a string does not hide the path (review round 1).
+        "python3 -c \"# it's\nprint(open('.env').read())\"",
+        "python3 -c \"x=1 # don't\nprint(open('.env').read())\"",
+        "python3 - <<'PY'\n# load the config, don't print\nprint(open('.env').read())\nPY",
+        // Escapes, adjacent literals, quote-like operators.
+        "python3 -c \"open('\\x2eenv').read()\"",
+        "python3 -c \"open('\\56env').read()\"",
+        "node -e \"require('fs').readFileSync('\\u002eenv')\"",
+        "python3 -c \"open('.e' 'nv').read()\"",
+        "python3 -c \"open('.en''v').read()\"",
+        "perl -e 'open F, q{.env}; print <F>'",
+        "ruby -e 'puts File.read(%q(.env))'",
+        // Launchers and other interpreters.
+        "nodejs -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "powershell -c \"Get-Content '.env'\"",
+        "uv run python -c \"print(open('.env').read())\"",
+        "uv run --with requests python -c \"print(open('.env').read())\"",
+        "poetry run python -c \"print(open('.env').read())\"",
+        "npx tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "ts-node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        "pypy3 -c \"print(open('.env').read())\"",
+        "Rscript -e \"readLines('.env')\"",
+        "deno run - <<'TS'\nconsole.log(Deno.readTextFileSync('.env'))\nTS",
+        "uv run python - <<'PY'\nprint(open('.env').read())\nPY",
+        // Folded and spaced paths.
+        "python3 -c \"open('apps/my app/.env').read()\"",
+        // A mention is not proof of a read, but the scan cannot tell: it fails closed.
+        "python3 -c \"print('see .env for keys')\"",
+        "python3 - <<'PY'\nIGNORE = ['.env', 'node_modules']\nPY",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+    let folded = format!(
+        "python3 -c \"print(open('{}.env').read())\"",
+        "./".repeat(2100)
+    );
+    check("folded ./ path", w.x4("Bash", &bash(&folded)), DENY4);
+}
+
+#[test]
+fn i22_input_redirects_behind_quoted_separators_deny_at_every_tier() {
+    let w = i22_world("i22-redirect");
+    for cmd in [
+        "python3 -c 'import sys;print(sys.stdin.read())' < ~/.ssh/id_ed25519",
+        "python3 -c \"import sys; print(sys.stdin.read())\" < .env",
+        "sed 's/a/b/;s/c/d/' < .env",
+        "tr ';' '\\n' < .env",
+        "awk -F'|' 1 < .env",
+        "cut -d';' -f1 < ~/.aws/credentials",
+        "exec 3<.env; cat <&3",
+        "xargs --arg .env echo",
+        "xargs --arg-f=.env echo",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn i22_ansi_c_quotes_divisions_cd_and_awk_stdin_deny_at_every_tier() {
+    let w = i22_world("i22-r2");
+    w.put("apps/prod.env", "PROD_KEY=prod_secret_cccccccccccc\n");
+    for cmd in [
+        // ANSI-C quoting does not hide the next command from the secret-read check.
+        "echo $'it\\'s'; cat id.json",
+        "echo $'a\\'b' && cat .env",
+        // A string between two divisions is not a regex.
+        "perl -e '$x=1/2; open F, \"\\.env\"; print <F>; $y=3/4'",
+        "awk 'BEGIN{x=1/2; while((getline l < \"\\.env\")>0) print l; y=3/4}'",
+        // A bare name resolves against a `cd` target.
+        "cd apps && python3 -c \"print(open('prod.env').read())\"",
+        // An awk program on stdin.
+        "awk -f - .gitignore <<'EOF'\nBEGIN{while((getline l < \".env\")>0) print l}\nEOF",
+        "awk -f /dev/stdin <<< 'BEGIN{while((getline l < \".env\")>0) print l}'",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn i22_code_over_the_inspection_limits_never_passes_quietly() {
+    let w = i22_world("i22-limits");
+    // Junk literals before the path are not judged (data literals cost nothing): the path is.
+    let junk: Vec<String> = (0..4200).map(|i| format!("'a{i}'")).collect();
+    let cmd = format!(
+        "python3 -c \"x=[{}]; print(open('.env').read())\"",
+        junk.join(",")
+    );
+    check("4200 literals then .env", w.x4("Bash", &bash(&cmd)), DENY4);
+    // More distinct paths than the checks examine asks (a hard guard).
+    let paths: Vec<String> = (0..4200).map(|i| format!("'/p/{i}'")).collect();
+    let cmd = format!("python3 -c \"x=[{}]\"", paths.join(","));
+    check("4200 paths", w.x4("Bash", &bash(&cmd)), ASK4);
+}
+
+#[test]
+fn i22_other_readers_redirects_and_xargs_deny_at_every_tier() {
+    let w = i22_world("i22-readers");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(".env", w.proj.join("notes.txt")).unwrap();
+    let mut rows = vec![
+        ". .env",
+        "cat < .env",
+        "tail -n 3 .env",
+        "less .env",
+        "base64 .env",
+        "xxd .env",
+        "cut -d= -f2 .env",
+        "sort .env",
+        "wc -l .env",
+        "echo .env | xargs cat",
+        "printf '%s\\n' .env | xargs grep KEY",
+        "xargs -a .env echo",
+        "xargs -0a .env echo",
+        "xargs --arg-file=.env echo",
+        "xargs -a ~/.aws/credentials echo",
+        "echo ~/.aws/credentials | xargs cat",
+    ];
+    if cfg!(unix) {
+        // A symlink is judged by where it leads.
+        rows.push("cat notes.txt");
+    }
+    for cmd in rows {
+        check(cmd, w.x4("Bash", &bash(cmd)), DENY4);
+    }
+}
+
+#[test]
+fn i22_env_reads_behind_keywords_and_wrappers_deny_at_every_tier() {
+    let w = i22_world("i22-wrapped");
+    for cmd in ["grep KEY .env", "python3 -c \"print(open('.env').read())\""] {
+        for spelling in I21_SPELLINGS {
+            if spelling.contains("xargs") {
+                continue;
+            }
+            let row = spelling.replace("{c}", cmd);
+            check(&row, w.x4("Bash", &bash(&row)), DENY4);
+        }
+    }
+}
+
+#[test]
+fn i22_templates_and_metadata_have_no_opinion() {
+    let w = i22_world("i22-no");
+    for cmd in [
+        "cat .env.example",
+        "grep KEY .env.example",
+        "sed -n p .env.example",
+        "cat .env.schema",
+        "python3 -c \"print(open('.env.example').read())\"",
+        "echo .env.example | xargs cat",
+        "ls .env",
+        "ls -la .env",
+        "stat .env",
+        "test -f .env",
+        "[ -f .env ] && echo yes",
+        "if [ -f .env ]; then echo ok; fi",
+        "touch .env",
+        "file .env",
+        "echo .env | xargs ls -la",
+        "node -e \"console.log(process.env)\"",
+        "python3 -c \"import os; print(os.environ.get('KEY'))\"",
+        "node -e \"console.log('process.env')\"",
+        "awk '$0 ~ \".env\"' .gitignore",
+        "perl -ne \"print if /'\\.env'/\" src/config.py",
+        "tr ';' '\\n' < notes.md",
+        // Known hole (SECURITY.md, "Directory search"): a recursive search whose operands
+        // name no env file is not judged a read; the sandbox `denyRead` closes it.
+        "grep -r KEY .",
+    ] {
+        check(cmd, w.x4("Bash", &bash(cmd)), NO4);
+    }
+}

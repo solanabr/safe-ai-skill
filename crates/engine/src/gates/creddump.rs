@@ -27,8 +27,10 @@
 //! `solana-test-validator`) may name a keypair under `~/.config/solana` or `*-keypair.json`:
 //! they use it without printing it, and the on-chain gates own those commands.
 //!
-//! A `NAME=value` prefix assignment's value is checked the same way (`S=~/.ssh/id_ed25519;
-//! cat $S`). Residual: analysis of argv is incomplete by nature (variables built from parts,
+//! A `NAME=value` prefix assignment's value, an `xargs -a` file, an input redirect target and
+//! every path named in interpreter code ([`code_paths`]) are checked the same way
+//! (`S=~/.ssh/id_ed25519; cat $S`). A command with more words or paths than the checks examine
+//! asks. Residual: analysis of argv is incomplete by nature (variables built from parts,
 //! `eval`, encodings, scripts
 //! that build the path, subprocesses). `safe-ai-skill doctor` prints the sandbox `denyRead`
 //! snippet generated from `credentials.list`; that is the real control. Naming a private key
@@ -103,13 +105,58 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
     if matches!(known, crate::io::Decision::Deny { .. }) {
         return None;
     }
-    if let Some(what) =
-        path_check(&parsed.commands, cwd).or_else(|| assigned_hit(&parsed.assigned_values, cwd))
-    {
-        return Some(Verdict::Deny(path_reason(&what)));
+    match inspect(command, &parsed, cwd, policy, tier) {
+        Ok(verdict) => verdict,
+        Err(TooComplex) => Some(Verdict::Ask(
+            "Command too complex to inspect for credential paths (too many words or paths in \
+             it); review it manually."
+                .to_string(),
+        )),
+    }
+}
+
+/// More words, files or code paths than the checks examine: a hard guard asks rather than
+/// answer "no opinion" to a command it did not inspect.
+#[derive(Debug)]
+struct TooComplex;
+
+/// The path checks of [`decide`] over a parsed command.
+fn inspect(
+    command: &str,
+    parsed: &shell::Parsed,
+    cwd: &Path,
+    policy: &Policy,
+    tier: Tier,
+) -> Result<Option<Verdict>, TooComplex> {
+    let code = code_paths(parsed, cwd)?;
+    let hit = match path_check(&parsed.commands, cwd)? {
+        Some(hit) => Some(hit),
+        None => [
+            ("assignment", parsed.assigned_values.as_slice()),
+            ("xargs -a", parsed.arg_files.as_slice()),
+            ("redirect", parsed.input_files.as_slice()),
+            ("code", code.as_slice()),
+        ]
+        .into_iter()
+        .map(|(what, files)| file_hit(what, files, cwd))
+        .find_map(Result::transpose)
+        .transpose()?,
+    };
+    if let Some(what) = hit {
+        return Ok(Some(Verdict::Deny(path_reason(&what))));
     }
     let stdin_free = !command.contains(['|', '<']);
-    match env_check(&parsed.commands, cwd, policy, stdin_free)? {
+    let named: Vec<String> = parsed
+        .arg_files
+        .iter()
+        .chain(&parsed.input_files)
+        .chain(&code)
+        .cloned()
+        .collect();
+    let Some(usage) = env_check(&parsed.commands, &named, cwd, policy, stdin_free)? else {
+        return Ok(None);
+    };
+    Ok(match usage {
         EnvUse::Read(file) => {
             let hint = read::varlock_hint(cwd, &cwd.join(&file));
             match read::env_verdict(&file, policy, hint) {
@@ -119,7 +166,7 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
             }
         }
         EnvUse::Write(file) => crate::gates::envwrite::bash_write(&file, tier),
-    }
+    })
 }
 
 /// How a command uses a project env file it names.
@@ -558,12 +605,22 @@ fn relocation_destinations(words: &[&str]) -> Vec<usize> {
 /// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
 fn env_check(
     commands: &[SimpleCommand],
+    named: &[String],
     hook_cwd: &Path,
     policy: &Policy,
     stdin_free: bool,
-) -> Option<EnvUse> {
+) -> Result<Option<EnvUse>, TooComplex> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
+    if named.len() > MAX_WORDS {
+        return Err(TooComplex);
+    }
+    if let Some(hit) = named
+        .iter()
+        .find_map(|f| env_word_hit(f, &cwds, &homes, policy))
+    {
+        return Ok(Some(EnvUse::Read(hit)));
+    }
     let mut budget = MAX_WORDS;
     let mut write: Option<String> = None;
     for cmd in commands {
@@ -599,7 +656,7 @@ fn env_check(
             Vec::new()
         };
         for (i, word) in words.iter().enumerate().skip(usize::from(!program_path)) {
-            budget = budget.checked_sub(1)?;
+            budget = budget.checked_sub(1).ok_or(TooComplex)?;
             if std::mem::take(&mut skip_value) {
                 continue;
             }
@@ -617,12 +674,409 @@ fn env_check(
                 if removes || dests.contains(&i) {
                     write.get_or_insert(hit);
                 } else {
-                    return Some(EnvUse::Read(hit));
+                    return Ok(Some(EnvUse::Read(hit)));
                 }
             }
         }
     }
-    write.map(EnvUse::Write)
+    Ok(write.map(EnvUse::Write))
+}
+
+/// A credential path among `files`, which the command reads outside its words (a `NAME=`
+/// value, `xargs -a F`, an input redirect, a path in interpreter code).
+fn file_hit(what: &str, files: &[String], hook_cwd: &Path) -> Result<Option<String>, TooComplex> {
+    if files.len() > MAX_WORDS {
+        return Err(TooComplex);
+    }
+    let cwds = [hook_cwd.to_path_buf()];
+    Ok(files
+        .iter()
+        .find_map(|f| word_hit(f, &cwds, Exempt::None))
+        .map(|hit| format!("{what} {hit}")))
+}
+
+// ---------------------------------------------------------------------------------------
+// Interpreter code
+// ---------------------------------------------------------------------------------------
+
+/// awk dialects: their program word is code (the parser treats awk as data).
+const AWKS: &[&str] = &["awk", "gawk", "mawk", "nawk"];
+
+/// The paths interpreter code names: the code words of every interpreter command (`python3
+/// -c`, `node -e`, `uv run python -c`, an awk program, …) and the code fed to one on stdin
+/// ([`shell::Parsed::stdin_code`]). Shells are not scanned: the parser reads their scripts as
+/// commands.
+///
+/// The scan does not pair quotes (an apostrophe in a comment would misalign it). It decodes
+/// escapes (`\x2e`, `\56`, `.`, `\u{2e}`), joins adjacent or `+`/`.`-joined literals
+/// (`'.e' 'nv'`, `".e"+"nv"`), then splits the text at every character a path cannot hold, so
+/// `.env`, `apps/web/.env.local` and `~/.aws/credentials` are found whatever surrounds them,
+/// `q{.env}` and `%q(.env)` included. A quoted span holding whitespace and a `/` is also kept
+/// whole (`'apps/my app/.env'`). In awk and Perl code a match pattern (`~ ".env"`, `/\.env/`)
+/// is not a path.
+///
+/// Cheap by construction: tokens are deduplicated, and a relative token without a `/` is kept
+/// only when it exists in the hook's cwd or is a dotfile name mentioning `env`/`vars`
+/// (`process.env`, `.read` and data literals cost a `stat` at most). More distinct paths than
+/// the checks examine, or one longer than 4096 bytes after folding `.` and `//`, asks.
+fn code_paths(parsed: &shell::Parsed, cwd: &Path) -> Result<Vec<String>, TooComplex> {
+    let mut seen = std::collections::BTreeSet::new();
+    if parsed.stdin_code.is_empty()
+        && !parsed.commands.iter().any(|c| {
+            AWKS.contains(&c.program().as_str()) || shell::interpreter_at(&c.words).is_some()
+        })
+    {
+        return Ok(Vec::new());
+    }
+    // The effective cwds, as the word checks track them (`cd apps && python3 -c …`).
+    let mut dirs: Vec<PathBuf> = vec![cwd.to_path_buf()];
+    let mut listed: Vec<CwdNames> = vec![CwdNames::read(cwd)];
+    for cmd in &parsed.commands {
+        let first = cmd.program();
+        if matches!(first.as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut dirs);
+            for dir in dirs.iter().skip(listed.len()) {
+                listed.push(CwdNames::read(dir));
+            }
+        }
+        let cwd = listed.as_slice();
+        let (start, patterns) = if AWKS.contains(&first.as_str()) {
+            (1, true)
+        } else if let Some(i) = shell::interpreter_at(&cmd.words) {
+            let name = cmd.words.get(i).map(|w| shell::base_name(&w.text));
+            (i.saturating_add(1), name.as_deref() == Some("perl"))
+        } else {
+            continue;
+        };
+        // Code words only: flags, the script path and plain arguments are the word checks'
+        // (which know the loaders' `--env-file`).
+        let mut after_flag = false;
+        for word in cmd.words.iter().skip(start) {
+            let text = word.text.as_str();
+            let code_like = text.contains(|c: char| {
+                c.is_whitespace() || matches!(c, '(' | '\'' | '"' | ';' | '{' | '`')
+            });
+            if code_like || std::mem::take(&mut after_flag) {
+                scan_code(text, patterns, cwd, &mut seen)?;
+            }
+            after_flag = INLINE_FLAGS.contains(&text)
+                || (text.starts_with('-') && !text.starts_with("--") && text.ends_with(['e', 'E']));
+        }
+    }
+    for text in &parsed.stdin_code {
+        scan_code(text, false, &listed, &mut seen)?;
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Add the path tokens of code `text` to `seen` (see [`code_paths`]).
+fn scan_code(
+    text: &str,
+    patterns: bool,
+    cwd: &[CwdNames],
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<(), TooComplex> {
+    let text = if patterns {
+        blank_patterns(text)
+    } else {
+        text.to_string()
+    };
+    let code = join_literals(&decode_escapes(&text));
+    for quote in ['\'', '"', '`'] {
+        let marks: Vec<usize> = code.match_indices(quote).map(|(i, _)| i).collect();
+        for pair in marks.windows(2) {
+            let span = code.get(pair[0] + 1..pair[1]).unwrap_or_default();
+            if span.contains('/') && span.contains(' ') && !span.contains('\n') {
+                keep_path(span, cwd, seen)?;
+            }
+        }
+    }
+    for token in code.split(|c: char| !is_path_char(c)) {
+        keep_path(token, cwd, seen)?;
+    }
+    Ok(())
+}
+
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-' | '$')
+}
+
+/// Keep `token` for judging when it can name a file (see [`code_paths`]).
+fn keep_path(
+    token: &str,
+    cwds: &[CwdNames],
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<(), TooComplex> {
+    if !token.chars().any(char::is_alphanumeric) {
+        return Ok(());
+    }
+    let token = fold_slashes(token);
+    if token.len() > 4096 {
+        return Err(TooComplex);
+    }
+    let rooted = token.starts_with(['/', '~']);
+    let lower = token.to_ascii_lowercase();
+    let kept = if token.starts_with('$') {
+        token.contains('/').then_some(token)
+    } else if rooted
+        || token.contains('/')
+        || (token.starts_with('.') && (lower.contains("env") || lower.contains("vars")))
+    {
+        Some(token)
+    } else {
+        // A bare name counts where it exists: the hook's cwd as written, a later `cd` target
+        // as the joined path (the checks resolve against the hook's cwd).
+        cwds.iter()
+            .enumerate()
+            .find(|(_, c)| c.has(&token))
+            .map(|(i, c)| {
+                if i == 0 {
+                    token.clone()
+                } else {
+                    c.dir.join(&token).to_string_lossy().into_owned()
+                }
+            })
+    };
+    if let Some(token) = kept {
+        if seen.insert(token) && seen.len() > MAX_WORDS {
+            return Err(TooComplex);
+        }
+    }
+    Ok(())
+}
+
+/// Most entries of the hook's cwd listed for [`CwdNames`]; a bigger directory is asked per
+/// name.
+const MAX_CWD_NAMES: usize = 16_384;
+
+/// The names in the hook's cwd, listed once so a bare code token costs a lookup, not a
+/// `stat`.
+struct CwdNames {
+    dir: PathBuf,
+    names: Option<std::collections::HashSet<std::ffi::OsString>>,
+}
+
+impl CwdNames {
+    fn read(dir: &Path) -> CwdNames {
+        let names = std::fs::read_dir(dir).ok().and_then(|entries| {
+            let mut names = std::collections::HashSet::new();
+            for entry in entries {
+                if names.len() >= MAX_CWD_NAMES {
+                    return None;
+                }
+                names.insert(entry.ok()?.file_name());
+            }
+            Some(names)
+        });
+        CwdNames {
+            dir: dir.to_path_buf(),
+            names,
+        }
+    }
+
+    /// Whether `name` (no `/`) exists in the directory.
+    fn has(&self, name: &str) -> bool {
+        match &self.names {
+            Some(names) => names.contains(std::ffi::OsStr::new(name)),
+            None => std::fs::symlink_metadata(self.dir.join(name)).is_ok(),
+        }
+    }
+}
+
+/// `token` with `//` and `.` components folded (`./././.env` → `.env`), `..` kept.
+fn fold_slashes(token: &str) -> String {
+    let absolute = token.starts_with('/');
+    let parts: Vec<&str> = token
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
+/// Decode `\xHH`, `\NNN` (octal), `\uHHHH` and `\u{H…}`; any other escaped character stands
+/// for itself.
+fn decode_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&next) = chars.peek() else {
+            out.push(c);
+            break;
+        };
+        let decoded = match next {
+            'x' => {
+                chars.next();
+                escape_digits(16, 2, &mut chars)
+            }
+            'u' => {
+                chars.next();
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let ch = escape_digits(16, 6, &mut chars);
+                    if chars.peek() == Some(&'}') {
+                        chars.next();
+                    }
+                    ch
+                } else {
+                    escape_digits(16, 4, &mut chars)
+                }
+            }
+            '0'..='7' => escape_digits(8, 3, &mut chars),
+            _ => {
+                chars.next();
+                Some(next)
+            }
+        };
+        if let Some(ch) = decoded {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Up to `max` digits in `radix` from `chars`, as a character.
+fn escape_digits(
+    radix: u32,
+    max: usize,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<char> {
+    let mut value: u32 = 0;
+    let mut n = 0;
+    while n < max {
+        let Some(d) = chars.peek().and_then(|c| c.to_digit(radix)) else {
+            break;
+        };
+        value = value.saturating_mul(radix).saturating_add(d);
+        chars.next();
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    char::from_u32(value)
+}
+
+/// Join adjacent literals: a quote, optional whitespace, an optional `+` or `.` and the same
+/// quote again are removed (`'.e' 'nv'` → `'.env'`, `".e"+"nv"` → `".env"`).
+fn join_literals(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if matches!(c, '\'' | '"') {
+            let mut j = skip_blanks(&chars, i.saturating_add(1));
+            if chars.get(j).is_some_and(|c| matches!(c, '+' | '.')) {
+                j = skip_blanks(&chars, j.saturating_add(1));
+            }
+            if chars.get(j) == Some(&c) {
+                i = j.saturating_add(1);
+                continue;
+            }
+        }
+        out.push(c);
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+/// The first index at or after `from` that is not a space or tab.
+fn skip_blanks(chars: &[char], from: usize) -> usize {
+    let mut j = from;
+    while chars.get(j).is_some_and(|c| *c == ' ' || *c == '\t') {
+        j = j.saturating_add(1);
+    }
+    j
+}
+
+/// Words after which a Perl or awk `/` opens a regex, not a division.
+const REGEX_KEYWORDS: &[&str] = &[
+    "if", "unless", "and", "or", "not", "split", "grep", "return", "while", "until", "when",
+];
+
+/// Whether a `/` at `at` opens a regex literal: it starts the code or follows an operator that
+/// takes an operand (`(`, `,`, `!`, `&`, `|`, `{`, `;`, `=`, `~`) or a keyword such as `if`,
+/// ignoring blanks. After a value (`1/2`, `$x /`, `"a" /`) it divides.
+fn opens_regex(chars: &[char], at: usize) -> bool {
+    let back = |mut k: usize, take: fn(&char) -> bool| {
+        while let Some(p) = k.checked_sub(1) {
+            if !chars.get(p).is_some_and(take) {
+                break;
+            }
+            k = p;
+        }
+        k
+    };
+    let k = back(at, |c| *c == ' ' || *c == '\t');
+    let Some(prev) = k.checked_sub(1).and_then(|p| chars.get(p)) else {
+        return true;
+    };
+    if matches!(
+        prev,
+        '(' | ',' | '!' | '&' | '|' | '{' | ';' | '=' | '~' | '\n'
+    ) {
+        return true;
+    }
+    let start = back(k, char::is_ascii_alphabetic);
+    let word: String = chars.get(start..k).unwrap_or_default().iter().collect();
+    REGEX_KEYWORDS.contains(&word.as_str())
+}
+
+/// awk and Perl code with its match patterns blanked: the operand of `~`/`=~`/`!~` (a quoted
+/// string or `/…/`) and a `/…/` regex literal ([`opens_regex`]). A `/` that divides, and `~/`
+/// (a home path), are left alone, so a string between two divisions stays visible.
+fn blank_patterns(text: &str) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        let next = i.saturating_add(1);
+        let operand = if c == '~' && chars.get(next) != Some(&'/') {
+            let j = skip_blanks(&chars, next);
+            chars
+                .get(j)
+                .filter(|d| matches!(d, '"' | '\'' | '/'))
+                .map(|_| j)
+        } else if c == '/' && opens_regex(&chars, i) {
+            Some(i)
+        } else {
+            None
+        };
+        let Some(open) = operand else {
+            i = next;
+            continue;
+        };
+        let delim = chars.get(open).copied().unwrap_or('/');
+        let mut k = open.saturating_add(1);
+        while let Some(&d) = chars.get(k) {
+            if d == '\\' {
+                k = k.saturating_add(2);
+                continue;
+            }
+            if d == delim || d == '\n' {
+                break;
+            }
+            k = k.saturating_add(1);
+        }
+        if chars.get(k) == Some(&delim) {
+            for ch in chars.iter_mut().take(k.saturating_add(1)).skip(open) {
+                *ch = ' ';
+            }
+            i = k.saturating_add(1);
+        } else {
+            i = next;
+        }
+    }
+    chars.into_iter().collect()
 }
 
 /// Whether `word` names a project env file; the file as written.
@@ -704,17 +1158,6 @@ fn env_candidate(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy
     false
 }
 
-/// A `NAME=<credential path>` prefix assignment: the variable then names the store
-/// (`S=~/.ssh/id_ed25519; cat $S`). Judged like a word of an ordinary command.
-fn assigned_hit(values: &[String], hook_cwd: &Path) -> Option<String> {
-    let cwds = [hook_cwd.to_path_buf()];
-    values
-        .iter()
-        .take(MAX_WORDS)
-        .find_map(|v| word_hit(v, &cwds, Exempt::None))
-        .map(|hit| format!("assignment {hit}"))
-}
-
 fn reason(what: &str) -> String {
     format!(
         "Credential read blocked (`{what}`): the command prints a stored credential into the \
@@ -735,7 +1178,7 @@ fn path_reason(what: &str) -> String {
 // Path check
 // ---------------------------------------------------------------------------------------
 
-fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
+fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Result<Option<String>, TooComplex> {
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
     let mut budget = MAX_WORDS;
     for cmd in commands {
@@ -754,7 +1197,7 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
         let skip = usize::from(!program_path);
         let identity = identity_values(&program, cmd);
         for (i, word) in cmd.words.iter().enumerate().skip(skip) {
-            budget = budget.checked_sub(1)?;
+            budget = budget.checked_sub(1).ok_or(TooComplex)?;
             let exempt = if identity.contains(&i) {
                 Exempt::SshKey
             } else if signer {
@@ -763,14 +1206,14 @@ fn path_check(commands: &[SimpleCommand], hook_cwd: &Path) -> Option<String> {
                 Exempt::None
             };
             if let Some(hit) = word_hit(&word.text, &cwds, exempt) {
-                return Some(format!("{program} {hit}"));
+                return Ok(Some(format!("{program} {hit}")));
             }
         }
         if let Some(hit) = tree_hit(cmd, &program, &cwds) {
-            return Some(format!("{program} {hit}"));
+            return Ok(Some(format!("{program} {hit}")));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Indices of the words that are an SSH identity value, which may name a private key: `-i
@@ -1469,8 +1912,12 @@ mod tests {
     #[test]
     fn ssh_identity_values_are_the_only_exempt_key_paths() {
         // The path check alone (the secrets gate may deny some of these first).
-        let d =
-            |c: &str| path_check(&shell::parse(c).commands, Path::new("/tmp")).map(Verdict::Deny);
+        let d = |c: &str| {
+            path_check(&shell::parse(c).commands, Path::new("/tmp"))
+                .ok()
+                .flatten()
+                .map(Verdict::Deny)
+        };
         for c in [
             "ssh -i ~/.ssh/id_rsa host",
             "ssh -i~/.ssh/id_rsa host",
@@ -1568,5 +2015,89 @@ mod tests {
         ] {
             assert!(!decide_text(c), "{c}");
         }
+    }
+
+    #[test]
+    fn interpreter_code_paths() {
+        let dir = std::env::temp_dir();
+        let paths = |c: &str| code_paths(&shell::parse(c), &dir).map_err(|_| ());
+        let has = |c: &str, p: &str| {
+            let got = paths(c).unwrap_or_default();
+            assert!(got.iter().any(|g| g == p), "{c}: {got:?}");
+        };
+        has("python3 -c \"print(open('.env').read())\"", ".env");
+        has("python3 -c \"# it's\nprint(open('.env').read())\"", ".env");
+        has("python3 -c \"open('\\x2eenv')\"", ".env");
+        has("python3 -c \"open('\\56env')\"", ".env");
+        has("node -e \"f('\\u002eenv')\"", ".env");
+        has("node -e \"f('\\u{2e}env')\"", ".env");
+        has("python3 -c \"open('.e' 'nv')\"", ".env");
+        has("python3 -c \"open('.en''v')\"", ".env");
+        has("node -e \"f('.e'+'nv')\"", ".env");
+        has("perl -e 'open F, q{.env}'", ".env");
+        has("ruby -e 'File.read(%q(.env))'", ".env");
+        has(
+            "python3 -c \"open('apps/my app/.env')\"",
+            "apps/my app/.env",
+        );
+        has("uv run python -c \"open('.env')\"", ".env");
+        has("python3 <<< \"open('./././.env')\"", ".env");
+        for quiet in [
+            "node -e \"console.log(process.env)\"",
+            "python3 -c \"open(name).read()\"",
+            "bash -c \"cat '.env'\"",
+            "grep \"open('.env')\" src.py",
+            "awk '$0 ~ \".env\"' .gitignore",
+            "perl -ne \"print if /'\\.env'/\" src/config.py",
+        ] {
+            let got = paths(quiet).unwrap_or_default();
+            assert!(!got.iter().any(|g| g.contains("env")), "{quiet}: {got:?}");
+        }
+        let many: Vec<String> = (0..MAX_WORDS + 10).map(|i| format!("'/p{i}'")).collect();
+        assert!(paths(&format!("python3 -c \"{}\"", many.join(","))).is_err());
+        let long = format!("python3 -c \"open('{}x')\"", "a/".repeat(2100));
+        assert!(paths(&long).is_err());
+        assert_eq!(fold_slashes("./././.env"), ".env");
+        assert_eq!(fold_slashes("//etc//./x"), "/etc/x");
+    }
+}
+#[cfg(all(test, unix))]
+mod perf_tests {
+    use super::*;
+
+    /// CPU seconds this thread has used (wall time is meaningless on a loaded machine).
+    fn thread_cpu() -> f64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec; the call only fills it.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    }
+
+    #[test]
+    fn a_large_data_script_is_cheap_to_inspect_and_has_no_opinion() {
+        let rows: Vec<String> = (0..4000)
+            .map(|i| format!("    {{'name': 'v{i}', 'kind': 'utf8', 'id': {i}}},"))
+            .collect();
+        let cmd = format!(
+            "python3 - <<'PY'\nimport json\n# don't edit by hand\nROWS = [\n{}\n]\nprint(json.dumps(ROWS))\nPY",
+            rows.join("\n")
+        );
+        let dir = std::env::temp_dir().join(format!("creddump-perf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let start = thread_cpu();
+        let paths = code_paths(&shell::parse(&cmd), &dir);
+        let scan = thread_cpu() - start;
+        let start = thread_cpu();
+        let verdict = decide(&cmd, &dir, &Policy::default(), Tier::Relaxed);
+        let whole = thread_cpu() - start;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(paths.map(|p| p.len()).ok(), Some(0));
+        assert!(verdict.is_none(), "{verdict:?}");
+        // Debug build: about 0.05 s for the scan and 0.4 s for the whole gate.
+        assert!(scan < 1.0, "code scan took {scan:.3} s CPU");
+        assert!(whole < 3.0, "gate took {whole:.3} s CPU");
     }
 }

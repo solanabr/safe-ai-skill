@@ -26,23 +26,110 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "busybox",
 ];
 
-/// Interpreters whose `-c`/`-e` code runs programs the parser cannot see.
+/// Interpreters whose `-c`/`-e` code runs programs the parser cannot see (a versioned name,
+/// `python3.12`, counts as its base).
 const INTERPRETERS: &[&str] = &[
     "python",
     "python2",
     "python3",
+    "pypy",
+    "pypy3",
     "node",
     "nodejs",
+    "tsx",
+    "ts-node",
     "perl",
     "ruby",
     "deno",
     "bun",
     "php",
     "lua",
+    "luajit",
+    "rscript",
+    "julia",
+    "tclsh",
     "osascript",
     "pwsh",
     "powershell",
 ];
+
+/// Whether `program` (a base name, [`base_name`]) is one of [`INTERPRETERS`].
+pub fn is_interpreter(program: &str) -> bool {
+    INTERPRETERS
+        .iter()
+        .any(|i| program == *i || program.starts_with(&format!("{i}.")))
+}
+
+/// Project runners that run their command in an environment: `(name, subcommand)`, where an
+/// empty subcommand means the name alone (`npx tsx`).
+const RUNNERS: &[(&str, &str)] = &[
+    ("uv", "run"),
+    ("uvx", ""),
+    ("poetry", "run"),
+    ("pipenv", "run"),
+    ("pdm", "run"),
+    ("hatch", "run"),
+    ("rye", "run"),
+    ("conda", "run"),
+    ("mamba", "run"),
+    ("micromamba", "run"),
+    ("npx", ""),
+    ("bunx", ""),
+    ("pnpx", ""),
+    ("pnpm", "exec"),
+    ("pnpm", "dlx"),
+    ("yarn", "exec"),
+    ("yarn", "dlx"),
+    ("npm", "exec"),
+];
+
+/// Value-taking options of [`RUNNERS`].
+const RUNNER_VALUE_FLAGS: &[&str] = &[
+    "--with",
+    "--python",
+    "-p",
+    "--project",
+    "--directory",
+    "-n",
+    "--name",
+    "--prefix",
+    "--package",
+    "--from",
+    "-e",
+    "--env",
+];
+
+/// The index of the interpreter a command runs: 0 for `python3 …`, the inner one behind a
+/// project runner (`uv run python …`, `npx tsx …`, `conda run -n x python …`). `None` when it
+/// runs none.
+pub fn interpreter_at(words: &[Word]) -> Option<usize> {
+    let first = base_name(&words.first()?.text);
+    if is_interpreter(&first) {
+        return Some(0);
+    }
+    let second = words.get(1).map(|w| w.text.as_str()).unwrap_or_default();
+    let (_, sub) = RUNNERS
+        .iter()
+        .find(|(name, sub)| *name == first && (sub.is_empty() || *sub == second))?;
+    let mut i = if sub.is_empty() { 1 } else { 2 };
+    while let Some(word) = words.get(i) {
+        let text = word.text.as_str();
+        if text == "--" {
+            i += 1;
+            break;
+        }
+        if !text.starts_with('-') {
+            break;
+        }
+        i += if RUNNER_VALUE_FLAGS.contains(&text) {
+            2
+        } else {
+            1
+        };
+    }
+    let inner = base_name(&words.get(i)?.text);
+    is_interpreter(&inner).then_some(i)
+}
 
 /// Programs that run one of their later arguments as a command (`find … -exec solana …`).
 const LAUNCHERS: &[&str] = &[
@@ -589,6 +676,15 @@ pub struct Parsed {
     /// The values of `NAME=value` prefix assignments, which [`SimpleCommand::words`] drops
     /// (`S=~/.ssh/id_ed25519; cat $S`): checked for credential paths.
     pub assigned_values: Vec<String>,
+    /// Files whose contents a wrapper turns into the command's arguments (`xargs -a F`), which
+    /// [`SimpleCommand::words`] drops: checked as reads.
+    pub arg_files: Vec<String>,
+    /// Interpreter code fed on standard input (`python3 - <<EOF`, `python3 <<< '…'`, `echo '…' |
+    /// node`), which no word carries: checked for the files it names.
+    pub stdin_code: Vec<String>,
+    /// Input redirect targets (`< F`, `3< F`, `<> F`), which [`SimpleCommand::words`] drops:
+    /// checked as reads.
+    pub input_files: Vec<String>,
 }
 
 /// Record that a command runs a file or stdin as code: after a family write, that is a
@@ -790,7 +886,10 @@ impl Lexer<'_> {
                         match line_reads {
                             Reads::Shell => parse_into(&body, self.depth + 1, true, self.out),
                             // Interpreter code the parser cannot read.
-                            Reads::Interpreter => opaque(self.out, &body),
+                            Reads::Interpreter => {
+                                opaque(self.out, &body);
+                                self.out.stdin_code.push(body);
+                            }
                             Reads::Data => {
                                 self.out.writes_family_text |=
                                     self.line_writes && script_runs_family(&body, self.depth);
@@ -1025,8 +1124,14 @@ impl Lexer<'_> {
             });
         } else if herestring {
             cmd.herestrings.push(target);
-        } else if writes && !is_harmless_target(&target.text) {
-            cmd.writes_file = true;
+        } else {
+            let descriptor = target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
+            if first == '<' && !descriptor {
+                self.out.input_files.push(target.text.clone());
+            }
+            if writes && !is_harmless_target(&target.text) {
+                cmd.writes_file = true;
+            }
         }
     }
 
@@ -1551,11 +1656,15 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 .any(|w| w.text.starts_with("-C") || w.text.starts_with("--chdir"));
         }
         let appends = program == "xargs";
+        if appends {
+            out.arg_files
+                .extend(xargs_arg_files(&words[..skip.min(words.len())]));
+        }
         words.drain(..skip.min(words.len()));
         if appends
             && words.first().is_some_and(|w| {
                 let p = base_name(&w.text);
-                SHELLS.contains(&p.as_str()) || INTERPRETERS.contains(&p.as_str())
+                SHELLS.contains(&p.as_str()) || is_interpreter(&p)
             })
         {
             // `xargs -a x.sh sh -c '{}'`: its input becomes code.
@@ -1564,6 +1673,13 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 out.opaque = true;
                 out.opaque_mention = true;
             }
+        }
+        if appends && piped_in {
+            // `echo .env | xargs cat`: the emitted words become arguments.
+            words.extend(upstream_emits.split_whitespace().map(|t| Word {
+                text: t.to_string(),
+                ..Word::default()
+            }));
         }
         if appends {
             // xargs appends arguments the command line does not show.
@@ -1620,6 +1736,11 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         executes(out);
     }
 
+    // `uv run python …`, `npx tsx …`: the interpreter behind a project runner.
+    let (program, args) = match interpreter_at(&words).and_then(|i| words.get(i..)) {
+        Some([inner, rest @ ..]) if !std::ptr::eq(inner, first) => (base_name(&inner.text), rest),
+        _ => (program, args),
+    };
     match program.as_str() {
         "cd" | "pushd" | "popd" => out.cwd_changed = true,
         "export" | "declare" | "typeset" | "local" | "readonly" => {
@@ -1691,12 +1812,17 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 }
             }
         }
-        p if INTERPRETERS
-            .iter()
-            .any(|i| p == *i || p.starts_with(&format!("{i}."))) =>
-        {
+        p if is_interpreter(p) => {
+            // `deno run -`, `deno eval CODE`: the subcommand is not the script.
+            let deno_eval = p == "deno" && args.first().is_some_and(|w| w.text == "eval");
+            let args = match args.first() {
+                Some(w) if p == "deno" && matches!(w.text.as_str(), "run" | "eval") => {
+                    args.get(1..).unwrap_or_default()
+                }
+                _ => args,
+            };
             let code_flag = |w: &Word| matches!(w.text.as_str(), "-c" | "-e" | "-E" | "--eval");
-            let runs_code = args.iter().any(code_flag) || !herestrings.is_empty();
+            let runs_code = deno_eval || args.iter().any(code_flag) || !herestrings.is_empty();
             let code: Vec<&str> = args
                 .iter()
                 .chain(herestrings.iter())
@@ -1706,17 +1832,31 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             // solana-family program).
             if piped_in {
                 opaque(out, &upstream);
+                if !upstream_emits.is_empty() {
+                    out.stdin_code.push(upstream_emits.clone());
+                }
             }
+            out.stdin_code
+                .extend(herestrings.iter().map(|w| w.text.clone()));
             if runs_code {
                 opaque(out, &code.join(" "));
             }
-            if !args.iter().any(code_flag) {
+            if !deno_eval && !args.iter().any(code_flag) {
                 // A script file or stdin: either way it runs code.
                 executes(out);
                 if interpreter_reads_stdin(args) {
                     reads = Reads::Interpreter;
                 }
             }
+        }
+        "awk" | "gawk" | "mawk" | "nawk" if awk_program_on_stdin(args) => {
+            // `awk -f - <<EOF`: the program comes on stdin; its text names files like code.
+            if piped_in && !upstream_emits.is_empty() {
+                out.stdin_code.push(upstream_emits.clone());
+            }
+            out.stdin_code
+                .extend(herestrings.iter().map(|w| w.text.clone()));
+            reads = Reads::Interpreter;
         }
         p if LAUNCHERS.contains(&p) => launch(args, p, depth, out),
         _ => {}
@@ -1761,6 +1901,24 @@ fn interpreter_reads_stdin(args: &[Word]) -> bool {
         None => true,
         Some(word) => is_stdin_path(&word.text),
     }
+}
+
+/// Whether an awk's `-f` program file is its standard input (`-f -`, `-f /dev/stdin`,
+/// `-f-`, `--file=-`).
+fn awk_program_on_stdin(args: &[Word]) -> bool {
+    let mut iter = args.iter().map(|w| w.text.as_str());
+    while let Some(text) = iter.next() {
+        let value = match text {
+            "-f" | "--file" => iter.next(),
+            _ => text
+                .strip_prefix("--file=")
+                .or_else(|| text.strip_prefix("-f").filter(|v| !v.is_empty())),
+        };
+        if value.is_some_and(is_stdin_path) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What a shell invocation runs.
@@ -1824,6 +1982,42 @@ fn env_split_string(words: &[Word]) -> Option<String> {
     None
 }
 
+/// Whether `text` spells xargs's `--arg-file` as getopt accepts it: any prefix from `--arg`.
+fn is_xargs_arg_file(text: &str) -> bool {
+    text.len() >= "--arg".len() && "--arg-file".starts_with(text)
+}
+
+/// The `-a F`, `-aF`, `--arg-file F` and `--arg-file=F` values (long form abbreviated down to
+/// `--arg`) among `xargs`'s own words.
+fn xargs_arg_files(words: &[Word]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut iter = words.iter().skip(1).map(|w| w.text.as_str());
+    while let Some(text) = iter.next() {
+        if let Some((flag, value)) = text.split_once('=') {
+            if is_xargs_arg_file(flag) {
+                out.push(value.to_string());
+            }
+        } else if is_xargs_arg_file(text) {
+            out.extend(iter.next().map(str::to_string));
+        } else if let Some(cluster) = text.strip_prefix('-').filter(|c| !c.starts_with('-')) {
+            // A short cluster: the first value-taking short consumes the rest or the next word.
+            if let Some(pos) = cluster.find(|c| "ILnPsdEa".contains(c)) {
+                let (_, rest) = cluster.split_at(pos);
+                let mut chars = rest.chars();
+                let short = chars.next();
+                let value = match chars.as_str() {
+                    "" => iter.next().unwrap_or_default(),
+                    v => v,
+                };
+                if short == Some('a') && !value.is_empty() {
+                    out.push(value.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Words a wrapper takes before its command (its own name included).
 fn wrapper_len(words: &[Word], shorts: &str, longs: &[&str], positionals: usize) -> usize {
     let mut i = 1;
@@ -1842,7 +2036,8 @@ fn wrapper_len(words: &[Word], shorts: &str, longs: &[&str], positionals: usize)
         }
         i += 1;
         if text.starts_with("--") {
-            if !text.contains('=') && longs.contains(&text) {
+            let xargs_file = longs.contains(&"--arg-file") && is_xargs_arg_file(text);
+            if !text.contains('=') && (longs.contains(&text) || xargs_file) {
                 i += 1;
             }
             continue;
@@ -2442,5 +2637,28 @@ mod tests {
         assert!(mentions_family("S\\PL-token transfer"));
         assert!(mentions_family("$'\\x73olana'"));
         assert!(!mentions_family("ls -la"));
+    }
+
+    #[test]
+    fn xargs_inputs_and_stdin_code_are_kept() {
+        assert_eq!(parse("xargs -a .env echo").arg_files, [".env"]);
+        assert_eq!(parse("xargs -0a.env echo").arg_files, [".env"]);
+        assert_eq!(parse("xargs --arg-file=f -n 1 echo").arg_files, ["f"]);
+        assert_eq!(parse("xargs -n 1 -a f echo").arg_files, ["f"]);
+        assert!(parse("xargs -n 1 echo").arg_files.is_empty());
+        let piped = parse("echo .env | xargs cat");
+        let words: Vec<&str> = piped.commands[1]
+            .words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(words, ["cat", ".env", "$XARGS"]);
+        assert_eq!(parse("python3 <<< 'open(1)'").stdin_code, ["open(1)"]);
+        assert_eq!(parse("echo 'open(1)' | node").stdin_code, ["open(1)"]);
+        assert_eq!(
+            parse("python3 - <<'EOF'\nopen(1)\nEOF").stdin_code,
+            ["open(1)\n"]
+        );
+        assert!(parse("cat <<< 'open(1)'").stdin_code.is_empty());
     }
 }
