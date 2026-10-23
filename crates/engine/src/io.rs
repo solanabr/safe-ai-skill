@@ -165,8 +165,14 @@ impl Decision {
 /// Shape: `{"hookSpecificOutput":{"hookEventName":"PreToolUse",
 /// "permissionDecision":"allow|ask|deny","permissionDecisionReason":"…"}}`.
 /// The reason key is omitted for `allow`. [`Decision::Defer`] renders to `None`: no
-/// opinion is no output.
+/// opinion is no output. The process's [`crate::adapt`] client applies (Codex gets no `ask`).
 pub fn render_pretooluse(d: &Decision) -> Option<Value> {
+    render_pretooluse_for(d, crate::adapt::current())
+}
+
+/// [`render_pretooluse`] under `client`'s output contract ([`crate::adapt::render`]).
+pub fn render_pretooluse_for(d: &Decision, client: crate::adapt::Client) -> Option<Value> {
+    let d = &crate::adapt::render(d, client);
     if matches!(d, Decision::Defer) {
         return None;
     }

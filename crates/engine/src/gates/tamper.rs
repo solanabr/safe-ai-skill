@@ -309,11 +309,23 @@ pub struct Protected {
 impl Protected {
     /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CONFIG_DIR` and
     /// `CLAUDE_PROJECT_DIR` (a project root). No file is read.
+    ///
+    /// Under the Codex adapter, where no `CLAUDE_PLUGIN_DATA` is set, the data dir is the one
+    /// discovery finds (the Claude Code plugin's), so it stays protected there too.
     pub fn from_env() -> Self {
-        let var = |key: &str| std::env::var(key).ok();
+        let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
+        let data = var("CLAUDE_PLUGIN_DATA").or_else(|| {
+            if !crate::adapt::is_codex() {
+                return None;
+            }
+            crate::datadir::data_dir_with_cwd(None)
+                .ok()
+                .filter(|d| !d.is_unresolved())
+                .map(|d| d.path.to_string_lossy().into_owned())
+        });
         let mut protected = Protected::new(
             var("HOME").as_deref(),
-            var("CLAUDE_PLUGIN_DATA").as_deref(),
+            data.as_deref(),
             var("CLAUDE_PLUGIN_ROOT").as_deref(),
         );
         if let Some(dir) = var("CLAUDE_CONFIG_DIR") {
@@ -667,11 +679,21 @@ pub fn decide_file(tool_input: Option<&Value>, cwd: &Path, protected: &Protected
     let Some(input) = tool_input else {
         return Decision::Defer;
     };
+    let targets: Vec<&str> = ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(Value::as_str))
+        .collect();
+    decide_paths(&targets, cwd, protected)
+}
+
+/// [`decide_file`] over several targets (an `apply_patch` patch's files), resolving the
+/// protected locations once: deny on the first protected target.
+pub fn decide_paths(targets: &[&str], cwd: &Path, protected: &Protected) -> Decision {
+    if targets.is_empty() {
+        return Decision::Defer;
+    }
     let resolved = protected.clone().with_session_cwd(cwd).resolved();
-    for key in ["file_path", "notebook_path"] {
-        let Some(target) = input.get(key).and_then(Value::as_str) else {
-            continue;
-        };
+    for target in targets {
         for candidate in path_candidates(target, cwd, &resolved) {
             let word = normalize_word(&candidate, &resolved);
             let names = if is_absolute(&word) {

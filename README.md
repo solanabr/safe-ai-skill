@@ -338,6 +338,8 @@ The kit's `stbr` marketplace installs this plugin; don't add this marketplace to
 
 The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs); the proposed kit-side changes are drafted in [docs/drafts/aikit-firewall-split.md](docs/drafts/aikit-firewall-split.md). Until the kit change lands, `/firewall` does not run `safe-ai-skill tier`; run `safe-ai-skill tier <t> --project` yourself. Today both hook sets run on every Bash call.
 
+**Codex CLI (experimental):** `safe-ai-skill adapt codex <gate>` runs the Bash, file-edit and MCP gates as Codex hooks, and turns every `ask` into a `deny` because Codex hooks cannot ask. Setup and limits are in [docs/adapters.md](docs/adapters.md). opencode is not covered yet ([#23](https://github.com/solanabr/safe-ai-skill/issues/23)).
+
 safe-ai-skill is standalone — it can be installed independently of any particular skill hub. It adds a security and control layer over whatever skills, MCPs, and agents you already have.
 
 ## Security
