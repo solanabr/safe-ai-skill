@@ -537,7 +537,11 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["deny", "deny", "deny", "deny"],
     ),
     (
-        "Inline curl/wget POST body to non-localhost",
+        "Inline curl/wget POST body to a known Solana RPC host",
+        ["n/o", "n/o", "n/o", "ask"],
+    ),
+    (
+        "Inline curl/wget POST body to any other non-localhost host; any file-body upload",
         ["ask", "ask", "ask", "ask"],
     ),
     (

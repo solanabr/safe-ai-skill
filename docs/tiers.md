@@ -128,7 +128,7 @@ One shared list, `credentials.list`, with the classes `key_material`, `host_toke
 The naive-exfil tripwire (a network-capable command fed a secret, or a request to a known request-bin, tunnel or paste host from `exfil-hosts.list`) is **not in 1.1.0**; it is planned in [#19](https://github.com/solanabr/safe-ai-skill/issues/19). What ships:
 
 - A network command that takes a key file, a credential store or a project env file by path (`curl -d @.env`, `--data-binary @`, `-T`, `-F k=@`, `wget --post-file`, `scp`) is denied at every tier, because it is a read of that file.
-- An inline `curl`/`wget` POST body to a non-localhost host asks at every tier (a deny when headless). This includes JSON-RPC calls to a devnet RPC.
+- An inline `curl`/`wget` POST body to a non-localhost host asks at every tier (a deny when headless), with one exception: when every destination is a known Solana RPC host and the body is inline, it has no opinion at Off, Relaxed and Medium and asks at High (a deny when headless at High; below High it stays no opinion headless, so a JSON-RPC health check passes under CI). The hosts (`SOLANA_RPC_HOSTS` in `gates/secrets.rs`): `api.mainnet-beta.solana.com`, `api.devnet.solana.com`, `api.testnet.solana.com`, `localhost` and `127.0.0.1` (already quiet at every tier), and at a label boundary `helius-rpc.com`, `quiknode.pro`, `rpcpool.com`, `ankr.com`, `syndica.io`, `extrnode.com`, plus Alchemy's `solana-*.….alchemy.com` hosts. Still asking at every tier: a file or stdin body (`-d @file`, `--data-binary @file`, `--json @file`, `-T`, `-F`, `wget --post-file`), a second destination that is not on the list (another URL, a bare host, `$RPC`), a userinfo `@` or URL glob in the URL, and flags that send the request elsewhere or read more options (`-x`/`--proxy`, `--resolve`, `--connect-to`, `--doh-url`, `-K`/`--config`, `--next`, `--unix-socket`, wget `-e`/`-i`/`-B`).
 - Requests to listed exfil hosts, IP literals, redirects, DNS, `WebFetch` and values already in context are not gated. solana-ai-kit's sandbox `deniedDomains` (the same 70/79/84-host list, by kit tier) or Claude Code's own sandbox with the entries in [SECURITY.md](../SECURITY.md#recommended-setup) closes the host list for sandboxed commands.
 - Code run through an MCP executor (for example context-mode's `ctx_execute`): shell code gets the Bash checks (credential and env reads, on-chain and wallet gates), never an allow and never a grant; other languages get their string literals checked as paths and shell commands, and a Solana CLI named there asks (deny at High).
 
@@ -149,7 +149,7 @@ One rule, shared with the kit.
 2. When headless, **every `ask` becomes a `deny`** (irreversible actions on a devnet, value-moving actions on mainnet, hard-guard asks, opaque commands, MCP asks), with the reason "approve interactively, or run it yourself".
 3. The only thing that passes is a grant you confirmed interactively beforehand, for grantable Class C scopes, below High.
 4. Env escapes (`CONFIRM_MAINNET`, `CONFIRM_*`, anything repo-settable) are ignored. No `defer`, ever. Nothing can be confirmed in a headless session.
-5. A Relaxed localnet deploy passes headless (it has no opinion). The inline `curl`/`wget` POST ask is still in 1.1.0, so such a call is denied under CI.
+5. A Relaxed localnet deploy passes headless (it has no opinion), and so does an inline JSON-RPC POST to a known Solana RPC host below High. Any other inline `curl`/`wget` POST asks, so such a call is denied under CI.
 
 ## Known holes
 

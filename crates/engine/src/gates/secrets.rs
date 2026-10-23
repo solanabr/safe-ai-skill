@@ -31,6 +31,7 @@ use crate::gates::read;
 use crate::gates::secretpath::{self, Class};
 use crate::gates::tamper;
 use crate::io::Decision;
+use crate::policy::tier::Tier;
 use crate::policy::Policy;
 
 /// Commands that read or copy file contents — the ones that can leak a secret file. A nudge,
@@ -50,6 +51,90 @@ const WRAPPERS: &[&str] = &["sudo", "env", "command", "exec", "time", "nohup", "
 /// Hosts to which an outbound POST of local data is considered benign. Keep minimal: the
 /// gate only *asks* (not denies) on an off-allowlist host, so a short list is safe.
 const ALLOWLISTED_POST_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
+
+/// Known Solana JSON-RPC hosts. An inline `curl`/`wget` POST body (no file upload) whose every
+/// destination is one of them has no opinion below High and asks at High. An entry matches the
+/// host exactly; an entry starting with `.` matches at a label boundary (`x.helius-rpc.com`,
+/// not `evilhelius-rpc.com`). Alchemy serves much more than Solana, so only its `solana-*`
+/// hosts count ([`SOLANA_RPC_ALCHEMY`]). Keep this list small.
+pub const SOLANA_RPC_HOSTS: &[&str] = &[
+    "api.mainnet-beta.solana.com",
+    "api.devnet.solana.com",
+    "api.testnet.solana.com",
+    "localhost",
+    "127.0.0.1",
+    "helius-rpc.com",
+    ".helius-rpc.com",
+    ".quiknode.pro",
+    ".rpcpool.com",
+    ".ankr.com",
+    ".syndica.io",
+    ".extrnode.com",
+];
+
+/// The suffix of Alchemy's Solana hosts; the host's first label must start with `solana-`.
+pub const SOLANA_RPC_ALCHEMY: &str = ".alchemy.com";
+
+/// curl/wget flags that send the request somewhere other than the URL host, read more URLs or
+/// options from elsewhere, or start another request: a POST using one is never quiet.
+const REDIRECTING_HTTP_FLAGS: &[&str] = &[
+    "-x",
+    "--proxy",
+    "--preproxy",
+    "--socks4",
+    "--socks4a",
+    "--socks5",
+    "--socks5-hostname",
+    "--resolve",
+    "--connect-to",
+    "--doh-url",
+    "-K",
+    "--config",
+    "--next",
+    "-:",
+    "-e",
+    "--execute",
+    "-i",
+    "--input-file",
+    "-B",
+    "--base",
+    "--unix-socket",
+    "--abstract-unix-socket",
+];
+
+/// curl/wget flags whose next word is their value (not a URL).
+const VALUE_HTTP_FLAGS: &[&str] = &[
+    "-d",
+    "--data",
+    "--data-raw",
+    "--data-ascii",
+    "--data-binary",
+    "--data-urlencode",
+    "--json",
+    "--post-data",
+    "-H",
+    "--header",
+    "-X",
+    "--request",
+    "-o",
+    "--output",
+    "-O",
+    "--output-document",
+    "-A",
+    "--user-agent",
+    "-m",
+    "--max-time",
+    "--connect-timeout",
+    "--retry",
+    "--retry-delay",
+    "--retry-max-time",
+    "-w",
+    "--write-out",
+    "-t",
+    "--tries",
+    "--timeout",
+    "--limit-rate",
+];
 
 /// Detect secret-path access or exfil curl in a raw bash command string.
 ///
@@ -702,8 +787,8 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
                     posts = true;
                 }
             }
-            "-d" | "--data" | "--data-binary" | "--data-raw" | "--data-urlencode" | "-T"
-            | "--upload-file" | "-F" | "--form" | "--post-data" | "--post-file" => {
+            "-d" | "--data" | "--data-binary" | "--data-raw" | "--data-urlencode" | "--json"
+            | "-T" | "--upload-file" | "-F" | "--form" | "--post-data" | "--post-file" => {
                 posts = true;
                 // If the payload references a secret file, that is a hard deny.
                 if let Some(payload) = tokens.get(i + 1) {
@@ -735,6 +820,18 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
         return Decision::Defer;
     }
 
+    if let Some(hosts) = solana_rpc_destinations(tokens) {
+        if hosts.iter().all(|h| host_allowlisted(h)) || policy.tier() < Tier::High {
+            return Decision::Defer;
+        }
+        return Decision::Ask {
+            reason: format!(
+                "Outbound POST to Solana RPC host `{}` at tier high — approve to proceed",
+                hosts.join("`, `")
+            ),
+        };
+    }
+
     // POSTing to an off-allowlist host: the outbound telemetry pattern. Ask, don't
     // hard-block — third-party telemetry endpoints are not always malicious.
     if let Some(host) = first_url_host(tokens) {
@@ -753,6 +850,108 @@ fn decide_http_exfil(tokens: &[String], policy: &Policy) -> Decision {
     }
 
     Decision::Defer
+}
+
+/// The destination hosts of a `curl`/`wget` POST when every one is a known Solana RPC host
+/// ([`SOLANA_RPC_HOSTS`]) and the body is inline: `None` for a file or stdin body (`@…`, `<…`,
+/// `-T`, `-F`, `--post-file`), a redirecting flag ([`REDIRECTING_HTTP_FLAGS`]), a word that
+/// may be a URL but names another host, or no destination at all.
+fn solana_rpc_destinations(tokens: &[String]) -> Option<Vec<String>> {
+    let mut hosts = Vec::new();
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].trim_matches(|c| c == '"' || c == '\'');
+        i += 1;
+        let (flag, inline) = match tok.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+            _ => (tok, None),
+        };
+        if REDIRECTING_HTTP_FLAGS.contains(&flag)
+            || matches!(
+                flag,
+                "-T" | "--upload-file" | "-F" | "--form" | "--form-string" | "--post-file"
+            )
+        {
+            return None;
+        }
+        if flag == "--url" {
+            let url = match inline {
+                Some(v) => v,
+                None => {
+                    i += 1;
+                    tokens.get(i - 1)?.as_str()
+                }
+            };
+            hosts.push(solana_rpc_host(url)?);
+            continue;
+        }
+        if VALUE_HTTP_FLAGS.contains(&flag) {
+            let value = match inline {
+                Some(v) => v,
+                None => {
+                    i += 1;
+                    tokens.get(i - 1)?.as_str()
+                }
+            };
+            if flag.starts_with("-d") || flag.contains("data") || flag == "--json" {
+                let value = value.trim_matches(|c| c == '"' || c == '\'');
+                if value.contains('@') || value.starts_with('<') {
+                    return None;
+                }
+            }
+            continue;
+        }
+        if tok.starts_with("--") {
+            continue;
+        }
+        if let Some(cluster) = tok.strip_prefix('-') {
+            // A short-flag cluster may end in a value-taking or redirecting flag (`-sx host`,
+            // `-sd@file`): only letters that take no value are quiet.
+            // wget's `-qO-` (body to stdout) is allowed too.
+            let cluster = cluster.strip_suffix("O-").unwrap_or(cluster);
+            if cluster.chars().all(|c| "sSLfkvIgGq4612".contains(c)) {
+                continue;
+            }
+            return None;
+        }
+        hosts.push(solana_rpc_host(tok)?);
+    }
+    (!hosts.is_empty()).then_some(hosts)
+}
+
+/// The host of `word` (an `http(s)://` URL or a bare host, path allowed) when it is a known
+/// Solana RPC host; `None` for anything else, including a userinfo `@`, URL globbing,
+/// expansions and non-hostname characters.
+fn solana_rpc_host(word: &str) -> Option<String> {
+    let word = word.trim_matches(|c| c == '"' || c == '\'');
+    let lower = word.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        Some(_) => return None,
+        None => authority,
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return None;
+    }
+    let known = SOLANA_RPC_HOSTS.iter().any(|h| match h.strip_prefix('.') {
+        Some(suffix) => host
+            .strip_suffix(suffix)
+            .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.')),
+        None => host == *h,
+    }) || host
+        .strip_suffix(SOLANA_RPC_ALCHEMY)
+        .is_some_and(|sub| sub.starts_with("solana-") && !sub.ends_with('.'));
+    known.then(|| host.to_string())
 }
 
 /// If `payload` is (or references via `@file`) a path matching a deny glob, return it.
@@ -1015,6 +1214,56 @@ mod tests {
     fn cat_normal_file_defers() {
         let d = decide("cat README.md", &policy());
         assert!(matches!(d, Decision::Defer), "{d:?}");
+    }
+
+    #[test]
+    fn solana_rpc_hosts_match_exactly_or_at_a_label_boundary() {
+        for host in [
+            "https://api.devnet.solana.com",
+            "https://API.MAINNET-BETA.SOLANA.COM./",
+            "api.testnet.solana.com",
+            "http://127.0.0.1:8899",
+            "https://mainnet.helius-rpc.com/?api-key=k",
+            "https://x.solana-mainnet.quiknode.pro/t/",
+            "https://solana-devnet.g.alchemy.com/v2/k",
+            "https://rpc.ankr.com/solana",
+            "https://a.rpcpool.com",
+            "https://solana-mainnet.api.syndica.io/k",
+            "https://solana-mainnet.rpc.extrnode.com",
+        ] {
+            assert!(solana_rpc_host(host).is_some(), "{host}");
+        }
+        for host in [
+            "https://api.devnet.solana.com.evil.io",
+            "https://evilhelius-rpc.com",
+            "https://quiknode.pro",
+            "https://eth-mainnet.g.alchemy.com/v2/k",
+            "https://api.devnet.solana.com@evil.io",
+            "https://{api.devnet.solana.com,evil.io}",
+            "https://api.devnet.solana.com:x",
+            "$RPC",
+            "",
+        ] {
+            assert!(solana_rpc_host(host).is_none(), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_solana_rpc_post_is_quiet_below_high_and_asks_at_high() {
+        let cmd = "curl -X POST -H 'Content-Type: application/json' \
+                   -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}' \
+                   https://api.devnet.solana.com";
+        let mut p = policy();
+        for tier in [Tier::Off, Tier::Relaxed, Tier::Medium] {
+            p.runtime.tier = tier;
+            assert_eq!(decide(cmd, &p), Decision::Defer, "{tier:?}");
+        }
+        p.runtime.tier = Tier::High;
+        assert!(matches!(decide(cmd, &p), Decision::Ask { .. }));
+        // A file body keeps the ask below High.
+        p.runtime.tier = Tier::Relaxed;
+        let upload = "curl -d @body.json https://api.devnet.solana.com";
+        assert!(matches!(decide(upload, &p), Decision::Ask { .. }));
     }
 
     #[test]
