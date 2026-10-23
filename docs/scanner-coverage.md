@@ -224,7 +224,7 @@ still blocks through `state.json`.
 * `verify deps --online`: an explicit, user-invoked mode that queries an advisory database
   (osv.dev batch) for the lockfile's resolved versions. Out of scope for the offline engine.
 * Reading `~/.cargo/registry/src` for which crates in `Cargo.lock` have a `build.rs` or are
-  proc-macros, stored and warned on change (spec D7.2).
+  proc-macros, stored and warned on change.
 * Detecting `cargo-vet` (`supply-chain/`) and `cargo-deny` (`deny.toml`) audit records.
 * A Bash-gate rule that treats `npm install` / `cargo build` / `pip install` run inside a pack
   with build- or install-time findings as its own decision (ask at High).
@@ -378,4 +378,6 @@ rule ideas were reimplemented here; no rule lists were copied.
   fetch, and whatever a spent budget leaves (the time budget is wall-clock, so a heavily loaded
   machine can report it). A shallow clone's missing parents are not reported. Symlink and
   submodule entries in old trees are not scanned. Combos that span files see one historical
-  blob at a time.
+  blob at a time. A blob is scanned under each file name (and exec bit) it had, not each full
+  path, so a rule that depends on the directory (such as `.claude/settings.json`) can miss a
+  historical version stored under another directory with the same file name.
