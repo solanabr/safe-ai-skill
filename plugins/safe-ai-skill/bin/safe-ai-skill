@@ -19,7 +19,8 @@
 #   - Codex hooks (`adapt codex <gate>`): Codex runs the call when a hook fails, so every
 #     failure above, and an engine exit other than 0 or an answer other than nothing or one
 #     deny line, prints Codex's deny JSON with exit 0. `adapt codex redact` (opt-in) blocks
-#     the result the same way; `adapt codex session-start` reports like SessionStart.
+#     the result the same way; `adapt codex session-start` reports like SessionStart. Any other
+#     `adapt` entry denies too, and SAFE_AI_SKILL_DISABLE does not apply to `adapt`.
 #   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
 #     project settings mention it (a repo can't disable the firewall); SessionStart
@@ -62,8 +63,9 @@ case $sub in
     case ${2:-}/${3:-} in
       codex/session-start) kind=session sub='adapt codex session-start' ;;
       codex/redact) kind=codex_post ;;
-      codex/*) kind=codex ;;
-      *) kind=cli ;;
+      # Only another client's hook runs `adapt`: an entry nobody recognises (a typo in the
+      # hook config) blocks rather than letting Codex run the call.
+      *) kind=codex ;;
     esac
     ;;
   *) kind=cli ;;
@@ -74,8 +76,14 @@ if [ "${SAFE_AI_SKILL_STRICT:-}" = 1 ]; then strict=1; fi
 
 # What an engine that cannot run means for the session, as SessionStart reports it.
 inactive_effect='Solana CLI commands ask for manual review; the other gates are off.'
+tampered_effect='Solana CLI and MCP calls are blocked, other tool calls ask for review. Reinstall the plugin.'
+crashed_effect='A crashing engine blocks Solana CLI and MCP calls and skips the other gates.'
 case $sub in
-  'adapt codex session-start') inactive_effect='Every tool call the Codex hooks check is blocked until this is fixed.' ;;
+  'adapt codex session-start')
+    inactive_effect='Every tool call the Codex hooks check is blocked until this is fixed.'
+    tampered_effect='Every tool call the Codex hooks check is blocked. Reinstall safe-ai-skill.'
+    crashed_effect='A crashing engine blocks every tool call the Codex hooks check.'
+    ;;
 esac
 
 # Static PreToolUse `ask` for the Solana surface while the engine can't judge it.
@@ -121,7 +129,11 @@ disable_set_by_repo() {
 
 repo_disable=
 repo_note='SAFE_AI_SKILL_DISABLE set by project settings — ignored.'
-if [ "${SAFE_AI_SKILL_DISABLE:-}" = 1 ] && [ "$kind" != cli ]; then
+# Another client's hooks (`adapt`) ignore SAFE_AI_SKILL_DISABLE: its environment comes from the
+# login shell, whose startup files an agent can write.
+adapt_hook=
+if [ "$sub" = adapt ] || [ "$sub" = 'adapt codex session-start' ]; then adapt_hook=1; fi
+if [ "${SAFE_AI_SKILL_DISABLE:-}" = 1 ] && [ "$kind" != cli ] && [ -z "$adapt_hook" ]; then
   if disable_set_by_repo; then
     repo_disable=1
   elif [ -z "$strict" ]; then
@@ -198,7 +210,7 @@ tampered() {
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
     broad) ask_json "safe-ai-skill engine binary on $label fails its sha256 check (tampered?); review this call manually" ;;
-    session) session_notice "safe-ai-skill firewall TAMPERED on $label: the engine binary fails its sha256 check and was not run. Solana CLI and MCP calls are blocked, other tool calls ask for review. Reinstall the plugin.${repo_disable:+ $repo_note}" ;;
+    session) session_notice "safe-ai-skill firewall TAMPERED on $label: the engine binary fails its sha256 check and was not run. $tampered_effect${repo_disable:+ $repo_note}" ;;
   esac
   exit 0
 }
@@ -248,7 +260,7 @@ crashed() {
   printf 'safe-ai-skill: engine crashed (%s); %s skipped\n' "$how" "$sub" >&2
   if [ -n "$strict" ]; then exit 2; fi
   if [ "$kind" = session ]; then
-    session_notice "safe-ai-skill firewall INACTIVE on $label: the engine crashed ($how) in the session check. A crashing engine blocks Solana CLI and MCP calls and skips the other gates.${repo_disable:+ $repo_note}"
+    session_notice "safe-ai-skill firewall INACTIVE on $label: the engine crashed ($how) in the session check. $crashed_effect${repo_disable:+ $repo_note}"
   fi
   exit 0
 }
@@ -347,6 +359,7 @@ case $kind/$status in
     codex_fail 'the engine gave an answer Codex cannot use'
     ;;
   codex/126 | codex/127 | codex_post/126 | codex_post/127) ;;
+  codex/3 | codex_post/3) codex_fail 'this hook entry is misconfigured (see `safe-ai-skill adapt codex` usage); fix the hooks.json command' ;;
   codex/* | codex_post/*) crashed "$status" ;;
 esac
 

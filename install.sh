@@ -129,6 +129,16 @@ fi
 mkdir -p "${BIN_DIR}"
 install_path="${BIN_DIR}/safe-ai-skill${ext}"
 
+# place <src> <dest>: copy to a temp file beside <dest>, make it executable, then rename it
+# over <dest>. A running hook never sees a half-written file, and a signed macOS binary is
+# never rewritten in place.
+place() {
+  tmp_file="$(dirname "$2")/.$(basename "$2").install.$$"
+  cp "$1" "${tmp_file}" || fatal "could not write ${tmp_file}."
+  chmod 0755 "${tmp_file}" || fatal "could not chmod ${tmp_file}."
+  mv -f "${tmp_file}" "$2" || fatal "could not install $2."
+}
+
 shim_expected=""
 case "${plat}" in
   windows-*) ;;
@@ -141,14 +151,11 @@ if [ -n "${shim_expected}" ]; then
   [ "${shim_actual}" = "${shim_expected}" ] \
     || fatal "checksum mismatch for safe-ai-skill-shim. Do NOT use it; the artifact may be tampered."
   # The binary first, so the shim never points at a missing or older one.
-  cp "${tmp_dir}/${binary_name}" "${BIN_DIR}/${binary_name}"
-  chmod 0755 "${BIN_DIR}/${binary_name}"
-  cp "${tmp_dir}/safe-ai-skill-shim" "${install_path}"
-  chmod 0755 "${install_path}"
+  place "${tmp_dir}/${binary_name}" "${BIN_DIR}/${binary_name}"
+  place "${tmp_dir}/safe-ai-skill-shim" "${install_path}"
   err "installed safe-ai-skill ${VERSION} → ${install_path} (shim) + ${BIN_DIR}/${binary_name} (checksums verified)."
 else
-  cp "${tmp_dir}/${binary_name}" "${install_path}"
-  chmod 0755 "${install_path}"
+  place "${tmp_dir}/${binary_name}" "${install_path}"
   err "installed safe-ai-skill ${VERSION} → ${install_path} (checksum verified)."
 fi
 

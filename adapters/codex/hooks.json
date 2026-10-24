@@ -3,7 +3,12 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill adapt codex session-start", "timeout": 60, "statusMessage": "safe-ai-skill: checking skills and MCP servers" }
+          {
+            "type": "command",
+            "command": "safe-ai-skill adapt codex session-start",
+            "timeout": 60,
+            "statusMessage": "safe-ai-skill: tier and state check (Codex skills and MCP servers are not scanned)"
+          }
         ]
       }
     ],
@@ -11,20 +16,37 @@
       {
         "matcher": "^Bash$",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill adapt codex gate-bash", "timeout": 20, "statusMessage": "safe-ai-skill: checking command" },
-          { "type": "command", "command": "safe-ai-skill adapt codex gate-bash-secrets", "timeout": 10 }
+          {
+            "type": "command",
+            "command": "safe-ai-skill adapt codex gate-bash || printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"safe-ai-skill: the hook command could not run (is safe-ai-skill on the login-shell PATH?); blocked. Run safe-ai-skill doctor --codex.\"}}'",
+            "timeout": 20,
+            "statusMessage": "safe-ai-skill: checking command"
+          },
+          {
+            "type": "command",
+            "command": "safe-ai-skill adapt codex gate-bash-secrets || printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"safe-ai-skill: the hook command could not run (is safe-ai-skill on the login-shell PATH?); blocked. Run safe-ai-skill doctor --codex.\"}}'",
+            "timeout": 10
+          }
         ]
       },
       {
         "matcher": "^apply_patch$",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill adapt codex gate-tamper", "timeout": 10 }
+          {
+            "type": "command",
+            "command": "safe-ai-skill adapt codex gate-tamper || printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"safe-ai-skill: the hook command could not run (is safe-ai-skill on the login-shell PATH?); blocked. Run safe-ai-skill doctor --codex.\"}}'",
+            "timeout": 10
+          }
         ]
       },
       {
         "matcher": "^mcp__.*",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill adapt codex gate-mcp", "timeout": 15 }
+          {
+            "type": "command",
+            "command": "safe-ai-skill adapt codex gate-mcp || printf '%s\\n' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"safe-ai-skill: the hook command could not run (is safe-ai-skill on the login-shell PATH?); blocked. Run safe-ai-skill doctor --codex.\"}}'",
+            "timeout": 15
+          }
         ]
       }
     ]

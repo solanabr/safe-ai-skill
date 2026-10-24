@@ -401,11 +401,23 @@ codex_matrix() {
   fresh
   engine "$bin_dir/safe-ai-skill-linux-x64" deny
   e_disable=1
-  t "codex: SAFE_AI_SKILL_DISABLE=1 turns the Codex hooks off"
+  t "codex: SAFE_AI_SKILL_DISABLE=1 does not turn the Codex hooks off"
   run adapt codex gate-bash
   expect_rc 0
-  expect_no_out
-  expect_not_ran safe-ai-skill-linux-x64
+  expect_out "$DENY"
+  expect_ran safe-ai-skill-linux-x64
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  t "codex: a mistyped adapt entry denies"
+  run adapt codx gate-bash
+  expect_rc 0
+  expect_codex_deny
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" exit:3
+  t "codex: a usage error says the hook entry is misconfigured"
+  run adapt codex gate-bash
+  expect_rc 0
+  expect_json '"misconfigured" in d["hookSpecificOutput"]["permissionDecisionReason"]'
   env_case missing
   e_strict=1
   t "codex: strict still answers Codex with a deny"
