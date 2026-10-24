@@ -659,6 +659,12 @@ for sh_name in sh dash bash busybox; do
     echo "skip: $sh_name not installed"
     continue
   fi
+  # A busybox built with "prefer applets" runs its own uname even with PATH
+  # emptied, so the mocked uname below can never take effect there.
+  if [ "$sh_name" = busybox ] && busybox sh -c 'PATH=/nonexistent; uname' >/dev/null 2>&1; then
+    echo "skip: busybox sh prefers its built-in applets (uname cannot be mocked)"
+    continue
+  fi
   case $sh_name in
     bash) sh_cmd='bash --posix' ;;
     busybox) sh_cmd='busybox sh' ;;
