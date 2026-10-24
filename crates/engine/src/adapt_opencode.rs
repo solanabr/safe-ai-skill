@@ -135,13 +135,15 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
             json!({ "pattern": arg("pattern"), "path": arg("path") }),
         ),
         ("gate-read", "grep") => {
-            // opencode runs ripgrep in `path` when it is a directory, else in its parent
-            // (`src/tool/grep.ts`): a file path searches the whole directory, so it is judged
-            // as that directory.
-            let mut root = match arg("path").filter(|p| !p.trim().is_empty()) {
+            // opencode resolves `path` with realpath (falling back to the path as given,
+            // `core/src/fs-util.ts` `resolve`) and runs ripgrep in it when it is a directory,
+            // else in its parent (`src/tool/grep.ts`): a file path, or a link to one, searches
+            // the whole directory it is in, so it is judged as that directory.
+            let given = match arg("path").filter(|p| !p.trim().is_empty()) {
                 Some(p) => absolute(p, &directory, home().as_deref()),
                 None => directory.clone(),
             };
+            let mut root = std::fs::canonicalize(&given).unwrap_or(given);
             if !root.is_dir() {
                 root = root.parent().map(Path::to_path_buf).unwrap_or(root);
             }
@@ -205,12 +207,21 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
     let plugin = text("pluginPath");
     let targets = || Targets::from_env(&directory, plugin);
     let reason = match tool {
-        "write" | "edit" => arg("filePath").and_then(|p| targets().path_reason(p, &cwd)),
+        "write" | "edit" => arg("filePath").and_then(|p| {
+            let added = arg("content").or(arg("newString")).unwrap_or("");
+            let targets = targets();
+            targets
+                .path_reason(p, &cwd)
+                .or_else(|| targets.rc_path_reason(p, added, &cwd))
+        }),
         "apply_patch" => {
             let targets = targets();
-            crate::adapt::patch_paths(arg("patchText").unwrap_or(""))
-                .iter()
-                .find_map(|p| targets.path_reason(p, &cwd))
+            let patch = arg("patchText").unwrap_or("");
+            crate::adapt::patch_paths(patch).iter().find_map(|p| {
+                targets
+                    .path_reason(p, &cwd)
+                    .or_else(|| targets.rc_path_reason(p, patch, &cwd))
+            })
         }
         "bash" if gate == "gate-bash-secrets" => {
             targets().bash_reason(arg("command").unwrap_or(""), &cwd)
@@ -484,8 +495,12 @@ pub fn grep_rewrite(updated: Value) -> Rewrite {
         return Rewrite::Args(json!({ "include": glob }));
     }
     let exclusion = glob.strip_prefix(&include).unwrap_or(&glob).trim();
+    // The root is canonical (see `prepare`); `/` has no components and reaches everything.
     let reaches_home = match (GREP_ROOT.get(), home()) {
-        (Some(root), Some(home)) => starts_with(&lower_components(&home), root),
+        (Some(root), Some(home)) => {
+            let home = std::fs::canonicalize(&home).unwrap_or(home);
+            lower_components(root).is_empty() || starts_with(&lower_components(&home), root)
+        }
         _ => true,
     };
     if !reaches_home && include_is_code_only(&include, exclusion) {
@@ -606,6 +621,25 @@ const MUTATORS: &[&str] = &[
     "rm", "mv", "cp", "ln", "chmod", "chown", "truncate", "install", "unlink", "dd", "tee", "sed",
     "perl", "shred", "touch", "rsync", "curl", "wget",
 ];
+
+/// Shell startup files (relative to `$HOME`) whose `PATH` lines decide which engine the next
+/// opencode start finds.
+const RC_FILES: &[&str] = &[
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".config/fish/config.fish",
+];
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    lower_components(a) == lower_components(b)
+        || lower_components(&canonical_prefix(a)) == lower_components(&canonical_prefix(b))
+}
 
 /// Wrappers skipped when finding the command a segment runs.
 const PREFIXES: &[&str] = &[
@@ -782,6 +816,22 @@ impl Targets {
         None
     }
 
+    /// Why a write of `added` text to `target` may not happen: `target` is a shell startup
+    /// file ([`RC_FILES`] in `$HOME`) and the text mentions `PATH`, which could put a planted
+    /// `safe-ai-skill` first on the `PATH` of the next opencode start.
+    pub fn rc_path_reason(&self, target: &str, added: &str, cwd: &Path) -> Option<String> {
+        let home = self.home.as_deref()?;
+        let full = absolute(target, cwd, Some(home));
+        let rc = RC_FILES.iter().any(|f| same_file(&full, &home.join(f)));
+        (rc && added.contains("PATH")).then(|| {
+            format!(
+                "safe-ai-skill: this changes `PATH` in the shell startup file `{target}`, which \
+                 could put another safe-ai-skill engine ahead of the real one at the next opencode \
+                 start; edit it yourself, outside the agent."
+            )
+        })
+    }
+
     /// Why an opencode shell command may not run, judged on its words (nothing is run):
     ///
     /// - deletes, moves and overwrites of an existing protected file or a directory holding
@@ -820,12 +870,13 @@ impl Targets {
             .filter(|w| !w.is_empty())
             .collect();
         let mentions = needles.iter().any(|n| lower.contains(n.as_str()))
-            || words.iter().any(|w| self.word_mentions(w, cwd));
+            || words.iter().any(|w| self.word_mentions(w, cwd))
+            || (flat.contains("PATH") && RC_FILES.iter().any(|rc| lower.contains(rc)));
         if mentions && !only_reads(&flat, &segments) {
             return Some(
                 "safe-ai-skill: this command names opencode config, plugin or tool code, the \
-                 safe-ai-skill engine or Claude Code settings, and does more than read it. Do it \
-                 yourself, outside the agent."
+                 safe-ai-skill engine, Claude Code settings or a shell startup file's PATH, and \
+                 does more than read it. Do it yourself, outside the agent."
                     .into(),
             );
         }
@@ -868,17 +919,22 @@ impl Targets {
                     glob::MatchOptions {
                         case_sensitive: false,
                         require_literal_separator: true,
-                        require_literal_leading_dot: false,
+                        require_literal_leading_dot: true,
                     },
                 )
             })
         };
         let comps: Vec<&str> = word.split('/').collect();
+        // A bare wildcard (`dir/*`) creates nothing, and its deletes of existing files are the
+        // scanner's (`clobber_of`): only a component with a literal character names a file.
+        // Under `.config`, though, `*` can expand to the existing `opencode` dir.
+        let literal = |c: &str| c.chars().any(|ch| !matches!(ch, '*' | '?'));
         let named = comps.iter().enumerate().any(|(i, c)| {
-            [".opencode", "opencode.json", "opencode.jsonc"]
-                .iter()
-                .any(|n| matches(c, n))
-                || (i > 0 && matches(comps[i - 1], ".config") && matches(c, "opencode"))
+            let name = literal(c)
+                && [".opencode", "opencode.json", "opencode.jsonc"]
+                    .iter()
+                    .any(|n| matches(c, n));
+            name || (i > 0 && matches(comps[i - 1], ".config") && matches(c, "opencode"))
         });
         if named {
             return true;
@@ -1120,8 +1176,10 @@ mod tests {
             "cp /tmp/evil.js ~/.config/open\"\"code/plugins/a.js",
             "cp x .o?encode/plugins/",
             "cp x ~/.conf*/open*/plugins/",
+            "cp x ~/.config/*/plugins/",
             "echo x > ~/.claude/settings.json",
             "cp hooks.json ~/.claude/plugins/cache/x/hooks/",
+            "echo 'export PATH=~/bin2:$PATH' >> ~/.zshrc",
         ] {
             assert!(t.bash_reason(c, cwd).is_some(), "{c}");
         }
@@ -1137,11 +1195,33 @@ mod tests {
             "which safe-ai-skill",
             "ls ~/.local/bin/*",
             "rm -f build/*.o",
+            "chmod +x scripts/*",
+            "cp dist/* /usr/local/lib/",
+            "cat ~/.zshrc; echo $PATH",
+            "echo 'alias ll=ls' >> ~/.zshrc",
             "cargo build",
             "echo hello > out.txt",
         ] {
             assert!(t.bash_reason(c, cwd).is_none(), "{c}");
         }
+    }
+
+    #[test]
+    fn path_lines_in_shell_startup_files_are_denied() {
+        let cwd = Path::new("/w/proj");
+        let t = targets();
+        assert!(t
+            .rc_path_reason("~/.zshrc", "export PATH=~/bin2:$PATH", cwd)
+            .is_some());
+        assert!(t
+            .rc_path_reason(
+                "/home/u/.config/fish/config.fish",
+                "fish_add_path ~/b; set PATH",
+                cwd
+            )
+            .is_some());
+        assert!(t.rc_path_reason("~/.zshrc", "alias ll=ls", cwd).is_none());
+        assert!(t.rc_path_reason("notes/.zshrc", "PATH=x", cwd).is_none());
     }
 
     #[test]

@@ -159,6 +159,11 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
    The plugin resolves the engine to an absolute path once, when opencode starts. If the
    `PATH` lookup later finds another file, or the file changes, every gated call is blocked
    until opencode restarts (restart after upgrading safe-ai-skill).
+
+   **Recommended: pin the engine.** An absolute `engine` option in `opencode.json` is used as
+   is, with no `PATH` lookup, and the agent cannot change opencode config. Without a pin, the
+   engine is whatever `safe-ai-skill` comes first on `PATH` when opencode starts (see
+   [Not covered](#not-covered-opencode)).
 4. Check it: ask the agent to run `cat ~/.config/solana/id.json`. The call must fail with a
    `safe-ai-skill:` message. If it runs, the plugin is not loaded (see below).
 
@@ -194,9 +199,11 @@ tool sent to the wrong gate.
 
 ### Grep under opencode
 
-opencode runs ripgrep with `--hidden` in the grep's `path` when it is a directory, and in its
-parent directory otherwise (`src/tool/grep.ts`): a `path` naming a file, or one that does not
-exist, searches the whole directory around it. The engine judges it as that directory. It
+opencode resolves the grep's `path` with `realpath` (`packages/core/src/fs-util.ts`), then
+runs ripgrep with `--hidden` in it when it is a directory, and in its parent directory
+otherwise (`src/tool/grep.ts`): a `path` naming a file, a symlink to a file, or a path that does
+not exist searches the whole directory around it (for a link, the target's directory). The
+engine resolves it the same way and judges that directory. It
 passes the `include` to ripgrep as a single `--glob` (`packages/core/src/ripgrep.ts`), so it
 cannot carry both an include and safe-ai-skill's credential-file exclusion.
 
@@ -204,7 +211,8 @@ cannot carry both an include and safe-ai-skill's credential-file exclusion.
   `include`, and the plugin writes it into the call's `args` in place, which opencode then
   passes to the tool. ripgrep searches every file the negated glob does not match.
 - An `include` naming code files only (`*.ts`, `**/*.{ts,tsx}`, `*.rs`; not `*.md`), searched
-  outside `$HOME` and the directories above it: the call runs unchanged. The one credential
+  outside `$HOME` and the directories above it (`/` included, compared after resolving
+  symlinks): the call runs unchanged. The one credential
   name it can still reach is an `.env.<ext>` file (`.env.local.ts`, matched by `**/.env.*`).
 - Any other `include` (`*.json`, `*`, `config/**`, or any `include` over `$HOME`, where
   `--hidden` reaches excluded directories such as `~/.claude/projects`): denied with a reason.
@@ -268,6 +276,15 @@ redirected to a file. A command that writes a file named `safe-ai-skill` by a ba
   `opencode.json` `plugin` entries, and opencode runs that code in-process at startup, before
   any gate exists. Start opencode with `OPENCODE_DISABLE_PROJECT_CONFIG=1` in a repository you
   do not trust.
+- **An engine planted for the next start, without a pin.** Writes to `safe-ai-skill` in the
+  current `PATH` directories are denied, and so are writes that put a `PATH` line into a shell
+  startup file in `$HOME` (`.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`, `.bashrc`,
+  `.bash_profile`, `.bash_login`, `.profile`, `.config/fish/config.fish`, through the file
+  tools, patches and the shell). Other ways of changing the next session's `PATH` are not seen:
+  `$ZDOTDIR` or other startup files, a `PATH` line built so the word `PATH` never appears, a
+  terminal or launcher config, or a new directory placed ahead on `PATH` by some other tool. A
+  `safe-ai-skill` planted there is the engine the next unpinned opencode start uses. Pin the
+  engine (above).
 - **The shell is the user's.** opencode runs `bash` commands in the user's shell, and accepts
   `pwsh` on Unix through `$SHELL` or the config's `shell` key. The gates parse POSIX shell
   syntax only.
@@ -289,7 +306,10 @@ redirected to a file. A command that writes a file named `safe-ai-skill` by a ba
   - In a project with `.opencode/` files, `find . … -delete` and `git clean -fd` are denied.
   - A grep `include` that is not code-only, or any `include` over `$HOME`, is denied (above).
   - A writing command whose glob can match a protected file is denied (`chmod +x
-    ~/.local/bin/*` when `~/.local/bin` is on `PATH`).
+    ~/.local/bin/*` when `~/.local/bin` is on `PATH`). A bare `dir/*` does not count as naming
+    `.opencode` or `opencode.json`.
+  - Writing a `PATH` line to a shell startup file in `$HOME` is denied, as is any non-read
+    command that names such a file and contains `PATH`.
   - An unknown or ambiguous MCP name can match a high-risk or value-moving word across the
     server/tool boundary.
 - **MCP servers from config the engine cannot read.** Remote (`.well-known/opencode`),

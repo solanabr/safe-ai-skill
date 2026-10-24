@@ -82,6 +82,22 @@ test("an engine planted earlier on PATH blocks", async () => {
   }
 })
 
+test("an absolute engine pin wins over PATH", async () => {
+  const early = join(work, "pin-early-bin")
+  mkdirSync(early, { recursive: true })
+  writeFileSync(join(early, "safe-ai-skill"), "#!/bin/sh\nexit 0\n")
+  chmodSync(join(early, "safe-ai-skill"), 0o755)
+  const pinned = fake("pinned", `cat >/dev/null; printf '%s' '${DENY}'`)
+  const saved = process.env.PATH
+  process.env.PATH = `${early}:${saved}`
+  try {
+    const h = await hooks(pinned)
+    await blocked(h, "bash", { command: "ls" }, /nope/)
+  } finally {
+    process.env.PATH = saved
+  }
+})
+
 test("inherited object keys are ordinary tool ids", async () => {
   const h = await hooks(fake("silent2", "cat >/dev/null; exit 0"))
   for (const tool of ["constructor", "toString", "__proto__"]) await call(h, tool, {})

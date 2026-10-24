@@ -678,3 +678,103 @@ fn claude_code_settings_and_plugins_are_protected() {
     );
     assert_eq!(label(&run), "deny");
 }
+
+/// Re-review 1a: opencode resolves the grep path with realpath before taking its directory.
+#[cfg(unix)]
+#[test]
+fn grep_through_a_symlinked_file_is_judged_at_the_link_target() {
+    use std::os::unix::fs::symlink;
+    let w = World::new("oc-grep-link");
+    let ssh = w.home.join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    std::fs::write(ssh.join("known_hosts"), "h").unwrap();
+    std::fs::write(
+        ssh.join("id_ed25519"),
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+    )
+    .unwrap();
+    let sol = w.home.join(".config/solana");
+    std::fs::create_dir_all(&sol).unwrap();
+    std::fs::write(sol.join("devnet.json"), format!("{:?}", vec![1u8; 64])).unwrap();
+    symlink(ssh.join("known_hosts"), w.proj.join("kh")).unwrap();
+    symlink(sol.join("devnet.json"), w.proj.join("dv")).unwrap();
+    symlink(w.home.path(), w.proj.join("h")).unwrap();
+    std::fs::write(w.home.join(".bashrc"), "x").unwrap();
+    symlink(w.home.join(".bashrc"), w.proj.join("rc")).unwrap();
+    for (path, include) in [
+        ("kh", None),
+        ("kh", Some("*.ts")),
+        ("dv", None),
+        ("dv", Some("*.rs")),
+    ] {
+        let mut args = json!({ "pattern": "PRIVATE", "path": path });
+        if let Some(i) = include {
+            args["include"] = json!(i);
+        }
+        let run = w.oc("gate-read", "grep", args);
+        assert_eq!(label(&run), "deny", "{path} {include:?}: {}", run.stdout);
+    }
+    for path in ["h", "rc"] {
+        let run = w.oc(
+            "gate-read",
+            "grep",
+            json!({ "pattern": "x", "path": path, "include": "*.ts" }),
+        );
+        assert_eq!(label(&run), "deny", "{path}: {}", run.stdout);
+        let run = w.oc("gate-read", "grep", json!({ "pattern": "x", "path": path }));
+        assert_ne!(label(&run), "", "{path}");
+    }
+}
+
+/// Re-review 6a: a grep at `/` reaches `$HOME`.
+#[test]
+fn an_include_at_the_filesystem_root_denies() {
+    let w = World::new("oc-grep-root-dir");
+    let run = w.oc(
+        "gate-read",
+        "grep",
+        json!({ "pattern": "x", "path": "/", "include": "*.ts" }),
+    );
+    assert_eq!(label(&run), "deny", "{}", run.stdout);
+}
+
+/// Re-review 2a: a `PATH` line in a shell startup file could plant an engine for the next start.
+#[test]
+fn path_lines_in_shell_startup_files_deny() {
+    let w = World::new("oc-rc");
+    let zshrc = w.home.join(".zshrc");
+    let run = w.oc(
+        "gate-tamper",
+        "write",
+        json!({ "filePath": zshrc.to_str().unwrap(), "content": "export PATH=~/bin2:$PATH\n" }),
+    );
+    assert_eq!(label(&run), "deny");
+    let run = w.oc(
+        "gate-tamper",
+        "edit",
+        json!({ "filePath": "~/.bashrc", "oldString": "a", "newString": "PATH=/tmp/b:$PATH" }),
+    );
+    assert_eq!(label(&run), "deny");
+    let run = w.oc(
+        "gate-bash-secrets",
+        "bash",
+        json!({ "command": "echo 'export PATH=$HOME/bin2:$PATH' >> ~/.zshrc" }),
+    );
+    assert_eq!(label(&run), "deny");
+    let run = w.oc(
+        "gate-tamper",
+        "write",
+        json!({ "filePath": zshrc.to_str().unwrap(), "content": "alias ll='ls -la'\n" }),
+    );
+    assert_eq!(label(&run), "");
+}
+
+/// Re-review 3a: `dir/*` does not name `.opencode` or `opencode.json`.
+#[test]
+fn plain_wildcards_in_writing_commands_pass() {
+    let w = World::new("oc-star");
+    for command in ["chmod +x scripts/*", "cp dist/* build/"] {
+        let run = w.oc("gate-bash-secrets", "bash", json!({ "command": command }));
+        assert_eq!(label(&run), "", "{command}: {}", run.stdout);
+    }
+}
