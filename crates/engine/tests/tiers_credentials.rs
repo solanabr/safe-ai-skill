@@ -641,14 +641,20 @@ fn loopback_shares_are_read_like_the_drive() {
         .trim_start_matches(r"\\?\")
         .to_string();
     let (drive, rest) = real.split_once(":\\").unwrap();
+    let mut ran = 0;
     for host in [r"\\localhost", r"\\127.0.0.1", r"\\?\UNC\localhost"] {
         let path = format!(r"{host}\{drive}$\{rest}");
         if std::fs::metadata(&path).is_err() {
             eprintln!("skipped {path}: the administrative share is not available here");
             continue;
         }
+        ran += 1;
         for tier in tiers() {
             assert_eq!(w.read(tier, &path), "deny", "{tier:?} {path}");
         }
+    }
+    // CI's Windows runners are admin with `C$` shared: there the test must not skip it all.
+    if std::env::var_os("CI").is_some() {
+        assert!(ran > 0, "no loopback spelling of {real} was available");
     }
 }

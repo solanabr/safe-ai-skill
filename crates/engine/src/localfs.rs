@@ -182,7 +182,11 @@ fn classify(text: &str, computer: Option<&str>) -> Share {
     let first = parts.next().unwrap_or("");
     let device = matches!(first, "?" | ".");
     if device {
-        let kind = parts.next().unwrap_or("");
+        let mut kind = parts.next().unwrap_or("");
+        // `\\?\GLOBAL\…` (`\??\Global`) is the same namespace.
+        if kind.eq_ignore_ascii_case("global") {
+            kind = parts.next().unwrap_or("");
+        }
         if kind.eq_ignore_ascii_case("unc") {
             return unc(parts, computer);
         }
@@ -348,6 +352,13 @@ mod tests {
             ),
             (r"\\.\globalroot\device\mup\host\share", unc(r"host\share")),
             (r"\\?\GLOBALROOT\Device\HarddiskVolume1\x", Share::Device),
+            (r"\\?\GLOBAL\UNC\host\share\x", unc(r"host\share")),
+            (r"\\.\Global\UNC\host\share", unc(r"host\share")),
+            (
+                r"\\?\global\GLOBALROOT\Device\Mup\host\share",
+                unc(r"host\share"),
+            ),
+            (r"\\?\Global\C:\Users\x", Share::Local),
             (r"\\localhost\c$\Users\me", Share::Local),
             (r"\\127.0.0.1\c$\Users\me", Share::Local),
             (r"\\127.1.2.3\c$", Share::Local),
