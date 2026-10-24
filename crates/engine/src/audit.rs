@@ -64,9 +64,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Append `entry` as one JSON line to `${plugin_data}/audit.jsonl`, creating the directory
-/// if needed.
+/// (mode 0700, as for state files: the standalone data dir may not exist yet) if needed.
 pub fn append(entry: &AuditEntry, plugin_data: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(plugin_data)?;
+    crate::statefile::create_dir_private(plugin_data)?;
     let path = plugin_data.join("audit.jsonl");
     let mut file = std::fs::OpenOptions::new()
         .create(true)

@@ -291,6 +291,8 @@ class Sim:
         env = {
             "HOME": self.home,
             "CLAUDE_CONFIG_DIR": self.cfg,
+            # The standalone data dir would prefer an existing one under the real passwd home.
+            "SAFE_AI_SKILL_DATA": os.path.join(self.home, ".local", "share", "safe-ai-skill-data"),
             "PATH": self.stub + ":/usr/bin:/bin:/usr/sbin:/sbin",
             "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
             "LANG": "en_US.UTF-8",

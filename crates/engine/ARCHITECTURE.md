@@ -133,10 +133,12 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
 ## State files (in the data dir: `datadir::data_dir()`)
 
 `datadir::data_dir()` resolves `CLAUDE_PLUGIN_DATA`, else the preferred `safe-ai-skill-*` dir
-under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`; never a relative path.
-`DataDir::trusted` holds only inside `<passwd home>/.claude/plugins/data`, or inside
-`$CLAUDE_CONFIG_DIR/plugins/data` when that config dir is under the passwd home and neither
-it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
+under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`, else (no Claude Code plugin)
+the standalone dir: `$SAFE_AI_SKILL_DATA`, else `safe-ai-skill-data` under the platform data
+root; never a relative path. `DataDir::trusted` holds only inside
+`<passwd home>/.claude/plugins/data`, for the standalone default under the passwd home, or for
+an env-placed dir (`$CLAUDE_CONFIG_DIR/plugins/data/*`, `$SAFE_AI_SKILL_DATA`, …) under the
+passwd home and not inside the project or hook cwd (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
 `key`). The CLI resolves the same dir from a terminal; state is never written to
 `~/.safe-ai-skill` or the cwd.
 

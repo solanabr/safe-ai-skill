@@ -1252,6 +1252,7 @@ fn run_env_in_terminal(dir: &Path, args: &[&str], stdin: &str, tier: &str) -> Ru
         .env_clear()
         .env("HOME", dir)
         .env("CLAUDE_CONFIG_DIR", dir.join(".claude"))
+        .env("SAFE_AI_SKILL_DATA", common::standalone_data(dir))
         .env("PATH", "/usr/bin:/bin")
         .env("SAFE_AI_SKILL_TIER", tier)
         .stdin(Stdio::piped())

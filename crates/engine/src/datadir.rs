@@ -9,12 +9,24 @@
 //!    (see below), falling back to `HOME`/`USERPROFILE` only when the lookup fails. In the
 //!    root, `safe-ai-skill-safe-ai-skill` wins, then `safe-ai-skill-stbr`; failing both, a
 //!    lone `safe-ai-skill-*` dir is used, and several are ambiguous (unresolved);
-//! 3. else unresolved: an error telling the user to set `CLAUDE_PLUGIN_DATA`. No dir is
-//!    invented (the plugin's dir exists once Claude Code installed it).
+//! 3. else, when the Claude Code plugin is installed but Claude Code has not created its data
+//!    dir yet (a `plugins/cache/<marketplace>/safe-ai-skill` dir beside the root), an error
+//!    telling the user to start a Claude Code session once: that dir will be the one source of
+//!    truth, so nothing is put elsewhere meanwhile;
+//! 4. else the standalone data dir, for installs without the Claude Code plugin (the Codex
+//!    adapter, the CLI on its own): `$SAFE_AI_SKILL_DATA` when set (absolute), else
+//!    [`STANDALONE_NAME`] under the platform's data root: `~/Library/Application Support` on
+//!    macOS, `$XDG_DATA_HOME` (absolute) or `~/.local/share` on other unix, `%LOCALAPPDATA%` or
+//!    `%USERPROFILE%\AppData\Local` on Windows. `~` is the OS user-database home when the dir
+//!    already exists there, else `HOME`. It is created on the first store.
+//!
+//! The Claude Code plugin's dir wins whenever it exists, so a user with both clients keeps one
+//! set of state; `$SAFE_AI_SKILL_DATA` only places the standalone dir.
 //!
 //! There is no `./.safe-ai-skill` fallback: a relative state dir would let a repo plant it.
-//! When nothing resolves, [`data_dir`] errors; code that needs a path anyway uses
-//! [`unresolved`], a sentinel that loads nothing and refuses stores.
+//! When nothing resolves (an ambiguous install, the case in 3., no home at all), [`data_dir`]
+//! errors; code that needs a path anyway uses [`unresolved`], a sentinel that loads nothing
+//! and refuses stores.
 //!
 //! ## Trust
 //!
@@ -31,6 +43,11 @@
 //!   the passwd home and not inside `CLAUDE_PROJECT_DIR` or the hook cwd, and the data dir
 //!   itself is not inside either. (An allow-list: a deny-list of temp dirs would trust
 //!   whatever a repo-set `TMPDIR` leaves out.)
+//! - the standalone dir: trusted when its canonical path is the default one built from the
+//!   passwd home (whatever the project or cwd); a dir placed by `SAFE_AI_SKILL_DATA`,
+//!   `XDG_DATA_HOME`, `LOCALAPPDATA` or a `HOME` other than the passwd home is trusted only under
+//!   the same allow-list as `$CLAUDE_CONFIG_DIR`: strictly inside the passwd home (not `/`),
+//!   and not inside `CLAUDE_PROJECT_DIR` or the hook cwd.
 //!
 //! Everything else is untrusted. Callers still read untrusted state for tightening; they never
 //! relax on it.
@@ -48,6 +65,14 @@ const DIR_PREFIX: &str = "safe-ai-skill-";
 
 /// Install dir names preferred, in order, when several `safe-ai-skill-*` dirs exist.
 const PREFERRED: [&str; 2] = ["safe-ai-skill-safe-ai-skill", "safe-ai-skill-stbr"];
+
+/// Name of the standalone data dir under the platform data root. Distinct from any repo or
+/// binary name, because the tamper scan treats every path component equal to the live data
+/// dir's name as that dir.
+pub const STANDALONE_NAME: &str = "safe-ai-skill-data";
+
+/// Places the standalone data dir (absolute paths only).
+pub const STANDALONE_ENV: &str = "SAFE_AI_SKILL_DATA";
 
 /// The resolved plugin data dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +135,11 @@ struct Env {
     project_dir: Option<PathBuf>,
     /// The OS user-database home: the trusted home root.
     passwd_home: Option<PathBuf>,
+    /// `SAFE_AI_SKILL_DATA`, when absolute.
+    standalone: Option<PathBuf>,
+    /// The platform data root from the environment (`XDG_DATA_HOME`, `LOCALAPPDATA`), when
+    /// absolute.
+    data_home: Option<PathBuf>,
 }
 
 impl Env {
@@ -121,7 +151,42 @@ impl Env {
             env_home: var("HOME").or_else(|| var("USERPROFILE")),
             project_dir: var("CLAUDE_PROJECT_DIR"),
             passwd_home: None,
+            standalone: var(STANDALONE_ENV).filter(|p| p.is_absolute()),
+            data_home: var(if cfg!(windows) {
+                "LOCALAPPDATA"
+            } else {
+                "XDG_DATA_HOME"
+            })
+            .filter(|p| p.is_absolute() && !cfg!(target_os = "macos")),
         }
+    }
+
+    /// The standalone dir built from the passwd home alone: the one trusted wherever the
+    /// session runs.
+    fn passwd_standalone(&self) -> Option<PathBuf> {
+        self.passwd_home
+            .as_deref()
+            .map(|h| data_root_under(h).join(STANDALONE_NAME))
+    }
+
+    /// Where the standalone dir is: `SAFE_AI_SKILL_DATA`; else the passwd-home default when it
+    /// exists; else the environment's data root (`XDG_DATA_HOME`/`LOCALAPPDATA`), else the one
+    /// under `HOME`, else under the passwd home.
+    fn standalone_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = &self.standalone {
+            return Some(dir.clone());
+        }
+        let passwd = self.passwd_standalone();
+        if passwd.as_deref().is_some_and(Path::is_dir) {
+            return passwd;
+        }
+        if let Some(root) = &self.data_home {
+            return Some(root.join(STANDALONE_NAME));
+        }
+        self.env_home
+            .as_deref()
+            .map(|h| data_root_under(h).join(STANDALONE_NAME))
+            .or(passwd)
     }
 
     fn config_root(&self) -> Option<PathBuf> {
@@ -155,13 +220,37 @@ enum Install {
     Ambiguous,
 }
 
+/// The platform data root under `home`.
+fn data_root_under(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else if cfg!(windows) {
+        home.join("AppData").join("Local")
+    } else {
+        home.join(".local").join("share")
+    }
+}
+
 fn resolve(env: &Env, cwd: Option<&Path>) -> Result<DataDir, EngineError> {
     let path = match &env.plugin_data {
         Some(dir) => dir.clone(),
-        None => discover(&env.discovery_roots())?,
+        None => match discover(&env.discovery_roots()) {
+            Ok(dir) => dir,
+            Err(Discovery::Fatal(e)) => return Err(e),
+            Err(Discovery::NoInstall(e)) => env.standalone_dir().ok_or(e)?,
+        },
     };
     let trusted = is_trusted(&path, env, cwd) || test_trusted();
     Ok(DataDir { path, trusted })
+}
+
+/// Why [`discover`] found no Claude Code plugin data dir.
+enum Discovery {
+    /// Nothing may be used instead: several install dirs, or a plugin installed whose dir
+    /// Claude Code has not created yet.
+    Fatal(EngineError),
+    /// No Claude Code plugin install: the standalone dir applies.
+    NoInstall(EngineError),
 }
 
 /// Test-only: integration tests cannot place a data dir under the real passwd home, so a
@@ -180,36 +269,38 @@ fn test_trusted() -> bool {
 /// The `test-hooks` override read by [`test_trusted`].
 pub const TEST_TRUST_ENV: &str = "SAFE_AI_SKILL_TEST_TRUST_DATA_DIR";
 
-fn discover(roots: &[PathBuf]) -> Result<PathBuf, EngineError> {
+fn discover(roots: &[PathBuf]) -> Result<PathBuf, Discovery> {
     for root in roots {
         match pick_install_dir(root) {
             Install::One(dir) => return Ok(dir),
             Install::Ambiguous => {
-                return Err(Error::Other(format!(
+                return Err(Discovery::Fatal(Error::Other(format!(
                     "cannot pick the plugin data dir: several safe-ai-skill-* dirs under {}; \
                      set CLAUDE_PLUGIN_DATA",
                     root.display()
-                )))
+                ))))
             }
             Install::None => {}
         }
     }
-    Err(Error::Other(match roots.first() {
-        Some(root) if plugin_installed_beside(root) => format!(
+    if let Some(root) = roots.first().filter(|r| plugin_installed_beside(r)) {
+        return Err(Discovery::Fatal(Error::Other(format!(
             "safe-ai-skill is installed but has no data dir yet under {}: Claude Code creates it \
              the first time a session runs the plugin's hooks. Start a Claude Code session once \
              (any project), then run this again; or set CLAUDE_PLUGIN_DATA to the data dir",
             root.display()
-        ),
+        ))));
+    }
+    Err(Discovery::NoInstall(Error::Other(match roots.first() {
         Some(root) => format!(
-            "no plugin data dir under {} (is the plugin installed?); set CLAUDE_PLUGIN_DATA to \
-             the plugin's data dir, usually ~/.claude/plugins/data/safe-ai-skill-<marketplace>",
+            "no plugin data dir under {} and no home for the standalone one; set \
+             CLAUDE_PLUGIN_DATA or SAFE_AI_SKILL_DATA",
             root.display()
         ),
-        None => "cannot resolve the plugin data dir: no CLAUDE_PLUGIN_DATA, CLAUDE_CONFIG_DIR or \
-                 home; set CLAUDE_PLUGIN_DATA"
+        None => "cannot resolve the data dir: no CLAUDE_PLUGIN_DATA, SAFE_AI_SKILL_DATA, \
+                 CLAUDE_CONFIG_DIR or home; set CLAUDE_PLUGIN_DATA or SAFE_AI_SKILL_DATA"
             .to_string(),
-    }))
+    })))
 }
 
 /// Whether the plugin is installed next to the data root `<config>/plugins/data`: some
@@ -257,18 +348,20 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
     if env.home_root().is_some_and(|r| strictly_inside(&r)) {
         return true;
     }
+    if env
+        .passwd_standalone()
+        .and_then(|d| canonical_lenient(&d))
+        .is_some_and(|d| d == canon)
+    {
+        return true;
+    }
 
-    // `$CLAUDE_CONFIG_DIR` is env-settable, so its root is allow-listed: the config dir must
-    // be under the passwd home, and neither it nor the data dir inside the project or cwd.
-    let (Some(cfg), Some(cfg_root), Some(home)) =
-        (&env.config_dir, env.config_root(), &env.passwd_home)
-    else {
+    // Env-settable locations are allow-listed: under the passwd home, and not inside the
+    // project or cwd.
+    let Some(home) = env.passwd_home.as_deref().and_then(canonical_lenient) else {
         return false;
     };
-    let (Some(cfg), Some(home)) = (canonical_lenient(cfg), canonical_lenient(home)) else {
-        return false;
-    };
-    // A home of `/` (no parent) would put every config dir "under the home".
+    // A home of `/` (no parent) would put every dir "under the home".
     if home.parent().is_none() {
         return false;
     }
@@ -280,6 +373,22 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
         .filter_map(canonical_lenient)
         .collect();
     let in_session = |p: &Path| session_dirs.iter().any(|d| p.starts_with(d));
+
+    // The standalone dir placed by the environment (no Claude Code plugin dir in play).
+    if env.plugin_data.is_none()
+        && env.standalone_dir().and_then(|d| canonical_lenient(&d)) == Some(canon.clone())
+    {
+        return canon != home && canon.starts_with(&home) && !in_session(&canon);
+    }
+
+    // `$CLAUDE_CONFIG_DIR`: the config dir must be under the passwd home, and neither it nor
+    // the data dir inside the project or cwd.
+    let (Some(cfg), Some(cfg_root)) = (&env.config_dir, env.config_root()) else {
+        return false;
+    };
+    let Some(cfg) = canonical_lenient(cfg) else {
+        return false;
+    };
     cfg.starts_with(&home) && !in_session(&cfg) && !in_session(&canon) && strictly_inside(&cfg_root)
 }
 
@@ -688,14 +797,104 @@ mod tests {
     }
 
     #[test]
-    fn no_install_dir_is_an_error_naming_claude_plugin_data() {
+    fn no_install_dir_uses_the_standalone_dir() {
         let home = tmp("default");
-        let err = resolve(&env_home(&home), None).unwrap_err().to_string();
-        assert!(err.contains("CLAUDE_PLUGIN_DATA"), "{err}");
+        let d = resolve(&env_home(&home), None).unwrap();
+        assert_eq!(d.path, data_root_under(&home).join(STANDALONE_NAME));
+        assert!(d.trusted, "the passwd-home default is trusted");
+        assert!(!d.path.exists(), "resolution creates nothing");
         assert!(!data_root(&home)
             .join("safe-ai-skill-safe-ai-skill")
             .exists());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_claude_plugin_dir_wins_over_the_standalone_dir() {
+        let home = tmp("onetruth");
+        std::fs::create_dir_all(data_root_under(&home).join(STANDALONE_NAME)).unwrap();
+        let plugin = data_root(&home).join("safe-ai-skill-stbr");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let env = Env {
+            standalone: Some(home.join("elsewhere")),
+            ..env_home(&home)
+        };
+        assert_eq!(resolve(&env, None).unwrap().path, plugin);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_installed_plugin_without_its_dir_is_not_replaced_by_the_standalone_dir() {
+        let home = tmp("firstrun");
+        std::fs::create_dir_all(home.join(".claude/plugins/cache/stbr/safe-ai-skill")).unwrap();
+        let err = resolve(&env_home(&home), None).unwrap_err().to_string();
+        assert!(err.contains("Start a Claude Code session"), "{err}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn safe_ai_skill_data_places_the_standalone_dir_under_the_allow_list() {
+        let home = tmp("sasdata");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let placed = home.join(".sas");
+        let env = Env {
+            standalone: Some(placed.clone()),
+            ..env_home(&home)
+        };
+        let d = resolve(&env, Some(&project)).unwrap();
+        assert_eq!(d.path, placed);
+        assert!(d.trusted, "under the passwd home, outside the project");
+        let inside = Env {
+            standalone: Some(project.join(".sas")),
+            ..env_home(&home)
+        };
+        assert!(!resolve(&inside, Some(&project)).unwrap().trusted);
+        let outside = tmp("sasdata-out");
+        let away = Env {
+            standalone: Some(outside.join("d")),
+            ..env_home(&home)
+        };
+        assert!(!resolve(&away, None).unwrap().trusted);
+        let at_home = Env {
+            standalone: Some(home.clone()),
+            ..env_home(&home)
+        };
+        assert!(!resolve(&at_home, None).unwrap().trusted, "the home itself");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_repo_set_home_moves_the_standalone_dir_out_of_trust() {
+        let real = tmp("sareal");
+        let fake = tmp("safake");
+        let env = Env {
+            env_home: Some(fake.clone()),
+            passwd_home: Some(real.clone()),
+            ..Env::default()
+        };
+        // Nothing exists yet: the dir follows HOME (so a test HOME never reaches the real
+        // one), and is untrusted there.
+        let d = resolve(&env, None).unwrap();
+        assert_eq!(d.path, data_root_under(&fake).join(STANDALONE_NAME));
+        assert!(!d.trusted);
+        // Once the passwd-home dir exists, it is used and trusted whatever HOME says.
+        std::fs::create_dir_all(data_root_under(&real).join(STANDALONE_NAME)).unwrap();
+        let d = resolve(&env, Some(&real)).unwrap();
+        assert_eq!(d.path, data_root_under(&real).join(STANDALONE_NAME));
+        assert!(d.trusted, "trusted even when the cwd is the home");
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    #[test]
+    fn relative_safe_ai_skill_data_is_ignored() {
+        let env = Env::from_lookup(|k| match k {
+            "SAFE_AI_SKILL_DATA" => Some(OsString::from("rel/dir")),
+            _ => None,
+        });
+        assert_eq!(env.standalone, None);
     }
 
     #[test]
@@ -708,7 +907,10 @@ mod tests {
             ..env_home(&home)
         };
         // `$CLAUDE_CONFIG_DIR` replaces `~/.claude`: the home install is not consulted.
-        assert!(resolve(&env, None).is_err());
+        assert_eq!(
+            resolve(&env, None).unwrap().path,
+            data_root_under(&home).join(STANDALONE_NAME)
+        );
         let under_cfg = cfg.join("plugins").join("data").join("safe-ai-skill-stbr");
         std::fs::create_dir_all(&under_cfg).unwrap();
         let d = resolve(&env, None).unwrap();

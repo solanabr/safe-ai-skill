@@ -45,6 +45,11 @@ pub enum SandboxMode {
 }
 
 /// Absolute path to the built `safe-ai-skill` binary (Cargo-provided).
+/// The standalone data dir an [`Invocation`] pins inside its `home` (`SAFE_AI_SKILL_DATA`).
+pub fn standalone_data(home: &Path) -> PathBuf {
+    home.join(".local").join("share").join("safe-ai-skill-data")
+}
+
 pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_safe-ai-skill")
 }
@@ -328,6 +333,11 @@ impl<'a> Invocation<'a> {
         // Data-dir discovery uses the OS user-database home, not HOME; `CLAUDE_CONFIG_DIR`
         // replaces it, so point that at the fake home too (an explicit `.env` overrides).
         cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
+        // The standalone data dir (no plugin dir found) would prefer an existing one under the
+        // real passwd home: pin it inside the fake home.
+        cmd.env_remove("XDG_DATA_HOME");
+        cmd.env_remove("LOCALAPPDATA");
+        cmd.env("SAFE_AI_SKILL_DATA", standalone_data(&home));
         for (k, v) in self.tier_setup().iter().chain(&self.extra_env) {
             cmd.env(k, v);
         }
