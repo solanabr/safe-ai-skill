@@ -40,6 +40,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "-c",
             "core.hooksPath=/dev/null",
         ])
+        // No background auto-gc/maintenance: it can repack objects while a test walks them.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -693,6 +695,7 @@ fn tree_bomb(dir: &Path, levels: usize) -> String {
 fn git_stdin(dir: &Path, args: &[&str], input: &str) -> String {
     use std::io::Write;
     let mut child = Command::new("git")
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
