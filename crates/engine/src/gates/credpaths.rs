@@ -343,15 +343,42 @@ fn is_home_seg(seg: &str) -> bool {
 /// Whether `path` (normalised: absolute, `/` separators, lowercased) is a credential store
 /// entry that is not a readable exception. Fails closed when the embedded lists are unusable.
 pub fn is_credential(path: &Path) -> bool {
-    check(path, false)
+    check(path, false, false)
 }
 
 /// [`is_credential`] for a word the shell may glob-expand (see the module docs).
 pub fn is_credential_glob(path: &Path) -> bool {
-    check(path, true)
+    check(path, true, false)
 }
 
-fn check(path: &Path, globbing: bool) -> bool {
+/// [`is_credential_glob`] for a pattern whose filesystem expansion is unknown (it lies on a
+/// network share that is not looked up, [`crate::localfs`]): the `**/…` records are matched as
+/// patterns too, and no readable exception clears it (the pattern may name other files).
+pub fn is_credential_pattern(path: &Path) -> bool {
+    if check(path, true, true) {
+        return true;
+    }
+    let text = secretpath::normalize(&path.to_string_lossy(), None);
+    let segs = segments(&text);
+    let path: Vec<&str> = segs.iter().map(String::as_str).collect();
+    PATTERN_TREES.iter().any(|tree| {
+        let pat = segments(tree);
+        segs_match(&pat, &path, false, true)
+    })
+}
+
+/// The trees [`secretpath`] hard-denies by name anywhere (its `tree_class`), as patterns an
+/// unexpanded word is matched against.
+const PATTERN_TREES: &[&str] = &[
+    "**/.config/solana/**",
+    "**/.superstack/**",
+    "**/.config/varlock/**",
+    "**/.varlock/**",
+    "**/.claude/projects/**",
+    "**/.ssh/id_*",
+];
+
+fn check(path: &Path, globbing: bool, unexpanded: bool) -> bool {
     // Unusable embedded lists (a build defect the tests pin) fail closed.
     let Some(entries) = entries() else {
         return true;
@@ -380,7 +407,7 @@ fn check(path: &Path, globbing: bool) -> bool {
                 // `**/…` records are matched literally: a pattern would overlap them
                 // everywhere (`*.json` vs `*-keypair.json`); the filesystem expansion of a
                 // wildcard word decides those.
-                Root::Anywhere => segs_match(&entry.segs, &path, entry.dir, false),
+                Root::Anywhere => segs_match(&entry.segs, &path, entry.dir, unexpanded),
                 Root::Abs => *abs && matches(&entry.segs),
                 Root::Home => *abs && roots.iter().any(|root| matches(&joined(root, &entry.segs))),
                 Root::ConfigDir => {
@@ -399,6 +426,9 @@ fn check(path: &Path, globbing: bool) -> bool {
             continue;
         }
         if entry.exception {
+            if unexpanded {
+                continue;
+            }
             return false;
         }
         denied = true;
@@ -556,7 +586,10 @@ pub fn grep_exclusions_as(dir: &Path, given: &Path) -> Vec<String> {
         }
     }
     let homes = secretpath::homes_resolved();
-    if secretpath::data_dir_reach(&dir.to_string_lossy(), &homes).is_some() {
+    // A root on a network share that is not looked up is unknown: it may hold a home or a data
+    // dir, so it gets everything.
+    let foreign = crate::localfs::is_foreign(dir) || crate::localfs::is_foreign(given);
+    if foreign || secretpath::data_dir_reach(&dir.to_string_lossy(), &homes).is_some() {
         for glob in data_key_globs() {
             push(glob, &mut globs);
         }
@@ -564,7 +597,7 @@ pub fn grep_exclusions_as(dir: &Path, given: &Path) -> Vec<String> {
     for glob in config_dir_globs(dir, given, all) {
         push(glob, &mut globs);
     }
-    if !touches_home(dir) {
+    if !foreign && !touches_home(dir) {
         return globs;
     }
     for entry in all.iter().filter(|e| !e.exception) {
@@ -1101,6 +1134,24 @@ mod tests {
             "/p/src/*.rs",
         ] {
             assert!(!is_credential_glob(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn an_unexpanded_pattern_is_matched_against_the_anywhere_records() {
+        for p in [
+            "//h/s/home/me/.config/sol*/id.json",
+            "//h/s/proj/deploy-k*.json",
+            "//h/s/proj/*-keypair.json",
+            "//h/s/home/me/.ssh/id_*",
+        ] {
+            assert!(is_credential_pattern(Path::new(p)), "{p}");
+        }
+        // A bare `*` could be any file there (`*.pem` included), so it is a hit; a pattern no
+        // record overlaps is not.
+        assert!(is_credential_pattern(Path::new("//h/s/proj/src/*")));
+        for p in ["//h/s/proj/*.rs", "//h/s/docs/[id].tsx"] {
+            assert!(!is_credential_pattern(Path::new(p)), "{p}");
         }
     }
 

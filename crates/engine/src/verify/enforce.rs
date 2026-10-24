@@ -399,9 +399,8 @@ pub(super) fn skill_verdict_in(
     // A pack `on_block: move` took out of scope is no longer on disk to be found above, but
     // its skill names stay denied.
     if blocked.is_none() {
-        let user = user_skills
-            .canonicalize()
-            .unwrap_or_else(|_| user_skills.to_path_buf());
+        let user =
+            crate::localfs::canonicalize(user_skills).unwrap_or_else(|_| user_skills.to_path_buf());
         blocked = st
             .packs
             .iter()

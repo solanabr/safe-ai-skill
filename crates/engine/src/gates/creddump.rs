@@ -1120,7 +1120,7 @@ fn env_candidate(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy
             require_literal_separator: true,
             require_literal_leading_dot: true,
         };
-        let expanded = glob::glob_with(&pattern, options)
+        let expanded = crate::localfs::glob_with(&pattern, options)
             .map(|g| {
                 g.filter_map(Result::ok)
                     .take(MAX_GLOB_MATCHES)
@@ -1516,8 +1516,15 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
     let bare = is_bare(word);
     let judged = |path: &Path| -> bool {
         if wild {
+            // On a share that is not looked up the expansion is unknown: the pattern itself is
+            // matched against every record.
+            let pattern_hit = if crate::localfs::is_foreign(path) {
+                credpaths::is_credential_pattern(path)
+            } else {
+                credpaths::is_credential_glob(path)
+            };
             !exempt.allows(path)
-                && (credpaths::is_credential_glob(path)
+                && (pattern_hit
                     || secretpath::is_transcript_tree(
                         &path.to_string_lossy(),
                         &secretpath::homes_resolved(),

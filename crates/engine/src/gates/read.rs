@@ -131,6 +131,13 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     if suspect && sniffed == Sniffed::Unreadable {
         return hard_deny("possible key file that could not be checked");
     }
+    // A file on a network share that is not looked up: its content is unknown, and it could be
+    // a keypair under any name.
+    if sniffed == Sniffed::Unreadable
+        && (crate::localfs::is_foreign(&raw) || crate::localfs::is_foreign(file))
+    {
+        return unknown_content(policy);
+    }
     if pem && sniffed == Sniffed::TooLarge {
         return hard_deny("key file too large to check (over 1 MiB)");
     }
@@ -138,6 +145,23 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
         return guard_env_schema(file);
     }
     Decision::Defer
+}
+
+/// The verdict for a read whose content could not be checked because it is on a network share
+/// that is not looked up ([`crate::localfs`]): ask, deny at tier High (headless turns the ask
+/// into a deny downstream).
+fn unknown_content(policy: &Policy) -> Decision {
+    let reason = "safe-ai-skill: this file is on a network share safe-ai-skill does not open, so \
+                  its content (a keypair or private key under any name) could not be checked";
+    if policy.tier() == crate::policy::tier::Tier::High {
+        Decision::Deny {
+            reason: format!("{reason} — denied at tier high"),
+        }
+    } else {
+        Decision::Ask {
+            reason: format!("{reason} — approve to proceed"),
+        }
+    }
 }
 
 /// Whether the absolute `candidate` names a project env file whose raw read the env gate
@@ -443,12 +467,22 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
         absolute(path, cwd, &homes)
     };
 
-    if !crate::localfs::is_dir(&target) {
+    // A root on a network share that is not looked up may be a directory: it gets the full
+    // exclusion list (ripgrep ignores `--glob` for a single file anyway).
+    let foreign = crate::localfs::is_foreign(&target);
+    if !foreign && !crate::localfs::is_dir(&target) {
         // A single file (or nothing): judged like a Read; the glob does not apply.
         if path.trim().is_empty() {
             return ReadVerdict::Decide(Decision::Defer);
         }
         return ReadVerdict::Decide(decide_path(path, cwd, policy));
+    }
+    // It may be a file too: its name rules still deny (its unknown content is covered by the
+    // exclusions when it is a directory, and asked about by a Read).
+    if foreign {
+        if let deny @ Decision::Deny { .. } = decide_path(path, cwd, policy) {
+            return ReadVerdict::Decide(deny);
+        }
     }
 
     let real = crate::localfs::canonicalize(&target).unwrap_or_else(|_| target.clone());

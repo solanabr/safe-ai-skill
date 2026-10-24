@@ -421,6 +421,8 @@ impl Wallets {
         if let Some(home) = homes.expand_base() {
             if let Some(custom) = config_keypair_path(home) {
                 if let Some(path) = resolve(&custom, home, homes) {
+                    // The user's own config names it: its share is looked up like the home's.
+                    crate::localfs::trust_share_of(&path);
                     files.push(path);
                 }
             }
