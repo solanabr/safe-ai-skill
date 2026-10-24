@@ -567,10 +567,12 @@ fn corrupted_objects_never_panic_and_are_reported() {
                 bytes[at..].fill(0xff);
             }
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&victim, fs::Permissions::from_mode(0o644));
+        // git writes objects read-only.
+        if let Ok(meta) = fs::metadata(&victim) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&victim, perms);
         }
         fs::write(&victim, &bytes).unwrap();
         let _ = history::scan_with(&work, unlimited());

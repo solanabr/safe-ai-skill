@@ -105,6 +105,7 @@ fn cli_before_the_first_session_says_to_start_one() {
     );
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn status_lists_pending_requests_without_their_codes() {
     let home = TempDir::new("ddir-pending");

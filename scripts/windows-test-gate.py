@@ -26,6 +26,7 @@ DOCTESTS = re.compile(r"^\s*Doc-tests (\S+)")
 # Doc-test names contain spaces (`src/lib.rs - item (line 12)`).
 RESULT = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)")
 SUMMARY = re.compile(r"^test result: ")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def load_allowlist(path):
@@ -46,8 +47,9 @@ def main():
     allowed = load_allowlist(args.allowlist)
 
     cmd = ["cargo", "test", "--manifest-path", MANIFEST, "--no-fail-fast", *args.cargo_args]
+    env = dict(os.environ, CARGO_TERM_COLOR="never")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            encoding="utf-8", errors="replace")
+                            encoding="utf-8", errors="replace", env=env)
     binary = "?"
     failed, passed = set(), set()
     # Test binaries that started but never printed a `test result:` line (crashed or aborted):
@@ -55,6 +57,7 @@ def main():
     started, finished = [], set()
     for line in proc.stdout:
         sys.stdout.write(line)
+        line = ANSI.sub("", line)
         m = RUNNING.match(line) or DOCTESTS.match(line)
         if m:
             binary = m.group(1) if RUNNING.match(line) else "doctest"

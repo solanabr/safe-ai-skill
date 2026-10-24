@@ -82,3 +82,38 @@ fn a_fifo_installed_plugins_does_not_stall_the_session() {
         assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
     }
 }
+
+/// The harness strips the Windows notice from `verify session` output on Windows (see
+/// `common::without_windows_notice`); check that rewrite on fixed inputs, on every platform.
+#[test]
+fn the_harness_reads_a_windows_session_as_unix_would() {
+    let notice = "safe-ai-skill on Windows: the shell gates cover the Bash tool (Git Bash) only; \
+                  PowerShell tool calls are not gated.";
+    let tier = "safe-ai-skill tier: relaxed (hooks only) (default); sandbox: off; lists: x";
+    let emit = |sys: &str, ctx: &str| {
+        serde_json::json!({
+            "systemMessage": sys,
+            "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx},
+        })
+        .to_string()
+    };
+    let quiet = format!("{tier}\n{notice}");
+    assert_eq!(common::without_windows_notice(&emit(&quiet, &quiet)), "");
+    let tipped = common::without_windows_notice(&emit(&format!("{quiet}\ntip"), &quiet));
+    let v: serde_json::Value = serde_json::from_str(&tipped).unwrap();
+    assert_eq!(v, serde_json::json!({"systemMessage": "tip"}));
+    let busy = format!("{tier}\nBLOCK x\n{notice}");
+    let v: serde_json::Value =
+        serde_json::from_str(&common::without_windows_notice(&emit(&busy, &busy))).unwrap();
+    let kept = format!("{tier}\nBLOCK x");
+    assert_eq!(v["systemMessage"], kept.as_str());
+    assert_eq!(v["hookSpecificOutput"]["additionalContext"], kept.as_str());
+    let high = "safe-ai-skill tier: high (project); sandbox: off; lists: x";
+    let v: serde_json::Value = serde_json::from_str(&common::without_windows_notice(&emit(
+        &format!("{high}\n{notice}"),
+        &format!("{high}\n{notice}"),
+    )))
+    .unwrap();
+    assert_eq!(v["systemMessage"], high);
+    assert_eq!(common::without_windows_notice(""), "");
+}

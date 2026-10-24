@@ -348,12 +348,90 @@ impl<'a> Invocation<'a> {
             }
         }
         let out = child.wait_with_output().expect("wait safe-ai-skill");
+        let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        if cfg!(windows) && self.args.len() >= 2 && self.args[..2] == ["verify", "session"] {
+            stdout = without_windows_notice(&stdout);
+        }
         Run {
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stdout,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             code: out.status.code(),
         }
     }
+}
+
+/// The Windows scope notice every SessionStart carries on Windows (`platform.rs`).
+const WINDOWS_NOTICE: &str = "safe-ai-skill on Windows: the shell gates cover the Bash tool \
+                              (Git Bash) only; PowerShell tool calls are not gated.";
+
+/// A `verify session` emit as it would read on unix: the Windows notice removed and, when it
+/// was the only thing said to the model, the plain-default tier line it brought along too
+/// (a clean default session is silent). Tests about the notice itself are unit tests.
+pub fn without_windows_notice(stdout: &str) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return stdout.to_string();
+    };
+    let strip = |text: &str| -> String {
+        text.lines()
+            .filter(|l| *l != WINDOWS_NOTICE)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plain_default = |text: &str| {
+        text.starts_with("safe-ai-skill tier: relaxed")
+            && text.contains(" (default); sandbox: ")
+            && !text.contains('\n')
+    };
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .map(strip)
+        .unwrap_or_default();
+    let drop_tier = plain_default(&ctx);
+    let fields: [&[&str]; 2] = [
+        &["hookSpecificOutput", "additionalContext"],
+        &["systemMessage"],
+    ];
+    for path in fields {
+        let (parent, key) = match path {
+            [k] => (&mut v, *k),
+            [p, k] => (&mut v[*p], *k),
+            _ => unreachable!(),
+        };
+        let Some(text) = parent.get(key).and_then(|t| t.as_str()).map(strip) else {
+            continue;
+        };
+        let mut lines: Vec<&str> = text.lines().collect();
+        if drop_tier && lines.first().is_some_and(|l| plain_default(l)) {
+            lines.remove(0);
+        }
+        let text = lines.join("\n");
+        let Some(map) = parent.as_object_mut() else {
+            continue;
+        };
+        if text.is_empty() {
+            map.remove(key);
+        } else {
+            map.insert(key.to_string(), serde_json::Value::String(text));
+        }
+    }
+    let hso_left = v["hookSpecificOutput"]
+        .as_object()
+        .is_some_and(|m| m.keys().any(|k| k != "hookEventName"));
+    if !hso_left {
+        if let Some(map) = v.as_object_mut() {
+            map.remove("hookSpecificOutput");
+        }
+    }
+    if v.as_object().is_some_and(|m| m.is_empty()) {
+        return String::new();
+    }
+    format!("{v}\n")
+}
+
+/// `p` as a Bash command spells it: `/`-separated (`C:/…` under Git Bash, where a backslash
+/// is a shell escape). Unchanged on unix.
+pub fn sh_path(p: &Path) -> String {
+    p.to_str().expect("UTF-8 temp path").replace('\\', "/")
 }
 
 /// Extract `hookSpecificOutput.permissionDecision` from a PreToolUse emit.

@@ -156,6 +156,7 @@ fn raising_applies_at_once_with_nothing_pending() {
     assert_eq!((r.tier, r.source), (Tier::High, TierSource::UserGlobal));
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn lowering_waits_for_the_users_whole_prompt_confirmation() {
     let w = World::new("tiers-off");
@@ -457,6 +458,7 @@ fn an_untrusted_data_dir_selects_nothing() {
 // env_read
 // ---------------------------------------------------------------------------------------
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
     let w = World::new("tiers-envread");
@@ -624,7 +626,7 @@ fn agents_may_request_a_tier_but_not_write_tier_json() {
     let echo = w.hook(
         &["gate-bash-secrets"],
         json!({"hook_event_name":"PreToolUse","tool_name":"Bash","cwd": w.proj.path(),
-               "tool_input":{"command": format!("echo '{{}}' > {}", target.display())}}),
+               "tool_input":{"command": format!("echo '{{}}' > {}", common::sh_path(&target))}}),
     );
     assert_eq!(common::decision_label(&echo), "deny");
 }

@@ -97,7 +97,7 @@ fn state_entry(data: &Path, suffix: &str) -> Option<serde_json::Value> {
     v["body"]["packs"]
         .as_object()?
         .iter()
-        .find(|(k, _)| k.ends_with(suffix))
+        .find(|(k, _)| k.replace('\\', "/").ends_with(suffix))
         .map(|(_, e)| e.clone())
 }
 

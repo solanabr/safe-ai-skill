@@ -68,20 +68,21 @@ impl Sandbox {
         }
     }
 
+    // `/`-separated paths: they go into Bash commands (see `common::sh_path`).
     fn home(&self) -> String {
-        self.home.path().display().to_string()
+        common::sh_path(self.home.path())
     }
 
     fn data(&self) -> String {
-        self.data.display().to_string()
+        common::sh_path(&self.data)
     }
 
     fn root(&self) -> String {
-        self.root.path().display().to_string()
+        common::sh_path(self.root.path())
     }
 
     fn project(&self) -> String {
-        self.project.path().display().to_string()
+        common::sh_path(self.project.path())
     }
 
     fn run(&self, sub: &str, tool: &str, tool_input: Value) -> Run {
@@ -400,7 +401,7 @@ fn checkout_named_like_the_plugin_has_no_opinion() {
     let sb = Sandbox::new("tw-fork");
     let fork = sb.project.join("safe-ai-skill-fork");
     std::fs::create_dir_all(fork.join("src")).expect("create checkout");
-    let fork = fork.display().to_string();
+    let fork = common::sh_path(&fork);
     for cmd in [
         format!("cd {fork} && cargo test"),
         "git clone https://github.com/solanabr/safe-ai-skill safe-ai-skill-dev".to_string(),
@@ -434,7 +435,7 @@ fn project_root_named_like_the_live_data_dir_has_no_opinion() {
     let sb = Sandbox::new("tw-root");
     let checkout = sb.project.join("safe-ai-skill-stbr");
     std::fs::create_dir_all(checkout.join("src")).expect("create checkout");
-    let checkout = checkout.display().to_string();
+    let checkout = common::sh_path(&checkout);
     let bash = sb.run_at(
         &checkout,
         "gate-bash-secrets",

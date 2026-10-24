@@ -340,7 +340,7 @@ impl Protected {
     /// The session's working directory (the hook payload's `cwd`): a project root, and where a
     /// Bash command's `cd`s and relative paths start from.
     pub fn with_session_cwd(mut self, cwd: &Path) -> Self {
-        if cwd.is_absolute() {
+        if cwd.has_root() {
             self.start_dir = Some(normalize_path(&cwd.to_string_lossy()));
         }
         self.with_project_root(cwd)
@@ -348,7 +348,7 @@ impl Protected {
 
     /// `$CLAUDE_CONFIG_DIR`: its `plugins/data` is where plugin data dirs live.
     fn with_config_dir(mut self, dir: &Path) -> Self {
-        if dir.is_absolute() && dir.parent().is_some() {
+        if dir.has_root() && dir.parent().is_some() {
             push_new(
                 &mut self.config_roots,
                 normalize_path(&dir.to_string_lossy()),
@@ -360,7 +360,7 @@ impl Protected {
 
     /// Add a project root: its components never count as a data dir name.
     fn with_project_root(mut self, dir: &Path) -> Self {
-        if dir.is_absolute() && dir.parent().is_some() && !self.projects.iter().any(|p| p == dir) {
+        if dir.has_root() && dir.parent().is_some() && !self.projects.iter().any(|p| p == dir) {
             push_new(
                 &mut self.project_roots,
                 normalize_path(&dir.to_string_lossy()),
@@ -375,7 +375,7 @@ impl Protected {
     pub fn new(home: Option<&str>, plugin_data: Option<&str>, plugin_root: Option<&str>) -> Self {
         let specific = |p: Option<&str>| {
             p.map(PathBuf::from)
-                .filter(|p| p.is_absolute() && p.parent().is_some())
+                .filter(|p| p.has_root() && p.parent().is_some())
         };
         let home = specific(home);
         let data =

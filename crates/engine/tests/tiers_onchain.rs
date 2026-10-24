@@ -657,14 +657,16 @@ fn e2e_class_u_cluster_sources() {
     let w = World::new("onchain-u-src");
     // No `solana` on PATH: the CLI default is unknown.
     assert_eq!(w.bash("spl-token close-mint M", Tier::Relaxed), "deny");
-    // CLI config devnet / localnet: ask; testnet / mainnet: deny.
-    for (url, want) in [
+    // CLI config devnet / localnet: ask; testnet / mainnet: deny. (The `solana` stub is a
+    // #!/bin/sh script, which Windows cannot exec.)
+    let cli_urls = [
         ("https://api.devnet.solana.com", "ask"),
         ("http://localhost:8899", "ask"),
         ("https://api.testnet.solana.com", "deny"),
         ("https://api.mainnet-beta.solana.com", "deny"),
         ("https://rpc.example.com", "deny"),
-    ] {
+    ];
+    for (url, want) in cli_urls.into_iter().filter(|_| cfg!(unix)) {
         // A fresh data dir each: a trusted one caches the CLI's answer for 60 s.
         let fresh = World::new("onchain-u-cli");
         fresh.cli_config(url);
@@ -794,7 +796,7 @@ fn e2e_wallet_destruction_denies_at_every_tier() {
         for cmd in cases {
             assert_eq!(w.bash(cmd, tier), "deny", "{cmd} {tier:?}");
         }
-        let abs = format!("rm {}", w.wallet().display());
+        let abs = format!("rm {}", common::sh_path(&w.wallet()));
         assert_eq!(w.bash(&abs, tier), "deny", "{abs}");
     }
     // Cluster flags change nothing.
@@ -834,10 +836,13 @@ fn e2e_wallet_writes_deny_at_every_tier() {
                 "{tool} custom {tier:?}"
             );
         }
-        assert_eq!(w.bash(&format!("rm {}", custom.display()), tier), "deny");
+        assert_eq!(
+            w.bash(&format!("rm {}", common::sh_path(&custom)), tier),
+            "deny"
+        );
         assert_eq!(
             w.bash(
-                &format!("solana-keygen new -o {} --force", custom.display()),
+                &format!("solana-keygen new -o {} --force", common::sh_path(&custom)),
                 tier
             ),
             "deny"
@@ -1180,8 +1185,8 @@ fn e2e_wallet_directories_globs_and_cd() {
         "cd ~/.config/solana; solana-keygen new --force --outfile ./id.json".to_string(),
         "cd $SOMEWHERE && rm -rf solana".to_string(),
         "(cd ~/.config/solana && rm id.json)".to_string(),
-        format!("rm -rf {}", w.home.join("keys").display()),
-        format!("rm {}", custom.display()),
+        format!("rm -rf {}", common::sh_path(&w.home.join("keys"))),
+        format!("rm {}", common::sh_path(&custom)),
         "echo x >& ~/.config/solana/id.json".to_string(),
     ];
     for cmd in &deny {

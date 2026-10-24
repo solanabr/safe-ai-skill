@@ -135,6 +135,10 @@ fn every_shape_grades_as_declared() {
     let mut failures = Vec::new();
     for name in &names {
         let (spec, report) = scan_shape(name);
+        // Symlinks are materialised on unix only (see `materialise`).
+        if !cfg!(unix) && spec["symlinks"].as_array().is_some_and(|l| !l.is_empty()) {
+            continue;
+        }
         let got = grade_name(rules::grade(&report));
         let want = spec["expect"].as_str().unwrap();
         if got != want {

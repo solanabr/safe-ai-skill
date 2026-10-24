@@ -3,6 +3,6 @@
 # CI job fails on any failing test not listed here, so a new Windows failure can't ship.
 # Delete a line once its test passes (the job warns). Entries need a reason comment.
 #
-# Seeded empty: the suite has not run on Windows yet. If the first windows-latest run
-# fails, triage each failure: fix it, or list it here with the reason (unix-only fixture,
-# symlinks, FIFOs, modes) and a tracking issue.
+# Empty: the first windows-latest run (PR #28, 361 failures) was triaged by fixing the
+# causes or gating Unix-only tests with #[cfg(unix)]. List a new failure here only with the
+# reason (unix-only fixture, symlinks, FIFOs, modes) and a tracking issue.

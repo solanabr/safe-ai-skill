@@ -142,17 +142,12 @@ fn generate_keypair() -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
-/// Read 32 cryptographically secure random bytes from the OS.
-///
-/// Sources from `/dev/urandom` (no extra crate dependency). Any read failure is an error —
-/// the engine never falls back to a weak source for key material.
+/// Read 32 cryptographically secure random bytes from the OS CSPRNG (`OsRng`). Any failure
+/// is an error — the engine never falls back to a weak source for key material.
 fn os_random_32() -> Result<[u8; 32]> {
-    use std::io::Read;
     let mut buf = [0u8; 32];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| Error::Other(format!("open /dev/urandom: {e}")))?;
-    f.read_exact(&mut buf)
-        .map_err(|e| Error::Other(format!("read /dev/urandom: {e}")))?;
+    rand_core::RngCore::try_fill_bytes(&mut rand_core::OsRng, &mut buf)
+        .map_err(|e| Error::Other(format!("OS random source: {e}")))?;
     Ok(buf)
 }
 

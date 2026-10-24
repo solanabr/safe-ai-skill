@@ -427,6 +427,12 @@ mod tests {
         );
     }
 
+    /// `p` as a git argument: Windows `canonicalize` gives a `\\?\` path git cannot use.
+    fn arg(p: &Path) -> &str {
+        let s = p.to_str().unwrap();
+        s.strip_prefix(r"\\?\").unwrap_or(s)
+    }
+
     fn pack(root: &Path, rel: &str) -> PathBuf {
         let dir = root.join(rel);
         fs::create_dir_all(&dir).unwrap();
@@ -491,7 +497,7 @@ mod tests {
                 "submodule",
                 "add",
                 "-q",
-                upstream.to_str().unwrap(),
+                arg(&upstream),
                 ".claude/skills/ext/jup",
             ],
         );
@@ -529,7 +535,7 @@ mod tests {
         git(&main, &["add", "a"]);
         git(&main, &["commit", "-q", "-m", "x"]);
         let wt = temp("wt-tree").join("w");
-        git(&main, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        git(&main, &["worktree", "add", "-q", arg(&wt)]);
         let tracked = pack(&wt, "skills/tracked");
         git(&wt, &["add", "skills/tracked"]);
         let loose = pack(&wt, "skills/loose");

@@ -1024,7 +1024,10 @@ fn no_search_returns_the_state_key() {
     }
     check(
         "grep -r data dir",
-        w.x4("Bash", &bash(&format!("grep -r . {data}"))),
+        w.x4(
+            "Bash",
+            &bash(&format!("grep -r . {}", common::sh_path(w.data.path()))),
+        ),
         DENY4,
     );
     // Above the data dir: the search proceeds with the key excluded.
@@ -1374,7 +1377,7 @@ impl World {
             self.pre(
                 s,
                 "Bash",
-                &bash(&format!("cat {}/SKILL.md", pack.display())),
+                &bash(&format!("cat {}/SKILL.md", common::sh_path(&pack))),
             ),
         ]
     }
