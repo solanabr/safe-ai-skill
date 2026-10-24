@@ -21,9 +21,6 @@ const MODE_DIR: u32 = 0o040000;
 /// Mask of the file-type bits of an index mode.
 const MODE_TYPE: u32 = 0o170000;
 
-/// The [`Tracking::Tracked`] text for a path the index lists (as opposed to a doubt).
-pub const INDEX_LISTS_IT: &str = "the git index lists it";
-
 /// Whether a pack may be moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tracking {
@@ -98,7 +95,7 @@ pub fn tracking(pack: &Path) -> Tracking {
                 Slurp::Missing => {}
                 Slurp::Unreadable => return Tracking::Tracked("the git index cannot be read"),
                 Slurp::Data(bytes) => match index_covers(&bytes, &rel) {
-                    Ok(true) => return Tracking::Tracked(INDEX_LISTS_IT),
+                    Ok(true) => return Tracking::Tracked("the git index lists it"),
                     Ok(false) => {}
                     Err(()) => return Tracking::Tracked("the git index cannot be parsed"),
                 },
