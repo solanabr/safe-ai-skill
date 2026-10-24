@@ -1,23 +1,30 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "safe-ai-skill adapt codex session-start", "timeout": 60, "statusMessage": "safe-ai-skill: checking skills and MCP servers" }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^Bash$",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill-codex gate-bash", "timeout": 20, "statusMessage": "safe-ai-skill: checking command" },
-          { "type": "command", "command": "safe-ai-skill-codex gate-bash-secrets", "timeout": 10 }
+          { "type": "command", "command": "safe-ai-skill adapt codex gate-bash", "timeout": 20, "statusMessage": "safe-ai-skill: checking command" },
+          { "type": "command", "command": "safe-ai-skill adapt codex gate-bash-secrets", "timeout": 10 }
         ]
       },
       {
         "matcher": "^apply_patch$",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill-codex gate-tamper", "timeout": 10 }
+          { "type": "command", "command": "safe-ai-skill adapt codex gate-tamper", "timeout": 10 }
         ]
       },
       {
         "matcher": "^mcp__.*",
         "hooks": [
-          { "type": "command", "command": "safe-ai-skill-codex gate-mcp", "timeout": 15 }
+          { "type": "command", "command": "safe-ai-skill adapt codex gate-mcp", "timeout": 15 }
         ]
       }
     ]
