@@ -244,9 +244,20 @@ fn codex_hooks_template_names_offered_entries() {
         for group in groups.as_array().expect("groups") {
             for hook in group["hooks"].as_array().expect("hooks array") {
                 let command = hook["command"].as_str().expect("command");
-                let entry = command
+                let (head, fallback) = match command.split_once(" || ") {
+                    Some((h, f)) => (h, Some(f)),
+                    None => (command, None),
+                };
+                let entry = head
                     .strip_prefix("safe-ai-skill adapt codex ")
                     .unwrap_or_else(|| panic!("unexpected command {command}"));
+                if event == "PreToolUse" {
+                    let fallback = fallback.expect("a PreToolUse entry fails closed in the shell");
+                    assert!(
+                        fallback.contains(r#""permissionDecision":"deny""#),
+                        "{fallback}"
+                    );
+                }
                 let timeout = hook["timeout"].as_u64().expect("timeout");
                 assert!(timeout > 8, "{entry}: the engine bounds itself at 8 s");
                 seen.push((event.clone(), entry.to_string()));
@@ -486,10 +497,11 @@ fn protected_paths_in_interpreter_code_deny() {
     assert_eq!(codex_label(&run), "deny");
 }
 
-/// Phase 2: the three ordinary commands that used to deny in a project with `.codex/` pass
-/// unless they reach a protected file.
+/// Destructive `find` and path-less `git clean` / `git stash -u` whose root holds Codex hook
+/// config stay denied (the gate does not evaluate `find` tests or read git's index); a root
+/// that holds none, a plain reader and `rm config.toml` without hook config pass.
 #[test]
-fn ordinary_cleanups_pass_beside_a_codex_dir() {
+fn cleanups_beside_a_codex_dir() {
     let w = World::new("adapt-fp");
     for dir in [w.home.join(".codex"), w.proj.join(".codex")] {
         std::fs::create_dir_all(&dir).unwrap();
@@ -498,30 +510,37 @@ fn ordinary_cleanups_pass_beside_a_codex_dir() {
     }
     std::fs::create_dir_all(w.proj.join("src")).unwrap();
     for command in [
-        "find . -name '*.tmp' -delete",
-        "find . -type f -name '*.log' -exec rm {} +",
-        "find . -maxdepth 1 -name '*.json' -delete",
-        "find . -path './target/*' -delete",
-        "find . -name '*.rs' -exec grep -l unsafe {} +",
         "find src -delete",
+        "find src -name '*.tmp' -exec rm {} +",
+        "find . -name '*.rs' -exec grep -l unsafe {} +",
         "rm config.toml",
         "rm -f ./config.toml",
-        "git clean -n",
     ] {
         let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
         assert_eq!(codex_label(&run), "", "{command}: {}", run.stdout);
     }
     for command in [
-        "find . -name hooks.json -delete",
-        "find . -name '*.json' -delete",
+        "find . -name '*.tmp' -delete",
+        "find . -name 'h\\ooks.json' -delete",
+        "find ~/.codex -path '/*' -delete",
+        "find ~ -path '/*/.codex/*' -delete",
+        "find $HOME/.codex -path '/*' -exec rm {} +",
+        "find . -name hooks.json -exec rg --pre rm x {} \\;",
+        "find ~/.codex -exec rg --pre=rm x {} +",
+        "find . -exec grep --pre rm x {} +",
         "find . -name .codex -exec rm -rf {} +",
-        "find . -path '*/.codex/*' -delete",
-        "find . -type f -delete",
-        "find . -name '*.tmp' -o -name hooks.json -delete",
         "find . -delete",
         "rm hooks.json",
         "cp evil config.toml",
         "git clean -fd",
+        "git clean -n",
+        "git clean -fdx -e-n",
+        "git clean -fdx -e -n",
+        "git clean -fdx -e foo",
+        "git stash -u -m n",
+        "git stash push -u -m -n",
+        "git stash push -u",
+        "git checkout --pathspec-from-file=list",
     ] {
         let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
         assert_eq!(codex_label(&run), "deny", "{command}");
@@ -540,42 +559,51 @@ fn ordinary_cleanups_pass_beside_a_codex_dir() {
     assert_eq!(codex_label(&run), "deny");
 }
 
-/// `git clean` keeps tracked files: a committed `.codex/` survives it.
+/// Login-shell startup files: Codex runs hooks through `$SHELL -lc`, so a write there could
+/// switch them off.
 #[test]
-fn git_clean_passes_when_the_codex_config_is_tracked() {
-    let w = World::new("adapt-gitclean");
-    std::fs::create_dir_all(w.proj.join(".codex")).unwrap();
-    std::fs::write(w.proj.join(".codex/hooks.json"), "{}").unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(["-c", "init.defaultBranch=main"])
-            .args(args)
-            .current_dir(w.proj.path())
-            .env("HOME", w.home.path())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q"]);
-    let clean = json!({ "command": "git clean -fdx" });
-    assert_eq!(
-        codex_label(&w.codex("gate-bash-secrets", "Bash", clean.clone())),
-        "deny"
+fn login_shell_startup_files_are_protected() {
+    let w = World::new("adapt-rc");
+    for command in [
+        "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.zshenv",
+        "echo 'PATH=/tmp/evil:$PATH' >> ~/.profile",
+        "rm ~/.bash_profile",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    let run = w.codex(
+        "gate-tamper",
+        "apply_patch",
+        patch(&[&format!(
+            "*** Add File: {}/.zprofile",
+            w.home.path().display()
+        )]),
     );
-    git(&["add", ".codex/hooks.json"]);
-    assert_eq!(
-        codex_label(&w.codex("gate-bash-secrets", "Bash", clean)),
-        ""
+    assert_eq!(codex_label(&run), "deny");
+    let run = w.codex(
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": "source ~/.zprofile" }),
     );
-    let stash = json!({ "command": "git stash -u" });
-    assert_eq!(
-        codex_label(&w.codex("gate-bash-secrets", "Bash", stash)),
-        ""
+    assert_eq!(codex_label(&run), "");
+}
+
+/// An oversized result under the opt-in redaction is withheld, not passed unscanned.
+#[test]
+fn oversized_results_are_withheld_under_redaction() {
+    let w = World::new("adapt-redact-big");
+    let big = "x".repeat(safe_ai_skill::redact::MAX_SCAN_BYTES + 1);
+    let body = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                      "cwd": w.proj.path(), "tool_input": {"command": "cat big"},
+                      "tool_response": big})
+    .to_string();
+    let run = w.run(
+        &["adapt", "codex", "redact", "--block-with-redaction"],
+        body,
     );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.json()["decision"], "block", "{}", run.stdout);
 }
 
 #[test]
