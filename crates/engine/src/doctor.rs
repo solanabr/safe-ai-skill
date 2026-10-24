@@ -169,8 +169,12 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
     out
 }
 
-/// `safe-ai-skill doctor` entry point. Always exits 0 (it only reports).
-pub fn main(_args: &[String]) -> ExitCode {
+/// `safe-ai-skill doctor` entry point. Always exits 0 (it only reports). `--codex` runs the
+/// Codex hook check instead ([`crate::adapt::codex_doctor`]), which exits 1 on a failure.
+pub fn main(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) == Some("--codex") {
+        return crate::adapt::codex_doctor::main();
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let text = report(home.as_deref(), &cwd);

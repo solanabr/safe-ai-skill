@@ -184,7 +184,11 @@ fn a_usage_error_reaches_codex_as_a_deny() {
         json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
     );
     let out = l.sh("safe-ai-skill adapt codex gate-read", &body, &[]);
-    assert!(deny_reason(&out).contains("exit 3"), "{}", out.stdout);
+    assert!(
+        deny_reason(&out).contains("misconfigured"),
+        "{}",
+        out.stdout
+    );
 }
 
 #[test]
@@ -336,4 +340,42 @@ fn the_shim_is_found_by_path_lookup() {
         &[],
     );
     deny_reason(&out);
+}
+
+/// `doctor --codex` runs each configured hook as Codex would and fails on one that can't start.
+#[test]
+fn doctor_codex_checks_the_configured_hooks() {
+    let Some(l) = install("shim-doctor") else {
+        return;
+    };
+    let template = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../adapters/codex/hooks.json"
+    ))
+    .unwrap();
+    let shim = l.bin.join("safe-ai-skill");
+    let wired = template.replace(
+        "safe-ai-skill adapt codex",
+        &format!("{} adapt codex", common::sh_path(&shim)),
+    );
+    std::fs::create_dir_all(l.home.join(".codex")).unwrap();
+    std::fs::write(l.home.join(".codex/hooks.json"), &wired).unwrap();
+    let env = [("SHELL", "/bin/sh")];
+    let out = l.sh("safe-ai-skill doctor --codex", "", &env);
+    assert_eq!(out.code, Some(0), "{}\n{}", out.stdout, out.stderr);
+    assert!(out.stdout.contains("all hooks answered"), "{}", out.stdout);
+    assert!(!out.stdout.contains("FAIL"), "{}", out.stdout);
+
+    // A path that no longer exists (an update removed it): Codex would fail open.
+    let gone = template.replace(
+        "safe-ai-skill adapt codex",
+        &format!(
+            "{}/gone/safe-ai-skill adapt codex",
+            common::sh_path(l.home.path())
+        ),
+    );
+    std::fs::write(l.home.join(".codex/hooks.json"), gone).unwrap();
+    let out = l.sh("safe-ai-skill doctor --codex", "", &env);
+    assert_eq!(out.code, Some(1), "{}", out.stdout);
+    assert!(out.stdout.contains("FAIL"), "{}", out.stdout);
 }

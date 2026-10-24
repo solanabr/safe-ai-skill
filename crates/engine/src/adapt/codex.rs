@@ -51,10 +51,25 @@ pub fn usage() -> String {
     )
 }
 
+/// What `adapt codex session-start` checks, shown on every Codex session start.
+pub const SESSION_SCOPE: &str = "safe-ai-skill (Codex): this report covers the tier and \
+     safe-ai-skill's state only. Codex skills (`.agents/skills`, `$CODEX_HOME/skills`) and the \
+     MCP servers in Codex's config.toml are not scanned; the Bash, apply_patch and MCP gates \
+     still apply.";
+
 /// Opening of the reason that carries a redacted result.
 pub const REDACTED_PREFIX: &str = "safe-ai-skill withheld this tool result because it contained \
      secrets (opt-in redaction for Codex). The same output with the secrets replaced by \
      placeholders follows; use it as the command's output:";
+
+/// The PostToolUse block for a result too large (or too malformed) to scan.
+pub fn withheld() -> Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": "safe-ai-skill withheld this tool result: it is too large to scan for secrets \
+                   (opt-in redaction for Codex). Narrow the command's output and run it again.",
+    })
+}
 
 /// The PostToolUse output for a redaction: a block whose reason is the redacted result (Codex
 /// shows the model the reason in place of the result), or `None` when nothing was redacted.
@@ -103,15 +118,16 @@ fn defines_hooks(toml: &str) -> bool {
 /// Shells: with no `-c` script, no script file and no input from somewhere other than the
 /// terminal, they read commands from a terminal the model can type into.
 const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "tcsh", "csh", "busybox", "yash",
-    "elvish", "nu", "pwsh", "xonsh",
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "tcsh", "csh", "yash", "elvish",
+    "nu", "pwsh", "xonsh",
 ];
 
 /// Interpreters with a REPL: no `-c`/`-e` code, no `-m` module and no script means a prompt.
 const REPLS: &[&str] = &[
     "python", "python2", "python3", "node", "nodejs", "ruby", "perl", "php", "lua", "luajit",
     "irb", "pry", "ghci", "julia", "tclsh", "wish", "R", "deno", "bun", "expect", "gdb", "lldb",
-    "sqlplus",
+    "sqlplus", "ipython", "bpython", "ptpython", "jshell", "scala", "clojure", "clj", "erl", "iex",
+    "racket", "guile", "sbcl", "ocaml", "utop", "swift", "kotlinc",
 ];
 
 /// Database shells: interactive unless given a command or file.
@@ -183,6 +199,11 @@ const WRAPPERS: &[&str] = &[
     "doas",
     "caffeinate",
     "systemd-inhibit",
+    "rlwrap",
+    "npx",
+    "bunx",
+    "pnpx",
+    "winpty",
 ];
 
 /// Why a Codex shell command may not run because it opens an interactive shell, REPL or any
@@ -267,6 +288,9 @@ fn segments(toks: &[Tok]) -> Vec<Segment<'_>> {
 }
 
 fn interactive_depth(command: &str, depth: usize) -> Option<String> {
+    if let Some(reason) = terminal_substitution(command) {
+        return Some(reason);
+    }
     let toks = tokenize(command);
     let segs = segments(&toks);
     if let Some(reason) = read_eval_loop(&segs) {
@@ -274,6 +298,54 @@ fn interactive_depth(command: &str, depth: usize) -> Option<String> {
     }
     segs.iter()
         .find_map(|s| interactive_segment(&s.words, s.input, depth))
+}
+
+/// A command or process substitution whose command reads the terminal (`"$(cat)"`, `<(cat)`,
+/// `` `head -n1` ``): its output, which `write_stdin` supplies, becomes a command or script.
+fn terminal_substitution(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let open = match (bytes[i], bytes.get(i + 1)) {
+            (b'$' | b'<', Some(b'(')) => Some(i + 2),
+            (b'`', _) => Some(i + 1),
+            _ => None,
+        };
+        let Some(start) = open else {
+            i += 1;
+            continue;
+        };
+        let close = if bytes[i] == b'`' { '`' } else { ')' };
+        let inner = command
+            .get(start..)
+            .and_then(|rest| rest.split(close).next())
+            .unwrap_or("");
+        let toks = tokenize(inner);
+        let segs = segments(&toks);
+        let reads_terminal = segs.first().is_some_and(|seg| {
+            seg.input == Input::Terminal
+                && program_index(&seg.words).0.is_some_and(|at| {
+                    let program = base(seg.words[at]);
+                    matches!(program, "read" | "line")
+                        || (PASS_THROUGH.contains(&program) && passes_through(&seg.words))
+                })
+        });
+        if reads_terminal {
+            return deny_exec("a command substitution");
+        }
+        i = start;
+    }
+    None
+}
+
+/// The program name without a version suffix (`python3.12` → `python`, `lua5.4` → `lua`).
+fn unversioned(program: &str) -> &str {
+    let trimmed = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if trimmed.is_empty() {
+        program
+    } else {
+        trimmed
+    }
 }
 
 fn base(word: &str) -> &str {
@@ -313,6 +385,34 @@ fn program_index(words: &[&str]) -> (Option<usize>, bool) {
         if is_assignment(w) || KEYWORDS.contains(w) {
             i += 1;
             continue;
+        }
+        // Runners whose subcommand runs a command (`uv run python`, `mise exec node --`,
+        // `npm exec -- tsx`).
+        if let Some(sub) = words.get(i + 1) {
+            let runs = match b {
+                "uv" | "poetry" | "pipx" | "pdm" | "rye" | "hatch" | "pixi" => *sub == "run",
+                "mise" | "rtx" => matches!(*sub, "exec" | "x"),
+                "npm" | "pnpm" | "yarn" => *sub == "exec",
+                _ => false,
+            };
+            if runs {
+                i += 2;
+                if let Some(dash) = words[i..].iter().position(|w| *w == "--") {
+                    if matches!(b, "mise" | "rtx" | "npm" | "pnpm") {
+                        i += dash + 1;
+                    }
+                }
+                while words
+                    .get(i)
+                    .is_some_and(|w| w.starts_with('-') && *w != "--")
+                {
+                    i += 1;
+                }
+                if words.get(i) == Some(&"--") {
+                    i += 1;
+                }
+                continue;
+            }
         }
         if !(PREFIXES.contains(&b) || WRAPPERS.contains(&b)) {
             return (Some(i), shell_flag);
@@ -564,13 +664,63 @@ fn ssh_has_command(args: &[&str]) -> bool {
 }
 
 fn interactive_segment(words: &[&str], input: Input, depth: usize) -> Option<String> {
+    // `env -S 'bash -i'` splits its argument into the command.
+    if let Some(i) = words
+        .iter()
+        .position(|w| matches!(*w, "-S" | "--split-string"))
+    {
+        if words[..i].iter().any(|w| base(w) == "env") && depth < 2 {
+            if let Some(split) = words.get(i + 1) {
+                if let Some(reason) = interactive_depth(split, depth + 1) {
+                    return Some(reason);
+                }
+            }
+        }
+    }
     let (at, sudo_shell) = program_index(words);
     let Some(at) = at else {
         return sudo_shell.then(|| deny("sudo")).flatten();
     };
     let program_word = words[at];
-    let program = base(program_word);
+    let raw_program = base(program_word);
+    let known = |p: &str| SHELLS.contains(&p) || REPLS.contains(&p) || DB_SHELLS.contains(&p);
+    let program = if !known(raw_program) && known(unversioned(raw_program)) {
+        unversioned(raw_program)
+    } else {
+        raw_program
+    };
     let args: Vec<&str> = words[at + 1..].to_vec();
+    // `busybox sh` runs the applet.
+    if program == "busybox" && args.first().is_some_and(|a| !a.starts_with('-')) {
+        return interactive_segment(&args, input, depth);
+    }
+    // `find … -exec bash \;` runs the command with find's terminal.
+    if program == "find" {
+        let mut rest = args.as_slice();
+        while let Some(i) = rest
+            .iter()
+            .position(|a| matches!(*a, "-exec" | "-execdir" | "-ok" | "-okdir"))
+        {
+            let cmd: Vec<&str> = rest[i + 1..]
+                .iter()
+                .copied()
+                .take_while(|a| *a != ";" && *a != "+")
+                .collect();
+            if let Some(reason) = interactive_segment(&cmd, input, depth) {
+                return Some(reason);
+            }
+            rest = &rest[i + 1 + cmd.len()..];
+        }
+        return None;
+    }
+    if program == "socat"
+        && args.iter().any(|a| {
+            let up = a.to_ascii_uppercase();
+            up.starts_with("EXEC:") || up.starts_with("SYSTEM:")
+        })
+    {
+        return deny(program);
+    }
     let flag = |pred: &dyn Fn(&str) -> bool| args.iter().any(|a| a.starts_with('-') && pred(a));
     let positionals: Vec<&str> = args
         .iter()
@@ -688,6 +838,31 @@ fn interactive_segment(words: &[&str], input: Input, depth: usize) -> Option<Str
                 !positionals.is_empty()
             };
             (!rest_after_dir).then(|| deny(program)).flatten()
+        }
+        "nix-shell" => {
+            let command = args
+                .iter()
+                .position(|a| matches!(*a, "--run" | "--command"))
+                .and_then(|i| args.get(i + 1));
+            match command {
+                Some(cmd) if depth < 2 => interactive_depth(cmd, depth + 1),
+                Some(_) => None,
+                None => deny(program),
+            }
+        }
+        "nix" if matches!(positionals.first(), Some(&"develop" | &"shell")) => {
+            let command = args.iter().any(|a| matches!(*a, "-c" | "--command"));
+            (!command).then(|| deny(program)).flatten()
+        }
+        "docker" | "podman" if positionals.first() == Some(&"compose") => {
+            // `compose exec` allocates a terminal unless told not to (`-T`, `-d`).
+            let sub = positionals.get(1).copied().unwrap_or("");
+            let no_tty = args
+                .iter()
+                .any(|a| matches!(*a, "-T" | "--no-TTY" | "--no-tty" | "-d" | "--detach"));
+            (matches!(sub, "exec" | "run" | "attach") && !no_tty && terminal)
+                .then(|| deny(program))
+                .flatten()
         }
         "docker" | "podman" | "nerdctl" | "kubectl" | "oc" => {
             let sub = positionals.first().copied().unwrap_or("");
@@ -832,6 +1007,25 @@ mod tests {
             "nice -n 5 bash",
             "timeout 60 bash",
             "exec -a x bash",
+            "bash -c \"$(cat)\"",
+            "eval \"$(cat)\"",
+            "$(cat)",
+            "bash <(cat)",
+            "sh -c \"`head -n1`\"",
+            "busybox sh",
+            "python3.12",
+            "ipython",
+            "rlwrap bash",
+            "socat - EXEC:bash,pty",
+            "docker compose exec web sh",
+            "nix-shell",
+            "nix develop",
+            "uv run python",
+            "poetry run python",
+            "npx node",
+            "env -S 'bash -i'",
+            "find . -exec bash \\;",
+            "mise exec node -- node",
         ] {
             assert!(interactive_reason(c).is_some(), "{c}");
         }
@@ -873,6 +1067,18 @@ mod tests {
             "echo cmd | docker exec -i web sh",
             "timeout 60 cargo test",
             "nice -n 5 make",
+            "echo \"$(cat file.txt)\"",
+            "bash -c \"$(git rev-parse HEAD)\"",
+            "busybox ls",
+            "python3.12 script.py",
+            "docker compose exec -T web sh -c 'ls'",
+            "docker compose ps",
+            "nix-shell --run 'cargo test'",
+            "nix develop -c cargo build",
+            "uv run pytest",
+            "npx tsc",
+            "find . -exec grep -l x {} +",
+            "socat TCP:host:80 -",
         ] {
             assert!(interactive_reason(c).is_none(), "{c}");
         }

@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use crate::io::Decision;
 
 pub mod codex;
+pub mod codex_doctor;
 
 pub use codex::interactive_reason;
 
@@ -195,7 +196,26 @@ pub struct CodexTargets {
     /// The shim, engines and old wrapper: this executable, its siblings by [`ENGINE_NAMES`],
     /// and each name found on `PATH` (as given and canonical).
     engines: Vec<PathBuf>,
+    /// Login-shell startup files Codex's `$SHELL -lc` hook runs read (home and `$ZDOTDIR`).
+    startup: Vec<PathBuf>,
+    /// State files in the live data dir, so a recursive remove or move of a directory above it
+    /// (`rm -rf ~/.local/share`) is caught.
+    state: Vec<PathBuf>,
 }
+
+/// Startup files a login shell reads, relative to the home (zsh also under `$ZDOTDIR`).
+const STARTUP_FILES: &[&str] = &[
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+    ".config/fish/config.fish",
+];
+
+/// The zsh files that move with `$ZDOTDIR`.
+const ZDOTDIR_FILES: &[&str] = &[".zshenv", ".zprofile", ".zlogin"];
 
 impl CodexTargets {
     /// Read `HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PATH` and the current executable.
@@ -213,6 +233,24 @@ impl CodexTargets {
         if let Some(h) = &home {
             t.push_codex_home(h.join(".codex"));
             t.push_claude_dir(h.join(".claude"));
+        }
+        for h in home.iter().chain(crate::datadir::passwd_home().as_ref()) {
+            for f in STARTUP_FILES {
+                push_spellings(&mut t.startup, h.join(f));
+            }
+        }
+        if let Some(z) = var("ZDOTDIR").filter(|z| z.is_absolute()) {
+            for f in ZDOTDIR_FILES {
+                push_spellings(&mut t.startup, z.join(f));
+            }
+        }
+        if let Some(dir) = crate::datadir::data_dir_with_cwd(None)
+            .ok()
+            .filter(|d| !d.is_unresolved())
+        {
+            for f in ["key", "tier.json", "grants.json", "spend.json"] {
+                push_spellings(&mut t.state, dir.path.join(f));
+            }
         }
         if let Some(c) = var("CODEX_HOME").filter(|c| c.is_absolute()) {
             t.push_codex_home(c);
@@ -246,6 +284,8 @@ impl CodexTargets {
     /// they exist, `.codex/` config and `.claude/` settings in `cwd` and every directory above.
     pub fn files(&self, cwd: &Path) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = self.engines.clone();
+        files.extend(self.startup.iter().cloned());
+        files.extend(self.state.iter().filter(|f| f.exists()).cloned());
         for home in &self.codex_homes {
             files.extend(["hooks.json", "config.toml"].map(|f| home.join(f)));
         }
@@ -391,6 +431,21 @@ pub fn patch_target_reason(target: &str, cwd: &Path, targets: &CodexTargets) -> 
                  change them. Edit it yourself, outside the agent."
             ));
         }
+        let fish_conf_d = comps.len() >= 4
+            && comps[comps.len() - 4..comps.len() - 1] == [".config", "fish", "conf.d"];
+        if targets.startup.iter().any(|f| same_path(f, full))
+            || (fish_conf_d
+                && targets
+                    .home
+                    .iter()
+                    .any(|h| full.starts_with(h.join(".config/fish/conf.d"))))
+        {
+            return Some(format!(
+                "safe-ai-skill: `{target}` is a login-shell startup file; Codex runs its hooks \
+                 through a login shell, so a change there could switch them off. Edit it \
+                 yourself, outside the agent."
+            ));
+        }
         if targets.engines.iter().any(|e| same_path(e, full)) {
             return Some(format!(
                 "safe-ai-skill: `{target}` is the safe-ai-skill binary the Codex hooks run; \
@@ -445,6 +500,8 @@ const READ_ONLY: &[&str] = &[
     "true",
     "basename",
     "dirname",
+    "source",
+    ".",
 ];
 
 /// Commands that write, move or remove their arguments.
@@ -692,7 +749,43 @@ mod tests {
         t.push_claude_dir(PathBuf::from("/home/u/.claude"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill-codex"));
+        for f in STARTUP_FILES {
+            push_spellings(&mut t.startup, PathBuf::from("/home/u").join(f));
+        }
         t
+    }
+
+    #[test]
+    fn login_shell_startup_files_are_protected() {
+        let cwd = Path::new("/w/proj");
+        let t = targets();
+        for p in [
+            "~/.zshenv",
+            "/home/u/.zprofile",
+            "~/.bash_profile",
+            "~/.profile",
+            "~/.config/fish/config.fish",
+            "~/.config/fish/conf.d/evil.fish",
+        ] {
+            assert!(patch_target_reason(p, cwd, &t).is_some(), "{p}");
+        }
+        for c in [
+            "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.zshenv",
+            "printf 'PATH=/tmp/x:$PATH' > ~/.profile",
+            "cp evil ~/.bash_profile",
+            "sed -i '' 's/a/b/' ~/.zprofile",
+            "echo x > ~/.config/fish/conf.d/x.fish",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_some(), "{c}");
+        }
+        for c in [
+            "source ~/.zprofile",
+            ". ~/.profile",
+            "cat ~/.zshenv",
+            "echo hi >> ~/.zshrc",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
+        }
     }
 
     #[test]

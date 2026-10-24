@@ -1759,7 +1759,8 @@ fn subcommand_reason(sub: &str) -> String {
     if HOOK_SUBCOMMANDS.contains(&sub) || sub.starts_with("gate-") {
         return format!(
             "safe-ai-skill tamper tripwire: `safe-ai-skill {sub}` is a hook subcommand: only \
-             Claude Code runs it, with the real hook payload. Do not retry or work around this \
+             the agent client's own hooks (Claude Code, or Codex for `adapt`) run it, with the \
+             real hook payload. Do not retry or work around this \
              check."
         );
     }

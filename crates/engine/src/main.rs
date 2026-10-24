@@ -940,8 +940,12 @@ fn cmd_gate_tamper() -> ExitCode {
 }
 
 fn cmd_redact() -> ExitCode {
-    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5).
+    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5), except under
+    // the opt-in Codex route, where a result that cannot be scanned is withheld.
     let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
+        if adapt::is_codex() {
+            let _ = io::emit_value(Some(adapt::codex::withheld()));
+        }
         return ExitCode::SUCCESS;
     };
     let Some(response) = input.tool_response.as_ref() else {
@@ -1282,7 +1286,14 @@ fn cmd_verify_session() -> ExitCode {
     let _ = SpendLedger::load(&plugin_data);
 
     let (effective, resolution) = load_runtime(&cwd, &dir);
-    let mut res = verify::run_session(&dir, &cwd, &effective);
+    // The sweep reads Claude Code's skill dirs and `.mcp.json`; Codex loads neither, so under
+    // Codex it is not run (pinning or moving Claude Code's packs from a Codex session would
+    // only change another client's state). The report says what is and is not checked.
+    let mut res = if adapt::is_codex() {
+        verify::SessionResult::default()
+    } else {
+        verify::run_session(&dir, &cwd, &effective)
+    };
 
     // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
     // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
@@ -1307,10 +1318,20 @@ fn cmd_verify_session() -> ExitCode {
     } else {
         platform::session_notices()
     };
-    let notices: Vec<String> = [effective.ignored_notice(), loosenings]
+    let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
         .into_iter()
         .flatten()
         .chain(platform_notices)
+        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+            format!(
+                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+                 {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
+                 use (key included) or delete it.",
+                d.display(),
+                dir.path.display()
+            )
+        }))
         .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
@@ -2410,6 +2431,10 @@ fn cmd_status() -> ExitCode {
         "env_read": resolution.env_read.label(),
         "sandbox": effective.runtime.sandbox.label(),
         "data_dir_trusted": dir.trusted,
+        "other_state_dirs": datadir::other_state_dirs(&dir)
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>(),
         "grants_state": grants_state,
         "tier_state": tier_state_label(&dir),
         "grants": grants_view,
