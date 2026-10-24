@@ -318,12 +318,12 @@ impl Protected {
     /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CONFIG_DIR` and
     /// `CLAUDE_PROJECT_DIR` (a project root). No file is read.
     ///
-    /// Under the Codex adapter, where no `CLAUDE_PLUGIN_DATA` is set, the data dir is the one
+    /// Under the Codex and opencode adapters, where no `CLAUDE_PLUGIN_DATA` is set, the data dir is the one
     /// discovery finds (the Claude Code plugin's), so it stays protected there too.
     pub fn from_env() -> Self {
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let data = var("CLAUDE_PLUGIN_DATA").or_else(|| {
-            if !crate::adapt::is_codex() {
+            if !crate::adapt::is_foreign() {
                 return None;
             }
             crate::datadir::data_dir_with_cwd(None)

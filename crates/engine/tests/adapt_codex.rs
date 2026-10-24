@@ -212,7 +212,7 @@ fn usage_errors_exit_3_with_no_output() {
     for args in [
         &["adapt"][..],
         &["adapt", "codex"],
-        &["adapt", "opencode", "gate-bash"],
+        &["adapt", "codex", "gate-skill"],
         &["adapt", "codex", "gate-read"],
         &["adapt", "codex", "redact"],
         &["adapt", "codex", "gate-nope"],

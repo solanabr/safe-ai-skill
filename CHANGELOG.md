@@ -23,6 +23,11 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - The Claude Code plugin's dir still wins whenever it exists, so there is one set of state.
   - Before, the CLI exited 1 asking for `CLAUDE_PLUGIN_DATA`, and Codex hooks ran with nothing relaxed or audited.
 
+### Added
+
+- **opencode adapter (experimental, #26).** `safe-ai-skill adapt opencode <gate>` runs `gate-bash`, `gate-bash-secrets`, `gate-read`, `gate-tamper` and `gate-mcp` on a call from opencode's `tool.execute.before` hook, and [`adapters/opencode/safe-ai-skill.js`](adapters/opencode/safe-ai-skill.js) is the plugin that calls it (one file, no dependencies). opencode's tool ids and camelCase arguments are mapped to the gates' input; MCP tool names (`<server>_<tool>`) are split using the server names in the opencode config, and an unknown or ambiguous name is judged on every word of it. Every `ask` becomes a block (opencode plugins have no ask), nothing is ever allowed outright, and the plugin blocks the call when the engine is missing, fails, times out or answers in any other form. A directory Grep gets the credential-file exclusion as its `include`; a Grep whose `include` could reach a credential file (anything but code-file extensions) is denied, because opencode passes one glob only. A grep whose `path` is a file is judged as its directory, which is what opencode searches. Writes to `.opencode/`, `opencode.json(c)`, the global opencode config and cache dirs, `$OPENCODE_CONFIG(_DIR)`, the plugin's own file and configured path plugins, `safe-ai-skill` in every `PATH` directory, and Claude Code's settings and plugins dir are denied through the file tools and the shell. The plugin resolves the engine once at startup and blocks every call if it later changes. The shim handles `adapt opencode` like `adapt codex`: any engine failure, or an answer other than nothing, one deny line or a Grep rewrite, becomes a deny. Setup and gaps: [docs/adapters.md](docs/adapters.md#opencode-plugin-experimental).
+- **One shell-startup guard for Codex and opencode.** Under either adapter, every agent write to a login-shell startup file (`~/.zshenv`, `.zprofile`, `.zlogin`, `.bash_profile`, `.bash_login`, `.profile`, fish `config.fish` and `conf.d/`, and the zsh files under `$ZDOTDIR`) is denied. In `~/.zshrc`, `~/.bashrc` and `$ZDOTDIR/.zshrc`, a write that sets `PATH` (also zsh's `path` array and `fish_add_path`) or names a safe-ai-skill or hook-config variable (`SAFE_AI_SKILL_*`, `KIT_FIREWALL_*`, `CODEX_HOME`, `OPENCODE_CONFIG*`) is denied, and so is a copy, move, link or download onto one; other edits (aliases, prompts) pass. Reading or sourcing these files is not affected.
+
 ### Changes
 
 - `gates/envread.rs` decides by `(tier, env_read, project)`; `is_project_env` resolves the path inside the project root. `gates/envwrite.rs` splits project and other env files and takes Bash writes from `creddump`, which now tells reads from writes (`sed -i`, redirects, `tee`, `mv`, write calls in code) and denies an env read beside a network command. The shell parser records output redirect targets.
@@ -38,14 +43,16 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - `ssh host` without a command, `su`, `sudo -i|-s`;
   - interactive `docker`/`kubectl` `exec`/`run`, `docker compose exec`, `nix-shell`, `socat … EXEC:`;
   - command or process substitutions of a terminal reader (`bash -c "$(cat)"`, `bash <(cat)`).
-- **Codex self-protection widened.** Under Codex, writes to the login-shell startup files that `$SHELL -lc` reads (`~/.zshenv`, `~/.zprofile`, `~/.bash_profile`, `~/.profile`, fish `config.fish` and `conf.d`) are denied. So are recursive removes and moves of a directory above the data dir. Option arguments of `git clean -e` / `git stash -m` are no longer read as paths, and `--pathspec-from-file` counts as path-less. A bare `rm config.toml` is denied only when a Codex `config.toml` that defines hooks exists. `SAFE_AI_SKILL_DISABLE` does not apply to Codex hooks. `find -exec` with a plain reader (`grep`, `cat`, …, without options like `--pre`) is not treated as destructive.
+- **Codex self-protection widened.** Under Codex, recursive removes and moves of a directory above the data dir. Option arguments of `git clean -e` / `git stash -m` are no longer read as paths, and `--pathspec-from-file` counts as path-less. A bare `rm config.toml` is denied only when a Codex `config.toml` that defines hooks exists. `SAFE_AI_SKILL_DISABLE` does not apply to Codex hooks. `find -exec` with a plain reader (`grep`, `cat`, …, without options like `--pre`) is not treated as destructive.
 - **`safe-ai-skill doctor --codex`** runs each configured Codex hook as Codex would and fails on one that cannot start, times out or answers wrongly. Codex runs the call when a hook command cannot start, so the template's PreToolUse commands now end in a `|| printf` deny fallback. Run `doctor --codex` after every update.
 - **Forked state is reported.** `session-start` and `status` (`other_state_dirs`) name any other data dir that still holds state, for example after installing the Claude Code plugin over a standalone dir.
 - The audit log's directory is created with mode 0700, like the state files.
 
 ### Documentation
 
-- `docs/adapters.md` now verifies the hook contract against Codex `rust-v0.164.0` and covers the shim install, the standalone data dir, confirmations under Codex, session start, opt-in redaction and the remaining gaps.
+- `docs/adapters.md` now verifies the hook contract against Codex `rust-v0.164.0` and covers the shim install, the standalone data dir, confirmations under Codex, session start, opt-in redaction and the remaining gaps, and adds the opencode plugin setup and its gaps.
+
+---
 
 ## [1.1.0] — Unreleased
 

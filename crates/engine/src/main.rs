@@ -14,7 +14,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use safe_ai_skill::audit::{self, AuditEntry};
@@ -31,8 +31,8 @@ use safe_ai_skill::spend::{self, SpendLedger};
 use safe_ai_skill::statefile::Loaded;
 use safe_ai_skill::tierstate::{self, Plan};
 use safe_ai_skill::{
-    adapt, grants, headless, migrate, notice, platform, promptguard, redact, registry, relax,
-    sandbox, session, verify,
+    adapt, adapt_opencode, grants, headless, migrate, notice, platform, promptguard, redact,
+    registry, relax, sandbox, session, verify,
 };
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
@@ -210,9 +210,9 @@ fn install_panic_ask() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
-        // Codex reads stdout only on exit 0, and a release build aborts after this hook: end
-        // here so the deny counts.
-        if adapt::is_codex() {
+        // Codex (and the opencode plugin) read stdout only on exit 0, and a release build
+        // aborts after this hook: end here so the deny counts.
+        if adapt::is_foreign() {
             std::process::exit(0);
         }
         default(info);
@@ -291,8 +291,15 @@ fn cmd_unknown(sub: &str) -> ExitCode {
 /// payload, never sent by Claude Code) is no opinion except on `gate-bash`. The scanners
 /// (`redact`, `prompt-guard`) have no opinion on any of them.
 fn read_input() -> (Vec<u8>, Result<HookInput, Unreadable>) {
+    if let Some(translated) = TRANSLATED_INPUT.get() {
+        return io::read_payload(translated.as_slice());
+    }
     io::read_payload(std::io::stdin())
 }
+
+/// The Claude-shaped payload an adapter built from another client's stdin; [`read_input`]
+/// reads it in place of stdin.
+static TRANSLATED_INPUT: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Emit the fail-closed `ask` for a PreToolUse payload the engine could not inspect.
 ///
@@ -331,9 +338,9 @@ fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
         cwd,
         dir,
         &|k| std::env::var(k).ok(),
-        // Claude Code's sandbox does not wrap a Codex process, and nothing in Codex stops the
-        // agent from editing the settings that declare it.
-        if adapt::is_codex() {
+        // Claude Code's sandbox does not wrap a Codex or opencode process, and nothing there
+        // stops the agent from editing the settings that declare it.
+        if adapt::is_foreign() {
             sandbox::SandboxState::Off
         } else {
             sandbox::state(&root)
@@ -661,18 +668,22 @@ fn cmd_gate_read() -> ExitCode {
     let verdict = read::decide_tool(tool, input.tool_input.as_ref(), &cwd, &effective);
     let decision = match verdict {
         read::ReadVerdict::Decide(decision) => decision,
-        read::ReadVerdict::Rewrite(updated) => {
-            write_audit(
-                &effective,
-                &dir.path,
-                &input,
-                &raw,
-                "secret_read_rewrite",
-                &Decision::Defer,
-            );
-            let _ = io::emit_updated_input(updated);
-            return ExitCode::SUCCESS;
-        }
+        read::ReadVerdict::Rewrite(updated) => match adapt_opencode::grep_rewrite(updated) {
+            adapt_opencode::Rewrite::Args(updated) => {
+                write_audit(
+                    &effective,
+                    &dir.path,
+                    &input,
+                    &raw,
+                    "secret_read_rewrite",
+                    &Decision::Defer,
+                );
+                let _ = io::emit_updated_input(updated);
+                return ExitCode::SUCCESS;
+            }
+            adapt_opencode::Rewrite::Keep => Decision::Defer,
+            adapt_opencode::Rewrite::Deny(reason) => Decision::Deny { reason },
+        },
     };
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
@@ -889,10 +900,19 @@ fn cmd_adapt(rest: &[String]) -> ExitCode {
     let flags = rest.get(2..).unwrap_or_default();
     let route = match client {
         Some(adapt::Client::Codex) => adapt::codex::route(entry, flags),
+        Some(adapt::Client::OpenCode) if flags.is_empty() => adapt_opencode::GATES
+            .iter()
+            .find(|g| **g == entry)
+            .map(|g| Route::Gate(g)),
         _ => None,
     };
     let (Some(client), Some(route)) = (client, route) else {
-        let _ = writeln!(std::io::stderr(), "{}", adapt::codex::usage());
+        let _ = writeln!(
+            std::io::stderr(),
+            "{} | adapt opencode <{}>",
+            adapt::codex::usage(),
+            adapt_opencode::GATES.join("|")
+        );
         return ExitCode::from(EXIT_USAGE);
     };
     adapt::set(client);
@@ -902,10 +922,54 @@ fn cmd_adapt(rest: &[String]) -> ExitCode {
                 return ExitCode::from(EXIT_USAGE);
             };
             install_panic_ask();
+            if client == adapt::Client::OpenCode {
+                return run_with_deadline(
+                    gate_deadline(),
+                    cmd_adapt_opencode,
+                    vec![gate.to_string()],
+                );
+            }
             run_with_deadline(gate_deadline(), *handler, Vec::new())
         }
         Route::SessionStart => cmd_verify_session(),
         Route::RedactBlock => cmd_redact(),
+    }
+}
+
+/// `adapt opencode <gate>`: translate the opencode plugin's payload ([`adapt_opencode`]), then
+/// run the gate on it. A write to opencode's config or plugin code is denied here, and a
+/// payload that cannot be translated is the unreadable-input ask (a deny under opencode).
+fn cmd_adapt_opencode(rest: &[String]) -> ExitCode {
+    let gate = rest.first().map(String::as_str).unwrap_or("");
+    let (raw, parsed) = read_input();
+    if let Err(why @ (Unreadable::Oversized | Unreadable::Empty)) = parsed {
+        return ask_unreadable(why, &HookInput::default(), &raw);
+    }
+    let handler = SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == gate)
+        .map(|(_, handler)| *handler);
+    match (adapt_opencode::prepare(gate, &raw), handler) {
+        (adapt_opencode::Prepared::Gate(translated), Some(handler)) => {
+            let _ = TRANSLATED_INPUT.set(translated);
+            handler(&[])
+        }
+        (adapt_opencode::Prepared::Deny { reason, payload }, _) => {
+            let input: HookInput = serde_json::from_slice(&payload).unwrap_or_default();
+            let cwd = cwd_of(&input);
+            let dir = state_dir(&cwd);
+            let effective = load_effective_policy(&cwd, &dir);
+            let decision = Decision::Deny { reason };
+            record_decision(&decision);
+            write_audit(&effective, &dir.path, &input, &raw, "tamper", &decision);
+            let _ = io::emit_pretooluse(&decision);
+            ExitCode::SUCCESS
+        }
+        (adapt_opencode::Prepared::Malformed(why), _) => {
+            let _ = writeln!(std::io::stderr(), "safe-ai-skill: adapt opencode: {why}");
+            ask_unreadable(Unreadable::Malformed, &HookInput::default(), &raw)
+        }
+        (_, None) => ExitCode::from(EXIT_USAGE),
     }
 }
 
@@ -930,7 +994,13 @@ fn cmd_gate_tamper() -> ExitCode {
         else {
             return ask_unreadable(Unreadable::Malformed, &input, &raw);
         };
-        apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected)
+        let shell_rc = adapt::is_codex()
+            .then(|| adapt::patch_content_reason(patch, &cwd, &adapt::CodexTargets::from_env()))
+            .flatten();
+        match shell_rc {
+            Some(reason) => Decision::Deny { reason },
+            None => apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected),
+        }
     } else {
         file_write_decision(tool_input, &cwd, &effective, &protected)
     };

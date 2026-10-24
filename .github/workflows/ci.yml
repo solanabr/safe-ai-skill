@@ -99,8 +99,16 @@ jobs:
       - name: cargo build --verbose
         run: cargo build --manifest-path ${{ env.MANIFEST }} --verbose
 
+      - uses: actions/setup-node@v4
+        if: runner.os != 'Windows'
+        with:
+          node-version: "22"
+
       - name: cargo test --verbose
         run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
+        env:
+          # The opencode plugin's Node tests (real engine) must run, not skip.
+          SAFE_AI_SKILL_REQUIRE_NODE_TESTS: ${{ runner.os != 'Windows' && '1' || '' }}
 
       # The test-only overrides (trusted data dir, sandbox state, crash trigger) exist only in
       # these builds: the tier matrix, the shared corpus plugin column and the Off /
@@ -420,6 +428,13 @@ jobs:
         run: |
           node --check npm/bin/cli.js
           node --check npm/scripts/postinstall.js
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: opencode plugin (fail-closed tests, fake engines)
+        run: node --test adapters/opencode/test/plugin.test.mjs
 
       - name: shellcheck (install.sh + scripts)
         run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh

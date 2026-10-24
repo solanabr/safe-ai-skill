@@ -346,7 +346,11 @@ The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (
 - It can block results that hold secrets (opt-in).
 - It keeps tiers, grants and the audit log in a standalone data dir when the Claude Code plugin is not installed.
 
-Grants can only be confirmed in Claude Code. Run `safe-ai-skill doctor --codex` after setup and after every update: Codex runs the call when a hook command cannot start. Setup and limits are in [docs/adapters.md](docs/adapters.md). opencode is not covered yet; [#26](https://github.com/solanabr/safe-ai-skill/issues/26) tracks it together with this Codex work.
+Grants can only be confirmed in Claude Code. Run `safe-ai-skill doctor --codex` after setup and after every update: Codex runs the call when a hook command cannot start.
+
+**opencode (experimental):** a small plugin ([`adapters/opencode/`](adapters/opencode/)) runs the Bash, Read/Grep, file-edit and MCP gates through `safe-ai-skill adapt opencode <gate>` and blocks the call on a deny or an ask, since opencode plugins cannot ask either. Pin the engine's absolute path in `opencode.json`.
+
+Both adapters are experimental and have known gaps (calls their hooks never see, shell forms the gates can't parse); setup and limits are in [docs/adapters.md](docs/adapters.md) ([#26](https://github.com/solanabr/safe-ai-skill/issues/26)).
 
 safe-ai-skill is standalone — it can be installed independently of any particular skill hub. It adds a security and control layer over whatever skills, MCPs, and agents you already have.
 

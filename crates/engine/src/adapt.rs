@@ -30,6 +30,7 @@ use crate::io::Decision;
 
 pub mod codex;
 pub mod codex_doctor;
+pub mod shellrc;
 
 pub use codex::interactive_reason;
 
@@ -40,6 +41,8 @@ pub enum Client {
     ClaudeCode,
     /// Codex CLI: only `deny` blocks; `ask` and a bare `allow` fail open.
     Codex,
+    /// opencode, through its plugin ([`crate::adapt_opencode`]): no `ask`, no `allow`.
+    OpenCode,
 }
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -59,10 +62,22 @@ pub fn is_codex() -> bool {
     current() == Client::Codex
 }
 
+/// Whether this process answers opencode.
+pub fn is_opencode() -> bool {
+    current() == Client::OpenCode
+}
+
+/// Whether this process answers a client other than Claude Code (no Claude Code sandbox, no
+/// `CLAUDE_PLUGIN_DATA`, and no `ask`).
+pub fn is_foreign() -> bool {
+    current() != Client::ClaudeCode
+}
+
 /// Parse an `adapt` client name.
 pub fn client_named(name: &str) -> Option<Client> {
     match name {
         "codex" => Some(Client::Codex),
+        "opencode" => Some(Client::OpenCode),
         _ => None,
     }
 }
@@ -95,6 +110,7 @@ pub fn render(decision: &Decision, client: Client) -> Decision {
             }
         }
         (Client::Codex, Decision::Allow) => Decision::Defer,
+        (Client::OpenCode, d) => crate::adapt_opencode::render(d),
         _ => decision.clone(),
     }
 }
@@ -196,26 +212,12 @@ pub struct CodexTargets {
     /// The shim, engines and old wrapper: this executable, its siblings by [`ENGINE_NAMES`],
     /// and each name found on `PATH` (as given and canonical).
     engines: Vec<PathBuf>,
-    /// Login-shell startup files Codex's `$SHELL -lc` hook runs read (home and `$ZDOTDIR`).
-    startup: Vec<PathBuf>,
+    /// Shell startup files ([`shellrc`]): Codex's `$SHELL -lc` hook runs read the login ones.
+    shell: shellrc::ShellStartup,
     /// State files in the live data dir, so a recursive remove or move of a directory above it
     /// (`rm -rf ~/.local/share`) is caught.
     state: Vec<PathBuf>,
 }
-
-/// Startup files a login shell reads, relative to the home (zsh also under `$ZDOTDIR`).
-const STARTUP_FILES: &[&str] = &[
-    ".zshenv",
-    ".zprofile",
-    ".zlogin",
-    ".bash_profile",
-    ".bash_login",
-    ".profile",
-    ".config/fish/config.fish",
-];
-
-/// The zsh files that move with `$ZDOTDIR`.
-const ZDOTDIR_FILES: &[&str] = &[".zshenv", ".zprofile", ".zlogin"];
 
 impl CodexTargets {
     /// Read `HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `PATH` and the current executable.
@@ -234,16 +236,7 @@ impl CodexTargets {
             t.push_codex_home(h.join(".codex"));
             t.push_claude_dir(h.join(".claude"));
         }
-        for h in home.iter().chain(crate::datadir::passwd_home().as_ref()) {
-            for f in STARTUP_FILES {
-                push_spellings(&mut t.startup, h.join(f));
-            }
-        }
-        if let Some(z) = var("ZDOTDIR").filter(|z| z.is_absolute()) {
-            for f in ZDOTDIR_FILES {
-                push_spellings(&mut t.startup, z.join(f));
-            }
-        }
+        t.shell = shellrc::ShellStartup::from_env();
         if let Some(dir) = crate::datadir::data_dir_with_cwd(None)
             .ok()
             .filter(|d| !d.is_unresolved())
@@ -284,7 +277,8 @@ impl CodexTargets {
     /// they exist, `.codex/` config and `.claude/` settings in `cwd` and every directory above.
     pub fn files(&self, cwd: &Path) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = self.engines.clone();
-        files.extend(self.startup.iter().cloned());
+        files.extend(self.shell.existing_login_files());
+        files.extend(self.shell.login_files().iter().cloned());
         files.extend(self.state.iter().filter(|f| f.exists()).cloned());
         for home in &self.codex_homes {
             files.extend(["hooks.json", "config.toml"].map(|f| home.join(f)));
@@ -332,7 +326,7 @@ fn push_spellings(list: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// `path` resolved against `cwd` (`~/` expanded with `home`), lexically normalised.
-fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+pub(crate) fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     let expanded = match (path.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => home.join(rest),
         _ if path == "~" => home.map(Path::to_path_buf).unwrap_or_default(),
@@ -347,7 +341,7 @@ fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// Drop `.` and resolve `..` without touching the filesystem.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
@@ -363,7 +357,7 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// `path` with its longest existing ancestor canonicalised (symlinks resolved), the rest
 /// appended; `path` itself when nothing resolves.
-fn canonical_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonical_prefix(path: &Path) -> PathBuf {
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
@@ -404,6 +398,9 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// and `$CLAUDE_CONFIG_DIR`'s), the `safe-ai-skill` shim and engines, and, for a relative
 /// path, a safe-ai-skill state file or wallet name (the working dir may not be `cwd`).
 pub fn patch_target_reason(target: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    if let Some(reason) = targets.shell.login_reason(target, cwd) {
+        return Some(reason);
+    }
     let lexical = absolute(target, cwd, targets.home.as_deref());
     let canonical = canonical_prefix(&lexical);
     for full in [&lexical, &canonical] {
@@ -429,21 +426,6 @@ pub fn patch_target_reason(target: &str, cwd: &Path, targets: &CodexTargets) -> 
             return Some(format!(
                 "safe-ai-skill: `{target}` is Claude Code settings; a Codex session may not \
                  change them. Edit it yourself, outside the agent."
-            ));
-        }
-        let fish_conf_d = comps.len() >= 4
-            && comps[comps.len() - 4..comps.len() - 1] == [".config", "fish", "conf.d"];
-        if targets.startup.iter().any(|f| same_path(f, full))
-            || (fish_conf_d
-                && targets
-                    .home
-                    .iter()
-                    .any(|h| full.starts_with(h.join(".config/fish/conf.d"))))
-        {
-            return Some(format!(
-                "safe-ai-skill: `{target}` is a login-shell startup file; Codex runs its hooks \
-                 through a login shell, so a change there could switch them off. Edit it \
-                 yourself, outside the agent."
             ));
         }
         if targets.engines.iter().any(|e| same_path(e, full)) {
@@ -626,7 +608,18 @@ pub fn bash_reason(command: &str, cwd: &Path, targets: &CodexTargets) -> Option<
              agent."
         ));
     }
+    if let Some(reason) = targets.shell.bash_reason(command, cwd) {
+        return Some(reason);
+    }
     bash_reason_depth(command, cwd, targets, 0)
+}
+
+/// Why a Codex `apply_patch` may not apply: a file it touches is a shell startup file the
+/// patch text may not change ([`shellrc::ShellStartup::content_reason`]).
+pub fn patch_content_reason(patch: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    patch_paths(patch)
+        .iter()
+        .find_map(|p| targets.shell.content_reason(p, cwd, patch))
 }
 
 /// The path-like pieces of interpreter code: split on quotes, brackets, separators and
@@ -755,9 +748,11 @@ mod tests {
         t.push_claude_dir(PathBuf::from("/home/u/.claude"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill-codex"));
-        for f in STARTUP_FILES {
-            push_spellings(&mut t.startup, PathBuf::from("/home/u").join(f));
-        }
+        t.shell = shellrc::ShellStartup::for_homes(
+            Some(PathBuf::from("/home/u")),
+            &[PathBuf::from("/home/u")],
+            None,
+        );
         t
     }
 
@@ -781,6 +776,8 @@ mod tests {
             "cp evil ~/.bash_profile",
             "sed -i '' 's/a/b/' ~/.zprofile",
             "echo x > ~/.config/fish/conf.d/x.fish",
+            "echo 'export PATH=/tmp/x:$PATH' >> ~/.zshrc",
+            "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.bashrc",
         ] {
             assert!(bash_reason(c, cwd, &t).is_some(), "{c}");
         }
@@ -789,9 +786,14 @@ mod tests {
             ". ~/.profile",
             "cat ~/.zshenv",
             "echo hi >> ~/.zshrc",
+            "cat ~/.zshrc; echo $PATH",
         ] {
             assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
         }
+        let patch = "*** Begin Patch\n*** Update File: /home/u/.zshrc\n+export PATH=/tmp/x:$PATH\n*** End Patch";
+        assert!(patch_content_reason(patch, cwd, &t).is_some());
+        let patch = "*** Begin Patch\n*** Update File: /home/u/.zshrc\n+alias ll=ls\n*** End Patch";
+        assert!(patch_content_reason(patch, cwd, &t).is_none());
     }
 
     #[test]

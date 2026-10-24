@@ -41,6 +41,7 @@ DENY='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"
 SESSION='{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 SESSION_MSG='{"systemMessage":"engine notice","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 BLOCK='{"decision":"block","reason":"redacted text"}'
+REWRITE='{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"include":"!{**/.env}"}}}'
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
 payload_text=$(cat "$payload")
@@ -125,6 +126,7 @@ engine() {
     deny) mk "$1" "printf '%s\\n' '$DENY'" ;;
     deny2) mk "$1" "printf '%s\\n%s\\n' '$DENY' '$ALLOW'" ;;
     block) mk "$1" "printf '%s\\n' '$BLOCK'" ;;
+    rewrite) mk "$1" "printf '%s\\n' '$REWRITE'" ;;
     # An ELF header, elf:<EI_CLASS>:<e_machine lo>:<e_machine hi> in octal, whose body, if a
     # shell ever ran the file as a script, would leave a mark.
     elf:*)
@@ -426,8 +428,46 @@ codex_matrix() {
   expect_codex_deny
 }
 
+# opencode hooks (`adapt opencode …`, run by the opencode plugin): the same deny JSON on
+# every failure; nothing, one deny line or a gate-read rewrite passes through.
+opencode_matrix() {
+  for b in deny silent rewrite; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" "$b"
+    t "opencode: an engine $b answer passes through"
+    run adapt opencode gate-read
+    expect_rc 0
+    case $b in
+      deny) expect_out "$DENY" ;;
+      silent) expect_no_out ;;
+      rewrite) expect_out "$REWRITE" ;;
+    esac
+  done
+  for b in ok planted deny2 garbage exit:1 exit:2 exit:3 exit:134 kill block; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" "$b"
+    t "opencode: engine $b denies with exit 0"
+    run adapt opencode gate-bash
+    expect_rc 0
+    expect_codex_deny
+  done
+  env_case missing
+  t "opencode: a missing engine denies with exit 0"
+  run adapt opencode gate-tamper
+  expect_rc 0
+  expect_codex_deny
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" deny
+  e_disable=1
+  t "opencode: SAFE_AI_SKILL_DISABLE=1 does not turn the opencode hooks off"
+  run adapt opencode gate-bash
+  expect_rc 0
+  expect_out "$DENY"
+}
+
 matrix() {
   codex_matrix
+  opencode_matrix
 
   # Dispatch: each platform runs its own prebuilt, with args and stdin intact.
   for spec in Darwin/arm64/darwin-arm64 Darwin/x86_64/darwin-x64 Linux/x86_64/linux-x64 \

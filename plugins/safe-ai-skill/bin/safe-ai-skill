@@ -21,6 +21,9 @@
 #     deny line, prints Codex's deny JSON with exit 0. `adapt codex redact` (opt-in) blocks
 #     the result the same way; `adapt codex session-start` reports like SessionStart. Any other
 #     `adapt` entry denies too, and SAFE_AI_SKILL_DISABLE does not apply to `adapt`.
+#   - opencode hooks (`adapt opencode <gate>`, run by the opencode plugin): the same deny JSON
+#     on every failure, and the engine's answer passes only when it is nothing, one deny line
+#     or (gate-read) one `updatedInput` line.
 #   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
 #     project settings mention it (a repo can't disable the firewall); SessionStart
@@ -63,6 +66,7 @@ case $sub in
     case ${2:-}/${3:-} in
       codex/session-start) kind=session sub='adapt codex session-start' ;;
       codex/redact) kind=codex_post ;;
+      opencode/*) kind=opencode ;;
       # Only another client's hook runs `adapt`: an entry nobody recognises (a typo in the
       # hook config) blocks rather than letting Codex run the call.
       *) kind=codex ;;
@@ -105,6 +109,7 @@ codex_block() {
 codex_fail() {
   case $kind in
     codex) codex_deny "safe-ai-skill: $1. Codex would run this call unchecked, so it is blocked; review it and run it yourself." ;;
+    opencode) codex_deny "safe-ai-skill: $1. The call is blocked; review it and run it yourself." ;;
     codex_post) codex_block "safe-ai-skill: $1. This result was not scanned for secrets, so it is withheld." ;;
   esac
 }
@@ -344,23 +349,26 @@ out=$(run_engine "$@") || status=$?
 # Codex: only nothing, or one line of the expected answer, reaches Codex; anything else (a
 # second line, which Codex could not parse, included) blocks.
 case $kind/$status in
-  codex/0 | codex_post/0)
+  codex/0 | codex_post/0 | opencode/0)
     out=${out%.}
     out=${out%"$nl"}
     case $kind/$out in
       */) exit 0 ;;
-      */*"$nl"*) codex_fail 'the engine gave an answer Codex cannot use' ;;
+      */*"$nl"*) codex_fail 'the engine gave an answer the client cannot use' ;;
       'codex/{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",'*'}}' | \
+        'opencode/{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",'*'}}' | \
+        'opencode/{"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":'*'}}' | \
         'codex_post/{"decision":"block","reason":"'*'"}')
         printf '%s\n' "$out"
         exit 0
         ;;
     esac
-    codex_fail 'the engine gave an answer Codex cannot use'
+    codex_fail 'the engine gave an answer the client cannot use'
     ;;
-  codex/126 | codex/127 | codex_post/126 | codex_post/127) ;;
+  codex/126 | codex/127 | codex_post/126 | codex_post/127 | opencode/126 | opencode/127) ;;
   codex/3 | codex_post/3) codex_fail 'this hook entry is misconfigured (see `safe-ai-skill adapt codex` usage); fix the hooks.json command' ;;
-  codex/* | codex_post/*) crashed "$status" ;;
+  opencode/3) codex_fail 'this adapt entry is misconfigured (see `safe-ai-skill adapt opencode` usage); reinstall the opencode plugin' ;;
+  codex/* | codex_post/* | opencode/*) crashed "$status" ;;
 esac
 
 case $status in
