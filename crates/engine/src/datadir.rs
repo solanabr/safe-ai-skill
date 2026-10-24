@@ -66,8 +66,9 @@ impl DataDir {
 }
 
 /// The sentinel for an unresolvable data dir: untrusted, [`crate::statefile`] loads nothing
-/// from it and refuses to store into it, and its path lies under a device file, so plain
-/// filesystem reads and writes under it fail too.
+/// from it and refuses to store into it, and its path cannot exist (under `/dev/null` on
+/// unix; a name with `|`, which Windows filesystems refuse), so plain filesystem reads and
+/// writes under it fail too. (Not `\\.\NUL\…`: `create_dir_all` under it succeeded on Windows.)
 pub fn unresolved() -> DataDir {
     DataDir {
         path: unresolved_path(),
@@ -78,7 +79,7 @@ pub fn unresolved() -> DataDir {
 fn unresolved_path() -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(r"\\.\NUL\safe-ai-skill-unresolved")
+        PathBuf::from(r"C:\safe-ai-skill-unresolved|")
     }
     #[cfg(not(windows))]
     {

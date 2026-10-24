@@ -550,6 +550,9 @@ impl FileLock {
                         continue;
                     }
                 }
+                // Windows refuses to create a file whose previous holder is still deleting it
+                // (delete pending while another handle is open): contention, not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
                 Err(e) => return Err(e.into()),
             }
             if std::time::Instant::now() >= deadline {
@@ -1042,10 +1045,12 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(
-            names,
-            [GEN_INDEX, "grants.json", KEY_FILE, "spend.json", STATE_LOCK]
-        );
+        let mut want = vec![GEN_INDEX, "grants.json", KEY_FILE, "spend.json"];
+        // The non-unix lock is an O_EXCL file removed on release; the flock file stays.
+        if cfg!(unix) {
+            want.push(STATE_LOCK);
+        }
+        assert_eq!(names, want);
         // Breaking a stale file someone else already removed is not an error.
         assert!(break_stale(&dir.path.join("gone"), STALE_LOCK_AGE).is_ok());
         let _ = std::fs::remove_dir_all(&dir.path);

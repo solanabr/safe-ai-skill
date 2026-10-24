@@ -1628,9 +1628,15 @@ fn sweep_within(
         let pack = Pack {
             kind: e.kind,
             name: dir_name(&origin).unwrap_or_default(),
+            // `/`-separated like every other pack display, on Windows too.
             display: origin
                 .strip_prefix(&project)
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|p| {
+                    p.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
                 .unwrap_or_else(|_| key.clone()),
             dir: origin.clone(),
             canonical: origin.clone(),
@@ -3606,6 +3612,7 @@ mod orchestration_tests {
         assert!(r.additional_context.contains("… 2 more"));
     }
 
+    #[cfg(unix)] // Windows file names cannot hold control characters
     #[test]
     fn report_escapes_control_characters_in_names_and_paths() {
         let d = data("escape", false);
@@ -4790,9 +4797,16 @@ mod enforce_tests {
 
     #[test]
     fn the_cwd_is_read_from_an_unparseable_payload_head() {
+        let cwd = if cfg!(windows) {
+            "C:/work/proj"
+        } else {
+            "/work/proj"
+        };
         assert_eq!(
-            enforce::raw_cwd(br#"{"session_id":"s","cwd":"/work/proj","prompt":"/x"#),
-            Some(PathBuf::from("/work/proj"))
+            enforce::raw_cwd(
+                format!(r#"{{"session_id":"s","cwd":"{cwd}","prompt":"/x"#).as_bytes()
+            ),
+            Some(PathBuf::from(cwd))
         );
         assert_eq!(enforce::raw_cwd(br#"{"cwd":"relative/dir""#), None);
         assert_eq!(enforce::raw_cwd(br#"{"prompt":"x"#), None);
@@ -5364,6 +5378,7 @@ mod enforce_tests {
         }
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr6_a_matching_stat_fingerprint_is_trusted_without_rehashing() {
         let (d, project) = fresh_trusted("rr6-fp");
@@ -5408,6 +5423,7 @@ mod enforce_tests {
         );
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr6_p4_a_huge_pack_is_judged_by_its_fingerprint_and_approval_clears_it() {
         let (d, project) = fresh_trusted("rr6-p4fp");
@@ -5490,6 +5506,7 @@ mod enforce_tests {
         report
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr6_slow_packs_converge_over_successive_sweeps() {
         let (d, project) = fresh_trusted("rr6-3p4");
@@ -5851,6 +5868,7 @@ mod enforce_tests {
         );
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr7_a_slower_stat_walk_never_makes_the_gate_more_permissive() {
         let (d, project) = budget_cut_project("rr7-mono");
@@ -5926,6 +5944,7 @@ mod enforce_tests {
         grading::scan_pack(path)
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr7_matched_packs_hash_oldest_first_and_a_stale_full_hash_is_forced() {
         let (d, project) = fresh_trusted("rr7-oldest");
@@ -5999,6 +6018,7 @@ mod enforce_tests {
         }
     }
 
+    #[cfg(unix)] // fingerprints stand in for hashes only on unix (FINGERPRINT_TRUSTED)
     #[test]
     fn rr7_a_packs_lock_committed_later_tightens_a_fingerprint_matched_pack() {
         let (d, project) = fresh_trusted("rr7-lock");
