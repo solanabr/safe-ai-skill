@@ -231,13 +231,24 @@ pub fn is_project_env_name(name: &str) -> bool {
         && secretpath::classify(&lower) == Class::Env
 }
 
+static SESSION_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Fix the session's project dir for a client whose hook `cwd` is a command's working dir
+/// (opencode's `workdir`, [`crate::adapt_opencode`]): it stands in for `CLAUDE_PROJECT_DIR` in
+/// [`session_root`]. The first call wins.
+pub fn set_session_dir(dir: &Path) {
+    let _ = SESSION_DIR.set(dir.to_path_buf());
+}
+
 /// The session's project root: the git toplevel of `CLAUDE_PROJECT_DIR` (when it names a
 /// directory), else of the hook `cwd`; without a git toplevel, that directory itself. Fixed for
 /// the session: a `cd` never makes another project. `None` when the root is `/`, a home
 /// directory or above one: then no file is a project env file (the 1.1.0 rule applies).
 pub fn session_root(cwd: &Path) -> Option<PathBuf> {
-    let base = std::env::var_os("CLAUDE_PROJECT_DIR")
-        .map(PathBuf::from)
+    let base = SESSION_DIR
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
         .filter(|p| p.is_absolute() && p.is_dir())
         .unwrap_or_else(|| cwd.to_path_buf());
     let root = tier::project_root(&base);
@@ -328,7 +339,7 @@ fn absolute(file: &str, cwd: &Path) -> PathBuf {
 /// The canonical path of `path`; when it does not exist, its nearest existing ancestor's
 /// canonical path joined with the rest. `None` when the rest holds `.` or `..`.
 fn resolve(path: &Path) -> Option<PathBuf> {
-    if let Ok(real) = std::fs::canonicalize(path) {
+    if let Ok(real) = crate::localfs::canonicalize(path) {
         return Some(real);
     }
     let mut rest = Vec::new();
@@ -340,7 +351,7 @@ fn resolve(path: &Path) -> Option<PathBuf> {
         }
         rest.push(name);
         cur = cur.parent()?;
-        if let Ok(mut real) = std::fs::canonicalize(cur) {
+        if let Ok(mut real) = crate::localfs::canonicalize(cur) {
             real.extend(rest.iter().rev());
             return Some(real);
         }

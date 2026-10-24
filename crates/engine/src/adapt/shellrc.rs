@@ -121,7 +121,7 @@ impl ShellStartup {
             .cloned()
             .collect();
         for dir in &self.fish_conf_d {
-            if let Ok(entries) = std::fs::read_dir(dir) {
+            if let Ok(entries) = crate::localfs::read_dir(dir) {
                 out.extend(entries.filter_map(Result::ok).map(|e| e.path()).take(200));
             }
         }

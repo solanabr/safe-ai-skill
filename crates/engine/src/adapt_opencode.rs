@@ -119,6 +119,8 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let arg = |k: &str| args.get(k).and_then(Value::as_str);
+    // opencode's project dir is the session's project, wherever `workdir` points the command.
+    crate::gates::envread::set_session_dir(&directory);
     let mut cwd = directory.clone();
     let (tool_name, tool_input) = match (gate, tool) {
         ("gate-bash" | "gate-bash-secrets", "bash") => {
@@ -144,8 +146,8 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
                 Some(p) => absolute(p, &directory, home().as_deref()),
                 None => directory.clone(),
             };
-            let mut root = std::fs::canonicalize(&given).unwrap_or(given);
-            if !root.is_dir() {
+            let mut root = crate::localfs::canonicalize(&given).unwrap_or(given);
+            if !crate::localfs::is_dir(&root) {
                 root = root.parent().map(Path::to_path_buf).unwrap_or(root);
             }
             let _ = GREP_ROOT.set(root.clone());
@@ -686,7 +688,7 @@ impl Targets {
         }
         let plugin = plugin.map(PathBuf::from).filter(|p| p.is_absolute());
         for p in configured_plugin_paths(dir).into_iter().chain(plugin) {
-            if p.is_dir() {
+            if crate::localfs::is_dir(&p) {
                 push_spellings(&mut t.dirs, p);
             } else {
                 push_spellings(&mut t.files, p);

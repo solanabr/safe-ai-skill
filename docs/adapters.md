@@ -369,7 +369,7 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
 
 | opencode tool | Gates | Mapping |
 |---|---|---|
-| `bash` `{command, workdir?}` | `gate-bash`, `gate-bash-secrets` | `workdir` (relative to the project dir) is where relative paths resolve. |
+| `bash` `{command, workdir?}` | `gate-bash`, `gate-bash-secrets` | `workdir` (relative to the project dir) is where relative paths resolve; the project for the `.env` rules stays opencode's project dir. |
 | `read` `{filePath}` | `gate-read` | `filePath` → `file_path`. |
 | `grep` `{pattern, path?, include?}` | `gate-read` | `include` → `glob`; a file `path` is judged as its directory. See [Grep](#grep-under-opencode). |
 | `glob` `{pattern, path?}` | `gate-read` | Lists names only: no opinion, as in Claude Code. |

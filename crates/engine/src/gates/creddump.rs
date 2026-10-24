@@ -240,7 +240,7 @@ fn redirect_onto_key_material(
         }
         for variant in expand_vars(target) {
             for path in resolve_all(&variant, &cwds) {
-                let real = std::fs::canonicalize(&path).ok();
+                let real = crate::localfs::canonicalize(&path).ok();
                 let class = |p: &Path| {
                     crate::gates::secretpath::classify_with_homes(&p.to_string_lossy(), &homes)
                 };
@@ -252,7 +252,7 @@ fn redirect_onto_key_material(
                         | crate::gates::secretpath::Class::Env
                 );
                 let content = sniffable
-                    && path.exists()
+                    && crate::localfs::exists(&path)
                     && envread::key_material_in(real.as_deref().unwrap_or(&path)).is_some();
                 if hard || content {
                     return Ok(Some(format!(

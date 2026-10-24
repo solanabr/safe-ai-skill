@@ -146,7 +146,7 @@ fn other_verdict(
         // file and every other class keep the path check.
         let shell_like = literal.contains(char::is_whitespace)
             && secretpath::classify(literal) == secretpath::Class::Env
-            && std::fs::symlink_metadata(cwd.join(literal)).is_err();
+            && crate::localfs::symlink_metadata(cwd.join(literal)).is_err();
         let path = if shell_like {
             Decision::Defer
         } else {

@@ -242,6 +242,10 @@ fn seg_overlap(rec: &str, arg: &str, globbing: bool) -> bool {
     if !has_wild(rec) {
         return (!rec.starts_with('.') || arg.starts_with('.')) && pat_match(arg, rec, true);
     }
+    // As for a literal record: a shell wildcard does not match a leading dot.
+    if rec.starts_with('.') && !arg.starts_with('.') {
+        return false;
+    }
     let ((ap, asu), (rp, rsu)) = (affixes(arg), affixes(rec));
     let compat = |a: &str, b: &str, prefix: bool| {
         if prefix {

@@ -156,8 +156,12 @@ fn benign_calls_are_no_output() {
 #[test]
 fn secret_reads_deny_through_read_and_the_shell() {
     let w = World::new("oc-secret");
+    // The project `.env` follows the tier (readable at the default); its dotenvx keys never are.
     std::fs::write(w.proj.join(".env"), "KEY=v").unwrap();
     let run = w.oc("gate-read", "read", json!({ "filePath": ".env" }));
+    assert_eq!(label(&run), "", "{}", run.stdout);
+    std::fs::write(w.proj.join(".env.keys"), "DOTENV_PRIVATE_KEY=x").unwrap();
+    let run = w.oc("gate-read", "read", json!({ "filePath": ".env.keys" }));
     assert_eq!(label(&run), "deny");
     let wallet = w.home.join(".config/solana/id.json");
     std::fs::create_dir_all(wallet.parent().unwrap()).unwrap();
@@ -459,8 +463,8 @@ fn servers_from_the_plugin_payload_are_used() {
 #[test]
 fn mcp_resource_reads_get_the_path_check() {
     let w = World::new("oc-mcp-res");
-    std::fs::write(w.proj.join(".env"), "K=v").unwrap();
-    let env = w.proj.join(".env");
+    std::fs::write(w.proj.join(".env.keys"), "DOTENV_PRIVATE_KEY=x").unwrap();
+    let env = w.proj.join(".env.keys");
     let run = w.oc(
         "gate-mcp",
         "read_mcp_resource",
