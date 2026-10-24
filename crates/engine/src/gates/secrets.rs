@@ -160,7 +160,11 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
         return nested;
     }
     let rpc_quiet = !names_http_redirect_env(command);
-    let scanned = scan_segments(command, policy, Some(cwd), rpc_quiet, &mut budget);
+    // After a `cd`, a relative env path resolves elsewhere than the hook cwd: `creddump`, which
+    // tracks the `cd` targets, decides env reads then (`secret_arg_decision` with no cwd).
+    let changes_dir = crate::context::shell::parse(command).cwd_changed;
+    let scan_cwd = (!changes_dir).then_some(cwd);
+    let scanned = scan_segments(command, policy, scan_cwd, rpc_quiet, &mut budget);
     match (tripwire, nested) {
         // Too complex for the tripwire: a secret read found anyway still denies.
         (ask @ Decision::Ask { .. }, _) | (_, ask @ Decision::Ask { .. })
@@ -600,10 +604,20 @@ fn secret_arg_decision(
 ) -> Option<Decision> {
     match classify_arg(arg, policy)? {
         ArgClass::Env => {
+            // No cwd: the command changes directory, and `creddump` decides env reads.
+            let dir = cwd?;
+            let cwd = Some(dir);
             let file = normalize_path(arg);
             let hint = cwd.is_some_and(|dir| read::varlock_hint(dir, &dir.join(&file)));
             let project = cwd.is_some_and(|dir| envread::is_project_env(&file, dir));
-            Some(read::env_verdict(&file, project, policy, hint))
+            let verdict = read::env_verdict(&file, project, policy, hint);
+            // An open project env file is still denied when its content is key material.
+            if let (Decision::Defer, Some(dir)) = (&verdict, cwd) {
+                if let Some(reason) = envread::key_material_reason(&file, dir) {
+                    return Some(Decision::Deny { reason });
+                }
+            }
+            Some(verdict)
         }
         ArgClass::Secret => Some(Decision::Deny {
             reason: format!(

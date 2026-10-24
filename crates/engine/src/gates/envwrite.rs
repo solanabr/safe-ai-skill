@@ -35,45 +35,81 @@ use crate::policy::Policy;
 /// How deep `sh -c` / `eval` nesting is followed.
 const MAX_NESTING: usize = 4;
 
-/// Lowercase markers of a file write in interpreter code (Python, Node, Deno, Ruby, Perl, PHP).
-const CODE_WRITE_MARKERS: &[&str] = &[
-    "write",
-    "append",
-    "unlink",
-    "rename",
-    "remove(",
-    "os.replace",
-    "shutil.",
-    "set_key",
-    "unset_key",
-    "truncate",
-    "copyfile",
+/// Lowercase write calls in interpreter code (Python, Node, Deno, Ruby, PHP), tied to a call
+/// rather than a bare token: `stdout.write` and `print('w', …)` are not writes.
+const CODE_WRITE_CALLS: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    "writefile",
+    "appendfile",
+    "createwritestream",
+    "set_key(",
+    "unset_key(",
+    "os.replace(",
+    "os.rename(",
+    "os.remove(",
+    "os.unlink(",
+    "os.truncate(",
+    "shutil.copy",
+    "shutil.move",
     "fs.rm",
-    "'w'",
-    "\"w\"",
-    "'a'",
-    "\"a\"",
-    "'w+'",
-    "\"w+\"",
-    "'wb'",
-    "\"wb\"",
-    "'ab'",
-    "\"ab\"",
-    "'r+'",
-    "\"r+\"",
-    "'x'",
-    "\"x\"",
-    "'>",
-    "\">",
-    "'+<",
-    "\"+<",
+    "fs.unlink",
+    "fs.rename",
+    "fs.copyfile",
+    "fs.truncate",
+    "file.write(",
+    "io.write(",
+    "file_put_contents(",
+    "deno.writetextfile",
+    "deno.writefile",
+    "deno.remove(",
+    "deno.rename(",
+    "o_wronly",
+    "o_rdwr",
+    "o_append",
+    "o_trunc",
 ];
 
-/// Whether interpreter `code` shows a file write ([`CODE_WRITE_MARKERS`]): code that names an
-/// env file and writes is an env write (it may also read it).
+/// Whether interpreter `code` shows a file write: a write call ([`CODE_WRITE_CALLS`]) or an
+/// `open(…)` (also `File.open`, `fopen`, Perl `open F, …`) whose mode string writes (`w`,
+/// `a`, `x`, `+`, or Perl's `>`, `>>`, `+<`). Code that names an env file and writes is an env
+/// write (it may also read it). Callers pass the code strings only.
 pub fn code_writes(code: &str) -> bool {
     let lower = code.to_ascii_lowercase();
-    CODE_WRITE_MARKERS.iter().any(|m| lower.contains(m))
+    if CODE_WRITE_CALLS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    lower.match_indices("open").any(|(i, m)| {
+        let after = &lower[i.saturating_add(m.len())..];
+        let args = after.trim_start_matches([' ', '(']);
+        let segment = args.split([')', ';', '\n']).next().unwrap_or("");
+        quoted_strings(segment).any(|q| {
+            let q = q.trim();
+            q.starts_with('>')
+                || q.starts_with("+<")
+                || (!q.is_empty()
+                    && q.len() <= 4
+                    && q.chars().all(|c| "rwaxbtu+".contains(c))
+                    && q.chars().any(|c| "wax+".contains(c)))
+        })
+    })
+}
+
+/// The contents of the single- and double-quoted strings in `text`.
+fn quoted_strings(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let start = rest.find(['\'', '"'])?;
+        let quote = rest[start..].chars().next()?;
+        let body = &rest[start.saturating_add(1)..];
+        let Some(end) = body.find(quote) else {
+            rest = "";
+            return None;
+        };
+        let found = &body[..end];
+        rest = &body[end.saturating_add(1)..];
+        Some(found)
+    })
 }
 
 /// Whether the env-write rule denies a write to an env file at `tier`: Medium for a project
@@ -94,8 +130,16 @@ pub fn decide_file(
     let file = ["file_path", "notebook_path"]
         .iter()
         .find_map(|k| input.get(*k).and_then(Value::as_str))?;
+    if is_dotenv_keys_target(file, cwd) {
+        return Some(Verdict::Deny(
+            "safe-ai-skill: this is a dotenvx private-key file (`.env.keys`): key material, so agent writes, edits and removal are denied at every tier. Edit it yourself.".to_string(),
+        ));
+    }
     if !is_env_target(file, cwd) {
         return None;
+    }
+    if let Some(reason) = envread::key_material_reason(file, cwd) {
+        return Some(Verdict::Deny(reason));
     }
     let label = Path::new(file)
         .file_name()
@@ -176,6 +220,20 @@ fn writes_redaction_marker(input: &serde_json::Map<String, Value>) -> bool {
             .get("edits")
             .and_then(Value::as_array)
             .is_some_and(|edits| edits.iter().any(|e| marked(e.get("new_string"))))
+}
+
+/// Whether `file` (absolute, or relative to `cwd`), by its name or the file it resolves to, is
+/// a dotenvx private-key file ([`envread::is_dotenv_keys_name`]).
+fn is_dotenv_keys_target(file: &str, cwd: &Path) -> bool {
+    let raw = expand(file, cwd);
+    let mut candidates = vec![raw.clone()];
+    if let Some(real) = resolve(&raw) {
+        candidates.push(real);
+    }
+    candidates.iter().any(|p| {
+        p.file_name()
+            .is_some_and(|n| envread::is_dotenv_keys_name(&n.to_string_lossy()))
+    })
 }
 
 /// Whether `file` (absolute, or relative to `cwd`) is an env-class file, by its name or, for an

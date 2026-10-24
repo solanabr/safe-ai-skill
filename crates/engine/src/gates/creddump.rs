@@ -147,6 +147,10 @@ fn inspect(
     if let Some(what) = hit {
         return Ok(Some(Verdict::Deny(path_reason(&what))));
     }
+    // Env data flowing into a network sink: denied at every tier, before the tier rows.
+    if let Some(file) = env_to_network(command, cwd, policy)? {
+        return Ok(Some(envread::to_network(&file)));
+    }
     let stdin_free = !command.contains(['|', '<']);
     let named: Vec<String> = parsed
         .arg_files
@@ -154,7 +158,7 @@ fn inspect(
         .chain(&parsed.input_files)
         .cloned()
         .collect();
-    let code_writes = !code.is_empty() && crate::gates::envwrite::code_writes(command);
+    let code_writes = !code.is_empty() && crate::gates::envwrite::code_writes(&code_text(parsed));
     let usage = env_check(
         &parsed.commands,
         &EnvInputs {
@@ -167,12 +171,17 @@ fn inspect(
         policy,
         stdin_free,
     )?;
+    // A project env file the tier opens is still key material when its content is.
+    for hit in usage.read.iter().chain(&usage.write) {
+        if hit.project {
+            if let Some(reason) = envread::key_material_reason(&hit.file, &hit.dir) {
+                return Ok(Some(Verdict::Deny(reason)));
+            }
+        }
+    }
     let mut verdicts: Vec<Option<Verdict>> = Vec::new();
     if let Some(hit) = &usage.read {
-        if reaches_network(parsed, command) {
-            return Ok(Some(envread::to_network(&hit.file)));
-        }
-        let varlock = read::varlock_hint(cwd, &cwd.join(&hit.file));
+        let varlock = read::varlock_hint(cwd, &hit.dir.join(&hit.file));
         verdicts.push(
             match read::env_verdict(&hit.file, hit.project, policy, varlock) {
                 Decision::Deny { reason } => Some(Verdict::Deny(reason)),
@@ -196,25 +205,460 @@ fn inspect(
     }))
 }
 
-/// Whether the command line can send data off the machine: it runs a network program
-/// ([`envread::NETWORK_PROGRAMS`]), or it runs interpreter code that shows network use.
-fn reaches_network(parsed: &shell::Parsed, command: &str) -> bool {
-    let has_code = !parsed.stdin_code.is_empty()
-        || parsed.commands.iter().any(|c| {
-            AWKS.contains(&c.program().as_str()) || shell::interpreter_at(&c.words).is_some()
-        });
-    parsed
-        .commands
-        .iter()
-        .any(|c| envread::is_network_program(&c.program()))
-        || (has_code && envread::code_reaches_network(command))
+/// The code strings of a parsed command: the words after each interpreter (and an awk
+/// program), and code fed on standard input.
+fn code_text(parsed: &shell::Parsed) -> String {
+    let mut out: Vec<String> = parsed.stdin_code.clone();
+    for cmd in &parsed.commands {
+        let start = if AWKS.contains(&cmd.program().as_str()) {
+            Some(1)
+        } else {
+            shell::interpreter_at(&cmd.words).map(|i| i.saturating_add(1))
+        };
+        if let Some(start) = start {
+            out.extend(cmd.words.iter().skip(start).map(|w| w.text.clone()));
+        }
+    }
+    out.join("\n")
 }
 
-/// One env file a command uses: the file as named, and whether it is a project env file from
-/// every effective cwd ([`envread::is_project_env`]).
+// ---------------------------------------------------------------------------------------
+// Env data to the network
+// ---------------------------------------------------------------------------------------
+
+/// The env file whose data can flow into a network sink in `command`, if any (denied at every
+/// tier). Unrelated commands on one line do not count (`cat .env && curl localhost/health`).
+/// The command is split into statements (`;`, `&&`, `||`, `&`, newlines) and each into pipeline
+/// stages, outside quotes, substitutions and here-documents; a flow is:
+///
+/// 1. an env read upstream of, or in the same stage as, a network sink
+///    ([`envread::is_network_sink`], or an output redirect to `/dev/tcp`/`/dev/udp`): a pipe,
+///    an input redirect, a here-string, a process or command substitution in its words;
+/// 2. an env file loaded into the shell (`source`, `.`, `export`/`set`/`eval`, or a `$(…)` /
+///    backtick read) followed later in the line by a sink with an expansion in its words, or by
+///    interpreter code with a network client;
+/// 3. a reader's output-redirect target named later by a sink (`cat .env > /tmp/x; curl -T
+///    /tmp/x …`);
+/// 4. a command naming an env file whose following words run a sink or network code, or load
+///    a remote script or module (`dotenv -e .env -- curl …`, `docker run --env-file .env img
+///    curl …`, `deno run --env-file=.env https://…`);
+/// 5. interpreter code that names an env file and opens a network client (code strings only).
+fn env_to_network(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let statements = split_statements(command);
+    if statements.iter().map(Vec::len).sum::<usize>() > MAX_COMMANDS {
+        return Err(TooComplex);
+    }
+    let mut loaded: Option<String> = None;
+    let mut written: Vec<(String, String)> = Vec::new();
+    for stmt in &statements {
+        let mut upstream: Option<String> = None;
+        for stage in stmt {
+            let parsed = shell::parse(stage);
+            if let Some(file) = loader_to_network(&parsed, cwd, policy) {
+                return Ok(Some(file));
+            }
+            if let Some(file) = code_to_network(&parsed, cwd, policy)? {
+                return Ok(Some(file));
+            }
+            let read = stage_env_read(&parsed, cwd, policy)?;
+            let sink = parsed.commands.iter().any(is_sink)
+                || parsed
+                    .output_files
+                    .iter()
+                    .any(|f| envread::is_socket_path(f));
+            if sink {
+                if let Some(file) = read.clone().or_else(|| upstream.clone()) {
+                    return Ok(Some(file));
+                }
+                let expands = parsed
+                    .commands
+                    .iter()
+                    .any(|c| is_sink(c) && c.words.iter().skip(1).any(|w| w.dynamic));
+                if let Some(file) = loaded.as_ref().filter(|_| expands) {
+                    return Ok(Some(file.clone()));
+                }
+                if let Some((_, file)) =
+                    written.iter().find(|(out, _)| stage.contains(out.as_str()))
+                {
+                    return Ok(Some(file.clone()));
+                }
+            }
+            if let Some(file) = loaded.as_ref() {
+                if envread::code_reaches_network(&code_text(&parsed)) {
+                    return Ok(Some(file.clone()));
+                }
+            }
+            if let Some(file) = read {
+                if loads_into_shell(&parsed, stage) {
+                    loaded = Some(file.clone());
+                }
+                written.extend(
+                    parsed
+                        .output_files
+                        .iter()
+                        .filter(|f| !envread::is_socket_path(f) && !f.trim().is_empty())
+                        .map(|f| (f.clone(), file.clone())),
+                );
+                upstream = Some(file);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a simple command is a network sink ([`envread::is_network_sink`]). Leading
+/// substitutions that only set variables (`env $(cat .env | xargs) wget …`) are skipped, and
+/// the rest is parsed again when they were (`env $(…) sh -c 'curl …'`).
+fn is_sink(cmd: &SimpleCommand) -> bool {
+    let start = variable_prefix(cmd);
+    let words: Vec<&str> = cmd
+        .words
+        .iter()
+        .skip(start)
+        .map(|w| w.text.as_str())
+        .collect();
+    let dynamic = cmd
+        .words
+        .iter()
+        .skip(start.saturating_add(1))
+        .any(|w| w.dynamic);
+    if envread::is_network_sink(&words, dynamic) {
+        return true;
+    }
+    start > 0 && {
+        let inner = shell::parse(&requote(&words));
+        inner.commands.iter().any(is_sink) || envread::code_reaches_network(&code_text(&inner))
+    }
+}
+
+/// `words` as one shell line, each single-quoted.
+fn requote(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|w| format!("'{}'", w.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How many leading words of `cmd` only set variables: `env`, `NAME=value`, and command
+/// substitutions or backticks in program position.
+fn variable_prefix(cmd: &SimpleCommand) -> usize {
+    cmd.words
+        .iter()
+        .position(|w| {
+            let t = w.text.as_str();
+            !(t == "env"
+                || (w.dynamic && (t.starts_with("$(") || t.starts_with('`')))
+                || t.split_once('=').is_some_and(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }))
+        })
+        .unwrap_or(0)
+}
+
+/// The first project or other env file a stage reads (the env gate's reads, [`env_check`]).
+fn stage_env_read(
+    parsed: &shell::Parsed,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let code = code_paths(parsed, cwd)?;
+    let named: Vec<String> = parsed
+        .arg_files
+        .iter()
+        .chain(&parsed.input_files)
+        .cloned()
+        .collect();
+    let usage = env_check(
+        &parsed.commands,
+        &EnvInputs {
+            named: &named,
+            code: &code,
+            code_writes: false,
+            outputs: &[],
+        },
+        cwd,
+        policy,
+        false,
+    )?;
+    Ok(usage.read.map(|h| h.file))
+}
+
+/// Whether a stage that reads an env file puts its values into the shell: `source`/`.`,
+/// `export`/`set`/`eval`/`declare`, or a command substitution or backtick read.
+fn loads_into_shell(parsed: &shell::Parsed, stage: &str) -> bool {
+    stage.contains("$(")
+        || stage.contains('`')
+        || parsed.commands.iter().any(|c| {
+            matches!(
+                c.program().as_str(),
+                "source" | "." | "export" | "set" | "eval" | "declare" | "typeset" | "readonly"
+            )
+        })
+}
+
+/// Flow 4 of [`env_to_network`]: a command naming an env file whose following words run a
+/// sink or network code, or load a remote script or module.
+fn loader_to_network(parsed: &shell::Parsed, cwd: &Path, policy: &Policy) -> Option<String> {
+    let homes = crate::gates::secretpath::homes_resolved();
+    let cwds = [cwd.to_path_buf()];
+    for cmd in &parsed.commands {
+        let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+        let Some((at, file)) = words
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(i, w)| env_word_hit(w, &cwds, &homes, policy).map(|f| (i, f)))
+        else {
+            continue;
+        };
+        let after = words.get(at.saturating_add(1)..).unwrap_or(&[]);
+        let child = match after.iter().position(|w| *w == "--") {
+            Some(dashes) => after.get(dashes.saturating_add(1)..).unwrap_or(&[]),
+            None => after,
+        };
+        if child.is_empty() {
+            continue;
+        }
+        if remote_module(after) {
+            return Some(file);
+        }
+        let inner = shell::parse(&requote(child));
+        if inner.commands.iter().any(is_sink) || envread::code_reaches_network(&code_text(&inner)) {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Whether a loader's words name a remote script or module: its first positional, or the
+/// value of `--import`/`--loader`/`--experimental-loader`/`--require`/`-r`, is an
+/// `http(s)://` URL for a host other than this machine.
+fn remote_module(words: &[&str]) -> bool {
+    let remote = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        (w.starts_with("http://") || w.starts_with("https://")) && !envread::all_local(&[&w])
+    };
+    let flags = [
+        "--import",
+        "--loader",
+        "--experimental-loader",
+        "--require",
+        "-r",
+    ];
+    let mut first_positional = true;
+    let mut iter = words.iter().peekable();
+    while let Some(w) = iter.next() {
+        if let Some((flag, value)) = w.split_once('=') {
+            if flags.contains(&flag) && remote(value) {
+                return true;
+            }
+            continue;
+        }
+        if flags.contains(w) {
+            if iter.peek().is_some_and(|v| remote(v)) {
+                return true;
+            }
+            continue;
+        }
+        if w.starts_with('-') {
+            continue;
+        }
+        if first_positional && remote(w) {
+            return true;
+        }
+        first_positional = false;
+    }
+    false
+}
+
+/// Flow 5 of [`env_to_network`]: interpreter code in the stage that names an env file and opens
+/// a network client (the code strings only).
+fn code_to_network(
+    parsed: &shell::Parsed,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let code = code_paths(parsed, cwd)?;
+    if code.is_empty() || !envread::code_reaches_network(&code_text(parsed)) {
+        return Ok(None);
+    }
+    let homes = crate::gates::secretpath::homes_resolved();
+    let cwds = [cwd.to_path_buf()];
+    Ok(code
+        .iter()
+        .find_map(|f| env_word_hit(f, &cwds, &homes, policy)))
+}
+
+/// `command` split into statements (at `;`, `&&`, `||`, a lone `&` and newlines) and each into
+/// pipeline stages (at `|` and `|&`), outside quotes, `$(…)`/`(…)`/backticks and
+/// here-document bodies (a body stays with its stage).
+fn split_statements(command: &str) -> Vec<Vec<String>> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut statements: Vec<Vec<String>> = Vec::new();
+    let mut stages: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut backtick = false;
+    let mut heredocs: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let flush_stage = |cur: &mut String, stages: &mut Vec<String>| {
+        if !cur.trim().is_empty() {
+            stages.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    while let Some(&c) = chars.get(i) {
+        i = i.saturating_add(1);
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == '\\' && q == '"' {
+                if let Some(&n) = chars.get(i) {
+                    cur.push(n);
+                    i = i.saturating_add(1);
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(&n) = chars.get(i) {
+                    cur.push(n);
+                    i = i.saturating_add(1);
+                }
+            }
+            '\'' | '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '`' => {
+                backtick = !backtick;
+                cur.push(c);
+            }
+            '(' => {
+                depth = depth.saturating_add(1);
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            '<' if chars.get(i) == Some(&'<') && chars.get(i.saturating_add(1)) != Some(&'<') => {
+                // A here-document: remember its delimiter; the body follows the next newline.
+                cur.push_str("<<");
+                i = i.saturating_add(1);
+                if chars.get(i) == Some(&'-') {
+                    cur.push('-');
+                    i = i.saturating_add(1);
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    cur.push(chars[i]);
+                    i = i.saturating_add(1);
+                }
+                let mut word = String::new();
+                while let Some(&w) = chars.get(i) {
+                    if w.is_whitespace() || ";&|<>()".contains(w) {
+                        break;
+                    }
+                    word.push(w);
+                    cur.push(w);
+                    i = i.saturating_add(1);
+                }
+                let delimiter: String = word.chars().filter(|c| !"'\"\\".contains(*c)).collect();
+                if !delimiter.is_empty() {
+                    heredocs.push(delimiter);
+                }
+            }
+            '\n' if depth == 0 && !backtick && !heredocs.is_empty() => {
+                // Here-document bodies, in order, stay with this stage.
+                cur.push('\n');
+                for delimiter in std::mem::take(&mut heredocs) {
+                    loop {
+                        let mut line = String::new();
+                        while let Some(&l) = chars.get(i) {
+                            i = i.saturating_add(1);
+                            if l == '\n' {
+                                break;
+                            }
+                            line.push(l);
+                        }
+                        cur.push_str(&line);
+                        cur.push('\n');
+                        if line.trim_start_matches('\t') == delimiter || i >= chars.len() {
+                            break;
+                        }
+                    }
+                }
+                flush_stage(&mut cur, &mut stages);
+                if !stages.is_empty() {
+                    statements.push(std::mem::take(&mut stages));
+                }
+            }
+            ';' | '\n' if depth == 0 && !backtick => {
+                flush_stage(&mut cur, &mut stages);
+                if !stages.is_empty() {
+                    statements.push(std::mem::take(&mut stages));
+                }
+            }
+            '&' if depth == 0 && !backtick => {
+                let prev = cur.chars().last();
+                if chars.get(i) == Some(&'&') {
+                    i = i.saturating_add(1);
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                } else if matches!(prev, Some('>' | '<')) || chars.get(i) == Some(&'>') {
+                    cur.push(c);
+                } else {
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                }
+            }
+            '|' if depth == 0 && !backtick => {
+                if chars.get(i) == Some(&'|') {
+                    i = i.saturating_add(1);
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                } else if cur.ends_with('>') {
+                    cur.push(c);
+                } else {
+                    if chars.get(i) == Some(&'&') {
+                        i = i.saturating_add(1);
+                    }
+                    flush_stage(&mut cur, &mut stages);
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    flush_stage(&mut cur, &mut stages);
+    if !stages.is_empty() {
+        statements.push(stages);
+    }
+    statements
+}
+
+/// One env file a command uses: the file as named, the directory it resolves against (the
+/// cwd in effect), and whether it is a project env file of the session
+/// ([`envread::is_project_env_in`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EnvHit {
     file: String,
+    dir: PathBuf,
     project: bool,
 }
 
@@ -684,22 +1128,40 @@ fn env_check(
         return Err(TooComplex);
     }
     let mut usage = EnvUse::default();
+    // The session's project is fixed (a `cd` never makes another one); a word resolves against
+    // every `cd` target seen so far, else the hook cwd.
+    let root = envread::session_root(hook_cwd);
     let hit = |word: &str, cwds: &[PathBuf]| {
         env_word_hit(word, cwds, &homes, policy).map(|file| {
-            let project = cwds.iter().all(|c| envread::is_project_env(&file, c));
-            EnvHit { file, project }
+            let dirs = cwds.get(1..).filter(|d| !d.is_empty()).unwrap_or(cwds);
+            let project = root
+                .as_ref()
+                .is_some_and(|r| dirs.iter().all(|d| envread::is_project_env_in(&file, d, r)));
+            let dir = dirs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| hook_cwd.to_path_buf());
+            EnvHit { file, dir, project }
         })
     };
+    // Redirects and code paths are not tied to one command here: they resolve against every
+    // directory the line changes to (a project file only when it is one from each).
+    let mut every_cwd = cwds.clone();
+    for cmd in commands {
+        if matches!(cmd.program().as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut every_cwd);
+        }
+    }
     usage.read = inputs
         .named
         .iter()
         .chain(inputs.code)
-        .find_map(|f| hit(f, &cwds));
+        .find_map(|f| hit(f, &every_cwd));
     if inputs.code_writes {
-        usage.write = inputs.code.iter().find_map(|f| hit(f, &cwds));
+        usage.write = inputs.code.iter().find_map(|f| hit(f, &every_cwd));
     }
     if usage.write.is_none() {
-        usage.write = inputs.outputs.iter().find_map(|f| hit(f, &cwds));
+        usage.write = inputs.outputs.iter().find_map(|f| hit(f, &every_cwd));
     }
     let mut budget = MAX_WORDS;
     for cmd in commands {

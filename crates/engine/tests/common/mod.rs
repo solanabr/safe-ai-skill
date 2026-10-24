@@ -311,6 +311,7 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("SAFE_AI_SKILL_HOME");
         // The CLI resolves the hooks' data dir from these and HOME: never the real one.
         cmd.env_remove("CLAUDE_PLUGIN_DATA");
+        cmd.env_remove("CLAUDE_PROJECT_DIR");
         cmd.env_remove("CLAUDE_CONFIG_DIR");
         cmd.env_remove("CLAUDE_CODE_VERSION");
         cmd.env_remove("CLAUDE_CODE_EXECPATH");

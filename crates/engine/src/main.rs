@@ -1274,6 +1274,7 @@ fn cmd_verify_session() -> ExitCode {
     let mut migrated = migrate::run(&dir, now);
     migrated.extend(migrate::mode_to_tier(&dir, now));
     migrated.extend(migrate::retired_env_read(&dir, now));
+    migrated.extend(migrate::env_tier_notice(&dir, &tier::project_root(&cwd)));
     let spend_state = spend::ledger_state(&plugin_data);
     let _ = SpendLedger::load(&plugin_data);
 

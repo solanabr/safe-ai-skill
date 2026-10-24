@@ -557,6 +557,21 @@ fn v1_profiles_migrate_to_tiers_once() {
 }
 
 #[test]
+fn an_install_from_before_1_2_0_gets_the_env_notice_once() {
+    let w = World::new("tiers-env-notice");
+    // A data dir an earlier engine wrote: a state key and no 1.2.0 marker beside it.
+    safe_ai_skill::grants::save(&w.dir(), &safe_ai_skill::grants::Grants::default()).unwrap();
+    std::fs::remove_file(w.data.join(safe_ai_skill::statefile::KEY_ERA_MARKER)).unwrap();
+    let first = w.session();
+    assert!(first.contains("can now read the project's .env"), "{first}");
+    assert!(first.contains("--env-read deny"), "{first}");
+    assert!(!w.session().contains("can now read"), "shown twice");
+    // A new install never sees it.
+    let fresh = World::new("tiers-env-notice-fresh");
+    assert!(!fresh.session().contains("can now read"));
+}
+
+#[test]
 fn the_kit_policy_yaml_loads_with_only_documented_notes() {
     let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(KIT_POLICY));
     assert!(!p.is_fail_closed());

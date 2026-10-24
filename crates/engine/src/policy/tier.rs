@@ -550,7 +550,7 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["ask", "ask", "ask", "deny"],
     ),
     (
-        "Project env file and a network command in one command line",
+        "Env data flowing into a network sink (pipe, redirect, substitution, loader, code)",
         ["deny", "deny", "deny", "deny"],
     ),
     (

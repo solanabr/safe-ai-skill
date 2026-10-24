@@ -121,7 +121,14 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
 
     if verdicts.contains(&Verdict::Env) {
         let project = envread::is_project_env(path, cwd);
-        return env_verdict(path, project, policy, varlock_hint(cwd, &raw));
+        let verdict = env_verdict(path, project, policy, varlock_hint(cwd, &raw));
+        // A project env file the tier opens is still denied when it holds key material.
+        if matches!(verdict, Decision::Defer) {
+            if let Some(what) = envread::key_material_in(file) {
+                return hard_deny(what);
+            }
+        }
+        return verdict;
     }
     if let Some(Verdict::PolicyDeny(what)) = verdicts
         .iter()
@@ -470,7 +477,7 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     let mut keep_env = false;
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
-        let project = real.starts_with(crate::policy::tier::project_root(cwd));
+        let project = envread::session_root(cwd).is_some_and(|root| real.starts_with(root));
         let verdict = env_verdict(first, project, policy, varlock_hint(cwd, &real));
         if !matches!(verdict, Decision::Defer) {
             return ReadVerdict::Decide(verdict);
@@ -509,7 +516,8 @@ fn grep_exclusion_as(dir: &Path, given: &Path) -> String {
 }
 
 /// [`grep_exclusion`] without the project env globs (`**/.env`, `**/.env.*`), for an env Grep
-/// the tier leaves open.
+/// the tier leaves open. The dotenvx key globs (`**/.env.keys`, …, from `credentials.list`)
+/// and every other env glob stay.
 fn grep_exclusion_keeping_env(dir: &Path, given: &Path) -> String {
     let alts: Vec<String> = credpaths::grep_exclusions_as(dir, given)
         .iter()

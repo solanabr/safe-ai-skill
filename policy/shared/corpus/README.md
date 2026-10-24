@@ -91,6 +91,9 @@ checks them again on its actual verdicts for rows without `interim`.
   `sudo` row has kit `DDDD` at every tier in the end state, and its `combined` is `DDDD`; those rows
   only verify the engine. Rows where a wrapper might defeat a kit deny glob are `?`. A kit owner should
   review the whole column.
+- Project `.env` rows (engine 1.2.0, #16): the kit column is `?` at High for reads and at Medium for
+  writes, pending the kit owner (ai-kit's FIREWALL-SPEC denies them there); `combined` is the plugin's
+  `D` in those cells.
 - Seed ambiguities, resolved here: IR-1 and the other `--final` rows give the kit an end-state `----`
   (the contract's "both layers" is read as the interim state); DEV-3 uses 5 SOL, because the contract's
   50 SOL exceeds `hard_tx_sol_max` and denies (kept as DEV-3B); MN-3 and MN-4 get interim kit values.
