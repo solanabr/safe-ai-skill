@@ -128,6 +128,8 @@ jobs:
           mkdir -p npm/bin
           cp "$bin" "npm/bin/safe-ai-skill-${{ matrix.plat }}"
           node --check npm/bin/cli.js
+          export CLAUDE_PLUGIN_DATA="$RUNNER_TEMP/plugin-data"
+          mkdir -p "$CLAUDE_PLUGIN_DATA"
           out=$(node npm/bin/cli.js status)
           echo "$out"
           echo "$out" | grep -q '"command":"status"'
