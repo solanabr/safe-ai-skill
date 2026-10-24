@@ -858,7 +858,7 @@ struct CwdNames {
 
 impl CwdNames {
     fn read(dir: &Path) -> CwdNames {
-        let names = std::fs::read_dir(dir).ok().and_then(|entries| {
+        let names = crate::localfs::read_dir(dir).ok().and_then(|entries| {
             let mut names = std::collections::HashSet::new();
             for entry in entries {
                 if names.len() >= MAX_CWD_NAMES {
@@ -878,7 +878,7 @@ impl CwdNames {
     fn has(&self, name: &str) -> bool {
         match &self.names {
             Some(names) => names.contains(std::ffi::OsStr::new(name)),
-            None => std::fs::symlink_metadata(self.dir.join(name)).is_ok(),
+            None => crate::localfs::symlink_metadata(self.dir.join(name)).is_ok(),
         }
     }
 }
@@ -1108,7 +1108,8 @@ fn env_candidate(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy
     let bare = is_bare(word);
     for path in resolve_all(word, cwds) {
         if !wild {
-            if is_env(&path) || std::fs::canonicalize(&path).is_ok_and(|real| is_env(&real)) {
+            if is_env(&path) || crate::localfs::canonicalize(&path).is_ok_and(|real| is_env(&real))
+            {
                 return true;
             }
             continue;
@@ -1119,7 +1120,7 @@ fn env_candidate(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy
             require_literal_separator: true,
             require_literal_leading_dot: true,
         };
-        let expanded = glob::glob_with(&pattern, options)
+        let expanded = crate::localfs::glob_with(&pattern, options)
             .map(|g| {
                 g.filter_map(Result::ok)
                     .take(MAX_GLOB_MATCHES)
@@ -1345,7 +1346,7 @@ fn resolve_all(word: &str, cwds: &[PathBuf]) -> Vec<PathBuf> {
 
 /// Fold `.` and `..` lexically (then canonicalise when the path exists).
 fn fold_lexical(path: &Path) -> PathBuf {
-    if let Ok(real) = std::fs::canonicalize(path) {
+    if let Ok(real) = crate::localfs::canonicalize(path) {
         return real;
     }
     let mut out = PathBuf::new();
@@ -1504,7 +1505,7 @@ fn literal_hit(path: &Path, exempt: Exempt) -> bool {
     if !exempt.allows(path) && secret(path) {
         return true;
     }
-    std::fs::canonicalize(path).is_ok_and(|real| !exempt.allows(&real) && secret(&real))
+    crate::localfs::canonicalize(path).is_ok_and(|real| !exempt.allows(&real) && secret(&real))
 }
 
 fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
@@ -1515,8 +1516,15 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
     let bare = is_bare(word);
     let judged = |path: &Path| -> bool {
         if wild {
+            // On a share that is not looked up the expansion is unknown: the pattern itself is
+            // matched against every record.
+            let pattern_hit = if crate::localfs::is_foreign(path) {
+                credpaths::is_credential_pattern(path)
+            } else {
+                credpaths::is_credential_glob(path)
+            };
             !exempt.allows(path)
-                && (credpaths::is_credential_glob(path)
+                && (pattern_hit
                     || secretpath::is_transcript_tree(
                         &path.to_string_lossy(),
                         &secretpath::homes_resolved(),
@@ -1529,7 +1537,7 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
         if wild {
             // The filesystem decides what a pattern names; a bare one needs a match.
             let pattern = path.to_string_lossy().into_owned();
-            let matches: Vec<PathBuf> = glob::glob(&pattern)
+            let matches: Vec<PathBuf> = crate::localfs::glob(&pattern)
                 .map(|g| g.filter_map(Result::ok).take(MAX_GLOB_MATCHES).collect())
                 .unwrap_or_default();
             if matches.iter().any(|m| literal_hit(m, exempt)) {
@@ -1540,7 +1548,7 @@ fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
             }
         } else if bare {
             // A bare word is a file only when it exists in that directory.
-            if std::fs::symlink_metadata(&path).is_ok() && judged(&path) {
+            if crate::localfs::symlink_metadata(&path).is_ok() && judged(&path) {
                 return true;
             }
         } else if judged(&path) {

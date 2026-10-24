@@ -351,9 +351,10 @@ fn home_relative_paths_into_a_blocked_user_pack_are_denied() {
 fn an_unreadable_prompt_is_judged_in_the_payload_cwd() {
     let f = Fixture::new("sg-cwd");
     let elsewhere = TempDir::new("sg-cwd-elsewhere");
+    // The cwd as Claude Code sends it: a JSON string (`C:\\…` on Windows).
     let body = format!(
-        r#"{{"hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"/evil {}"}}"#,
-        f.cwd(),
+        r#"{{"hook_event_name":"UserPromptSubmit","cwd":{},"prompt":"/evil {}"}}"#,
+        serde_json::Value::from(f.cwd()),
         "x".repeat(1024 * 1024 + 16)
     );
     let run = Invocation::new(&["gate-prompt-expansion"])

@@ -135,10 +135,10 @@ fn expand(file: &str, cwd: &Path) -> PathBuf {
 
 /// The canonical path of `path`, or of its parent joined with its name when it does not exist.
 fn resolve(path: &Path) -> Option<PathBuf> {
-    if let Ok(real) = std::fs::canonicalize(path) {
+    if let Ok(real) = crate::localfs::canonicalize(path) {
         return Some(real);
     }
-    let parent = std::fs::canonicalize(path.parent()?).ok()?;
+    let parent = crate::localfs::canonicalize(path.parent()?).ok()?;
     Some(parent.join(path.file_name()?))
 }
 

@@ -25,9 +25,13 @@ struct World {
 
 impl World {
     fn new(tag: &str) -> World {
+        World::with_project(tag, TempDir::new(&format!("{tag}-proj")))
+    }
+
+    fn with_project(tag: &str, proj: TempDir) -> World {
         let w = World {
             home: TempDir::new(&format!("{tag}-home")),
-            proj: TempDir::new(&format!("{tag}-proj")),
+            proj,
             data: TempDir::new(&format!("{tag}-data")),
         };
         std::fs::create_dir_all(w.proj.join(".git")).unwrap();
@@ -426,7 +430,8 @@ fn grep_inside_a_credential_store_denies() {
 
 #[test]
 fn grep_in_a_project_keeps_the_short_exclusion_list() {
-    let w = World::new("cp-grep-proj");
+    // A project inside a home (the Windows temp dir is) gets the full list.
+    let w = World::with_project("cp-grep-proj", TempDir::outside_home("cp-grep-proj-proj"));
     std::fs::create_dir_all(w.proj.join("src")).unwrap();
     for tier in tiers() {
         let run = grep(&w, tier, json!({ "pattern": "fn", "path": "src" }));
@@ -564,5 +569,92 @@ fn exemptions_follow_symlinks_out_of_their_tree() {
                 "{tier:?} {cmd}"
             );
         }
+    }
+}
+
+/// The ways Windows spells a path on another machine's share (Git Bash passes `//h/s` as one).
+#[cfg(windows)]
+const SHARES: &[&str] = &[
+    r"\\unreachable.invalid\s",
+    "//unreachable.invalid/s",
+    r"\\?\UNC\unreachable.invalid\s",
+    r"\\?\unc\unreachable.invalid\s",
+    r"\\.\UNC\unreachable.invalid\s",
+    r"\\?\GLOBALROOT\Device\Mup\unreachable.invalid\s",
+];
+
+/// A share safe-ai-skill does not open (`localfs`) is unknown, not missing: credential denies
+/// hold by name and pattern, its content is asked about, and a search there gets every
+/// exclusion.
+#[cfg(windows)]
+#[test]
+fn credential_denies_hold_through_every_share_spelling() {
+    let w = World::new("cp-unc");
+    for share in SHARES {
+        let sh = share.replace('\\', "/");
+        for tier in tiers() {
+            for rel in [
+                "home/me/.config/solana/id.json",
+                "proj/deploy-keypair.json",
+                "home/me/.ssh/id_ed25519",
+            ] {
+                let path = format!("{share}\\{}", rel.replace('/', "\\"));
+                assert_eq!(w.read(tier, &path), "deny", "{tier:?} {path}");
+            }
+            if tier != Tier::Off {
+                let want = if tier == Tier::High { "deny" } else { "ask" };
+                let path = format!(r"{share}\proj\backup.json");
+                assert_eq!(w.read(tier, &path), want, "{tier:?} {path}");
+            }
+            let run = grep(&w, tier, json!({ "pattern": "PRIVATE KEY", "path": share }));
+            let v = run.json();
+            let glob = v["hookSpecificOutput"]["updatedInput"]["glob"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{share}: {v}"));
+            for want in ["**/.env", "**/*-keypair.json", ".aws", ".config/solana"] {
+                assert!(glob.contains(&ci(want)), "{share}: missing {want}");
+            }
+            for command in [
+                format!("cat {sh}/home/me/.config/sol*/id.json"),
+                format!("cat {sh}/proj/deploy-k*.json"),
+                format!("cat {sh}/home/me/.ssh/id_*"),
+            ] {
+                assert_eq!(w.bash(tier, &command), "deny", "{tier:?} {command}");
+            }
+        }
+    }
+}
+
+/// This machine's own shares are opened like a drive: a keypair under a neutral name is
+/// denied by its content through `\\localhost\C$`, `\\127.0.0.1\C$` and `\\?\UNC\localhost`.
+#[cfg(windows)]
+#[test]
+fn loopback_shares_are_read_like_the_drive() {
+    let w = World::new("cp-loop");
+    let file = w.proj.join("backup.json");
+    let body: Vec<String> = (0..64).map(|i| ((i * 7) % 256).to_string()).collect();
+    std::fs::write(&file, format!("[{}]", body.join(","))).unwrap();
+    let real = std::fs::canonicalize(&file).unwrap();
+    let real = real
+        .to_str()
+        .unwrap()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+    let (drive, rest) = real.split_once(":\\").unwrap();
+    let mut ran = 0;
+    for host in [r"\\localhost", r"\\127.0.0.1", r"\\?\UNC\localhost"] {
+        let path = format!(r"{host}\{drive}$\{rest}");
+        if std::fs::metadata(&path).is_err() {
+            eprintln!("skipped {path}: the administrative share is not available here");
+            continue;
+        }
+        ran += 1;
+        for tier in tiers() {
+            assert_eq!(w.read(tier, &path), "deny", "{tier:?} {path}");
+        }
+    }
+    // CI's Windows runners are admin with `C$` shared: there the test must not skip it all.
+    if std::env::var_os("CI").is_some() {
+        assert!(ran > 0, "no loopback spelling of {real} was available");
     }
 }

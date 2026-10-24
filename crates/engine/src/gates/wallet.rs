@@ -421,6 +421,8 @@ impl Wallets {
         if let Some(home) = homes.expand_base() {
             if let Some(custom) = config_keypair_path(home) {
                 if let Some(path) = resolve(&custom, home, homes) {
+                    // The user's own config names it: its share is looked up like the home's.
+                    crate::localfs::trust_share_of(&path);
                     files.push(path);
                 }
             }
@@ -431,7 +433,7 @@ impl Wallets {
             .collect();
         let canonical = files
             .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter_map(|p| crate::localfs::canonicalize(p).ok())
             .collect();
         Wallets { paths, canonical }
     }
@@ -445,7 +447,7 @@ impl Wallets {
                 .collect(),
             canonical: files
                 .iter()
-                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .filter_map(|p| crate::localfs::canonicalize(p).ok())
                 .collect(),
         }
     }
@@ -455,7 +457,7 @@ impl Wallets {
         let prefix = format!("{}/", key(dir));
         self.paths
             .iter()
-            .find(|(p, shown)| p.starts_with(&prefix) && Path::new(shown).exists())
+            .find(|(p, shown)| p.starts_with(&prefix) && crate::localfs::exists(shown))
             .map(|(_, shown)| shown.clone())
     }
 
@@ -465,7 +467,7 @@ impl Wallets {
         if let Some((_, shown)) = self.paths.iter().find(|(p, _)| *p == k) {
             return Some(shown.clone());
         }
-        let real = std::fs::canonicalize(path).ok()?;
+        let real = crate::localfs::canonicalize(path).ok()?;
         self.canonical
             .contains(&real)
             .then(|| real.display().to_string())
@@ -484,7 +486,7 @@ impl Wallets {
         if let Some((_, shown)) = self.paths.iter().find(|(p, _)| p.starts_with(&prefix)) {
             return Some(format!("{shown} (inside {})", path.display()));
         }
-        let real = std::fs::canonicalize(path).ok()?;
+        let real = crate::localfs::canonicalize(path).ok()?;
         self.canonical
             .iter()
             .find(|c| c.starts_with(&real) && **c != real)
@@ -543,7 +545,7 @@ fn key(path: &Path) -> String {
 /// `keypair_path` from `<home>/.config/solana/cli/config.yml`, when set.
 fn config_keypair_path(home: &Path) -> Option<String> {
     let path = home.join(CLI_CONFIG);
-    let meta = std::fs::metadata(&path).ok()?;
+    let meta = crate::localfs::metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
     }

@@ -586,11 +586,11 @@ fn corrupted_objects_never_panic_and_are_reported() {
         .join(".git/objects")
         .join(&blob_id[..2])
         .join(&blob_id[2..]);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).unwrap();
-    }
+    // git writes objects read-only (the readonly attribute on Windows).
+    let mut perms = fs::metadata(&loose).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&loose, perms).unwrap();
     fs::write(&loose, b"\x78\x9cnot zlib at all").unwrap();
     let h = history::scan_with(&dir, unlimited());
     assert!(

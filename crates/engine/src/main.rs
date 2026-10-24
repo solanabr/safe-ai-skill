@@ -419,6 +419,8 @@ fn cwd_of(input: &HookInput) -> PathBuf {
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // The payload's cwd (Claude Code's), not a model-chosen `workdir`, may be on a share.
+    safe_ai_skill::localfs::trust_share_of(&cwd);
     let workdir = input
         .tool_input
         .as_ref()
@@ -760,6 +762,7 @@ fn cmd_gate_prompt_expansion() -> ExitCode {
         // name cannot be read while a pack in scope is blocked, is blocked).
         _ => {
             let cwd = verify::enforce::raw_cwd(&raw).unwrap_or_else(process_cwd);
+            safe_ai_skill::localfs::trust_share_of(&cwd);
             let dir = state_dir(&cwd);
             let effective = load_effective_policy(&cwd, &dir);
             let block = verify::enforce::unreadable_prompt_verdict(&dir, &cwd, &effective, &raw);

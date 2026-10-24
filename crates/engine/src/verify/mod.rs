@@ -4809,6 +4809,26 @@ mod enforce_tests {
             Some(PathBuf::from(cwd))
         );
         assert_eq!(enforce::raw_cwd(br#"{"cwd":"relative/dir""#), None);
+        if cfg!(windows) {
+            assert_eq!(
+                enforce::raw_cwd(br#"{"cwd":"C:\\work\\proj","prompt":"/x"#),
+                Some(PathBuf::from(r"C:\work\proj"))
+            );
+        }
+        assert_eq!(
+            enforce::raw_cwd(br#"{"cwd":"/work/a\"b","prompt":"/x"#),
+            None
+        );
+        assert_eq!(
+            enforce::raw_cwd(br#"{"cwd":"/work/\u0041","prompt":"/x"#),
+            None
+        );
+        if !cfg!(windows) {
+            assert_eq!(
+                enforce::raw_cwd(br#"{"cwd":"\/work\/proj","prompt":"/x"#),
+                Some(PathBuf::from("/work/proj"))
+            );
+        }
         assert_eq!(enforce::raw_cwd(br#"{"prompt":"x"#), None);
     }
 

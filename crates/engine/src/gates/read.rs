@@ -81,12 +81,18 @@ pub fn decide_tool(tool: &str, input: Option<&Value>, cwd: &Path, policy: &Polic
 
 /// Judge a read of `path` (see the module docs for precedence).
 pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
+    decide_path_with(path, cwd, policy, true)
+}
+
+/// [`decide_path`]; without `unknown`, content on an unopened share is not asked about (a Grep
+/// root there gets the exclusions instead).
+fn decide_path_with(path: &str, cwd: &Path, policy: &Policy, unknown: bool) -> Decision {
     if path.trim().is_empty() {
         return Decision::Defer;
     }
     let homes = secretpath::homes_resolved();
     let raw = absolute(path, cwd, &homes);
-    let resolved = std::fs::canonicalize(&raw).ok();
+    let resolved = crate::localfs::canonicalize(&raw).ok();
     let mut candidates = vec![raw.to_string_lossy().into_owned()];
     if let Some(real) = &resolved {
         let real = real.to_string_lossy().into_owned();
@@ -131,6 +137,14 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     if suspect && sniffed == Sniffed::Unreadable {
         return hard_deny("possible key file that could not be checked");
     }
+    // A file on a network share that is not looked up: its content is unknown, and it could be
+    // a keypair under any name.
+    if unknown
+        && sniffed == Sniffed::Unreadable
+        && (crate::localfs::is_foreign(&raw) || crate::localfs::is_foreign(file))
+    {
+        return unknown_content(policy);
+    }
     if pem && sniffed == Sniffed::TooLarge {
         return hard_deny("key file too large to check (over 1 MiB)");
     }
@@ -138,6 +152,23 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
         return guard_env_schema(file);
     }
     Decision::Defer
+}
+
+/// The verdict for a read whose content could not be checked because it is on a network share
+/// that is not looked up ([`crate::localfs`]): ask, deny at tier High (headless turns the ask
+/// into a deny downstream).
+fn unknown_content(policy: &Policy) -> Decision {
+    let reason = "safe-ai-skill: this file is on a network share safe-ai-skill does not open, so \
+                  its content (a keypair or private key under any name) could not be checked";
+    if policy.tier() == crate::policy::tier::Tier::High {
+        Decision::Deny {
+            reason: format!("{reason} — denied at tier high"),
+        }
+    } else {
+        Decision::Ask {
+            reason: format!("{reason} — approve to proceed"),
+        }
+    }
 }
 
 /// Whether the absolute `candidate` names a project env file whose raw read the env gate
@@ -337,7 +368,7 @@ fn shell_label(file: &str) -> String {
 /// Whether the varlock hint applies: a `.env.schema` next to the file or in `cwd`, or a
 /// `varlock` executable on `PATH`.
 pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
-    let schema_in = |dir: &Path| dir.join(".env.schema").is_file();
+    let schema_in = |dir: &Path| crate::localfs::is_file(dir.join(".env.schema"));
     if schema_in(cwd) || file.parent().is_some_and(schema_in) {
         return true;
     }
@@ -347,7 +378,7 @@ pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
     std::env::split_paths(&path).any(|dir| {
         ["varlock", "varlock.exe", "varlock.cmd"]
             .iter()
-            .any(|name| dir.join(name).is_file())
+            .any(|name| crate::localfs::is_file(dir.join(name)))
     })
 }
 
@@ -356,7 +387,7 @@ pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
 /// literal secret-looking value for a sensitive key. A missing schema is no opinion. The schema
 /// is parsed natively ([`Schema`]); nothing in it is evaluated.
 pub fn guard_env_schema(file: &Path) -> Decision {
-    let meta = match std::fs::metadata(file) {
+    let meta = match crate::localfs::metadata(file) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Decision::Defer,
         Err(_) => return schema_denied("could not be resolved"),
@@ -443,15 +474,25 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
         absolute(path, cwd, &homes)
     };
 
-    if !target.is_dir() {
+    // A root on a network share that is not looked up may be a directory: it gets the full
+    // exclusion list (ripgrep ignores `--glob` for a single file anyway).
+    let foreign = crate::localfs::is_foreign(&target);
+    if !foreign && !crate::localfs::is_dir(&target) {
         // A single file (or nothing): judged like a Read; the glob does not apply.
         if path.trim().is_empty() {
             return ReadVerdict::Decide(Decision::Defer);
         }
         return ReadVerdict::Decide(decide_path(path, cwd, policy));
     }
+    // It may be a file too: its name rules still deny (its unknown content is covered by the
+    // exclusions when it is a directory, and asked about by a Read).
+    if foreign {
+        if let deny @ Decision::Deny { .. } = decide_path_with(path, cwd, policy, false) {
+            return ReadVerdict::Decide(deny);
+        }
+    }
 
-    let real = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let real = crate::localfs::canonicalize(&target).unwrap_or_else(|_| target.clone());
     if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
         return ReadVerdict::Decide(verdict.into());
     }
@@ -631,18 +672,21 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
 fn holds_claude_state(arg: &str, cwd: &Path) -> bool {
     let homes = secretpath::homes_resolved();
     let target = absolute(arg, cwd, &homes);
-    if !target.is_dir() {
+    if !crate::localfs::is_dir(&target) {
         return false;
     }
-    let forms: Vec<String> = [Some(target.clone()), std::fs::canonicalize(&target).ok()]
-        .into_iter()
-        .flatten()
-        .map(|p| {
-            secretpath::normalize(&p.to_string_lossy(), None)
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .collect();
+    let forms: Vec<String> = [
+        Some(target.clone()),
+        crate::localfs::canonicalize(&target).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| {
+        secretpath::normalize(&p.to_string_lossy(), None)
+            .trim_end_matches('/')
+            .to_string()
+    })
+    .collect();
     let configs: Vec<String> = homes
         .iter()
         .map(|h| {

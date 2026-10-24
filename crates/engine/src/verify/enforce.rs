@@ -109,19 +109,30 @@ fn blocked_packs(dir: &DataDir, st: &State) -> Vec<BlockedPack> {
             // Where it was moved, as recorded and with symlinks resolved (a data dir under
             // a symlinked temp dir is compared by its real path).
             for moved in e.quarantined_to.iter().map(PathBuf::from) {
-                if let Ok(real) = moved.canonicalize() {
+                if let Ok(real) = crate::localfs::canonicalize(&moved) {
                     roots.push(real);
                 }
                 roots.push(moved);
             }
             Some(BlockedPack {
                 roots,
-                shown: key.clone(),
+                shown: shown_key(key),
                 why,
                 class,
             })
         })
         .collect()
+}
+
+/// A pack's state key (its canonical path) as a denial shows it: on Windows without the
+/// `\\?\` prefix and `/`-separated, so it reads like the paths the user types and survives
+/// pasting into Git Bash.
+fn shown_key(key: &str) -> String {
+    if cfg!(windows) {
+        crate::localfs::without_verbatim(key).replace('\\', "/")
+    } else {
+        key.to_string()
+    }
 }
 
 fn why_label(reason: Option<state::Reason>) -> &'static str {
@@ -162,7 +173,7 @@ fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
     }
     let mut out: Vec<PathBuf> = Vec::new();
     for d in dirs {
-        let c = d.canonicalize().unwrap_or(d);
+        let c = crate::localfs::canonicalize(&d).unwrap_or(d);
         if !out.contains(&c) {
             out.push(c);
         }
@@ -388,9 +399,8 @@ pub(super) fn skill_verdict_in(
     // A pack `on_block: move` took out of scope is no longer on disk to be found above, but
     // its skill names stay denied.
     if blocked.is_none() {
-        let user = user_skills
-            .canonicalize()
-            .unwrap_or_else(|_| user_skills.to_path_buf());
+        let user =
+            crate::localfs::canonicalize(user_skills).unwrap_or_else(|_| user_skills.to_path_buf());
         blocked = st
             .packs
             .iter()
@@ -406,7 +416,7 @@ pub(super) fn skill_verdict_in(
                             .any(|p| origin.starts_with(p))
                     }
             })
-            .map(|(key, e)| (key.clone(), why_label(e.reason)))
+            .map(|(key, e)| (shown_key(key), why_label(e.reason)))
             .next();
     }
     if let Some((shown, why)) = blocked {
@@ -501,12 +511,24 @@ pub fn slash_name_from_raw(raw: &[u8]) -> Option<Option<String>> {
     }
 }
 
-/// The `cwd` an unparseable hook payload carries, read from its head.
+/// The `cwd` an unparseable hook payload carries, read from its head. JSON's `\\` and `\/`
+/// escapes are decoded (a Windows cwd is `C:\\…` in the payload); any other escape, which
+/// [`raw_string`] may have cut short, yields `None`.
 pub fn raw_cwd(raw: &[u8]) -> Option<PathBuf> {
-    raw_string(raw, "cwd")
-        .filter(|c| !c.is_empty() && !c.contains('\\'))
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+    let text = raw_string(raw, "cwd")?;
+    let mut cwd = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            cwd.push(c);
+            continue;
+        }
+        match chars.next()? {
+            e @ ('\\' | '/') => cwd.push(e),
+            _ => return None,
+        }
+    }
+    Some(PathBuf::from(cwd)).filter(|p| p.is_absolute())
 }
 
 /// The string value of JSON key `key` in the first [`RAW_HEAD_BYTES`] of `raw`, up to its
@@ -545,7 +567,7 @@ pub fn unreadable_prompt_verdict(
             let mut scope = project_dirs(cwd);
             // User-level packs load in every project.
             let user = expand_home(USER_SKILLS_DIR);
-            scope.push(user.canonicalize().unwrap_or(user));
+            scope.push(crate::localfs::canonicalize(&user).unwrap_or(user));
             let blocked = blocked_packs(dir, &st).into_iter().find(|b| {
                 (b.class == Class::Hard || tier == Tier::High)
                     && b.roots
@@ -656,7 +678,7 @@ fn keep_strictest<'a>(
 /// The blocked pack that lies inside the directory `root` (a hard pack before a high one).
 fn contains_blocked<'a>(root: &Path, blocked: &'a [BlockedPack]) -> Option<&'a BlockedPack> {
     let mut forms = vec![lenient_canonical(root)];
-    if let Ok(real) = root.canonicalize() {
+    if let Ok(real) = crate::localfs::canonicalize(root) {
         forms.push(real);
     }
     first_hit(blocked, |b| {
@@ -822,7 +844,7 @@ fn expand(wd: &Path, word: &str, home: Option<&Path>) -> Vec<PathBuf> {
     if !word.contains(['*', '?', '[']) {
         return vec![path];
     }
-    match glob::glob(&path.to_string_lossy()) {
+    match crate::localfs::glob(&path.to_string_lossy()) {
         Ok(paths) => paths.flatten().take(MAX_GLOB_MATCHES).collect(),
         Err(_) => vec![path],
     }
@@ -843,7 +865,7 @@ fn absolute(base: &Path, p: &str) -> PathBuf {
 /// comes before a high one.
 fn inside_blocked<'a>(path: &Path, blocked: &'a [BlockedPack]) -> Option<&'a BlockedPack> {
     let mut forms = vec![lenient_canonical(path)];
-    if let Ok(real) = path.canonicalize() {
+    if let Ok(real) = crate::localfs::canonicalize(path) {
         forms.push(real);
     }
     first_hit(blocked, |b| {
@@ -874,7 +896,7 @@ pub(super) fn lenient_canonical(path: &Path) -> PathBuf {
     let mut existing = path.clone();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        if let Ok(mut c) = existing.canonicalize() {
+        if let Ok(mut c) = crate::localfs::canonicalize(&existing) {
             for t in tail.iter().rev() {
                 c.push(t);
             }

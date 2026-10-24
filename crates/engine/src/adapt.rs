@@ -211,7 +211,7 @@ impl CodexTargets {
             for dir in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
                 for name in ENGINE_NAMES {
                     let candidate = dir.join(name);
-                    if candidate.exists() {
+                    if crate::localfs::exists(&candidate) {
                         t.push_engine(candidate);
                     }
                 }
@@ -239,7 +239,7 @@ impl CodexTargets {
                 ".claude/settings.local.json",
             ] {
                 let file = dir.join(rel);
-                if file.exists() && !files.contains(&file) {
+                if crate::localfs::exists(&file) && !files.contains(&file) {
                     files.push(file);
                 }
             }
@@ -306,7 +306,7 @@ fn canonical_prefix(path: &Path) -> PathBuf {
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
-        if let Ok(canon) = std::fs::canonicalize(cur) {
+        if let Ok(canon) = crate::localfs::canonicalize(cur) {
             let mut out = canon;
             for part in rest.iter().rev() {
                 out.push(part);
@@ -561,7 +561,13 @@ fn code_paths(code: &str) -> impl Iterator<Item = &str> {
                 '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '=' | '`'
             )
     })
-    .filter(|piece| piece.contains('/') || piece.starts_with('~'))
+    .filter(|piece| path_like(piece))
+}
+
+/// Whether a word or code piece may be a path: it holds a separator (`\` too on Windows,
+/// where code spells `C:\\…`) or starts with `~`.
+fn path_like(piece: &str) -> bool {
+    piece.contains('/') || piece.starts_with('~') || (cfg!(windows) && piece.contains('\\'))
 }
 
 fn bash_reason_depth(
@@ -606,7 +612,7 @@ fn bash_reason_depth(
                 return Some(reason);
             }
         }
-        if depth > 0 && (word.contains('/') || word.starts_with('~')) {
+        if depth > 0 && path_like(word) {
             if let Some(reason) = patch_target_reason(word, cwd, targets) {
                 return Some(reason);
             }
