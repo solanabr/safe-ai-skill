@@ -104,7 +104,7 @@ npx @stbr/safe-ai-skill add skill <name|url>  # or run without installing
 curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 ```
 
-Downloads the prebuilt binary for your platform and verifies its SHA-256 against the release's published `SHA256SUMS` before installing — checksum-pinned, not an opaque pipe. Set `SAFE_AI_SKILL_BIN_DIR` to override the install location (default `~/.local/bin`).
+Downloads the prebuilt binary for your platform and verifies its SHA-256 against the release's published `SHA256SUMS` before installing — checksum-pinned, not an opaque pipe. Set `SAFE_AI_SKILL_BIN_DIR` to override the install location (default `~/.local/bin`). From 1.2.0, on macOS and Linux, it also installs the plugin's shim as `safe-ai-skill`, with the binary beside it as `safe-ai-skill-<platform>`. The shim checks the binary's sha256, and it is the entry point the [Codex hooks](docs/adapters.md) need.
 
 **cargo** (any platform with a Rust toolchain)
 
@@ -252,7 +252,7 @@ safe-ai-skill revoke                 # drop every grant at once
 safe-ai-skill session                # show active session state
 ```
 
-`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. If none of these resolves it exits 1 and asks you to set `CLAUDE_PLUGIN_DATA`; when the plugin is installed but no session has run yet (Claude Code creates the data dir on the first hook run), it says to start a session once. `status` prints the dir it used and lists pending requests (id, kind, when created and when they lapse, how to confirm; never the code).
+`verify approve`, `install` and `add` change what the firewall pins, so the agent can't run them: the tamper tripwire denies them, and bare `verify` / `verify session` too, which only the SessionStart hook runs. Run them in your own terminal; `verify check <dir>` stays open to the agent because it pins nothing. From a terminal the CLI uses the same state as the hooks: `$CLAUDE_PLUGIN_DATA` if set, otherwise the plugin's dir under `~/.claude/plugins/data/` (or `$CLAUDE_CONFIG_DIR/plugins/data/`, which replaces `~/.claude`), `safe-ai-skill-safe-ai-skill` first, then `safe-ai-skill-stbr`, then the only `safe-ai-skill-*` dir. Without the plugin, it uses the standalone dir the Codex hooks share: `$SAFE_AI_SKILL_DATA`, else `safe-ai-skill-data` under `~/Library/Application Support` (macOS), `$XDG_DATA_HOME` or `~/.local/share` (other unix), or `%LOCALAPPDATA%` (Windows). It exits 1 when several plugin dirs make the choice ambiguous. When the plugin is installed but no session has run yet (Claude Code creates the data dir on the first hook run), it says to start a session once. `status` prints the dir it used and lists pending requests (id, kind, when created and when they lapse, how to confirm; never the code).
 
 **Relaxations need your confirmation in the prompt.** `allow` and a `tier` lowering (or an `--env-read` loosening) change
 nothing on their own (the agent may run them, because they only create a request it cannot confirm): they record a request (`request r3fa91c`) and print no code. Claude Code
@@ -338,7 +338,13 @@ The kit's `stbr` marketplace installs this plugin; don't add this marketplace to
 
 The proposal is in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs); the proposed kit-side changes are drafted in [docs/drafts/aikit-firewall-split.md](docs/drafts/aikit-firewall-split.md). Until the kit change lands, `/firewall` does not run `safe-ai-skill tier`; run `safe-ai-skill tier <t> --project` yourself. Today both hook sets run on every Bash call.
 
-**Codex CLI (experimental):** `safe-ai-skill adapt codex <gate>` runs the Bash, file-edit and MCP gates as Codex hooks, and turns every `ask` into a `deny` because Codex hooks cannot ask. Setup and limits are in [docs/adapters.md](docs/adapters.md). opencode is not covered yet ([#23](https://github.com/solanabr/safe-ai-skill/issues/23)).
+**Codex CLI (experimental):** `safe-ai-skill adapt codex <entry>`, run through the shim, does four things as Codex hooks:
+- It runs the Bash, file-edit and MCP gates, and turns every `ask` into a `deny` because Codex hooks cannot ask.
+- It runs the session-start sweep.
+- It can block results that hold secrets (opt-in).
+- It keeps tiers, grants and the audit log in a standalone data dir when the Claude Code plugin is not installed.
+
+Grants can only be confirmed in Claude Code. Setup and limits are in [docs/adapters.md](docs/adapters.md). opencode is not covered yet ([#26](https://github.com/solanabr/safe-ai-skill/issues/26)).
 
 safe-ai-skill is standalone — it can be installed independently of any particular skill hub. It adds a security and control layer over whatever skills, MCPs, and agents you already have.
 
