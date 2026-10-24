@@ -6,9 +6,14 @@
 //
 // Engine: the plugin option `engine` (`"plugin": [["file:///…/safe-ai-skill.js",
 // {"engine": "/abs/path/safe-ai-skill"}]]`), else $SAFE_AI_SKILL_ENGINE, else `safe-ai-skill`
-// on PATH. No dependencies; runs under Bun or Node.
+// on PATH. It is resolved to an absolute, symlink-free path once, when opencode loads the
+// plugin; if that resolution or the file later changes, every call is blocked until opencode
+// restarts. No dependencies; runs under Bun or Node.
 
 import { spawn } from "node:child_process"
+import { accessSync, constants, realpathSync, statSync } from "node:fs"
+import { delimiter, isAbsolute, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 const GATES = {
   bash: ["gate-bash", "gate-bash-secrets"],
@@ -20,7 +25,8 @@ const GATES = {
   apply_patch: ["gate-tamper"],
 }
 
-// Built-in tools no gate reads. Every other tool id (MCP `<server>_<tool>`, plugin and
+// Built-in tools no gate reads (the engine keeps the same list; a tool sent to the wrong gate
+// is denied there, so drift fails closed). Every other tool id (MCP `<server>_<tool>`, plugin and
 // custom tools, `read_mcp_resource`) goes to gate-mcp.
 const UNGATED = new Set([
   "task", "todowrite", "todoread", "question", "webfetch", "websearch", "plan_exit",
@@ -32,15 +38,39 @@ const TIMEOUT_MS = 15000
 const MAX_OUTPUT = 1 << 20
 const DENY_PREFIX = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny",'
 
+// The engine as an absolute, symlink-free path with the file's identity, or {error}.
+function locate(engine) {
+  const name = String(engine)
+  let candidates
+  if (name.includes("/") || name.includes("\\")) {
+    candidates = [resolve(name)]
+  } else {
+    const dirs = (process.env.PATH ?? "").split(delimiter).filter((d) => isAbsolute(d))
+    const names = process.platform === "win32" ? [`${name}.exe`, name] : [name]
+    candidates = dirs.flatMap((d) => names.map((n) => join(d, n)))
+  }
+  for (const candidate of candidates) {
+    try {
+      accessSync(candidate, constants.X_OK)
+      const path = realpathSync(candidate)
+      const st = statSync(path)
+      if (!st.isFile()) continue
+      return { path, id: `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}` }
+    } catch {}
+  }
+  return { error: `the safe-ai-skill engine (${name}) was not found` }
+}
+
 function runEngine(engine, gate, payload, timeoutMs) {
-  return new Promise((resolve) => {
+  return new Promise((done_) => {
     let stdout = ""
     let settled = false
+    let timer
     const done = (result) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      resolve(result)
+      done_(result)
     }
     let child
     try {
@@ -48,11 +78,12 @@ function runEngine(engine, gate, payload, timeoutMs) {
     } catch (e) {
       return done({ error: `could not start ${engine}: ${e.message}` })
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       child.kill("SIGKILL")
       done({ error: `the engine did not answer within ${timeoutMs} ms` })
     }, timeoutMs)
     child.on("error", (e) => done({ error: `could not run ${engine}: ${e.message}` }))
+    child.stdout.setEncoding("utf8")
     child.stdout.on("data", (chunk) => {
       stdout += chunk
       if (stdout.length > MAX_OUTPUT) {
@@ -100,7 +131,9 @@ function verdict(gate, result) {
 }
 
 export const SafeAiSkill = async ({ directory, worktree }, options) => {
-  const engine = options?.engine || process.env.SAFE_AI_SKILL_ENGINE || "safe-ai-skill"
+  const name = options?.engine || process.env.SAFE_AI_SKILL_ENGINE || "safe-ai-skill"
+  const engine = locate(name)
+  const pluginPath = fileURLToPath(import.meta.url)
   const timeoutMs = Number(options?.timeoutMs) > 0 ? Number(options.timeoutMs) : TIMEOUT_MS
   let mcpServers = []
   return {
@@ -109,7 +142,13 @@ export const SafeAiSkill = async ({ directory, worktree }, options) => {
     },
     "tool.execute.before": async (input, output) => {
       const tool = input?.tool
-      const gates = GATES[tool] ?? (UNGATED.has(tool) ? [] : ["gate-mcp"])
+      const gates = Object.hasOwn(GATES, tool) ? GATES[tool] : UNGATED.has(tool) ? [] : ["gate-mcp"]
+      if (gates.length === 0) return
+      if (engine.error) throw new Error(`safe-ai-skill: ${engine.error}; blocked until it is installed and opencode restarts.`)
+      const now = locate(name)
+      if (now.path !== engine.path || now.id !== engine.id) {
+        throw new Error("safe-ai-skill: the safe-ai-skill engine changed since opencode started; blocked until opencode restarts.")
+      }
       for (const gate of gates) {
         const payload = JSON.stringify({
           tool,
@@ -119,8 +158,9 @@ export const SafeAiSkill = async ({ directory, worktree }, options) => {
           directory,
           worktree,
           mcpServers,
+          pluginPath,
         })
-        const v = verdict(gate, await runEngine(engine, gate, payload, timeoutMs))
+        const v = verdict(gate, await runEngine(engine.path, gate, payload, timeoutMs))
         if (v.block !== undefined) throw new Error(`safe-ai-skill: ${v.block.replace(/^safe-ai-skill: /, "")}`)
         // opencode passes this same args object to the tool, so change it in place.
         if (v.args) Object.assign(output.args, v.args)

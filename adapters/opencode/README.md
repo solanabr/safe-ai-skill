@@ -19,6 +19,10 @@ Use `<repo>/.opencode/plugins/` instead for one project. To run an engine that i
 { "plugin": [["file:///abs/path/safe-ai-skill.js", { "engine": "/abs/path/safe-ai-skill" }]] }
 ```
 
+The engine is resolved to an absolute path when opencode starts. If it changes later (an
+upgrade, or another `safe-ai-skill` placed earlier on `PATH`), every gated call is blocked
+until opencode restarts.
+
 Check it by asking the agent to run `cat ~/.config/solana/id.json`: the call must fail with a
 `safe-ai-skill:` message.
 

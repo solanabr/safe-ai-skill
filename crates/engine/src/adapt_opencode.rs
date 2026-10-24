@@ -95,6 +95,9 @@ pub enum Prepared {
 /// The opencode args of the call being judged, kept for [`grep_rewrite`].
 static ORIGINAL_ARGS: OnceLock<Map<String, Value>> = OnceLock::new();
 
+/// The directory an opencode grep searches, kept for [`grep_rewrite`].
+static GREP_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
 /// Translate the plugin's payload for `gate` ([`GATES`]) and apply the opencode
 /// self-protection ([`Targets`]).
 pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
@@ -132,11 +135,20 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
             json!({ "pattern": arg("pattern"), "path": arg("path") }),
         ),
         ("gate-read", "grep") => {
+            // opencode runs ripgrep in `path` when it is a directory, else in its parent
+            // (`src/tool/grep.ts`): a file path searches the whole directory, so it is judged
+            // as that directory.
+            let mut root = match arg("path").filter(|p| !p.trim().is_empty()) {
+                Some(p) => absolute(p, &directory, home().as_deref()),
+                None => directory.clone(),
+            };
+            if !root.is_dir() {
+                root = root.parent().map(Path::to_path_buf).unwrap_or(root);
+            }
+            let _ = GREP_ROOT.set(root.clone());
             let mut input = Map::new();
             input.insert("pattern".into(), json!(arg("pattern")));
-            if let Some(p) = arg("path") {
-                input.insert("path".into(), json!(p));
-            }
+            input.insert("path".into(), json!(root));
             if let Some(g) = arg("include") {
                 input.insert("glob".into(), json!(g));
             }
@@ -187,8 +199,11 @@ pub fn prepare(gate: &str, raw: &[u8]) -> Prepared {
         "tool_name": tool_name,
         "tool_input": tool_input,
     });
-    let bytes = serde_json::to_vec(&translated).unwrap_or_default();
-    let targets = || Targets::from_env(&directory);
+    let Ok(bytes) = serde_json::to_vec(&translated) else {
+        return Prepared::Malformed("the payload could not be translated".into());
+    };
+    let plugin = text("pluginPath");
+    let targets = || Targets::from_env(&directory, plugin);
     let reason = match tool {
         "write" | "edit" => arg("filePath").and_then(|p| targets().path_reason(p, &cwd)),
         "apply_patch" => {
@@ -255,11 +270,11 @@ pub fn mcp_tool_name(tool: &str, servers: &[String]) -> String {
     }
 }
 
-/// MCP server names from the opencode config files the engine can read: the global config
-/// dir's `config.json`/`opencode.json(c)`, `$OPENCODE_CONFIG`, `opencode.json(c)` and
-/// `.opencode/opencode.json(c)` in `dir` and every directory above it,
-/// `$OPENCODE_CONFIG_DIR/opencode.json(c)` and `$OPENCODE_CONFIG_CONTENT`.
-pub fn configured_servers(dir: &Path) -> Vec<String> {
+/// The opencode config documents the engine can read, with the file each came from: the
+/// global config dir's `config.json`/`opencode.json(c)`, `$OPENCODE_CONFIG`, `opencode.json(c)`
+/// and `.opencode/opencode.json(c)` in `dir` and every directory above it,
+/// `$OPENCODE_CONFIG_DIR/opencode.json(c)` and `$OPENCODE_CONFIG_CONTENT` (no file).
+fn config_docs(dir: &Path) -> Vec<(Option<PathBuf>, Value)> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Some(global) = global_config_dir() {
         files.extend(["config.json", "opencode.json", "opencode.jsonc"].map(|f| global.join(f)));
@@ -280,24 +295,63 @@ pub fn configured_servers(dir: &Path) -> Vec<String> {
     if let Some(d) = env_path("OPENCODE_CONFIG_DIR") {
         files.extend(["opencode.json", "opencode.jsonc"].map(|f| d.join(f)));
     }
-    let mut texts: Vec<String> = files
-        .iter()
+    let parse = |text: &str| serde_json::from_str::<Value>(&strip_jsonc(text)).ok();
+    let mut docs: Vec<(Option<PathBuf>, Value)> = files
+        .into_iter()
         .filter(|f| std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() <= MAX_CONFIG_BYTES))
-        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .filter_map(|f| {
+            let v = parse(&std::fs::read_to_string(&f).ok()?)?;
+            Some((Some(f), v))
+        })
         .collect();
-    if let Ok(content) = std::env::var("OPENCODE_CONFIG_CONTENT") {
-        texts.push(content);
+    if let Some(v) = std::env::var("OPENCODE_CONFIG_CONTENT")
+        .ok()
+        .and_then(|t| parse(&t))
+    {
+        docs.push((None, v));
     }
-    let mut names = Vec::new();
-    for text in texts {
-        let Ok(v) = serde_json::from_str::<Value>(&strip_jsonc(&text)) else {
+    docs
+}
+
+/// MCP server names (the keys of `mcp`) in the opencode config ([`config_docs`]).
+pub fn configured_servers(dir: &Path) -> Vec<String> {
+    config_docs(dir)
+        .iter()
+        .filter_map(|(_, v)| v.get("mcp").and_then(Value::as_object))
+        .flat_map(|mcp| mcp.keys().cloned())
+        .collect()
+}
+
+/// The files and directories that path-spec plugins in the opencode config name (`"plugin":
+/// ["./x.ts", "file:///…", ["/abs/y.js", {…}]]`), resolved as opencode does: a `file://` URL
+/// or an absolute path as is, a `.`-relative path against the declaring file's directory.
+pub fn configured_plugin_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (file, doc) in config_docs(dir) {
+        let Some(list) = doc.get("plugin").and_then(Value::as_array) else {
             continue;
         };
-        if let Some(mcp) = v.get("mcp").and_then(Value::as_object) {
-            names.extend(mcp.keys().cloned());
+        let base = file
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| dir.to_path_buf());
+        for entry in list {
+            let spec = entry
+                .as_str()
+                .or_else(|| entry.get(0).and_then(Value::as_str))
+                .unwrap_or("");
+            let path = if let Some(rest) = spec.strip_prefix("file://") {
+                PathBuf::from(rest.replace("%20", " "))
+            } else if spec.starts_with('.') || Path::new(spec).is_absolute() {
+                base.join(spec)
+            } else {
+                continue;
+            };
+            out.push(lexical(&path));
         }
     }
-    names
+    out
 }
 
 /// JSONC to JSON: `//` and `/* */` comments outside strings removed, and a comma before a
@@ -387,28 +441,32 @@ pub enum Rewrite {
 }
 
 /// File extensions an opencode Grep `include` may name and still run unchanged: none of them
-/// is a credential file's.
+/// is a credential file's (an `.env.<ext>` file is the documented exception).
 const CODE_EXTS: &[&str] = &[
-    "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "md", "mdx", "sol",
-    "move", "c", "h", "cc", "cpp", "hpp", "cxx", "java", "kt", "kts", "swift", "rb", "php", "cs",
-    "css", "scss", "sass", "less", "html", "htm", "vue", "svelte", "lua", "zig", "sql", "graphql",
-    "proto",
+    "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "go", "sol", "move", "c",
+    "h", "cc", "cpp", "hpp", "cxx", "java", "kt", "kts", "swift", "rb", "php", "cs", "css", "scss",
+    "sass", "less", "html", "htm", "vue", "svelte", "lua", "zig", "sql", "graphql", "proto",
 ];
 
 /// Map the gate's Grep rewrite (`glob` with a ` !{…}` exclusion appended) onto opencode's
 /// grep, which passes `include` to ripgrep as one `--glob`:
 ///
 /// - no `include`: the exclusion becomes the `include` (ripgrep searches every file it does
-///   not match);
+///   not match); only `include` is printed, so no other arg is round-tripped;
 /// - an `include` of code files only (`*.rs`, `**/*.{ts,tsx}`, extensions in [`CODE_EXTS`])
-///   that no excluded name matches: unchanged, since it cannot reach a credential file;
-/// - any other `include`: denied, because one glob cannot both include and exclude.
+///   that no excluded name matches, searched outside `$HOME` and its ancestors: unchanged;
+/// - any other `include`: denied, because one glob cannot both include and exclude (ripgrep
+///   runs with `--hidden`, so a search of `$HOME` reaches its excluded directories).
 ///
 /// Outside opencode the rewrite passes unchanged.
 pub fn grep_rewrite(updated: Value) -> Rewrite {
     if !crate::adapt::is_opencode() {
         return Rewrite::Args(updated);
     }
+    debug_assert!(
+        ORIGINAL_ARGS.get().is_some(),
+        "prepare() runs before the gate"
+    );
     let original = ORIGINAL_ARGS.get().cloned().unwrap_or_default();
     let glob = updated
         .get("glob")
@@ -423,12 +481,14 @@ pub fn grep_rewrite(updated: Value) -> Rewrite {
         .trim()
         .to_string();
     if include.is_empty() {
-        let mut args = original;
-        args.insert("include".into(), Value::String(glob));
-        return Rewrite::Args(Value::Object(args));
+        return Rewrite::Args(json!({ "include": glob }));
     }
     let exclusion = glob.strip_prefix(&include).unwrap_or(&glob).trim();
-    if include_is_code_only(&include, exclusion) {
+    let reaches_home = match (GREP_ROOT.get(), home()) {
+        (Some(root), Some(home)) => starts_with(&lower_components(&home), root),
+        _ => true,
+    };
+    if !reaches_home && include_is_code_only(&include, exclusion) {
         return Rewrite::Keep;
     }
     Rewrite::Deny(format!(
@@ -553,51 +613,82 @@ const PREFIXES: &[&str] = &[
 ];
 
 /// Locations an opencode session must not write: what opencode loads as plugins, tools or
-/// config, and the engine the plugin runs.
+/// config, the engine the plugin runs, and Claude Code's settings and plugins.
 #[derive(Debug, Clone, Default)]
 pub struct Targets {
     home: Option<PathBuf>,
-    /// Whole directories: the global config dir and `$OPENCODE_CONFIG_DIR` (as given and
-    /// canonical).
+    /// Whole directories: the global config dir, `$OPENCODE_CONFIG_DIR`, opencode's npm plugin
+    /// cache, and directory plugins named in the config (as given and canonical).
     dirs: Vec<PathBuf>,
-    /// Single files: `$OPENCODE_CONFIG`, the engine (this executable and `safe-ai-skill` on
-    /// `PATH`).
+    /// Single files: `$OPENCODE_CONFIG`, this plugin, path plugins named in the config, and the
+    /// engine (this executable and `safe-ai-skill` in every `PATH` directory, present or not).
     files: Vec<PathBuf>,
+    /// Claude Code config dirs (`~/.claude`, `$CLAUDE_CONFIG_DIR`): their settings files and
+    /// `plugins/` are protected.
+    claude_dirs: Vec<PathBuf>,
     /// Existing files under the protected places, for the shell scanner's delete, move and
     /// ancestor checks.
     existing: Vec<PathBuf>,
 }
 
+/// opencode's cache dir, where it installs npm plugins: `$XDG_CACHE_HOME/opencode`, else
+/// `~/.cache/opencode`.
+fn cache_dir() -> Option<PathBuf> {
+    env_path("XDG_CACHE_HOME")
+        .or_else(|| home().map(|h| h.join(".cache")))
+        .map(|d| d.join("opencode"))
+}
+
 impl Targets {
-    /// Read `HOME`, `XDG_CONFIG_HOME`, `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `PATH` and the
-    /// current executable; list what exists of them and of `.opencode/` and `opencode.json(c)`
-    /// in `dir` and every directory above it.
-    pub fn from_env(dir: &Path) -> Self {
+    /// Read `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `OPENCODE_CONFIG`,
+    /// `OPENCODE_CONFIG_DIR`, `CLAUDE_CONFIG_DIR`, `PATH`, the current executable and the
+    /// opencode config's `plugin` entries; `plugin` is this plugin's own file (from the
+    /// payload). List what exists of them and of `.opencode/` and `opencode.json(c)` in `dir`
+    /// and every directory above it.
+    pub fn from_env(dir: &Path, plugin: Option<&str>) -> Self {
         let mut t = Targets {
             home: home(),
             ..Targets::default()
         };
-        for d in [global_config_dir(), env_path("OPENCODE_CONFIG_DIR")]
-            .into_iter()
-            .flatten()
+        for d in [
+            global_config_dir(),
+            env_path("OPENCODE_CONFIG_DIR"),
+            cache_dir(),
+        ]
+        .into_iter()
+        .flatten()
         {
             push_spellings(&mut t.dirs, d);
         }
         if let Some(f) = env_path("OPENCODE_CONFIG") {
             push_spellings(&mut t.files, f);
         }
+        let plugin = plugin.map(PathBuf::from).filter(|p| p.is_absolute());
+        for p in configured_plugin_paths(dir).into_iter().chain(plugin) {
+            if p.is_dir() {
+                push_spellings(&mut t.dirs, p);
+            } else {
+                push_spellings(&mut t.files, p);
+            }
+        }
         if let Ok(exe) = std::env::current_exe() {
             push_spellings(&mut t.files, exe);
         }
         if let Some(path) = std::env::var_os("PATH") {
             for d in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
-                let candidate = d.join("safe-ai-skill");
-                if candidate.exists() {
-                    push_spellings(&mut t.files, candidate);
-                }
+                push_spellings(&mut t.files, d.join("safe-ai-skill"));
             }
         }
-        let mut existing: Vec<PathBuf> = t.files.iter().filter(|f| f.exists()).cloned().collect();
+        for d in [
+            t.home.as_ref().map(|h| h.join(".claude")),
+            env_path("CLAUDE_CONFIG_DIR"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push_spellings(&mut t.claude_dirs, d);
+        }
+        let mut existing: Vec<PathBuf> = t.files.iter().filter(|f| f.is_file()).cloned().collect();
         let mut roots: Vec<PathBuf> = t.dirs.clone();
         for d in lexical(dir).ancestors() {
             roots.push(d.join(".opencode"));
@@ -610,6 +701,14 @@ impl Targets {
         }
         if let Some(h) = &t.home {
             roots.push(h.join(".opencode"));
+        }
+        for c in &t.claude_dirs {
+            for f in ["settings.json", "settings.local.json"] {
+                let file = c.join(f);
+                if file.is_file() {
+                    existing.push(file);
+                }
+            }
         }
         for root in roots.iter().filter(|r| r.is_dir()) {
             existing.extend(
@@ -630,8 +729,9 @@ impl Targets {
 
     /// Why an opencode session may not write `target` (a file tool path or a patch path), or
     /// `None`: a `.opencode` directory anywhere on the path, an `opencode.json(c)`, anything
-    /// in the global config dir or `$OPENCODE_CONFIG_DIR`, `$OPENCODE_CONFIG`, or the engine.
-    /// Symlinks in the existing part of the path are resolved too.
+    /// in a protected directory, a protected file (the engine in any `PATH` directory, this
+    /// plugin, `$OPENCODE_CONFIG`), or Claude Code's settings or plugins. Symlinks in the
+    /// existing part of the path are resolved too.
     pub fn path_reason(&self, target: &str, cwd: &Path) -> Option<String> {
         let lexical_path = absolute(target, cwd, self.home.as_deref());
         let canonical = canonical_prefix(&lexical_path);
@@ -651,9 +751,31 @@ impl Targets {
             }
             if self.files.iter().any(|f| lower_components(f) == comps) {
                 return Some(format!(
-                    "safe-ai-skill: `{target}` is the safe-ai-skill engine or opencode config \
-                     the plugin relies on; changing it would turn the gates off. Do it \
+                    "safe-ai-skill: `{target}` is the safe-ai-skill engine, the opencode plugin \
+                     or config it relies on; changing it would turn the gates off. Do it \
                      yourself, outside the agent."
+                ));
+            }
+            let settings = match comps.as_slice() {
+                [.., dir, file] => {
+                    (file == "settings.json" || file == "settings.local.json")
+                        && (dir == ".claude"
+                            || self.claude_dirs.iter().any(|c| {
+                                full.parent()
+                                    .is_some_and(|p| lower_components(p) == lower_components(c))
+                            }))
+                }
+                _ => false,
+            };
+            let claude_plugins = self
+                .claude_dirs
+                .iter()
+                .any(|c| starts_with(&comps, &c.join("plugins")));
+            if settings || claude_plugins {
+                return Some(format!(
+                    "safe-ai-skill: `{target}` is Claude Code settings or plugin code, which runs \
+                     safe-ai-skill's Claude Code hooks; an opencode session may not change it. \
+                     Edit it yourself, outside the agent."
                 ));
             }
         }
@@ -664,47 +786,112 @@ impl Targets {
     ///
     /// - deletes, moves and overwrites of an existing protected file or a directory holding
     ///   it (globs, `cd`, `find -delete`, `git` rewrites), through the wallet gate's scanner;
-    /// - any mention of `.opencode`, `opencode.json`, `.config/opencode` or a protected
-    ///   directory or file, unless every command in it only reads;
-    /// - the engine named by a writing command.
+    /// - a mention of a protected place, unless every command in it only reads. Quotes and
+    ///   backslashes are dropped first; a mention is `.opencode`, `opencode.json` or
+    ///   `.config/opencode` in the text, a path word [`Targets::path_reason`] denies, or a glob
+    ///   word matching one of those names or a protected file;
+    /// - the engine named by a writing command or as a redirection target.
     pub fn bash_reason(&self, command: &str, cwd: &Path) -> Option<String> {
         if let Some(what) = crate::gates::wallet::clobber_of(command, cwd, &self.existing) {
             return Some(format!(
                 "safe-ai-skill: {what}, which the opencode plugin needs (opencode config, \
-                 plugin code or the safe-ai-skill engine); do it yourself, outside the agent."
+                 plugin code, the safe-ai-skill engine or Claude Code settings); do it yourself, \
+                 outside the agent."
             ));
         }
-        let lower = command.to_ascii_lowercase();
+        let command = &without_fd_redirects(command);
+        let flat: String = command
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        let lower = flat.to_ascii_lowercase();
+        let segments = segments(&flat);
         let mut needles: Vec<String> = [".opencode", "opencode.json", ".config/opencode"]
             .map(String::from)
             .to_vec();
         for p in self.dirs.iter().chain(self.files.iter()) {
             needles.push(p.to_string_lossy().to_ascii_lowercase());
         }
-        let command = &without_fd_redirects(command);
-        let segments = segments(command);
-        if needles.iter().any(|n| lower.contains(n.as_str())) && !only_reads(command, &segments) {
+        let words: Vec<&str> = flat
+            .split(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '=' | ',' | '`')
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        let mentions = needles.iter().any(|n| lower.contains(n.as_str()))
+            || words.iter().any(|w| self.word_mentions(w, cwd));
+        if mentions && !only_reads(&flat, &segments) {
             return Some(
-                "safe-ai-skill: this command names opencode config, plugin or tool code (or the \
-                 safe-ai-skill engine) and does more than read it; opencode loads those without a \
-                 trust check. Do it yourself, outside the agent."
+                "safe-ai-skill: this command names opencode config, plugin or tool code, the \
+                 safe-ai-skill engine or Claude Code settings, and does more than read it. Do it \
+                 yourself, outside the agent."
                     .into(),
             );
         }
-        let engine_write = segments.iter().any(|words| {
+        let is_engine = |w: &str| w.rsplit('/').next() == Some("safe-ai-skill");
+        let mutator_write = segments.iter().any(|words| {
             words
                 .first()
                 .is_some_and(|w| MUTATORS.contains(&w.as_str()))
-                && words
-                    .iter()
-                    .skip(1)
-                    .any(|w| w.rsplit('/').next() == Some("safe-ai-skill"))
+                && words.iter().skip(1).any(|w| is_engine(w))
         });
-        engine_write.then(|| {
+        let redirect_write = flat
+            .split('>')
+            .skip(1)
+            .filter_map(|rest| {
+                rest.trim_start_matches(['>', '|'])
+                    .split_whitespace()
+                    .next()
+            })
+            .any(is_engine);
+        (mutator_write || redirect_write).then(|| {
             "safe-ai-skill: this command writes a file named safe-ai-skill, which may be the \
              engine the opencode plugin runs; do it yourself, outside the agent."
                 .into()
         })
+    }
+
+    /// Whether a shell word names a protected place: as a path, or as a glob whose components
+    /// can match `.opencode`, `opencode.json(c)` or `.config/opencode`, or whose expansion can
+    /// match a protected file.
+    fn word_mentions(&self, word: &str, cwd: &Path) -> bool {
+        let globby = word.contains(['*', '?', '[']);
+        if !globby {
+            let path_like = word.contains('/') || word.starts_with('~') || word.starts_with('.');
+            return path_like && self.path_reason(word, cwd).is_some();
+        }
+        let matches = |pattern: &str, name: &str| {
+            glob::Pattern::new(pattern).is_ok_and(|p| {
+                p.matches_with(
+                    name,
+                    glob::MatchOptions {
+                        case_sensitive: false,
+                        require_literal_separator: true,
+                        require_literal_leading_dot: false,
+                    },
+                )
+            })
+        };
+        let comps: Vec<&str> = word.split('/').collect();
+        let named = comps.iter().enumerate().any(|(i, c)| {
+            [".opencode", "opencode.json", "opencode.jsonc"]
+                .iter()
+                .any(|n| matches(c, n))
+                || (i > 0 && matches(comps[i - 1], ".config") && matches(c, "opencode"))
+        });
+        if named {
+            return true;
+        }
+        let full = absolute(word, cwd, self.home.as_deref());
+        let full = full.to_string_lossy();
+        let mut protected: Vec<PathBuf> = self.files.clone();
+        for c in &self.claude_dirs {
+            protected.extend(["settings.json", "settings.local.json"].map(|f| c.join(f)));
+        }
+        protected
+            .iter()
+            .any(|f| matches(&full, &f.to_string_lossy()))
     }
 }
 
@@ -810,8 +997,10 @@ mod tests {
             ],
             files: vec![
                 PathBuf::from("/home/u/.local/bin/safe-ai-skill"),
+                PathBuf::from("/usr/local/bin/safe-ai-skill"),
                 PathBuf::from("/etc/oc.json"),
             ],
+            claude_dirs: vec![PathBuf::from("/home/u/.claude"), PathBuf::from("/cc")],
             existing: Vec::new(),
         }
     }
@@ -888,6 +1077,11 @@ mod tests {
             "/etc/oc.json",
             "~/.local/bin/safe-ai-skill",
             "~/.opencode/plugins/x.js",
+            "~/.claude/settings.json",
+            "/cc/settings.local.json",
+            ".claude/settings.local.json",
+            "~/.claude/plugins/cache/x/hooks/hooks.json",
+            "/cc/plugins/marketplaces/m/x.sh",
         ] {
             assert!(t.path_reason(p, cwd).is_some(), "{p}");
         }
@@ -918,6 +1112,16 @@ mod tests {
             "cp evil ~/.local/bin/safe-ai-skill",
             "mv a /etc/oc.json",
             "cd x && rm safe-ai-skill",
+            "printf x > ~/.local/bin/safe-ai-skill",
+            "chmod +x ~/.local/bin/*",
+            "cat x >safe-ai-skill",
+            "mkdir -p .o''pencode/plugins && cp /tmp/evil.js .o''pencode/plugins/",
+            "mkdir -p .o\\pencode/plugins",
+            "cp /tmp/evil.js ~/.config/open\"\"code/plugins/a.js",
+            "cp x .o?encode/plugins/",
+            "cp x ~/.conf*/open*/plugins/",
+            "echo x > ~/.claude/settings.json",
+            "cp hooks.json ~/.claude/plugins/cache/x/hooks/",
         ] {
             assert!(t.bash_reason(c, cwd).is_some(), "{c}");
         }
@@ -928,7 +1132,11 @@ mod tests {
             "git diff opencode.json",
             "find .opencode -name '*.js'",
             "safe-ai-skill status",
+            "safe-ai-skill status > out.txt",
+            "npx @stbr/safe-ai-skill add skill x",
             "which safe-ai-skill",
+            "ls ~/.local/bin/*",
+            "rm -f build/*.o",
             "cargo build",
             "echo hello > out.txt",
         ] {
@@ -942,6 +1150,7 @@ mod tests {
         assert!(include_is_code_only("*.ts", excl));
         assert!(include_is_code_only("**/*.{ts,tsx}", excl));
         assert!(include_is_code_only("*.RS", excl));
+        assert!(!include_is_code_only("*.md", excl));
         assert!(!include_is_code_only("*.json", excl));
         assert!(!include_is_code_only("*.{ts,json}", excl));
         assert!(!include_is_code_only("*", excl));

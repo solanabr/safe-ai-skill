@@ -5,9 +5,10 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 import { SafeAiSkill } from "../safe-ai-skill.js"
 
@@ -47,7 +48,43 @@ test("a deny blocks with its reason", async () => {
 
 test("a missing engine blocks", async () => {
   const h = await hooks(join(work, "does-not-exist"))
-  await blocked(h, "read", { filePath: "a.txt" }, /could not run/)
+  await blocked(h, "read", { filePath: "a.txt" }, /^safe-ai-skill: .*not found/)
+  const odd = await hooks(123)
+  await blocked(odd, "read", { filePath: "a.txt" }, /^safe-ai-skill: .*not found/)
+})
+
+test("an engine replaced after load blocks", async () => {
+  const engine = fake("replaced", "cat >/dev/null; exit 0")
+  const h = await hooks(engine)
+  await call(h, "bash", { command: "ls" })
+  const swap = fake("replacement", "cat >/dev/null; exit 0 # a different file")
+  renameSync(swap, engine)
+  await blocked(h, "bash", { command: "ls" }, /engine changed/)
+})
+
+test("an engine planted earlier on PATH blocks", async () => {
+  const late = join(work, "late-bin")
+  const early = join(work, "early-bin")
+  mkdirSync(late, { recursive: true })
+  mkdirSync(early, { recursive: true })
+  writeFileSync(join(late, "safe-ai-skill"), "#!/bin/sh\ncat >/dev/null; exit 0\n")
+  chmodSync(join(late, "safe-ai-skill"), 0o755)
+  const saved = process.env.PATH
+  process.env.PATH = `${early}:${late}:${saved}`
+  try {
+    const h = await SafeAiSkill({ directory: work, worktree: work }, { timeoutMs: 2000 })
+    await call(h, "bash", { command: "ls" })
+    writeFileSync(join(early, "safe-ai-skill"), "#!/bin/sh\nexit 0\n")
+    chmodSync(join(early, "safe-ai-skill"), 0o755)
+    await blocked(h, "bash", { command: "ls" }, /engine changed/)
+  } finally {
+    process.env.PATH = saved
+  }
+})
+
+test("inherited object keys are ordinary tool ids", async () => {
+  const h = await hooks(fake("silent2", "cat >/dev/null; exit 0"))
+  for (const tool of ["constructor", "toString", "__proto__"]) await call(h, tool, {})
 })
 
 test("a non-zero exit blocks", async () => {
@@ -111,6 +148,7 @@ test("tools route to their gates; MCP calls carry the configured servers", async
   assert.equal(mcp.sessionID, "ses_1")
   assert.equal(mcp.directory, work)
   assert.deepEqual(mcp.mcpServers, ["helius", "solana-dev"])
+  assert.match(mcp.pluginPath, /safe-ai-skill\.js$/)
 })
 
 test("the first blocking gate stops the call", async () => {
@@ -128,9 +166,12 @@ test("the real engine: denies, rewrites, passes", { skip: !real && "SAFE_AI_SKIL
   await blocked(h, "bash", { command: "cat ~/.config/solana/id.json" }, /blocked/)
   await blocked(h, "write", { filePath: ".opencode/plugins/evil.js", content: "x" }, /opencode config/)
   await blocked(h, "bash", { command: "solana program deploy x.so --url mainnet-beta" }, /cannot ask for approval/)
-  const args = { pattern: "x" }
+  const args = { pattern: "x", path: "README.md" }
   await call(h, "grep", args)
   assert.match(args.include, /^!\{/)
+  assert.equal(args.path, "README.md")
+  const self = fileURLToPath(new URL("../safe-ai-skill.js", import.meta.url))
+  await blocked(h, "write", { filePath: self, content: "" }, /opencode plugin/)
   await call(h, "bash", { command: "ls -la" })
   await call(h, "read", { filePath: "README.md" })
 })

@@ -1,6 +1,6 @@
 //! `adapters/opencode/safe-ai-skill.js` (experimental, issue #26): runs the plugin's Node tests
 //! (`adapters/opencode/test/plugin.test.mjs`) with this build's engine, when Node 22 or later
-//! is on `PATH`. Fake engines check that every failure blocks the call; the real engine checks
+//! is on `PATH` (required when `SAFE_AI_SKILL_REQUIRE_NODE_TESTS` is set, as in CI). Fake engines check that every failure blocks the call; the real engine checks
 //! a deny, a Grep rewrite and a pass end to end. Skipped (with a note) without Node.
 
 #![cfg(unix)]
@@ -34,6 +34,12 @@ fn plugin_fails_closed_under_node() {
     match node_major() {
         Some(major) if major >= 22 => {}
         other => {
+            assert!(
+                std::env::var_os("SAFE_AI_SKILL_REQUIRE_NODE_TESTS")
+                    .filter(|v| !v.is_empty())
+                    .is_none(),
+                "SAFE_AI_SKILL_REQUIRE_NODE_TESTS is set but node >= 22 is missing ({other:?})"
+            );
             eprintln!("skipped: needs node >= 22 on PATH (found {other:?})");
             return;
         }

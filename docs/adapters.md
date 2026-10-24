@@ -156,6 +156,9 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
    `SAFE_AI_SKILL_ENGINE`, or load the plugin from `opencode.json` with an option instead of
    step 2:
    `"plugin": [["file:///abs/path/safe-ai-skill.js", { "engine": "/abs/path/safe-ai-skill" }]]`.
+   The plugin resolves the engine to an absolute path once, when opencode starts. If the
+   `PATH` lookup later finds another file, or the file changes, every gated call is blocked
+   until opencode restarts (restart after upgrading safe-ai-skill).
 4. Check it: ask the agent to run `cat ~/.config/solana/id.json`. The call must fail with a
    `safe-ai-skill:` message. If it runs, the plugin is not loaded (see below).
 
@@ -165,7 +168,7 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
 |---|---|---|
 | `bash` `{command, workdir?}` | `gate-bash`, `gate-bash-secrets` | `workdir` (relative to the project dir) is where relative paths resolve. |
 | `read` `{filePath}` | `gate-read` | `filePath` → `file_path`. |
-| `grep` `{pattern, path?, include?}` | `gate-read` | `include` → `glob`. See [Grep](#grep-under-opencode). |
+| `grep` `{pattern, path?, include?}` | `gate-read` | `include` → `glob`; a file `path` is judged as its directory. See [Grep](#grep-under-opencode). |
 | `glob` `{pattern, path?}` | `gate-read` | Lists names only: no opinion, as in Claude Code. |
 | `write` `{filePath, content}`, `edit` `{filePath, oldString, newString}` | `gate-tamper` | camelCase → `file_path`, `content`, `old_string`, `new_string`. |
 | `apply_patch` `{patchText}` | `gate-tamper` | Every file the patch adds, updates, deletes or moves to is checked; over 1000 files is denied unread. |
@@ -191,17 +194,21 @@ tool sent to the wrong gate.
 
 ### Grep under opencode
 
-opencode passes a grep's `include` to ripgrep as a single `--glob`
-(`packages/core/src/ripgrep.ts`), so it cannot carry both an include and safe-ai-skill's
-credential-file exclusion.
+opencode runs ripgrep with `--hidden` in the grep's `path` when it is a directory, and in its
+parent directory otherwise (`src/tool/grep.ts`): a `path` naming a file, or one that does not
+exist, searches the whole directory around it. The engine judges it as that directory. It
+passes the `include` to ripgrep as a single `--glob` (`packages/core/src/ripgrep.ts`), so it
+cannot carry both an include and safe-ai-skill's credential-file exclusion.
 
-- No `include`: the exclusion (`!{…}`) becomes the `include`. The plugin writes it into the
-  call's `args` in place, which opencode then passes to the tool. ripgrep searches every file
-  the negated glob does not match.
-- An `include` naming code files only (`*.ts`, `**/*.{ts,tsx}`, `*.rs`): the call runs
-  unchanged, since no credential file has those extensions.
-- Any other `include` (`*.json`, `*`, `config/**`): denied with a reason. Search without
-  `include`, or narrow `path`.
+- No `include`: the exclusion (`!{…}`) becomes the `include`. The engine prints only
+  `include`, and the plugin writes it into the call's `args` in place, which opencode then
+  passes to the tool. ripgrep searches every file the negated glob does not match.
+- An `include` naming code files only (`*.ts`, `**/*.{ts,tsx}`, `*.rs`; not `*.md`), searched
+  outside `$HOME` and the directories above it: the call runs unchanged. The one credential
+  name it can still reach is an `.env.<ext>` file (`.env.local.ts`, matched by `**/.env.*`).
+- Any other `include` (`*.json`, `*`, `config/**`, or any `include` over `$HOME`, where
+  `--hidden` reaches excluded directories such as `~/.claude/projects`): denied with a reason.
+  Search without `include`, or narrow `path`.
 
 ### MCP names
 
@@ -218,24 +225,35 @@ word checks see every part of it.
 
 ### What guards the guard
 
-opencode loads plugins, custom tools and config from `.opencode/`, `opencode.json(c)` and its
-config dirs with no trust check, and runs plugin hooks one after another. A file the agent
-writes there could remove this plugin, or run after it and change the args it checked. These
-writes are denied through `write`, `edit`, `apply_patch` and the shell:
+opencode loads plugins, custom tools and config from `.opencode/`, `opencode.json(c)`, its
+config dirs and its npm cache with no trust check, and runs plugin hooks one after another. A
+file the agent writes there could remove this plugin, or run after it and change the args it
+checked. These writes are denied through `write`, `edit`, `apply_patch` and the shell:
 
 - anything in a `.opencode` directory, anywhere (including `~/.opencode`);
 - any file named `opencode.json` or `opencode.jsonc`;
 - anything in the global config dir (`$XDG_CONFIG_HOME/opencode`, else
-  `~/.config/opencode`) and in `$OPENCODE_CONFIG_DIR`, and the `$OPENCODE_CONFIG` file;
-- the engine: the running `safe-ai-skill` and any on `PATH`;
+  `~/.config/opencode`), in `$OPENCODE_CONFIG_DIR` and in opencode's cache
+  (`$XDG_CACHE_HOME/opencode`, else `~/.cache/opencode`, where npm plugins are installed),
+  and the `$OPENCODE_CONFIG` file;
+- this plugin's own file, wherever it is loaded from, and every path plugin the opencode
+  config names (`"plugin": ["./x.ts", "file:///…"]`, resolved against the declaring file);
+- the engine: the running `safe-ai-skill`, and `safe-ai-skill` in every `PATH` directory,
+  whether or not it exists there yet;
+- Claude Code's settings (`.claude/settings.json`, `.claude/settings.local.json`, the user's
+  and `$CLAUDE_CONFIG_DIR`'s) and its plugins dir (`~/.claude/plugins`,
+  `$CLAUDE_CONFIG_DIR/plugins`), as under Codex;
 - safe-ai-skill's data dir (as under Codex).
 
 In the shell, deletes, moves and overwrites of an existing protected file or a directory
 holding it are read with the default-wallet gate's scanner (globs, `cd`, `find -delete`,
-`git checkout|restore|clean|…`). On top of that, a command that names `.opencode`,
-`opencode.json`, `.config/opencode` or one of the paths above is denied unless every command
-in it only reads (`cat`, `ls`, `grep`, `jq`, `find` without an action, `git status|diff|log|show`,
-…) and nothing is redirected to a file.
+`git checkout|restore|clean|…`). On top of that, quotes and backslashes are dropped
+(`.o''pencode`, `.o\pencode`), and a command that names `.opencode`, `opencode.json`,
+`.config/opencode` or one of the paths above, or holds a glob that can match one of them
+(`.o?encode`, `~/.local/bin/*`), is denied unless every command in it only reads (`cat`, `ls`,
+`grep`, `jq`, `find` without an action, `git status|diff|log|show`, …) and nothing is
+redirected to a file. A command that writes a file named `safe-ai-skill` by a bare name
+(`rm safe-ai-skill`, `> safe-ai-skill`) is denied too.
 
 ## Not covered (opencode)
 
@@ -243,15 +261,24 @@ in it only reads (`cat`, `ls`, `grep`, `jq`, `find` without an action, `git stat
   without it. `--pure` / `OPENCODE_PURE` skips external plugins, and
   `OPENCODE_DISABLE_PROJECT_CONFIG` skips project `.opencode/` plugins (prefer the global
   install). Run the check in [Install](#install-1) after every change.
-- **Other plugins.** Hooks run in load order (global config, project config, global plugin
-  dir, project plugin dir). A plugin that was already installed, and runs after this one, can
-  change a call's args after the check. Only new writes by the agent are blocked.
+- **Other plugins, and untrusted repositories.** Hooks run in load order (global config,
+  project config, global plugin dir, project plugin dir). A plugin that was already installed,
+  and runs after this one, can change a call's args after the check; only new writes by the
+  agent are blocked. A repository you clone can ship its own `.opencode/plugins/`, tools or
+  `opencode.json` `plugin` entries, and opencode runs that code in-process at startup, before
+  any gate exists. Start opencode with `OPENCODE_DISABLE_PROJECT_CONFIG=1` in a repository you
+  do not trust.
+- **The shell is the user's.** opencode runs `bash` commands in the user's shell, and accepts
+  `pwsh` on Unix through `$SHELL` or the config's `shell` key. The gates parse POSIX shell
+  syntax only.
 - **Real approval prompts.** None; asks block.
 - **Output redaction (`redact`).** Not mapped. opencode's `tool.execute.after` could rewrite
   tool output, but that is untested.
 - **`gate-skill`, prompt guards, the SessionStart supply-chain sweep.** Not mapped. The
   `skill`, `task`, `webfetch`, `websearch` and `lsp` tools run ungated; the code-mode
   `execute` tool runs ungated, but each MCP call it makes is gated.
+- **`read_mcp_resource`.** opencode reads its arguments before the hook runs, so a rewrite
+  would not reach it (none is made today; a deny still blocks it).
 - **Subagents.** `task` sessions build their tools through the same code path, so their
   calls should be gated too. Not tested.
 - **Shell writes are judged on their words; nothing is run.** A computed path, `eval` of
@@ -260,7 +287,9 @@ in it only reads (`cat`, `ls`, `grep`, `jq`, `find` without an action, `git stat
   - Any command that names `.opencode` or `opencode.json` and is not read-only is denied:
     `git add opencode.json`, `git commit -m "… .opencode …"`, `npm run x -- .opencode`.
   - In a project with `.opencode/` files, `find . … -delete` and `git clean -fd` are denied.
-  - A grep `include` that is not code-only is denied (above).
+  - A grep `include` that is not code-only, or any `include` over `$HOME`, is denied (above).
+  - A writing command whose glob can match a protected file is denied (`chmod +x
+    ~/.local/bin/*` when `~/.local/bin` is on `PATH`).
   - An unknown or ambiguous MCP name can match a high-risk or value-moving word across the
     server/tool boundary.
 - **MCP servers from config the engine cannot read.** Remote (`.well-known/opencode`),

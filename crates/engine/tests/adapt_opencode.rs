@@ -182,7 +182,11 @@ fn grep_without_include_gets_the_exclusion_as_its_include() {
     let run = w.oc("gate-read", "grep", json!({ "pattern": "secret" }));
     assert_eq!(label(&run), "rewrite", "{}", run.stdout);
     let updated = &run.json()["hookSpecificOutput"]["updatedInput"];
-    assert_eq!(updated["pattern"], "secret");
+    assert_eq!(
+        updated.as_object().unwrap().len(),
+        1,
+        "only include is round-tripped: {updated}"
+    );
     let include = updated["include"].as_str().unwrap();
     assert!(include.starts_with("!{"), "{include}");
     assert!(
@@ -525,4 +529,152 @@ fn a_panic_still_denies_with_exit_0() {
     let w = World::new("oc-panic").with_env("SAFE_AI_SKILL_TEST_PANIC", "1");
     let run = w.oc("gate-bash", "bash", json!({ "command": "ls" }));
     assert_eq!(label(&run), "deny", "{}", run.stderr);
+}
+
+/// Review finding 1: opencode searches a file `path`'s whole parent directory.
+#[test]
+fn grep_with_a_file_path_is_judged_as_its_directory() {
+    let w = World::new("oc-grep-file");
+    std::fs::write(w.proj.join(".env"), "K=v").unwrap();
+    std::fs::write(w.proj.join("README.md"), "hi").unwrap();
+    for path in ["README.md", "missing.txt"] {
+        let run = w.oc(
+            "gate-read",
+            "grep",
+            json!({ "pattern": "K=", "path": path }),
+        );
+        assert_eq!(label(&run), "rewrite", "{path}: {}", run.stdout);
+        let updated = &run.json()["hookSpecificOutput"]["updatedInput"];
+        assert!(updated["include"].as_str().unwrap().starts_with("!{"));
+        assert_eq!(
+            updated.as_object().unwrap().len(),
+            1,
+            "only include: {updated}"
+        );
+    }
+    std::fs::write(w.home.join(".bashrc"), "x").unwrap();
+    let bashrc = w.home.join(".bashrc");
+    let run = w.oc(
+        "gate-read",
+        "grep",
+        json!({ "pattern": "PRIVATE", "path": bashrc.to_str().unwrap() }),
+    );
+    assert_ne!(label(&run), "", "a grep of $HOME is never passed unchanged");
+    let run = w.oc(
+        "gate-read",
+        "grep",
+        json!({ "pattern": "x", "path": bashrc.to_str().unwrap(), "include": "*.ts" }),
+    );
+    assert_eq!(label(&run), "deny", "{}", run.stdout);
+}
+
+#[test]
+fn markdown_includes_are_not_code_only() {
+    let w = World::new("oc-grep-md");
+    let run = w.oc(
+        "gate-read",
+        "grep",
+        json!({ "pattern": "x", "include": "*.md" }),
+    );
+    assert_eq!(label(&run), "deny");
+}
+
+/// Review finding 2: an engine planted earlier on `PATH`.
+#[test]
+fn engine_names_in_every_path_dir_are_protected() {
+    let bin = TempDir::new("oc-pathbin");
+    let w = World::new("oc-pathbin-w").with_env("PATH", bin.path().to_str().unwrap());
+    let planted = bin.join("safe-ai-skill");
+    let run = w.oc(
+        "gate-tamper",
+        "write",
+        json!({ "filePath": planted.to_str().unwrap(), "content": "#!/bin/sh\nexit 0" }),
+    );
+    assert_eq!(label(&run), "deny", "{}", run.stdout);
+    let dir = common::sh_path(bin.path());
+    for command in [
+        format!("printf '#!/bin/sh' > {dir}/safe-ai-skill"),
+        format!("chmod +x {dir}/*"),
+        format!("ln -s /tmp/x {dir}/safe-ai-skill"),
+    ] {
+        let run = w.oc("gate-bash-secrets", "bash", json!({ "command": command }));
+        assert_eq!(label(&run), "deny", "{command}");
+    }
+}
+
+/// Review finding 3: quoting and globs in the shell mention check.
+#[test]
+fn quoted_and_globbed_opencode_paths_deny() {
+    let w = World::new("oc-quoted");
+    for command in [
+        "mkdir -p .o''pencode/plugins && cp /tmp/evil.js .o''pencode/plugins/",
+        "mkdir -p .o\\pencode/plugins",
+        "cp /tmp/evil.js ~/.config/open\"\"code/plugins/a.js",
+        "cp x .o?encode/plugins/",
+    ] {
+        let run = w.oc("gate-bash-secrets", "bash", json!({ "command": command }));
+        assert_eq!(label(&run), "deny", "{command}");
+    }
+}
+
+/// Review finding 4: plugin code outside the protected dirs.
+#[test]
+fn configured_plugins_this_plugin_and_the_npm_cache_are_protected() {
+    let w = World::new("oc-plugins");
+    let elsewhere = TempDir::new("oc-plugin-elsewhere");
+    let abs = elsewhere.join("abs-plugin.js");
+    std::fs::write(&abs, "//").unwrap();
+    std::fs::write(
+        w.proj.join("opencode.json"),
+        json!({ "plugin": ["./tools/mine.js", format!("file://{}", abs.display()), "some-npm-plugin"] })
+            .to_string(),
+    )
+    .unwrap();
+    let cache = w
+        .home
+        .join(".cache/opencode/packages/some-npm-plugin/index.js");
+    for target in [w.proj.join("tools/mine.js"), abs.clone(), cache] {
+        let run = w.oc(
+            "gate-tamper",
+            "write",
+            json!({ "filePath": target.to_str().unwrap(), "content": "x" }),
+        );
+        assert_eq!(label(&run), "deny", "{}", target.display());
+    }
+    let own = elsewhere.join("checkout/adapters/opencode/safe-ai-skill.js");
+    let body = json!({
+        "tool": "edit", "sessionID": "s", "callID": "c",
+        "args": { "filePath": own.to_str().unwrap(), "oldString": "a", "newString": "b" },
+        "directory": w.proj.path(), "pluginPath": own.to_str().unwrap(),
+    });
+    let run = w.run(&["adapt", "opencode", "gate-tamper"], body.to_string());
+    assert_eq!(label(&run), "deny", "{}", run.stdout);
+}
+
+/// Review finding 5: Claude Code settings and plugins, as under Codex.
+#[test]
+fn claude_code_settings_and_plugins_are_protected() {
+    let cc = TempDir::new("oc-ccdir");
+    let w = World::new("oc-claude").with_env("CLAUDE_CONFIG_DIR", cc.path().to_str().unwrap());
+    let home_settings = w.home.join(".claude/settings.json");
+    for target in [
+        home_settings.clone(),
+        w.home
+            .join(".claude/plugins/cache/m/safe-ai-skill/hooks/hooks.json"),
+        cc.join("settings.local.json"),
+        w.proj.join(".claude/settings.json"),
+    ] {
+        let run = w.oc(
+            "gate-tamper",
+            "write",
+            json!({ "filePath": target.to_str().unwrap(), "content": "{}" }),
+        );
+        assert_eq!(label(&run), "deny", "{}", target.display());
+    }
+    let run = w.oc(
+        "gate-bash-secrets",
+        "bash",
+        json!({ "command": "echo x > ~/.claude/settings.json" }),
+    );
+    assert_eq!(label(&run), "deny");
 }
