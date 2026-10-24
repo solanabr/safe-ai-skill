@@ -4,6 +4,21 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [1.2.0] — Unreleased
+
+### Behaviour changes (read before upgrading)
+
+- **Project `.env` follows the tier, as in solana-ai-kit** (#7, #16, the `.env` row of #20). A project env file is `.env` or `.env.*` (not `.env.example` or `.env.schema`) inside the project root, by name and by where it resolves. Raw agent reads (Read, Grep, Bash readers, varlock printers, MCP executor code) are open at Off, Relaxed and Medium and denied at High; writes (Write/Edit/MultiEdit, agent `env set|unset`, and Bash writes: `>`/`>>`, `tee`, `truncate`, `dd of=`, `rm`, `mv`, `cp` onto it, `sed -i`, `perl -pi`, interpreter code with a write call) are denied at Medium only. The read-then-edit workflow of #7 works at Off and Relaxed. **At Off, Relaxed and Medium the model sees the values**: a value it has seen can leave through channels hooks can't fully gate (`WebFetch`, MCP servers), so the sandbox's `deniedDomains` is the control (SECURITY.md).
+- **An env read next to the network denies at every tier.** A command line that reads an env file and also runs a network program (`curl`, `wget`, `nc`, `ssh`, `scp`, `rsync`, …) or interpreter code showing network use (`cat .env | nc …`, `python3 -c "requests.post(…, open('.env').read())"`) is denied at every tier, Off included, beside the existing deny of a secret file uploaded by path.
+- **Other env files stay denied.** `*.env`, `.envrc`, `.dev.vars`, `.varlock-frozen-env`, the Solana CLI config, and any env file outside the project keep 1.1.0's rule: raw reads denied at every tier, writes denied at Medium and High. Key material and credential stores are unchanged (denied at every tier).
+- **`env_read` is `tier` (default) or `deny`.** `safe-ai-skill tier --env-read deny` denies project env reads at every tier (applies at once; going back to `tier` needs your confirmation); a repo's `secrets.env_read: deny` tightens it for its project. The 1.1.0 opt-in is gone: the `env-read-opt-in` cargo feature and its sandbox condition are removed, `--env-read ask` is refused, and a stored `env_read: ask` is rewritten as `tier` at the first 1.2.0 SessionStart with a one-time notice. A stored `deny` is kept. A policy that fails to load (fail-closed) uses `deny`.
+- **Redaction keeps the values of a permitted read.** The Read tool's response to a raw read the tier permits is not value-scrubbed (pattern redaction for keys, seeds and tokens still applies), so an Edit can't write `«redacted:KEY»` over a real value; Bash output is still value-scrubbed, and writing a redaction marker into an env file is denied at every tier.
+
+### Changes
+
+- `gates/envread.rs` decides by `(tier, env_read, project)`; `is_project_env` resolves the path inside the project root. `gates/envwrite.rs` splits project and other env files and takes Bash writes from `creddump`, which now tells reads from writes (`sed -i`, redirects, `tee`, `mv`, write calls in code) and denies an env read beside a network command. The shell parser records output redirect targets.
+- The shared corpus `plugin` column, `tests/tiers_env.rs`, `tests/tiers_matrix.rs`, the README tier table and its golden test, SECURITY.md and `docs/tiers.md` follow the new rows.
+
 ## [1.1.0] — Unreleased
 
 ### Behaviour changes (read before upgrading)
