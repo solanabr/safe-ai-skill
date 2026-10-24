@@ -15,7 +15,8 @@ sha256, and turns any engine failure into a block. Tracking issues: #23, #26.
 1. Install the shim and the engine:
    - `install.sh` from 1.2.0 puts the shim at `~/.local/bin/safe-ai-skill` and the engine
      beside it as `safe-ai-skill-<platform>` (macOS and Linux).
-   - Or point the hooks at the Claude Code plugin's copy, `<plugin dir>/bin/safe-ai-skill`.
+   - Don't point the hooks at the Claude Code plugin's copy: its path carries the plugin
+     version and disappears on the next update.
    - The npm package's `safe-ai-skill` is a Node launcher, not the shim, and `cargo install`
      builds the bare engine. Neither turns an engine crash into a block, so don't wire Codex
      hooks to them.
@@ -26,6 +27,19 @@ sha256, and turns any engine failure into a block. Tracking issues: #23, #26.
 3. Start Codex and approve the hooks with `/hooks`. Codex skips untrusted hooks, and skips a
    hook again after it changes, until you re-approve it. Project `.codex/` layers load only in
    trusted projects.
+4. Run `safe-ai-skill doctor --codex`, and run it again after every safe-ai-skill or Codex
+   update. It runs each configured safe-ai-skill hook the way Codex does, with a payload that
+   must be denied (and, for the gates, one that must pass). It fails (exit 1) on a hook that
+   cannot start, times out, answers wrongly or is not the shim.
+
+**When the hook command itself can't start, Codex runs the call.** Exit 127 from the login
+shell (the shim is not on its `PATH`, a path an update removed, a typo in the program name)
+marks the hook failed, and Codex runs the tool call unchecked; the shim never gets the chance
+to deny. The template therefore ends every PreToolUse command with `|| printf …`, which prints
+a deny when the `safe-ai-skill` command fails to run. That fallback is plain shell: it does not
+help if `$SHELL` itself is broken, and it is only in the template's PreToolUse commands. A typo
+after `adapt` (`adapt codx gate-bash`) reaches the shim, which denies every call until the entry
+is fixed.
 
 **Migrating from 1.1.0.** The `safe-ai-skill-codex` wrapper is gone. Its fail-closed checks are
 now in the shim. Replace `safe-ai-skill-codex <gate>` with `safe-ai-skill adapt codex <gate>` in
@@ -41,7 +55,7 @@ shim and accepts its answers.
 | `apply_patch` tool | `gate-tamper` | Every file the patch adds, updates, deletes or moves to is checked. A patch touching more than 1000 files is denied unread. |
 | `apply_patch` run through the shell (heredoc, quoted argument, `$'…'`, piped) | `gate-bash-secrets` | Codex intercepts these and applies them as patches, so they get the same per-file checks. |
 | `mcp__<server>__<tool>` | `gate-mcp` | Receives the raw MCP arguments. |
-| Session start (`startup`, `resume`, `clear`, `compact`, `fork`) | `session-start` | The supply-chain sweep and the tier report, as `systemMessage` (shown to you) and `additionalContext` (given to the model). |
+| Session start (`startup`, `resume`, `clear`, `compact`, `fork`) | `session-start` | The tier and state report, as `systemMessage` (shown to you) and `additionalContext` (given to the model). The supply-chain sweep is not run: it reads Claude Code's skill dirs and `.mcp.json`, which Codex does not load. Codex skills (`.agents/skills`, `$CODEX_HOME/skills`) and the MCP servers in Codex's `config.toml` are not scanned, and the report says so. |
 | Tool results (opt-in) | `redact --block-with-redaction` | See [Redaction](#redaction-opt-in). |
 
 ### Self-protection
@@ -66,30 +80,37 @@ Literal paths inside interpreter code (`python3 -c "os.remove('…')"`) count to
   Codex.
 - The shim, the per-platform engines beside it and the old wrapper: next to the running engine
   and on `PATH`.
-- safe-ai-skill's data dir ([below](#state-tiers-grants-and-audit)).
+- safe-ai-skill's data dir ([below](#state-tiers-grants-and-audit)), and, for recursive
+  removes and moves, the directories above it (`rm -rf ~/.local/share`).
+- Login-shell startup files, because Codex runs its hooks through `$SHELL -lc`: `~/.zshenv`,
+  `~/.zprofile`, `~/.zlogin` (also under `$ZDOTDIR`), `~/.bash_profile`, `~/.bash_login`,
+  `~/.profile`, `~/.config/fish/config.fish` and `~/.config/fish/conf.d/*`. Any write is
+  denied: a line there could set an environment variable or shadow `safe-ai-skill` on `PATH`.
+  Reading or sourcing them passes. `~/.zshrc` and `~/.bashrc` (not read by a non-interactive
+  login shell) are not covered.
 - A relative path naming a state file or a wallet (`tier.json`, `grants.json`, `spend.json`,
   `audit.jsonl`, `id.json`, …). Codex's `exec_command` can run in a `workdir` the hook payload
   does not carry (`exec_command.rs` `pre_tool_use_payload` sends only `command`), so the hook
   cannot tell where such a write lands.
 
-These commands deny only when they would really reach one of those files:
+How the broad commands are judged:
 
-- **`find … -delete` / `-exec`.** When the expression is a plain AND of `-name`/`-iname`,
-  `-path`/`-ipath`, `-type` and `-maxdepth`/`-mindepth` tests, the gate checks each protected
-  file below the start dir, and each directory on the way to it, against the tests. For
-  example, `find . -name '*.tmp' -delete` passes beside a `.codex/` dir, and
-  `find . -name '*.json' -delete` is denied. An expression with `-o`, `!`, parentheses,
-  `-prune` or `-regex` is still denied whenever its start dir holds a protected file.
-- **`git clean` and `git stash -u|-a`** (path-less). These are denied only when a protected file
-  under the tree is untracked. Tracked files survive both, and tracking is read from the git
-  index (git itself is never run). A `.codex/` you committed is safe. `git clean -n` (dry run)
-  always passes. An ignored, untracked file still counts, even without `-x`.
+- **`find … -delete`, and `find -exec` with anything but a plain reader** (`grep`, `cat`,
+  `ls`, `wc`, … with no option that names a program, such as `--pre`): denied when a start dir
+  is, or holds, a protected file, whatever the `-name`/`-path` tests say. The gate does not
+  evaluate `find` expressions (glob escapes, `~` and `$HOME` expansion and `-o` would all have
+  to match `find` exactly), so `find . -name '*.tmp' -delete` in a project with a `.codex/` dir
+  is denied. Narrow the start dir (`find src -name '*.tmp' -delete`), or run it yourself.
+- **Path-less `git clean` and `git stash -u|-a`**: denied when a protected file exists under the
+  tree, tracked or not and dry run (`-n`) or not. Option arguments (`clean -e PAT`,
+  `stash -m MSG`) are not paths, and `--pathspec-from-file` counts as path-less.
 - **A bare `config.toml` / `hooks.json`** given to `rm`, `unlink`, `shred` or `truncate`. This
   is denied only when a Codex config it could be exists: a `hooks.json` in a Codex home or in a
   `.codex/` at or above the working dir, or a `config.toml` there that defines hooks
-  (`[hooks…]`, `hooks.…`). Removing a `config.toml` that defines no hooks cannot turn a gate off.
-  Writing one still can (`[features] hooks = false`), so any other writing command given a bare
-  `config.toml` is still denied.
+  (`[hooks…]`, `hooks.…`, which includes the hook approval state). Removing a `config.toml`
+  that defines no hooks cannot turn a gate off. Writing one still can
+  (`[features] hooks = false`), so any other writing command given a bare `config.toml` is
+  still denied.
 
 ### Interactive sessions are denied
 
@@ -114,7 +135,13 @@ terminal would therefore run unchecked whatever is typed into it later. These ar
 - Remote and switched-user shells: `ssh host` with no remote command (and no `-N`/`-W`),
   `mosh host`, `telnet`, `su` without `-c`, `sudo -i`, `sudo -s`, `chroot dir`.
 - Interactive containers: `docker`/`podman`/`kubectl` `exec`, `run` or `attach` with `-i`/`-it`
-  and the terminal as input.
+  and the terminal as input, and `docker compose exec|run` without `-T`/`-d`.
+- A command or process substitution of a terminal reader: `bash -c "$(cat)"`, `eval "$(cat)"`,
+  `bash <(cat)`.
+- The same programs behind a version suffix (`python3.12`), `busybox <applet>`, a runner
+  (`uv run`, `poetry run`, `pipx run`, `npx`, `mise exec`, `npm exec`, `rlwrap`), `env -S`, or
+  `find -exec`; `nix-shell` / `nix develop` without a command; `socat … EXEC:`; and other REPLs
+  (`ipython`, `jshell`, `iex`, …).
 
 The same commands with their input given as arguments, a file or a pipe from a command that
 produces it (`echo ls | bash`, `cat script.sh | bash`, `ssh host uptime`,
@@ -142,9 +169,11 @@ Codex's deny JSON, printed with exit 0:
 - an engine that exits non-zero, aborts or is killed;
 - an answer other than nothing or a single deny line.
 
-`SAFE_AI_SKILL_DISABLE=1` turns the Codex hooks off like the Claude Code ones (no output, so
-Codex runs the call). `SAFE_AI_SKILL_STRICT=1` still answers Codex with a deny. The engine also
-exits 0 after a panic under Codex.
+`SAFE_AI_SKILL_DISABLE` does not apply to the Codex hooks: their environment comes from the
+login shell, whose startup files an agent could write. To turn safe-ai-skill off under Codex,
+remove its groups from `hooks.json`. `SAFE_AI_SKILL_STRICT=1` still answers Codex with a deny.
+A misconfigured entry (the engine's usage error) is denied with a reason saying so. The engine
+also exits 0 after a panic under Codex.
 
 ## State: tiers, grants and audit
 
@@ -169,14 +198,23 @@ The CLI (`safe-ai-skill tier`, `status`, `revoke`, …) resolves it the same way
 in a terminal applies to the Codex hooks. The trust rules are unchanged:
 
 - State relaxes anything only in a trusted dir.
-- The default standalone dir under your passwd home is trusted.
-- A dir placed by `SAFE_AI_SKILL_DATA`, `XDG_DATA_HOME`, `LOCALAPPDATA` or a different `$HOME` is
-  trusted only when it is strictly inside your passwd home and not inside the project or the
-  hook's working dir. Otherwise its state can only tighten.
+- The standalone dir, whether the default or placed by `SAFE_AI_SKILL_DATA`, `XDG_DATA_HOME`,
+  `LOCALAPPDATA` or a different `$HOME`, is trusted only when all of these hold:
+  - it is strictly inside your passwd home;
+  - no component of its path below the home is a symlink;
+  - it is not inside a git repository below the home (a dotfiles repo at the home itself does
+    not count);
+  - it is not inside the project or the hook's working dir (a session started in the home
+    does not count).
+
+  Otherwise its state can only tighten.
 - State files keep their MAC under the dir's key.
 
-If you install the Claude Code plugin later, its dir takes over. Copy the whole standalone dir
-(key included) over it to keep your tier and grants.
+If you install the Claude Code plugin later, its dir takes over. `session-start` and `status`
+(`other_state_dirs`) then name any other dir that still holds state (a `key`), so it is not
+dropped silently. The same happens when two launchers resolve different standalone dirs. Copy
+the whole old dir (key included) over the one in use to keep your tier, grants and spend
+ledger, or delete it.
 
 **Confirmations are not possible under Codex.** Lowering the tier, `allow` grants, `verify
 trust` and `verify approve` each wait for a code that only a Claude Code hook shows (in a
@@ -202,7 +240,7 @@ secrets passes untouched. To turn it on, add this group to your `hooks.json`:
   {
     "matcher": "^(Bash|mcp__.*)$",
     "hooks": [
-      { "type": "command", "command": "safe-ai-skill adapt codex redact --block-with-redaction", "timeout": 10 }
+      { "type": "command", "command": "safe-ai-skill adapt codex redact --block-with-redaction || printf '%s\\n' '{\"decision\":\"block\",\"reason\":\"safe-ai-skill: the redaction hook could not run; result withheld.\"}'", "timeout": 10 }
     ]
   }
 ]
@@ -217,7 +255,9 @@ The cost:
 - Codex sends no PostToolUse for a command still running (an `exec_command` that returns a
   process id; `core/src/tools/context.rs`). So output read later through `write_stdin` polls
   that never complete is not scanned.
-- If the engine fails, the result is withheld (blocked with a short reason), not passed.
+- If the engine fails, or the result is too large to scan (over 8 MiB), the result is withheld
+  (blocked with a short reason), not passed. A scan that outlives the hook's `timeout` is
+  killed by Codex, and the result then passes.
   Without the flag the entry is a usage error, so this hook blocks every result until the
   config is fixed.
 - `redact.enabled: false` in the policy turns it off, as for Claude Code.
@@ -226,6 +266,10 @@ The cost:
 
 - **The Codex hook timeout.** If Codex kills the shim at its `timeout`, Codex runs the call. The
   engine answers within 8 seconds, and the template's timeouts (10–20 s) leave room for that.
+- **A hook command that cannot start.** Covered by the template's `|| printf` fallback and by
+  `doctor --codex` ([above](#install)), not by the shim.
+- **Codex skills and MCP servers.** The session start does not scan `.agents/skills`,
+  `$CODEX_HOME/skills` or the MCP servers in `config.toml`.
 - **Hooks wired to something other than the shim.** The npm launcher, a `cargo install`
   binary or the engine binary called directly lose the failure handling above.
 - **Native Windows.** Codex runs hooks with `cmd.exe /C` there, and the shim is POSIX `sh`. Use
@@ -257,9 +301,10 @@ The cost:
   - A bare `hooks.json` given to a writing command is denied whenever a Codex `hooks.json`
     exists (a user-scope install always has one). A bare `config.toml` given to a writing
     command other than a removal is always denied. The working dir is unknown in both cases.
-  - `find` expressions with `-o`, `!` or groups, and `git clean` near an untracked but ignored
-    `.codex/`, are denied as before. Each deny gives its reason. Run such a command yourself, or
-    narrow it (for example `find src -name '*.tmp' -delete`).
+  - Destructive `find` and path-less `git clean` / `git stash -u` whose root holds Codex hook
+    config, Claude Code settings or a login-shell startup file are denied whatever their tests
+    or flags. `find ~ … -delete` is always denied. Each deny gives its reason. Run such a
+    command yourself, or narrow its root (for example `find src -name '*.tmp' -delete`).
 - **Codex plugin hook files.** A plugin-bundled `hooks/hooks.json` is not protected.
 - **Captured payloads.** The tests use payloads built from Codex's source and its own test
   suite (`core/tests/suite/hooks.rs`), not captured from a live session.

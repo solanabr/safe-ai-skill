@@ -12,26 +12,26 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **`install.sh` installs the shim in front of the engine** on macOS and Linux, for releases that ship it (from 1.2.0). The shim goes to `safe-ai-skill` and the engine to `safe-ai-skill-<platform>` beside it, both checked against `SHA256SUMS`. Windows, and older releases, still get the bare engine. The release publishes the stamped shim as `safe-ai-skill-shim`.
 - **The CLI and the Codex hooks work without the Claude Code plugin.** When no Claude Code plugin data dir exists, state lives in a standalone dir:
   - `$SAFE_AI_SKILL_DATA`, else `safe-ai-skill-data` under `~/Library/Application Support` (macOS), `$XDG_DATA_HOME` or `~/.local/share` (other unix), or `%LOCALAPPDATA%` (Windows).
-  - Tiers, grants and the audit log work there, under the same trust rules: the default under your passwd home is trusted, and a dir placed by the environment is trusted only strictly inside it and outside the project.
+  - Tiers, grants and the audit log work there, under the usual trust rules. The dir must be strictly inside your passwd home, reached through no symlink below it, and not inside a git repository or the project; otherwise its state can only tighten.
   - The Claude Code plugin's dir still wins whenever it exists, so there is one set of state.
   - Before, the CLI exited 1 asking for `CLAUDE_PLUGIN_DATA`, and Codex hooks ran with nothing relaxed or audited.
 
 ### Changes
 
-- **Codex session start.** A `SessionStart` hook (`adapt codex session-start`) runs the supply-chain sweep and reports the tier in Codex's output shape. It never announces a confirmation code, because codes are confirmed only in Claude Code; the request waits for a Claude Code session. Confirmations remain impossible under Codex.
-- **Opt-in redaction for Codex.** `adapt codex redact --block-with-redaction` on PostToolUse blocks a result that holds secrets and gives the model the redacted text as the reason. Codex PostToolUse can only block, so the model sees such a result as a failed call. It is off by default, and the cost is documented in `docs/adapters.md`.
-- **More interactive starts are denied under Codex**, because `write_stdin` would feed them unchecked:
+- **Codex session start.** A `SessionStart` hook (`adapt codex session-start`) reports the tier and state in Codex's output shape. It says that Codex skills and MCP servers are not scanned. The Claude Code supply-chain sweep is not run there, because Codex loads neither its skill dirs nor its `.mcp.json`. It never announces a confirmation code, because codes are confirmed only in Claude Code; the request waits for a Claude Code session. Confirmations remain impossible under Codex.
+- **Opt-in redaction for Codex.** `adapt codex redact --block-with-redaction` on PostToolUse blocks a result that holds secrets and gives the model the redacted text as the reason. A result too large to scan is withheld. Codex PostToolUse can only block, so the model sees such a result as a failed call. It is off by default, and the cost is documented in `docs/adapters.md`.
+- **More interactive starts are denied under Codex**, because `write_stdin` would feed them unchecked (versioned names, `busybox`, runners such as `uv run`/`npx`, `env -S` and `find -exec` count too):
   - shells fed only by the terminal (`cat | bash`, `bash /dev/stdin`, `bash -s`, `bash < /dev/tty`);
   - read/eval loops;
   - `xargs` into a shell;
   - interpreters that execute their input (`perl -ne 'system $_'`, `awk '{system($0)}'`);
   - `script`, `tmux`, `screen` and other multiplexers;
   - `ssh host` without a command, `su`, `sudo -i|-s`;
-  - interactive `docker`/`kubectl` `exec`/`run`.
-- **Fewer false positives beside a `.codex/` dir.** These now deny only when they would reach Codex hook config:
-  - `find … -delete|-exec`: the `-name`/`-path`/`-type`/depth tests are evaluated, and `-exec` with a plain reader passes.
-  - `git clean` and `git stash -u`: they pass when the protected files are tracked in the git index.
-  - a bare `rm config.toml`: it passes unless a Codex `config.toml` that defines hooks exists.
+  - interactive `docker`/`kubectl` `exec`/`run`, `docker compose exec`, `nix-shell`, `socat … EXEC:`;
+  - command or process substitutions of a terminal reader (`bash -c "$(cat)"`, `bash <(cat)`).
+- **Codex self-protection widened.** Under Codex, writes to the login-shell startup files that `$SHELL -lc` reads (`~/.zshenv`, `~/.zprofile`, `~/.bash_profile`, `~/.profile`, fish `config.fish` and `conf.d`) are denied. So are recursive removes and moves of a directory above the data dir. Option arguments of `git clean -e` / `git stash -m` are no longer read as paths, and `--pathspec-from-file` counts as path-less. A bare `rm config.toml` is denied only when a Codex `config.toml` that defines hooks exists. `SAFE_AI_SKILL_DISABLE` does not apply to Codex hooks. `find -exec` with a plain reader (`grep`, `cat`, …, without options like `--pre`) is not treated as destructive.
+- **`safe-ai-skill doctor --codex`** runs each configured Codex hook as Codex would and fails on one that cannot start, times out or answers wrongly. Codex runs the call when a hook command cannot start, so the template's PreToolUse commands now end in a `|| printf` deny fallback. Run `doctor --codex` after every update.
+- **Forked state is reported.** `session-start` and `status` (`other_state_dirs`) name any other data dir that still holds state, for example after installing the Claude Code plugin over a standalone dir.
 - The audit log's directory is created with mode 0700, like the state files.
 
 ### Documentation
