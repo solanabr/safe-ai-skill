@@ -216,7 +216,7 @@ fn config_dir_forms(raw: &str) -> Vec<String> {
     if given.starts_with('/') || given.as_bytes().get(1) == Some(&b':') {
         out.push(given);
     }
-    if let Some(real) = std::fs::canonicalize(raw.trim())
+    if let Some(real) = crate::localfs::canonicalize(raw.trim())
         .ok()
         .and_then(|p| p.to_str().map(|s| normalize(s, None)))
     {
@@ -429,7 +429,7 @@ pub fn homes_resolved() -> Vec<String> {
     let mut out = homes();
     if let Some(real) = out
         .first()
-        .and_then(|h| std::fs::canonicalize(h).ok())
+        .and_then(|h| crate::localfs::canonicalize(h).ok())
         .and_then(|p| p.to_str().map(str::to_string))
     {
         if !out.contains(&real) {
@@ -439,8 +439,8 @@ pub fn homes_resolved() -> Vec<String> {
     out
 }
 
-/// Lowercased, `/`-separated, lexically folded form of `path` with a leading `~` expanded
-/// to `home`. Each component loses an NTFS `:stream` suffix (`.env::$DATA`) and trailing dots
+/// Lowercased, `/`-separated, lexically folded form of `path` (without a Windows verbatim
+/// `\\?\` prefix) with a leading `~` expanded to `home`. Each component loses an NTFS `:stream` suffix (`.env::$DATA`) and trailing dots
 /// and spaces (Windows ignores them). A drive letter (`C:`) keeps its colon.
 pub fn normalize(path: &str, home: Option<&str>) -> String {
     fold(path, home).to_ascii_lowercase()
@@ -449,8 +449,7 @@ pub fn normalize(path: &str, home: Option<&str>) -> String {
 /// [`normalize`] without the lowercasing (for case-sensitive allow globs).
 pub fn fold(path: &str, home: Option<&str>) -> String {
     // Case-insensitive filesystems fold these compatibility letters to ASCII (`.ſsh`, `.\u{212A}ey`).
-    let text = path
-        .trim()
+    let text = crate::localfs::without_verbatim(path.trim())
         .replace('\\', "/")
         .replace('\u{17F}', "s")
         .replace('\u{212A}', "k");
@@ -517,7 +516,7 @@ pub enum Sniffed {
 /// Look at up to `limit` bytes of `path`. Missing files and non-regular files (FIFOs,
 /// devices, directories) are [`Sniffed::Clean`] and never opened, so a FIFO cannot hang a gate.
 pub fn sniff(path: &Path, limit: usize) -> Sniffed {
-    let meta = match std::fs::metadata(path) {
+    let meta = match crate::localfs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Sniffed::Clean,
         Err(_) => return Sniffed::Unreadable,

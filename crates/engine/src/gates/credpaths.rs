@@ -275,7 +275,7 @@ fn canonical(path: &str) -> Option<String> {
     cache
         .entry(path.to_string())
         .or_insert_with(|| {
-            std::fs::canonicalize(path)
+            crate::localfs::canonicalize(path)
                 .ok()
                 .and_then(|p| p.to_str().map(str::to_string))
         })

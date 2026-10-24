@@ -667,7 +667,7 @@ impl Source {
                 let toml = ctx
                     .project_dir
                     .ancestors()
-                    .any(|d| d.join("Anchor.toml").exists());
+                    .any(|d| crate::localfs::exists(d.join("Anchor.toml")));
                 let base = if toml {
                     "Anchor.toml"
                 } else {

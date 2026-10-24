@@ -368,7 +368,7 @@ fn config_file_network(file: &str, base: Option<&Path>) -> Network {
 /// Read a regular file of at most [`MAX_CONFIG_BYTES`]; `None` otherwise (a FIFO or device
 /// is never opened).
 fn read_small_file(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = crate::localfs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
     }
@@ -663,7 +663,7 @@ fn network_from_anchor_toml(cwd: &Path) -> Option<Network> {
     let path = cwd
         .ancestors()
         .map(|dir| dir.join("Anchor.toml"))
-        .find(|p| std::fs::symlink_metadata(p).is_ok())?;
+        .find(|p| crate::localfs::symlink_metadata(p).is_ok())?;
     let Some(text) = read_small_file(&path) else {
         return Some(Network::Unknown);
     };
@@ -764,7 +764,7 @@ fn cli_config_fingerprint() -> String {
         return "no-home".to_string();
     };
     let path = PathBuf::from(home).join(".config/solana/cli/config.yml");
-    match std::fs::metadata(&path) {
+    match crate::localfs::metadata(&path) {
         Ok(meta) => {
             let mtime = meta
                 .modified()

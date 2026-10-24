@@ -20,7 +20,8 @@
 //! - Shared contracts (1.1.0): [`datadir`] (where state lives, and whether it is trusted),
 //!   [`statefile`] (MAC'd state), [`confirm`] (prompt-nonce confirmation), and
 //!   [`gate::Verdict`].
-//! - Platform (1.1.0): [`platform`] (SessionStart install and platform notices).
+//! - Platform (1.1.0): [`platform`] (SessionStart install and platform notices), [`localfs`]
+//!   (filesystem lookups for tool-input paths, never on a foreign Windows network share).
 //!
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
@@ -39,6 +40,7 @@ pub mod grants;
 pub mod headless;
 pub mod io;
 pub mod lists;
+pub mod localfs;
 pub mod migrate;
 pub mod mode;
 pub mod notice;

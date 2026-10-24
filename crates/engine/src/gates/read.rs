@@ -86,7 +86,7 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     }
     let homes = secretpath::homes_resolved();
     let raw = absolute(path, cwd, &homes);
-    let resolved = std::fs::canonicalize(&raw).ok();
+    let resolved = crate::localfs::canonicalize(&raw).ok();
     let mut candidates = vec![raw.to_string_lossy().into_owned()];
     if let Some(real) = &resolved {
         let real = real.to_string_lossy().into_owned();
@@ -337,7 +337,7 @@ fn shell_label(file: &str) -> String {
 /// Whether the varlock hint applies: a `.env.schema` next to the file or in `cwd`, or a
 /// `varlock` executable on `PATH`.
 pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
-    let schema_in = |dir: &Path| dir.join(".env.schema").is_file();
+    let schema_in = |dir: &Path| crate::localfs::is_file(dir.join(".env.schema"));
     if schema_in(cwd) || file.parent().is_some_and(schema_in) {
         return true;
     }
@@ -347,7 +347,7 @@ pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
     std::env::split_paths(&path).any(|dir| {
         ["varlock", "varlock.exe", "varlock.cmd"]
             .iter()
-            .any(|name| dir.join(name).is_file())
+            .any(|name| crate::localfs::is_file(dir.join(name)))
     })
 }
 
@@ -356,7 +356,7 @@ pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
 /// literal secret-looking value for a sensitive key. A missing schema is no opinion. The schema
 /// is parsed natively ([`Schema`]); nothing in it is evaluated.
 pub fn guard_env_schema(file: &Path) -> Decision {
-    let meta = match std::fs::metadata(file) {
+    let meta = match crate::localfs::metadata(file) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Decision::Defer,
         Err(_) => return schema_denied("could not be resolved"),
@@ -443,7 +443,7 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
         absolute(path, cwd, &homes)
     };
 
-    if !target.is_dir() {
+    if !crate::localfs::is_dir(&target) {
         // A single file (or nothing): judged like a Read; the glob does not apply.
         if path.trim().is_empty() {
             return ReadVerdict::Decide(Decision::Defer);
@@ -451,7 +451,7 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
         return ReadVerdict::Decide(decide_path(path, cwd, policy));
     }
 
-    let real = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let real = crate::localfs::canonicalize(&target).unwrap_or_else(|_| target.clone());
     if let Some(verdict) = credpaths::grep_root(&target, &real, &homes) {
         return ReadVerdict::Decide(verdict.into());
     }
@@ -631,18 +631,21 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
 fn holds_claude_state(arg: &str, cwd: &Path) -> bool {
     let homes = secretpath::homes_resolved();
     let target = absolute(arg, cwd, &homes);
-    if !target.is_dir() {
+    if !crate::localfs::is_dir(&target) {
         return false;
     }
-    let forms: Vec<String> = [Some(target.clone()), std::fs::canonicalize(&target).ok()]
-        .into_iter()
-        .flatten()
-        .map(|p| {
-            secretpath::normalize(&p.to_string_lossy(), None)
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .collect();
+    let forms: Vec<String> = [
+        Some(target.clone()),
+        crate::localfs::canonicalize(&target).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| {
+        secretpath::normalize(&p.to_string_lossy(), None)
+            .trim_end_matches('/')
+            .to_string()
+    })
+    .collect();
     let configs: Vec<String> = homes
         .iter()
         .map(|h| {

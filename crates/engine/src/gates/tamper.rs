@@ -406,10 +406,20 @@ impl Protected {
     fn resolved(&self) -> Self {
         let mut protected = self.clone();
         protected.add_spellings(|p| {
-            std::fs::canonicalize(p)
+            crate::localfs::canonicalize(p)
                 .ok()
                 .map(|c| c.to_string_lossy().into_owned())
         });
+        // A project root not on disk is spelled through its deepest existing ancestor, like a
+        // write target ([`path_candidates`]): on Windows `/work/p` resolves to `C:\work\p`.
+        for project in &self.projects {
+            if let Some(real) = resolve_existing(project) {
+                push_new(
+                    &mut protected.project_roots,
+                    normalize_path(&real.to_string_lossy()),
+                );
+            }
+        }
         protected
     }
 
@@ -445,9 +455,14 @@ impl Protected {
     }
 }
 
-/// A path as the matcher compares it: lowercase, `/`-separated, `.`/`..` resolved.
+/// A path as the matcher compares it: lowercase, `/`-separated, `.`/`..` resolved, without
+/// the Windows verbatim prefix (`\\?\`) a resolved spelling carries.
 fn normalize_path(path: &str) -> String {
-    lexical(&path.to_lowercase().replace('\\', "/"))
+    lexical(
+        &crate::localfs::without_verbatim(path)
+            .to_lowercase()
+            .replace('\\', "/"),
+    )
 }
 
 fn push_new(list: &mut Vec<String>, item: String) {
@@ -1636,7 +1651,9 @@ fn contains_path(word: &str, root: &str) -> bool {
 
 /// Expand `~`, `$HOME` and `${HOME}` to the first home spelling, then resolve `.`/`..`.
 fn normalize_word(word: &str, protected: &Protected) -> String {
-    let mut out = word.to_lowercase().replace('\\', "/");
+    let mut out = crate::localfs::without_verbatim(word)
+        .to_lowercase()
+        .replace('\\', "/");
     if let Some(home) = protected.homes.first() {
         if out.contains(['~', '$']) {
             out = expand_home(&out, home);
@@ -1737,7 +1754,7 @@ fn resolve_existing(path: &Path) -> Option<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut rest: Vec<OsString> = Vec::new();
     loop {
-        if let Ok(real) = std::fs::canonicalize(&existing) {
+        if let Ok(real) = crate::localfs::canonicalize(&existing) {
             return Some(rest.iter().rev().fold(real, |acc, c| acc.join(c)));
         }
         rest.push(existing.file_name()?.to_os_string());
