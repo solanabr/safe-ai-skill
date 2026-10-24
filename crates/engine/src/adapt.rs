@@ -33,6 +33,8 @@ pub enum Client {
     ClaudeCode,
     /// Codex CLI: only `deny` blocks; `ask` and a bare `allow` fail open.
     Codex,
+    /// opencode, through its plugin ([`crate::adapt_opencode`]): no `ask`, no `allow`.
+    OpenCode,
 }
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -52,10 +54,22 @@ pub fn is_codex() -> bool {
     current() == Client::Codex
 }
 
+/// Whether this process answers opencode.
+pub fn is_opencode() -> bool {
+    current() == Client::OpenCode
+}
+
+/// Whether this process answers a client other than Claude Code (no Claude Code sandbox, no
+/// `CLAUDE_PLUGIN_DATA`, and no `ask`).
+pub fn is_foreign() -> bool {
+    current() != Client::ClaudeCode
+}
+
 /// Parse an `adapt` client name.
 pub fn client_named(name: &str) -> Option<Client> {
     match name {
         "codex" => Some(Client::Codex),
+        "opencode" => Some(Client::OpenCode),
         _ => None,
     }
 }
@@ -87,6 +101,7 @@ pub fn render(decision: &Decision, client: Client) -> Decision {
             }
         }
         (Client::Codex, Decision::Allow) => Decision::Defer,
+        (Client::OpenCode, d) => crate::adapt_opencode::render(d),
         _ => decision.clone(),
     }
 }
@@ -271,7 +286,7 @@ fn push_spellings(list: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// `path` resolved against `cwd` (`~/` expanded with `home`), lexically normalised.
-fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+pub(crate) fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     let expanded = match (path.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => home.join(rest),
         _ if path == "~" => home.map(Path::to_path_buf).unwrap_or_default(),
@@ -286,7 +301,7 @@ fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// Drop `.` and resolve `..` without touching the filesystem.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
@@ -302,7 +317,7 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// `path` with its longest existing ancestor canonicalised (symlinks resolved), the rest
 /// appended; `path` itself when nothing resolves.
-fn canonical_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonical_prefix(path: &Path) -> PathBuf {
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
