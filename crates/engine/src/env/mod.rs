@@ -1,14 +1,16 @@
 //! `safe-ai-skill env keys|set|unset`: read and edit env-class files without printing values
 //! (#7, spec D3.4).
 //!
-//! Raw reads of env-class files are denied by the read gate; this subcommand is the sanctioned
+//! Raw reads of env files follow the env-read tier rule (`gates::envread`: project `.env`/`.env.*`
+//! open below High, other env files denied); this subcommand is the sanctioned
 //! path. `keys` lists keys with masked values ([`render`]); `set` takes the value on stdin so it
 //! never appears in argv, the transcript or any output; `unset` removes a key. Edits are
 //! byte-minimal ([`parse`] is lossless), verified by re-parsing, and atomic ([`write`]). Only
 //! env-class files are accepted ([`is_env_class`]), so `env` is not a general file reader or
-//! writer. `env keys` is never gated; an agent's `env set|unset` is denied at tier Medium and
-//! High by the `gate-bash-secrets` hook (the primary control), and refused here as a
-//! best-effort backstop when a Claude Code marker env is present.
+//! writer. `env keys` is never gated; an agent's `env set|unset` is denied at tier Medium (and
+//! at High for env files other than the project's `.env`/`.env.*`) by the `gate-bash-secrets`
+//! hook (the primary control), and refused here as a best-effort backstop when a Claude Code
+//! marker env is present.
 //!
 //! Exit codes: 0 ok; 1 refused or missing file, rejected stdin value, I/O error; 3 usage error
 //! (bad arguments or key name) or a `--require`d key that is missing, empty or a placeholder.
@@ -47,7 +49,8 @@ the value from stdin (one trailing newline is stripped); --multiline allows line
 --all updates every duplicate. `keys --require` exits 3 when a key is missing, empty or a
 placeholder. `keys` reads a varlock .env.schema beside FILE and annotates each key;
 `init-schema` writes that schema from FILE's keys (no values copied, never overwrites).
-From a Claude Code session, `set` and `unset` are refused at tier medium and high\n(the session's hook denies them first).
+From a Claude Code session, `set` and `unset` are refused at tier medium (and at high for env
+files other than the project's .env/.env.*; the session's hook denies them first).
 ";
 
 /// Whether `path` names an env-class file (spec D3.1, case-insensitive): `.env`, `.env.*`,
@@ -153,8 +156,9 @@ fn in_claude_code(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsSt
     })
 }
 
-/// The tier check for `env set|unset` run from a Claude Code session (D8 v2 spec §2: agent
-/// writes to project env files are denied at Medium and High).
+/// The tier check for `env set|unset` run from a Claude Code session (agent writes to project
+/// `.env`/`.env.*` are denied at Medium, to other env files at Medium and High;
+/// [`crate::gates::envwrite`]).
 ///
 /// The `gate-bash-secrets` hook is the primary control: it denies the command before it runs.
 /// This is a best-effort backstop for a form the hook did not recognise; a command that also
@@ -171,7 +175,11 @@ fn agent_write_refusal(args: &[String]) -> Option<String> {
     }
     let cwd = std::env::current_dir().ok()?;
     let mut dirs = vec![cwd.clone()];
-    if let Some(file) = args.iter().skip(1).find(|a| !a.starts_with('-')) {
+    let file = args.iter().skip(1).find(|a| !a.starts_with('-'));
+    let project = file.is_none_or(|f| {
+        crate::gates::envread::is_project_env(&expand_tilde(f).to_string_lossy(), &cwd)
+    });
+    if let Some(file) = file {
         let path = cwd.join(expand_tilde(file));
         let parent = path
             .parent()
@@ -180,7 +188,7 @@ fn agent_write_refusal(args: &[String]) -> Option<String> {
         dirs.push(fs::canonicalize(&parent).unwrap_or(parent));
     }
     let tier = dirs.iter().map(|dir| tier_for(dir)).max()?;
-    tier_refusal(action, tier)
+    tier_refusal(action, tier, project)
 }
 
 /// The effective tier for a session rooted at `dir`.
@@ -198,11 +206,14 @@ fn tier_for(dir: &Path) -> crate::policy::tier::Tier {
     policy.tier()
 }
 
-/// The refusal text for an agent's `env <action>` at `tier`, if that tier denies it.
-fn tier_refusal(action: &str, tier: crate::policy::tier::Tier) -> Option<String> {
-    (tier >= crate::policy::tier::Tier::Medium).then(|| {
+/// The refusal text for an agent's `env <action>` at `tier` on a project env file (`project`)
+/// or another env file, if that tier denies it.
+fn tier_refusal(action: &str, tier: crate::policy::tier::Tier, project: bool) -> Option<String> {
+    use crate::policy::tier::Tier;
+    let denied = tier == Tier::Medium || (!project && tier == Tier::High);
+    denied.then(|| {
         format!(
-            "refusing `env {action}` from a Claude Code session: tier {} denies agent writes to project env files. Run it in your own terminal, or edit the file yourself. `safe-ai-skill env keys` still works.",
+            "refusing `env {action}` from a Claude Code session: tier {} denies agent writes to this env file. Run it in your own terminal, or edit the file yourself. `safe-ai-skill env keys` still works.",
             tier.label()
         )
     })
@@ -826,14 +837,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_writes_are_refused_at_medium_and_high_only() {
+    fn agent_writes_follow_the_env_write_tier_rule() {
         use crate::policy::tier::Tier;
         for action in ["set", "unset"] {
-            assert!(tier_refusal(action, Tier::Off).is_none());
-            assert!(tier_refusal(action, Tier::Relaxed).is_none());
-            let why = tier_refusal(action, Tier::Medium).unwrap();
-            assert!(why.contains("tier medium") && why.contains(action), "{why}");
-            assert!(tier_refusal(action, Tier::High).is_some());
+            for project in [true, false] {
+                assert!(tier_refusal(action, Tier::Off, project).is_none());
+                assert!(tier_refusal(action, Tier::Relaxed, project).is_none());
+                let why = tier_refusal(action, Tier::Medium, project).unwrap();
+                assert!(why.contains("tier medium") && why.contains(action), "{why}");
+            }
+            assert!(tier_refusal(action, Tier::High, true).is_none());
+            assert!(tier_refusal(action, Tier::High, false).is_some());
         }
         assert!(agent_write_refusal(&["keys".to_string()]).is_none());
         assert!(agent_write_refusal(&[]).is_none());

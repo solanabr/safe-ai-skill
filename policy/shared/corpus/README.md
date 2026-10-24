@@ -11,7 +11,7 @@ One JSON object per line, eight topic files. The plugin's engine runner
 | `irreversible.jsonl` | Class U (14 shapes x mainnet, testnet, Unknown, localnet, devnet, wrapped), default-wallet destruction |
 | `credentials.jsonl` | home credential stores, command-form readers, Solana config |
 | `exfil.jsonl` | secret-to-network, exfil hosts, JSON-RPC quiet rows |
-| `env.jsonl` | project `.env` reads, opt-in, writes, `.env.schema` |
+| `env.jsonl` | project `.env` reads by tier, `env_read: deny`, other env files, writes, `.env.schema` |
 | `tier.jsonl` | tier selection inputs: raise-only hints, pending lowering |
 | `headless.jsonl` | the headless rule (every `ask` becomes `deny`) |
 
@@ -62,8 +62,9 @@ One JSON object per line, eight topic files. The plugin's engine runner
     - Additive: `reason` (required with `interim.plugin`): why the shipped engine differs, for
       example `exfil tripwire deferred (#19)`. The engine runner asserts `interim.plugin` on such a
       row.
-    - Additive: `until_feature`: a cargo feature (`env-read-opt-in`) that already gives the end
-      state; a build with it is held to `plugin`, a build without it to `interim.plugin`.
+    - Additive: `until_feature`: a cargo feature that already gives the end state; a build with
+      it is held to `plugin`, a build without it to `interim.plugin`. No feature is known since
+      1.2.0 retired `env-read-opt-in`.
   - Additive: `updated_input: true` (the gate must emit `updatedInput`, no decision), `note`.
 - **`?` (kit and interim columns only, additive):** the kit's verdict at that tier is not asserted
   (unknown from reading its source, or dependent on a kit choice not made yet). `combined` is then
@@ -90,6 +91,9 @@ checks them again on its actual verdicts for rows without `interim`.
   `sudo` row has kit `DDDD` at every tier in the end state, and its `combined` is `DDDD`; those rows
   only verify the engine. Rows where a wrapper might defeat a kit deny glob are `?`. A kit owner should
   review the whole column.
+- Project `.env` rows (engine 1.2.0, #16): the kit column is `?` at High for reads and at Medium for
+  writes, pending the kit owner (ai-kit's FIREWALL-SPEC denies them there); `combined` is the plugin's
+  `D` in those cells.
 - Seed ambiguities, resolved here: IR-1 and the other `--final` rows give the kit an end-state `----`
   (the contract's "both layers" is read as the interim state); DEV-3 uses 5 SOL, because the contract's
   50 SOL exceeds `hard_tx_sol_max` and denies (kept as DEV-3B); MN-3 and MN-4 get interim kit values.
@@ -103,8 +107,7 @@ checks them again on its actual verdicts for rows without `interim`.
 - **Hook wiring.** The runner calls `gate-bash` for every Bash row, matching `hooks.json`'s single
   unconditional `gate-bash` entry.
 - **Interim rows.** The exfil tripwire is deferred (#19): its host-list and quiet JSON-RPC rows hold
-  the shipped verdicts in `interim.plugin`. Raw env-read opt-in rows hold `DDDD` until the
-  `env-read-opt-in` feature is built (it ships disabled).
+  the shipped verdicts in `interim.plugin`.
 - **Sandbox.** `sandbox: unset` and `off` both map to the engine's "off" override under `test-hooks`,
   so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by F2's tests.
 - **Not in the corpus:** supply chain (needs pack fixtures) and PostToolUse redaction.
@@ -116,7 +119,6 @@ checks them again on its actual verdicts for rows without `interim`.
 cd crates/engine
 cargo test --test shared_corpus                      # schema test + runner smoke test
 cargo test --features test-hooks --test shared_corpus                  # the full plugin-column run
-cargo test --features test-hooks,env-read-opt-in --test shared_corpus  # opt-in rows at their end state
 SHARED_CORPUS_FILTER=U01,CL- SHARED_CORPUS_RESULTS=/tmp/plugin.jsonl \
   cargo test --features test-hooks --test shared_corpus
 sh scripts/conformance-diff.sh --column plugin /tmp/plugin.jsonl
@@ -124,13 +126,13 @@ sh scripts/conformance-diff.sh <kit-results.jsonl>   # kit runner output, compar
 ```
 
 The full plugin run is ignored without `--features test-hooks`, and **fails** when forced (`-- --ignored`), because it would otherwise
-skip every Off column, `env_read` opt-in, grant and `pre_cli` row. `SHARED_CORPUS_ALLOW_SKIP=1` accepts
+skip every Off column, `env_read: deny`, grant and `pre_cli` row. `SHARED_CORPUS_ALLOW_SKIP=1` accepts
 that gap explicitly. A filter that matches no cell also fails. `conformance-diff.sh` exits 1 on empty or
 garbage input, rows missing from the results (`--allow-missing` for a partial run), duplicate or
 value-less ids and unknown ids, so a crashed runner cannot pass.
 
 The runner drives each row through the hook entry the plugin wires for the tool (`gate-bash` and
 `gate-bash-secrets`, `gate-read`, `gate-tamper`, `gate-mcp`) and takes the strictest verdict, like
-Claude Code's merge. Rows needing Off, an `env_read` opt-in, a
+Claude Code's merge. Rows needing Off, `env_read: deny`, a
 grant or `pre_cli` need the `test-hooks` build (an authenticated tier.json in a trusted data dir). A
 no-opinion cell must print nothing (or, at most, a decision-less `systemMessage`/`updatedInput`).

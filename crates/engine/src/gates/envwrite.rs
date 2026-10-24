@@ -1,14 +1,25 @@
-//! Writes to project env files (D8 v2 spec §2): Write/Edit/MultiEdit to a project env file,
-//! and an agent's `safe-ai-skill env set|unset`, are denied at Medium and High (no opinion at
-//! Off and Relaxed). `env keys` and `env init-schema` are never gated.
+//! Writes to env files by tier (solana-ai-kit's model, #16).
 //!
-//! No Bash write coverage is claimed (`sed -i`, `perl -pi`, redirects; spec §8): only the
-//! sandbox's `denyWrite` closes those. `decide_cli` recognises `safe-ai-skill env set|unset` in
-//! command position: after `;`/`&&`/`|`/`$(`, assignments and the usual wrappers (`sudo`,
-//! `env -u X`, `timeout 5`, `xargs`, `npx`, …), and inside `sh -c '…'` / `eval`.
+//! | Write                                              | Off | Relaxed | Medium | High |
+//! |----------------------------------------------------|-----|---------|--------|------|
+//! | project `.env` / `.env.*` ([`envread::is_project_env`]) | n/o | n/o | deny | n/o  |
+//! | other env files (`.envrc`, `*.env`, `.dev.vars`, outside the project) | n/o | n/o | deny | deny |
+//! | a redaction marker written into any env file       | deny | deny   | deny   | deny |
 //!
-//! Call lines (shared files): `main::cmd_gate_tamper` ([`decide_file`]) and
-//! `main::cmd_gate_bash_secrets` ([`decide_cli`]).
+//! A write is Write/Edit/MultiEdit/NotebookEdit to the file ([`decide_file`]), an agent's
+//! `safe-ai-skill env set|unset` ([`decide_cli`]), and a Bash command that moves, removes,
+//! overwrites or edits it in place ([`bash_write`], from `creddump`: `rm`, `mv`, `cp` onto it,
+//! `>`/`>>`, `tee`, `truncate`, `dd of=`, `sed -i`, `perl -i`, interpreter code naming it with a
+//! write call, [`code_writes`]). Medium denies rather than asks: an ask is walked around by
+//! `python3 -c`, `perl -pi` or `sed -i`. High leaves writes open, as the kit does: the model can
+//! no longer read the file back. Bash coverage is a tripwire; the sandbox's `denyWrite` is the
+//! control. `env keys` and `env init-schema` are never gated. `decide_cli` recognises
+//! `safe-ai-skill env set|unset` in command position: after `;`/`&&`/`|`/`$(`, assignments and
+//! the usual wrappers (`sudo`, `env -u X`, `timeout 5`, `xargs`, `npx`, …), and inside
+//! `sh -c '…'` / `eval`.
+//!
+//! Call lines (shared files): `main::cmd_gate_tamper` ([`decide_file`]),
+//! `main::cmd_gate_bash_secrets` ([`decide_cli`]) and `creddump::inspect` ([`bash_write`]).
 
 use std::path::{Path, PathBuf};
 
@@ -16,12 +27,96 @@ use serde_json::Value;
 
 use crate::context::tokenize;
 use crate::gate::Verdict;
+use crate::gates::envread;
 use crate::gates::secretpath::{self, Class};
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
 
 /// How deep `sh -c` / `eval` nesting is followed.
 const MAX_NESTING: usize = 4;
+
+/// Lowercase write calls in interpreter code (Python, Node, Deno, Ruby, PHP), tied to a call
+/// rather than a bare token: `stdout.write` and `print('w', …)` are not writes.
+const CODE_WRITE_CALLS: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    "writefile",
+    "appendfile",
+    "createwritestream",
+    "set_key(",
+    "unset_key(",
+    "os.replace(",
+    "os.rename(",
+    "os.remove(",
+    "os.unlink(",
+    "os.truncate(",
+    "shutil.copy",
+    "shutil.move",
+    "fs.rm",
+    "fs.unlink",
+    "fs.rename",
+    "fs.copyfile",
+    "fs.truncate",
+    "file.write(",
+    "io.write(",
+    "file_put_contents(",
+    "deno.writetextfile",
+    "deno.writefile",
+    "deno.remove(",
+    "deno.rename(",
+    "o_wronly",
+    "o_rdwr",
+    "o_append",
+    "o_trunc",
+];
+
+/// Whether interpreter `code` shows a file write: a write call ([`CODE_WRITE_CALLS`]) or an
+/// `open(…)` (also `File.open`, `fopen`, Perl `open F, …`) whose mode string writes (`w`,
+/// `a`, `x`, `+`, or Perl's `>`, `>>`, `+<`). Code that names an env file and writes is an env
+/// write (it may also read it). Callers pass the code strings only.
+pub fn code_writes(code: &str) -> bool {
+    let lower = code.to_ascii_lowercase();
+    if CODE_WRITE_CALLS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    lower.match_indices("open").any(|(i, m)| {
+        let after = &lower[i.saturating_add(m.len())..];
+        let args = after.trim_start_matches([' ', '(']);
+        let segment = args.split([')', ';', '\n']).next().unwrap_or("");
+        quoted_strings(segment).any(|q| {
+            let q = q.trim();
+            q.starts_with('>')
+                || q.starts_with("+<")
+                || (!q.is_empty()
+                    && q.len() <= 4
+                    && q.chars().all(|c| "rwaxbtu+".contains(c))
+                    && q.chars().any(|c| "wax+".contains(c)))
+        })
+    })
+}
+
+/// The contents of the single- and double-quoted strings in `text`.
+fn quoted_strings(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let start = rest.find(['\'', '"'])?;
+        let quote = rest[start..].chars().next()?;
+        let body = &rest[start.saturating_add(1)..];
+        let Some(end) = body.find(quote) else {
+            rest = "";
+            return None;
+        };
+        let found = &body[..end];
+        rest = &body[end.saturating_add(1)..];
+        Some(found)
+    })
+}
+
+/// Whether the env-write rule denies a write to an env file at `tier`: Medium for a project
+/// env file, Medium and High for any other env file.
+fn denies(project: bool, tier: Tier) -> bool {
+    tier == Tier::Medium || (!project && tier == Tier::High)
+}
 
 /// The verdict for a Write|Edit|MultiEdit|NotebookEdit `tool_input`; `None` is no opinion.
 pub fn decide_file(
@@ -35,8 +130,16 @@ pub fn decide_file(
     let file = ["file_path", "notebook_path"]
         .iter()
         .find_map(|k| input.get(*k).and_then(Value::as_str))?;
-    if !is_project_env(file, cwd) {
+    if is_dotenv_keys_target(file, cwd) {
+        return Some(Verdict::Deny(
+            "safe-ai-skill: this is a dotenvx private-key file (`.env.keys`): key material, so agent writes, edits and removal are denied at every tier. Edit it yourself.".to_string(),
+        ));
+    }
+    if !is_env_target(file, cwd) {
         return None;
+    }
+    if let Some(reason) = envread::key_material_reason(file, cwd) {
+        return Some(Verdict::Deny(reason));
     }
     let label = Path::new(file)
         .file_name()
@@ -49,39 +152,57 @@ pub fn decide_file(
             "safe-ai-skill: this write would put a redaction marker (`***REDACTED:…***` / `«redacted:…»`) into {label}, overwriting a real secret. Edit only the lines you need, or ask the user to set the value: `printf %s '<value>' | safe-ai-skill env set {label} KEY`."
         )));
     }
-    if tier < Tier::Medium {
+    let project = envread::is_project_env(file, cwd);
+    if !denies(project, tier) {
         return None;
     }
     Some(Verdict::Deny(format!(
-        "safe-ai-skill: tier {} denies agent writes to project env files ({label}). Ask the user to edit it, or to set a value in their own terminal: `printf %s '<value>' | safe-ai-skill env set {label} KEY`. `safe-ai-skill env keys {label}` lists the keys.",
-        tier.label()
+        "safe-ai-skill: tier {} denies agent writes to {} ({label}). Ask the user to edit it, or to set a value in their own terminal: `printf %s '<value>' | safe-ai-skill env set {label} KEY`. `safe-ai-skill env keys {label}` lists the keys.",
+        tier.label(),
+        what(project)
     )))
+}
+
+/// `project env files` or `env files outside the project's .env/.env.*` for a reason.
+fn what(project: bool) -> &'static str {
+    if project {
+        "project env files"
+    } else {
+        "env files other than the project's .env/.env.*"
+    }
 }
 
 /// The verdict for a Bash `command` that may run `safe-ai-skill env set|unset`; `None` is no
 /// opinion.
 pub fn decide_cli(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
-    let _ = (cwd, policy);
+    let _ = policy;
     if tier < Tier::Medium {
         return None;
     }
-    let action = env_write_action(command, 0)?;
+    let (action, file) = env_write_action(command, 0)?;
+    let project = file
+        .as_deref()
+        .is_none_or(|f| envread::is_project_env(f, cwd));
+    if !denies(project, tier) {
+        return None;
+    }
     Some(Verdict::Deny(format!(
-        "safe-ai-skill: tier {} denies agent writes to project env files (`safe-ai-skill env {action}`). Ask the user to run it in their own terminal (`printf %s '<value>' | safe-ai-skill env set FILE KEY`), or to edit the file. `safe-ai-skill env keys FILE` still works.",
-        tier.label()
+        "safe-ai-skill: tier {} denies agent writes to {} (`safe-ai-skill env {action}`). Ask the user to run it in their own terminal (`printf %s '<value>' | safe-ai-skill env set FILE KEY`), or to edit the file. `safe-ai-skill env keys FILE` still works.",
+        tier.label(),
+        what(project)
     )))
 }
 
-/// The verdict for a Bash command that moves, removes or overwrites the project env file
-/// `label` (`rm`, `mv`, the destination of `cp`): a write, by the tier (no opinion at Off and
-/// Relaxed, deny at Medium and High).
-pub fn bash_write(label: &str, tier: Tier) -> Option<Verdict> {
-    if tier < Tier::Medium {
+/// The verdict for a Bash command that moves, removes, overwrites or edits in place the env file
+/// `label` ([`envread::is_project_env`] says `project`): a write, by the tier.
+pub fn bash_write(label: &str, project: bool, tier: Tier) -> Option<Verdict> {
+    if !denies(project, tier) {
         return None;
     }
     Some(Verdict::Deny(format!(
-        "safe-ai-skill: tier {} denies agent writes to project env files ({label} would be moved, removed or overwritten). Ask the user to do it in their own terminal. `safe-ai-skill env keys {label}` lists the keys.",
-        tier.label()
+        "safe-ai-skill: tier {} denies agent writes to {} ({label} would be moved, removed, overwritten or edited in place). Ask the user to do it in their own terminal. `safe-ai-skill env keys {label}` lists the keys.",
+        tier.label(),
+        what(project)
     )))
 }
 
@@ -101,10 +222,24 @@ fn writes_redaction_marker(input: &serde_json::Map<String, Value>) -> bool {
             .is_some_and(|edits| edits.iter().any(|e| marked(e.get("new_string"))))
 }
 
-/// Whether `file` (absolute, or relative to `cwd`) is a project env file, by its name or, for
-/// an existing path or symlink, by the file it resolves to. The Solana CLI config (env class
-/// for reads) is not a project env file.
-fn is_project_env(file: &str, cwd: &Path) -> bool {
+/// Whether `file` (absolute, or relative to `cwd`), by its name or the file it resolves to, is
+/// a dotenvx private-key file ([`envread::is_dotenv_keys_name`]).
+fn is_dotenv_keys_target(file: &str, cwd: &Path) -> bool {
+    let raw = expand(file, cwd);
+    let mut candidates = vec![raw.clone()];
+    if let Some(real) = resolve(&raw) {
+        candidates.push(real);
+    }
+    candidates.iter().any(|p| {
+        p.file_name()
+            .is_some_and(|n| envread::is_dotenv_keys_name(&n.to_string_lossy()))
+    })
+}
+
+/// Whether `file` (absolute, or relative to `cwd`) is an env-class file, by its name or, for an
+/// existing path or symlink, by the file it resolves to. The Solana CLI config (env class for
+/// reads) is not a write target here.
+fn is_env_target(file: &str, cwd: &Path) -> bool {
     let raw = expand(file, cwd);
     let mut candidates = vec![raw.clone()];
     if let Some(real) = resolve(&raw) {
@@ -142,8 +277,12 @@ fn resolve(path: &Path) -> Option<PathBuf> {
     Some(parent.join(path.file_name()?))
 }
 
-/// `set` or `unset` when `command` runs `safe-ai-skill env set|unset` in command position.
-fn env_write_action(command: &str, depth: usize) -> Option<&'static str> {
+/// `set` or `unset` (with the FILE operand, when given) when `command` runs
+/// `safe-ai-skill env set|unset` in command position.
+type Action = (&'static str, Option<String>);
+
+/// See [`Action`].
+fn env_write_action(command: &str, depth: usize) -> Option<Action> {
     if depth > MAX_NESTING {
         return None;
     }
@@ -196,7 +335,7 @@ fn segments(command: &str) -> Vec<String> {
 }
 
 /// The action of one simple command (already tokenized, quotes removed).
-fn segment_action(tokens: &[String], depth: usize) -> Option<&'static str> {
+fn segment_action(tokens: &[String], depth: usize) -> Option<Action> {
     if depth > MAX_NESTING {
         return None;
     }
@@ -224,17 +363,18 @@ fn segment_action(tokens: &[String], depth: usize) -> Option<&'static str> {
     env_action(args)
 }
 
-/// `env set|unset` among the arguments of a safe-ai-skill invocation.
-fn env_action(args: &[String]) -> Option<&'static str> {
+/// `env set|unset` (and its FILE) among the arguments of a safe-ai-skill invocation.
+fn env_action(args: &[String]) -> Option<Action> {
     let mut positional = args.iter().filter(|a| !a.starts_with('-'));
     if positional.next().map(String::as_str) != Some("env") {
         return None;
     }
-    match positional.next().map(String::as_str) {
-        Some("set") => Some("set"),
-        Some("unset") => Some("unset"),
-        _ => None,
-    }
+    let action = match positional.next().map(String::as_str) {
+        Some("set") => "set",
+        Some("unset") => "unset",
+        _ => return None,
+    };
+    Some((action, positional.next().cloned()))
 }
 
 /// The engine binary: `safe-ai-skill`, or a per-platform build `safe-ai-skill-<os>-<arch>`.
@@ -243,7 +383,7 @@ fn is_engine_binary(name: &str) -> bool {
 }
 
 /// `node …/safe-ai-skill/…/cli.js env set …` (the npm launcher).
-fn node_cli_action(args: &[String]) -> Option<&'static str> {
+fn node_cli_action(args: &[String]) -> Option<Action> {
     let rest = skip_options(args, &[]);
     let (script, tail) = rest.split_first()?;
     let script = script.to_ascii_lowercase();
@@ -254,7 +394,7 @@ fn node_cli_action(args: &[String]) -> Option<&'static str> {
 }
 
 /// `find … -exec|-execdir|-ok|-okdir CMD … ;|+`: each command run.
-fn find_exec_action(args: &[String], depth: usize) -> Option<&'static str> {
+fn find_exec_action(args: &[String], depth: usize) -> Option<Action> {
     let mut rest = args;
     while let Some(i) = rest
         .iter()
@@ -275,7 +415,7 @@ fn find_exec_action(args: &[String], depth: usize) -> Option<&'static str> {
 }
 
 /// `script -c CMD [file]` (util-linux) or `script [-q…] FILE CMD …` (BSD).
-fn script_action(args: &[String], depth: usize) -> Option<&'static str> {
+fn script_action(args: &[String], depth: usize) -> Option<Action> {
     if let Some(i) = args.iter().position(|a| a == "-c" || a == "--command") {
         let command = args.get(i.checked_add(1)?)?;
         return env_write_action(command, depth);
@@ -420,7 +560,7 @@ mod tests {
     use super::*;
 
     fn action(cmd: &str) -> Option<&'static str> {
-        env_write_action(cmd, 0)
+        env_write_action(cmd, 0).map(|(a, _)| a)
     }
 
     #[test]

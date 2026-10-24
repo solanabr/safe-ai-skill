@@ -16,8 +16,8 @@
 //!    `active_profile`), and the env `SAFE_AI_SKILL_TIER` / `SAFE_AI_SKILL_PROFILE`.
 //!    `effective = max(user, hints…)`; a hint below the user value is ignored with a note.
 //!
-//! `env_read` resolves the same way: the user value from `tier.json` (loosened only through a
-//! confirmation), else the base policy's; a repo value may only tighten it.
+//! `env_read` resolves the same way: the user value from `tier.json` (loosened back to `tier`
+//! only through a confirmation), else the base policy's; a repo value may only tighten it.
 //!
 //! Notes reach the model at SessionStart, so they echo only known words, never file text.
 
@@ -52,9 +52,10 @@ pub enum Tier {
     /// The default.
     #[default]
     Relaxed,
-    /// Relaxed plus the Medium exfil hosts and project env write denies.
+    /// Relaxed plus project env write denies.
     Medium,
-    /// A repo you distrust: never `allow`, Class C denied, HIGH packs denied until trusted.
+    /// A repo you distrust: never `allow`, Class C denied, HIGH packs denied until trusted,
+    /// project env reads denied.
     High,
 }
 
@@ -143,20 +144,29 @@ impl TierSource {
     }
 }
 
-/// Raw project env reads (`secrets.env_read`), ordered by looseness: `Deny < Ask < Tier`.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+/// Raw reads of project env files (`secrets.env_read`), ordered by looseness: `Deny < Tier`.
+///
+/// `tier` (the default) lets the tier decide: open at Off, Relaxed and Medium, denied at High.
+/// `deny` is a tightening the user (or a repo) may choose: denied at every tier. The 1.1.0
+/// loosening values `ask` and the sandbox-conditioned `tier` were retired in 1.2.0; a stored
+/// `ask` reads as `tier` and is removed at the next SessionStart ([`crate::migrate`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvRead {
-    /// Raw reads denied; served by `safe-ai-skill env` (the default).
-    #[default]
+    /// Raw reads denied at every tier; served by `safe-ai-skill env`.
     Deny,
-    /// Raw reads ask (Off to Medium) while the sandbox is on; deny at High.
-    Ask,
-    /// Raw reads follow the tier (no opinion at Off/Relaxed, deny at Medium/High) while the
-    /// sandbox is on.
+    /// Raw reads follow the tier (the default).
+    #[default]
     Tier,
+}
+
+impl<'de> Deserialize<'de> for EnvRead {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(d)?;
+        EnvRead::parse(&word)
+            .or_else(|| EnvRead::is_retired(&word).then_some(EnvRead::Tier))
+            .ok_or_else(|| serde::de::Error::custom("expected deny|tier"))
+    }
 }
 
 impl EnvRead {
@@ -164,19 +174,22 @@ impl EnvRead {
     pub fn label(self) -> &'static str {
         match self {
             EnvRead::Deny => "deny",
-            EnvRead::Ask => "ask",
             EnvRead::Tier => "tier",
         }
     }
 
-    /// Parse a policy word (`deny|ask|tier`, ASCII case and whitespace ignored).
+    /// Parse a policy word (`deny|tier`, ASCII case and whitespace ignored).
     pub fn parse(word: &str) -> Option<EnvRead> {
         match word.trim().to_ascii_lowercase().as_str() {
             "deny" => Some(EnvRead::Deny),
-            "ask" => Some(EnvRead::Ask),
             "tier" => Some(EnvRead::Tier),
             _ => None,
         }
+    }
+
+    /// Whether `word` is the retired 1.1.0 value `ask` (stored values still load, as `tier`).
+    pub fn is_retired(word: &str) -> bool {
+        word.trim().eq_ignore_ascii_case("ask")
     }
 }
 
@@ -276,7 +289,7 @@ impl Default for Inputs {
     fn default() -> Self {
         Inputs {
             base: Tier::Relaxed,
-            base_env_read: EnvRead::Deny,
+            base_env_read: EnvRead::Tier,
             user: tierstate::UserChoice::default(),
             kit: Ok(Vec::new()),
             repo: Vec::new(),
@@ -463,16 +476,16 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["deny", "deny", "deny", "deny"],
     ),
     (
-        "Project env raw read, default (env_read: deny)",
+        "Project .env / .env.* raw read (Read, Grep, Bash readers, MCP code), default env_read: tier",
+        ["n/o", "n/o", "n/o", "deny"],
+    ),
+    (
+        "Project .env / .env.* raw read, user-scope env_read: deny",
         ["deny", "deny", "deny", "deny"],
     ),
     (
-        "Project env raw read, user-scope env_read: tier, sandbox On",
-        ["n/o", "n/o", "deny", "deny"],
-    ),
-    (
-        "Project env raw read, user-scope env_read: ask, sandbox On",
-        ["ask", "ask", "ask", "deny"],
+        "Other env files raw read (.envrc, *.env, .dev.vars, Solana CLI config, env files outside the project)",
+        ["deny", "deny", "deny", "deny"],
     ),
     (
         "varlock value printers",
@@ -483,13 +496,17 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["n/o", "n/o", "n/o", "n/o"],
     ),
     (
-        "Write/Edit/MultiEdit to project env; agent env set|unset",
+        "Write/Edit/MultiEdit, Bash write or agent env set|unset to project .env / .env.*",
+        ["n/o", "n/o", "deny", "n/o"],
+    ),
+    (
+        "Write/Edit/MultiEdit or Bash write to other env files",
         ["n/o", "n/o", "deny", "deny"],
     ),
     ("env keys", ["n/o", "n/o", "n/o", "n/o"]),
     ("Pattern redaction", ["on", "on", "on", "on"]),
     (
-        "Value scrub, except the response of an opted-in raw read",
+        "Value scrub, except the Read response of a raw env read the tier permits",
         ["on", "on", "on", "on"],
     ),
     (
@@ -533,7 +550,7 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["ask", "ask", "ask", "deny"],
     ),
     (
-        "Project env file as a network command's input (a raw read)",
+        "Env data flowing into a network sink (pipe, redirect, substitution, loader, code)",
         ["deny", "deny", "deny", "deny"],
     ),
     (
@@ -598,9 +615,19 @@ mod tests {
 
     #[test]
     fn env_read_is_ordered_by_looseness() {
-        assert!(EnvRead::Deny < EnvRead::Ask && EnvRead::Ask < EnvRead::Tier);
+        assert!(EnvRead::Deny < EnvRead::Tier);
+        assert_eq!(EnvRead::default(), EnvRead::Tier);
         assert_eq!(EnvRead::parse("TIER"), Some(EnvRead::Tier));
         assert_eq!(EnvRead::parse("allow"), None);
+        assert_eq!(EnvRead::parse("ask"), None);
+    }
+
+    #[test]
+    fn a_stored_retired_ask_loads_as_tier() {
+        let e: EnvRead = serde_json::from_str("\"ask\"").unwrap();
+        assert_eq!(e, EnvRead::Tier);
+        assert_eq!(serde_json::to_string(&e).unwrap(), "\"tier\"");
+        assert!(serde_json::from_str::<EnvRead>("\"allow\"").is_err());
     }
 
     #[test]
@@ -674,10 +701,12 @@ mod tests {
     #[test]
     fn env_read_user_value_then_repo_may_only_tighten() {
         let mut i = inputs();
-        i.user.env_read = Some(EnvRead::Tier);
         assert_eq!(resolve_from(i.clone()).env_read, EnvRead::Tier);
-        i.repo_env_read = Some(EnvRead::Ask);
-        assert_eq!(resolve_from(i.clone()).env_read, EnvRead::Ask);
+        i.user.env_read = Some(EnvRead::Deny);
+        assert_eq!(resolve_from(i.clone()).env_read, EnvRead::Deny);
+        i.user.env_read = Some(EnvRead::Tier);
+        i.repo_env_read = Some(EnvRead::Deny);
+        assert_eq!(resolve_from(i.clone()).env_read, EnvRead::Deny);
         i.repo_env_read = Some(EnvRead::Tier);
         i.user.env_read = Some(EnvRead::Deny);
         assert_eq!(resolve_from(i).env_read, EnvRead::Deny);

@@ -28,6 +28,17 @@ fn project() -> TempDir {
 
 /// Run `sub` for `tool`/`tool_input` with the hook cwd at `cwd`; returns (label, reason).
 fn gate_full(sub: &str, tool: &str, tool_input: serde_json::Value, cwd: &Path) -> (String, String) {
+    gate_env(sub, tool, tool_input, cwd, &[])
+}
+
+/// [`gate_full`] with extra environment variables (`SAFE_AI_SKILL_TIER=high`).
+fn gate_env(
+    sub: &str,
+    tool: &str,
+    tool_input: serde_json::Value,
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> (String, String) {
     let data = TempDir::new("envschema-data");
     let home = TempDir::new("envschema-home");
     let payload = json!({
@@ -38,11 +49,14 @@ fn gate_full(sub: &str, tool: &str, tool_input: serde_json::Value, cwd: &Path) -
         "tool_input": tool_input,
     })
     .to_string();
-    let run = Invocation::new(&[sub])
+    let mut inv = Invocation::new(&[sub])
         .plugin_data(data.path())
         .home(home.path())
-        .stdin(payload)
-        .run();
+        .stdin(payload);
+    for (k, v) in env {
+        inv = inv.env(k, v);
+    }
+    let run = inv.run();
     let label = decision_label(&run);
     let reason = if label.is_empty() {
         String::new()
@@ -61,6 +75,17 @@ fn read(cwd: &Path, path: impl AsRef<Path>) -> (String, String) {
         "Read",
         json!({ "file_path": path.as_ref() }),
         cwd,
+    )
+}
+
+/// A Read at tier High, where project env reads deny.
+fn read_high(cwd: &Path, path: impl AsRef<Path>) -> (String, String) {
+    gate_env(
+        "gate-read",
+        "Read",
+        json!({ "file_path": path.as_ref() }),
+        cwd,
+        &[("SAFE_AI_SKILL_TIER", "high")],
     )
 }
 
@@ -95,7 +120,7 @@ fn read_schema_has_no_opinion() {
 }
 
 #[test]
-fn read_other_env_files_still_deny() {
+fn read_other_project_env_files_follow_the_tier() {
     let proj = project();
     for name in [
         ".env",
@@ -105,7 +130,8 @@ fn read_other_env_files_still_deny() {
         ".env.schema.local",
     ] {
         write(&proj, name, "X=1\n");
-        assert_eq!(read(proj.path(), proj.join(name)).0, "deny", "{name}");
+        assert_eq!(read(proj.path(), proj.join(name)).0, "", "{name}");
+        assert_eq!(read_high(proj.path(), proj.join(name)).0, "deny", "{name}");
     }
 }
 
@@ -123,12 +149,24 @@ fn grep_on_schema_has_no_opinion() {
 }
 
 #[test]
-fn bash_cat_schema_has_no_opinion_but_env_local_denies() {
+fn bash_cat_schema_has_no_opinion_and_env_local_follows_the_tier() {
     let proj = project();
     assert_eq!(bash_secrets(proj.path(), "cat .env.schema"), "");
     assert_eq!(bash_secrets(proj.path(), "cat sub/.env.schema"), "");
-    assert_eq!(bash_secrets(proj.path(), "cat .env.local"), "deny");
-    assert_eq!(bash_secrets(proj.path(), "cat .env.schema.local"), "deny");
+    assert_eq!(bash_secrets(proj.path(), "cat .env.local"), "");
+    let high = |c: &str| {
+        gate_env(
+            "gate-bash-secrets",
+            "Bash",
+            json!({ "command": c }),
+            proj.path(),
+            &[("SAFE_AI_SKILL_TIER", "high")],
+        )
+        .0
+    };
+    assert_eq!(high("cat .env.local"), "deny");
+    assert_eq!(high("cat .env.schema.local"), "deny");
+    assert_eq!(high("cat .env.schema"), "");
 }
 
 fn assert_schema_secret_denied(body: &str) {
@@ -260,11 +298,12 @@ fn unreadable_schema_denies() {
 
 #[cfg(unix)]
 #[test]
-fn schema_symlinked_to_env_denies() {
+fn schema_symlinked_to_env_is_a_read_of_env() {
     let proj = project();
     write(&proj, ".env", "PLAIN=hunter2\n");
     std::os::unix::fs::symlink(proj.join(".env"), proj.join(".env.schema")).unwrap();
-    assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "deny");
+    assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "");
+    assert_eq!(read_high(proj.path(), proj.join(".env.schema")).0, "deny");
 }
 
 #[test]
@@ -308,7 +347,7 @@ fn repo_listing_only_env_example_removes_the_schema_allow() {
 #[test]
 fn deny_reason_for_env_local_is_unchanged() {
     let proj = project();
-    let (label, reason) = read(proj.path(), proj.join(".env.local"));
+    let (label, reason) = read_high(proj.path(), proj.join(".env.local"));
     assert_eq!(label, "deny");
     assert!(reason.contains("is an env file"), "{reason}");
 }

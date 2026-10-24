@@ -7,7 +7,7 @@
 //!
 //! [`loosenings`] lists, for the user (`systemMessage`) and the model (`additionalContext`),
 //! everything that currently loosens the firewall or undermines its state: a user tier below
-//! the default, an `env_read` opt-in, live grants, state files that failed authentication, an
+//! the default, live grants, state files that failed authentication, an
 //! untrusted data dir, items migrated from 1.0, and a Claude Code sandbox that is off. Ignored
 //! hints and repo policy are listed by the tier resolution and
 //! [`crate::policy::Policy::ignored_notice`], and `SAFE_AI_SKILL_DISABLE` by the shim (the
@@ -21,7 +21,7 @@ use std::path::Path;
 
 use crate::datadir::DataDir;
 use crate::grants;
-use crate::policy::tier::{EnvRead, Resolution, Tier, TierContext};
+use crate::policy::tier::{Resolution, Tier, TierContext};
 use crate::sandbox::Declared;
 use crate::spend::LedgerState;
 use crate::statefile::Loaded;
@@ -79,21 +79,6 @@ pub fn loosenings(inputs: &Inputs<'_>) -> Option<String> {
                     "tier {} is active (your setting; every deny still holds)",
                     tier.label()
                 ));
-            }
-            if let Some(env_read) = choice.env_read.filter(|e| *e != EnvRead::Deny) {
-                lines.push(if crate::gates::envread::OPT_IN_AVAILABLE {
-                    format!(
-                        "secrets env_read {} is active (raw .env reads; only while the sandbox \
-                         is on)",
-                        env_read.label()
-                    )
-                } else {
-                    format!(
-                        "secrets env_read {} is stored but inactive in this build (raw .env \
-                         reads stay denied)",
-                        env_read.label()
-                    )
-                });
             }
         }
         Loaded::Tampered => lines.push(
@@ -170,7 +155,7 @@ mod tests {
     use super::*;
     use crate::grants::tests::{tmp_data, transfer_grant};
     use crate::grants::Grants;
-    use crate::policy::tier::TierSource;
+    use crate::policy::tier::{EnvRead, TierSource};
     use crate::sandbox::SandboxState;
 
     const ROOT: &str = "/work/proj";
@@ -208,7 +193,7 @@ mod tests {
     #[test]
     fn lists_every_loosening() {
         let dir = tmp_data("notice_all");
-        set_tier(&dir, Tier::Off, Some(EnvRead::Ask));
+        set_tier(&dir, Tier::Off, Some(EnvRead::Tier));
         grants::save(
             &dir,
             &Grants {
@@ -222,11 +207,6 @@ mod tests {
         let text = loosenings(&i).unwrap();
         for needle in [
             "tier off is active",
-            if crate::gates::envread::OPT_IN_AVAILABLE {
-                "env_read ask is active"
-            } else {
-                "env_read ask is stored but inactive in this build"
-            },
             "live grant g1",
             "spend.json was missing",
             "tier high (applied)",
@@ -235,6 +215,7 @@ mod tests {
             assert!(text.contains(needle), "{needle}: {text}");
         }
         assert!(!text.contains("grant old"), "{text}");
+        assert!(!text.contains("env_read"), "{text}");
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
@@ -283,7 +264,7 @@ mod tests {
             source: TierSource::Base,
             user: Tier::Relaxed,
             user_source: TierSource::Base,
-            env_read: EnvRead::Deny,
+            env_read: EnvRead::Tier,
             notes: Vec::new(),
         };
         let mut ctx = TierContext {

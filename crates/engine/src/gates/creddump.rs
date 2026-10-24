@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
-use crate::gates::{credpaths, read, secretpath};
+use crate::gates::{credpaths, envread, read, secretpath};
 use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -86,8 +86,10 @@ const MAX_GLOB_MATCHES: usize = 256;
 /// Most alternatives a brace group expands to.
 const MAX_BRACE: usize = 64;
 
-/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Credential reads and
-/// project env reads are tier-independent; an env-file write follows the env-write tier rule.
+/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Credential reads are
+/// tier-independent; an env-file read follows the env-read tier rule ([`envread`], denied at
+/// every tier when the command line also reaches the network), an env-file write the
+/// env-write tier rule.
 pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
     let parsed = shell::parse(command);
     if let Some(what) = parsed.commands.iter().find_map(reader) {
@@ -145,37 +147,611 @@ fn inspect(
     if let Some(what) = hit {
         return Ok(Some(Verdict::Deny(path_reason(&what))));
     }
+    if let Some(reason) = redirect_onto_key_material(parsed, cwd)? {
+        return Ok(Some(Verdict::Deny(reason)));
+    }
+    // Env data flowing into a network sink: denied at every tier, before the tier rows.
+    if let Some(file) = env_to_network(command, cwd, policy)? {
+        return Ok(Some(envread::to_network(&file)));
+    }
     let stdin_free = !command.contains(['|', '<']);
     let named: Vec<String> = parsed
         .arg_files
         .iter()
         .chain(&parsed.input_files)
-        .chain(&code)
         .cloned()
         .collect();
-    let Some(usage) = env_check(&parsed.commands, &named, cwd, policy, stdin_free)? else {
-        return Ok(None);
-    };
-    Ok(match usage {
-        EnvUse::Read(file) => {
-            let hint = read::varlock_hint(cwd, &cwd.join(&file));
-            match read::env_verdict(&file, policy, hint) {
+    let code_writes = !code.is_empty() && crate::gates::envwrite::code_writes(&code_text(parsed));
+    let usage = env_check(
+        &parsed.commands,
+        &EnvInputs {
+            named: &named,
+            code: &code,
+            code_writes,
+            outputs: &parsed.output_files,
+        },
+        cwd,
+        policy,
+        stdin_free,
+    )?;
+    // A project env file the tier opens is still key material when its content is.
+    for hit in usage.read.iter().chain(&usage.write) {
+        if hit.project {
+            if let Some(reason) = envread::key_material_reason(&hit.file, &hit.dir) {
+                return Ok(Some(Verdict::Deny(reason)));
+            }
+        }
+    }
+    let mut verdicts: Vec<Option<Verdict>> = Vec::new();
+    if let Some(hit) = &usage.read {
+        let varlock = read::varlock_hint(cwd, &hit.dir.join(&hit.file));
+        verdicts.push(
+            match read::env_verdict(&hit.file, hit.project, policy, varlock) {
                 Decision::Deny { reason } => Some(Verdict::Deny(reason)),
                 Decision::Ask { reason } => Some(Verdict::Ask(reason)),
                 _ => None,
-            }
-        }
-        EnvUse::Write(file) => crate::gates::envwrite::bash_write(&file, tier),
-    })
+            },
+        );
+    }
+    if let Some(hit) = &usage.write {
+        verdicts.push(crate::gates::envwrite::bash_write(
+            &hit.file,
+            hit.project,
+            tier,
+        ));
+    }
+    Ok(verdicts.into_iter().flatten().max_by_key(|v| match v {
+        Verdict::Deny(_) => 3,
+        Verdict::Ask(_) => 2,
+        Verdict::Allow(_) => 1,
+        Verdict::NoOpinion => 0,
+    }))
 }
 
-/// How a command uses a project env file it names.
+/// An output redirect (`>`, `>>`, `>|`, `: >`, a here-document into a file) onto key material,
+/// resolved against the hook cwd and every `cd` target: a credential path, a hard-deny name
+/// (`*-keypair.json`, `.env.keys`, …), or an existing `id.json`/`*.pem`/`*.key`/env file whose
+/// content is key material. Truncating it destroys the key: denied at every tier.
+fn redirect_onto_key_material(
+    parsed: &shell::Parsed,
+    hook_cwd: &Path,
+) -> Result<Option<String>, TooComplex> {
+    if parsed.output_files.is_empty() {
+        return Ok(None);
+    }
+    if parsed.output_files.len() > MAX_WORDS {
+        return Err(TooComplex);
+    }
+    let mut cwds = vec![hook_cwd.to_path_buf()];
+    for cmd in &parsed.commands {
+        if matches!(cmd.program().as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut cwds);
+        }
+    }
+    let homes = crate::gates::secretpath::homes_resolved();
+    for target in &parsed.output_files {
+        if envread::is_socket_path(target) || target.trim().is_empty() {
+            continue;
+        }
+        if let Some(what) = word_hit(target, &cwds, Exempt::None) {
+            return Ok(Some(format!(
+                "Protected secret file blocked: a redirect would overwrite {what} (key material); writing it is denied at every tier."
+            )));
+        }
+        for variant in expand_vars(target) {
+            for path in resolve_all(&variant, &cwds) {
+                let real = std::fs::canonicalize(&path).ok();
+                let class = |p: &Path| {
+                    crate::gates::secretpath::classify_with_homes(&p.to_string_lossy(), &homes)
+                };
+                let hard =
+                    class(&path).is_hard() || real.as_deref().is_some_and(|r| class(r).is_hard());
+                let sniffable = matches!(
+                    class(real.as_deref().unwrap_or(&path)),
+                    crate::gates::secretpath::Class::Suspect(_)
+                        | crate::gates::secretpath::Class::Env
+                );
+                let content = sniffable
+                    && path.exists()
+                    && envread::key_material_in(real.as_deref().unwrap_or(&path)).is_some();
+                if hard || content {
+                    return Ok(Some(format!(
+                        "Protected secret file blocked: a redirect would overwrite {target} (key material); writing it is denied at every tier."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The code strings of a parsed command: the words after each interpreter (and an awk
+/// program), and code fed on standard input.
+fn code_text(parsed: &shell::Parsed) -> String {
+    let mut out: Vec<String> = parsed.stdin_code.clone();
+    for cmd in &parsed.commands {
+        let start = if AWKS.contains(&cmd.program().as_str()) {
+            Some(1)
+        } else {
+            shell::interpreter_at(&cmd.words).map(|i| i.saturating_add(1))
+        };
+        if let Some(start) = start {
+            out.extend(cmd.words.iter().skip(start).map(|w| w.text.clone()));
+        }
+    }
+    out.join("\n")
+}
+
+// ---------------------------------------------------------------------------------------
+// Env data to the network
+// ---------------------------------------------------------------------------------------
+
+/// The env file whose data can flow into a network sink in `command`, if any (denied at every
+/// tier). Unrelated commands on one line do not count (`cat .env && curl localhost/health`).
+/// The command is split into statements (`;`, `&&`, `||`, `&`, newlines) and each into pipeline
+/// stages, outside quotes, substitutions and here-documents; a flow is:
+///
+/// 1. an env read upstream of, or in the same stage as, a network sink
+///    ([`envread::is_network_sink`], or an output redirect to `/dev/tcp`/`/dev/udp`): a pipe,
+///    an input redirect, a here-string, a process or command substitution in its words;
+/// 2. an env file loaded into the shell (`source`, `.`, `export`/`set`/`eval`, or a `$(…)` /
+///    backtick read) followed later in the line by a sink with an expansion in its words, or by
+///    interpreter code with a network client;
+/// 3. a reader's output-redirect target named later by a sink (`cat .env > /tmp/x; curl -T
+///    /tmp/x …`);
+/// 4. a command naming an env file whose following words run a sink or network code, or load
+///    a remote script or module (`dotenv -e .env -- curl …`, `docker run --env-file .env img
+///    curl …`, `deno run --env-file=.env https://…`);
+/// 5. interpreter code that names an env file and opens a network client (code strings only).
+fn env_to_network(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let statements = split_statements(command);
+    if statements.iter().map(Vec::len).sum::<usize>() > MAX_COMMANDS {
+        return Err(TooComplex);
+    }
+    let mut loaded: Option<String> = None;
+    let mut written: Vec<(String, String)> = Vec::new();
+    for stmt in &statements {
+        let mut upstream: Option<String> = None;
+        for stage in stmt {
+            let parsed = shell::parse(stage);
+            if let Some(file) = loader_to_network(&parsed, cwd, policy) {
+                return Ok(Some(file));
+            }
+            if let Some(file) = code_to_network(&parsed, cwd, policy)? {
+                return Ok(Some(file));
+            }
+            let read = stage_env_read(&parsed, cwd, policy)?;
+            let sink = parsed.commands.iter().any(is_sink)
+                || parsed
+                    .output_files
+                    .iter()
+                    .any(|f| envread::is_socket_path(f));
+            if sink {
+                if let Some(file) = read.clone().or_else(|| upstream.clone()) {
+                    return Ok(Some(file));
+                }
+                let expands = parsed
+                    .commands
+                    .iter()
+                    .any(|c| is_sink(c) && c.words.iter().skip(1).any(|w| w.dynamic));
+                if let Some(file) = loaded.as_ref().filter(|_| expands) {
+                    return Ok(Some(file.clone()));
+                }
+                if let Some((_, file)) =
+                    written.iter().find(|(out, _)| stage.contains(out.as_str()))
+                {
+                    return Ok(Some(file.clone()));
+                }
+            }
+            if let Some(file) = loaded.as_ref() {
+                if envread::code_reaches_network(&code_text(&parsed)) {
+                    return Ok(Some(file.clone()));
+                }
+            }
+            if let Some(file) = read {
+                if loads_into_shell(&parsed, stage) {
+                    loaded = Some(file.clone());
+                }
+                written.extend(
+                    parsed
+                        .output_files
+                        .iter()
+                        .filter(|f| !envread::is_socket_path(f) && !f.trim().is_empty())
+                        .map(|f| (f.clone(), file.clone())),
+                );
+                upstream = Some(file);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a simple command is a network sink ([`envread::is_network_sink`]). Leading
+/// substitutions that only set variables (`env $(cat .env | xargs) wget …`) are skipped, and
+/// the rest is parsed again when they were (`env $(…) sh -c 'curl …'`).
+fn is_sink(cmd: &SimpleCommand) -> bool {
+    let start = variable_prefix(cmd);
+    let words: Vec<&str> = cmd
+        .words
+        .iter()
+        .skip(start)
+        .map(|w| w.text.as_str())
+        .collect();
+    let dynamic = cmd
+        .words
+        .iter()
+        .skip(start.saturating_add(1))
+        .any(|w| w.dynamic);
+    if envread::is_network_sink(&words, dynamic) {
+        return true;
+    }
+    start > 0 && {
+        let inner = shell::parse(&requote(&words));
+        inner.commands.iter().any(is_sink) || envread::code_reaches_network(&code_text(&inner))
+    }
+}
+
+/// `words` as one shell line, each single-quoted.
+fn requote(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|w| format!("'{}'", w.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How many leading words of `cmd` only set variables: `env`, `NAME=value`, and command
+/// substitutions or backticks in program position.
+fn variable_prefix(cmd: &SimpleCommand) -> usize {
+    cmd.words
+        .iter()
+        .position(|w| {
+            let t = w.text.as_str();
+            !(t == "env"
+                || (w.dynamic && (t.starts_with("$(") || t.starts_with('`')))
+                || t.split_once('=').is_some_and(|(k, _)| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }))
+        })
+        .unwrap_or(0)
+}
+
+/// The first project or other env file a stage reads (the env gate's reads, [`env_check`]).
+fn stage_env_read(
+    parsed: &shell::Parsed,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let code = code_paths(parsed, cwd)?;
+    let named: Vec<String> = parsed
+        .arg_files
+        .iter()
+        .chain(&parsed.input_files)
+        .cloned()
+        .collect();
+    let usage = env_check(
+        &parsed.commands,
+        &EnvInputs {
+            named: &named,
+            code: &code,
+            code_writes: false,
+            outputs: &[],
+        },
+        cwd,
+        policy,
+        false,
+    )?;
+    Ok(usage.read.map(|h| h.file))
+}
+
+/// Whether a stage that reads an env file puts its values into the shell: `source`/`.`,
+/// `export`/`set`/`eval`/`declare`, or a command substitution or backtick read.
+fn loads_into_shell(parsed: &shell::Parsed, stage: &str) -> bool {
+    stage.contains("$(")
+        || stage.contains('`')
+        || parsed.commands.iter().any(|c| {
+            matches!(
+                c.program().as_str(),
+                "source" | "." | "export" | "set" | "eval" | "declare" | "typeset" | "readonly"
+            )
+        })
+}
+
+/// Flow 4 of [`env_to_network`]: a command naming an env file whose following words run a
+/// sink or network code, or load a remote script or module.
+fn loader_to_network(parsed: &shell::Parsed, cwd: &Path, policy: &Policy) -> Option<String> {
+    let homes = crate::gates::secretpath::homes_resolved();
+    let cwds = [cwd.to_path_buf()];
+    for cmd in &parsed.commands {
+        let words: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+        let Some((at, file)) = words
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(i, w)| env_word_hit(w, &cwds, &homes, policy).map(|f| (i, f)))
+        else {
+            continue;
+        };
+        // An interpreter loading the file through its own flag (`node --env-file=.env -e …`,
+        // `deno run --env-file .env --eval …`): its inline code runs with the values.
+        if shell::interpreter_at(&cmd.words).is_some() {
+            let inline = code_text(&shell::Parsed {
+                commands: vec![cmd.clone()],
+                ..shell::Parsed::default()
+            });
+            if envread::code_reaches_network(&inline) {
+                return Some(file);
+            }
+        }
+        let after = words.get(at.saturating_add(1)..).unwrap_or(&[]);
+        let child = match after.iter().position(|w| *w == "--") {
+            Some(dashes) => after.get(dashes.saturating_add(1)..).unwrap_or(&[]),
+            None => after,
+        };
+        if child.is_empty() {
+            continue;
+        }
+        if remote_module(after) {
+            return Some(file);
+        }
+        let inner = shell::parse(&requote(child));
+        if inner.commands.iter().any(is_sink) || envread::code_reaches_network(&code_text(&inner)) {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Whether a loader's words name a remote script or module: its first positional, or the
+/// value of `--import`/`--loader`/`--experimental-loader`/`--require`/`-r`, is an
+/// `http(s)://` URL for a host other than this machine.
+fn remote_module(words: &[&str]) -> bool {
+    let remote = |w: &str| {
+        let w = w.to_ascii_lowercase();
+        (w.starts_with("http://") || w.starts_with("https://")) && !envread::all_local(&[&w])
+    };
+    let flags = [
+        "--import",
+        "--loader",
+        "--experimental-loader",
+        "--require",
+        "-r",
+    ];
+    let mut first_positional = true;
+    let mut iter = words.iter().peekable();
+    while let Some(w) = iter.next() {
+        if let Some((flag, value)) = w.split_once('=') {
+            if flags.contains(&flag) && remote(value) {
+                return true;
+            }
+            continue;
+        }
+        if flags.contains(w) {
+            if iter.peek().is_some_and(|v| remote(v)) {
+                return true;
+            }
+            continue;
+        }
+        if w.starts_with('-') {
+            continue;
+        }
+        if first_positional && remote(w) {
+            return true;
+        }
+        first_positional = false;
+    }
+    false
+}
+
+/// Flow 5 of [`env_to_network`]: interpreter code in the stage that names an env file and opens
+/// a network client (the code strings only).
+fn code_to_network(
+    parsed: &shell::Parsed,
+    cwd: &Path,
+    policy: &Policy,
+) -> Result<Option<String>, TooComplex> {
+    let code = code_paths(parsed, cwd)?;
+    if code.is_empty() || !envread::code_reaches_network(&code_text(parsed)) {
+        return Ok(None);
+    }
+    let homes = crate::gates::secretpath::homes_resolved();
+    let cwds = [cwd.to_path_buf()];
+    Ok(code
+        .iter()
+        .find_map(|f| env_word_hit(f, &cwds, &homes, policy)))
+}
+
+/// `command` split into statements (at `;`, `&&`, `||`, a lone `&` and newlines) and each into
+/// pipeline stages (at `|` and `|&`), outside quotes, `$(…)`/`(…)`/backticks and
+/// here-document bodies (a body stays with its stage).
+fn split_statements(command: &str) -> Vec<Vec<String>> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut statements: Vec<Vec<String>> = Vec::new();
+    let mut stages: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0usize;
+    let mut backtick = false;
+    let mut heredocs: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let flush_stage = |cur: &mut String, stages: &mut Vec<String>| {
+        if !cur.trim().is_empty() {
+            stages.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    while let Some(&c) = chars.get(i) {
+        i = i.saturating_add(1);
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == '\\' && q == '"' {
+                if let Some(&n) = chars.get(i) {
+                    cur.push(n);
+                    i = i.saturating_add(1);
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\\' => {
+                cur.push(c);
+                if let Some(&n) = chars.get(i) {
+                    cur.push(n);
+                    i = i.saturating_add(1);
+                }
+            }
+            '\'' | '"' => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            '`' => {
+                backtick = !backtick;
+                cur.push(c);
+            }
+            '(' => {
+                depth = depth.saturating_add(1);
+                cur.push(c);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            '<' if chars.get(i) == Some(&'<') && chars.get(i.saturating_add(1)) != Some(&'<') => {
+                // A here-document: remember its delimiter; the body follows the next newline.
+                cur.push_str("<<");
+                i = i.saturating_add(1);
+                if chars.get(i) == Some(&'-') {
+                    cur.push('-');
+                    i = i.saturating_add(1);
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    cur.push(chars[i]);
+                    i = i.saturating_add(1);
+                }
+                let mut word = String::new();
+                while let Some(&w) = chars.get(i) {
+                    if w.is_whitespace() || ";&|<>()".contains(w) {
+                        break;
+                    }
+                    word.push(w);
+                    cur.push(w);
+                    i = i.saturating_add(1);
+                }
+                let delimiter: String = word.chars().filter(|c| !"'\"\\".contains(*c)).collect();
+                if !delimiter.is_empty() {
+                    heredocs.push(delimiter);
+                }
+            }
+            '\n' if depth == 0 && !backtick && !heredocs.is_empty() => {
+                // Here-document bodies, in order, stay with this stage.
+                cur.push('\n');
+                for delimiter in std::mem::take(&mut heredocs) {
+                    loop {
+                        let mut line = String::new();
+                        while let Some(&l) = chars.get(i) {
+                            i = i.saturating_add(1);
+                            if l == '\n' {
+                                break;
+                            }
+                            line.push(l);
+                        }
+                        cur.push_str(&line);
+                        cur.push('\n');
+                        if line.trim_start_matches('\t') == delimiter || i >= chars.len() {
+                            break;
+                        }
+                    }
+                }
+                flush_stage(&mut cur, &mut stages);
+                if !stages.is_empty() {
+                    statements.push(std::mem::take(&mut stages));
+                }
+            }
+            ';' | '\n' if depth == 0 && !backtick => {
+                flush_stage(&mut cur, &mut stages);
+                if !stages.is_empty() {
+                    statements.push(std::mem::take(&mut stages));
+                }
+            }
+            '&' if depth == 0 && !backtick => {
+                let prev = cur.chars().last();
+                if chars.get(i) == Some(&'&') {
+                    i = i.saturating_add(1);
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                } else if matches!(prev, Some('>' | '<')) || chars.get(i) == Some(&'>') {
+                    cur.push(c);
+                } else {
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                }
+            }
+            '|' if depth == 0 && !backtick => {
+                if chars.get(i) == Some(&'|') {
+                    i = i.saturating_add(1);
+                    flush_stage(&mut cur, &mut stages);
+                    if !stages.is_empty() {
+                        statements.push(std::mem::take(&mut stages));
+                    }
+                } else if cur.ends_with('>') {
+                    cur.push(c);
+                } else {
+                    if chars.get(i) == Some(&'&') {
+                        i = i.saturating_add(1);
+                    }
+                    flush_stage(&mut cur, &mut stages);
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    flush_stage(&mut cur, &mut stages);
+    if !stages.is_empty() {
+        statements.push(stages);
+    }
+    statements
+}
+
+/// One env file a command uses: the file as named, the directory it resolves against (the
+/// cwd in effect), and whether it is a project env file of the session
+/// ([`envread::is_project_env_in`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EnvUse {
-    /// Its contents can reach the output: the env-read verdict.
-    Read(String),
-    /// It is moved, removed or overwritten: the env-write tier rule.
-    Write(String),
+struct EnvHit {
+    file: String,
+    dir: PathBuf,
+    project: bool,
+}
+
+/// How a command line uses the env files it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EnvUse {
+    /// The first file whose contents can reach the output: the env-read verdict.
+    read: Option<EnvHit>,
+    /// The first file moved, removed, overwritten or edited in place: the env-write tier rule.
+    write: Option<EnvHit>,
+}
+
+/// The files a command line names outside its words.
+struct EnvInputs<'a> {
+    /// `xargs -a` files and input redirect targets: reads.
+    named: &'a [String],
+    /// Paths named in interpreter code: reads, and writes too when `code_writes`.
+    code: &'a [String],
+    /// The command line's code shows a file write ([`crate::gates::envwrite::code_writes`]).
+    code_writes: bool,
+    /// Output redirect targets: writes.
+    outputs: &'a [String],
 }
 
 /// Programs whose words naming an env file are not a raw read: the env CLI itself and
@@ -198,8 +774,11 @@ const ENV_REMOVERS: &[&str] = &["rm", "unlink", "shred"];
 
 /// Programs whose last positional (or `-t` value) is a destination and the rest are sources:
 /// an env file as the destination is a write, as a source a read (it relocates the secret to a
-/// name anything can read).
+/// name anything can read), and for `mv` a write too (the file is gone).
 const ENV_RELOCATORS: &[&str] = &["mv", "cp", "ln", "rsync", "install"];
+
+/// Programs that overwrite every file operand without printing it: a write.
+const ENV_OVERWRITERS: &[&str] = &["tee", "truncate"];
 
 /// Build tools a `dotenv`/`dotenvx` wrapper may run with the loaded environment.
 const ENV_BUILD_TOOLS: &[&str] = &["next", "vite", "anchor", "cargo", "make"];
@@ -598,32 +1177,68 @@ fn relocation_destinations(words: &[&str]) -> Vec<usize> {
     out
 }
 
-/// The first word of a non-metadata command that names a project env file (the env gate's
-/// definition, [`read::is_env_file`]): any program, the word resolved like a credential path
-/// (pieces after `=`/`:`, braces, `~`, every cwd), a wildcard expanded against the filesystem
-/// (dotfiles only by a literal leading dot, as the shell does) and matched lexically against
-/// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
+/// How a command line uses env files (the env gate's definition, [`read::is_env_file`]): each
+/// non-metadata command's words, resolved like a credential path (pieces after `=`/`:`,
+/// braces, `~`, every cwd), a wildcard expanded against the filesystem (dotfiles only by a
+/// literal leading dot, as the shell does) and matched lexically against env names, plus the
+/// files named outside the words ([`EnvInputs`]). A search's pattern and a `find` with no
+/// `-exec` (it prints names) are skipped. A word is a write for a remover, a relocator's
+/// destination (and `mv`'s source), `tee`/`truncate`, `dd of=`, and an in-place edit (`sed -i`,
+/// `perl -i`, `ruby -i`); otherwise a read.
 fn env_check(
     commands: &[SimpleCommand],
-    named: &[String],
+    inputs: &EnvInputs<'_>,
     hook_cwd: &Path,
     policy: &Policy,
     stdin_free: bool,
-) -> Result<Option<EnvUse>, TooComplex> {
+) -> Result<EnvUse, TooComplex> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
-    if named.len() > MAX_WORDS {
+    let total = inputs.named.len() + inputs.code.len() + inputs.outputs.len();
+    if total > MAX_WORDS {
         return Err(TooComplex);
     }
-    if let Some(hit) = named
+    let mut usage = EnvUse::default();
+    // The session's project is fixed (a `cd` never makes another one); a word resolves against
+    // every `cd` target seen so far, else the hook cwd.
+    let root = envread::session_root(hook_cwd);
+    let hit = |word: &str, cwds: &[PathBuf]| {
+        env_word_hit(word, cwds, &homes, policy).map(|file| {
+            let dirs = cwds.get(1..).filter(|d| !d.is_empty()).unwrap_or(cwds);
+            let project = root
+                .as_ref()
+                .is_some_and(|r| dirs.iter().all(|d| envread::is_project_env_in(&file, d, r)));
+            let dir = dirs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| hook_cwd.to_path_buf());
+            EnvHit { file, dir, project }
+        })
+    };
+    // Redirects and code paths are not tied to one command here: they resolve against every
+    // directory the line changes to (a project file only when it is one from each).
+    let mut every_cwd = cwds.clone();
+    for cmd in commands {
+        if matches!(cmd.program().as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut every_cwd);
+        }
+    }
+    usage.read = inputs
+        .named
         .iter()
-        .find_map(|f| env_word_hit(f, &cwds, &homes, policy))
-    {
-        return Ok(Some(EnvUse::Read(hit)));
+        .chain(inputs.code)
+        .find_map(|f| hit(f, &every_cwd));
+    if inputs.code_writes {
+        usage.write = inputs.code.iter().find_map(|f| hit(f, &every_cwd));
+    }
+    if usage.write.is_none() {
+        usage.write = inputs.outputs.iter().find_map(|f| hit(f, &every_cwd));
     }
     let mut budget = MAX_WORDS;
-    let mut write: Option<String> = None;
     for cmd in commands {
+        if usage.read.is_some() && usage.write.is_some() {
+            break;
+        }
         let program = cmd.program();
         if matches!(program.as_str(), "cd" | "pushd") {
             track_cd(cmd, &mut cwds);
@@ -649,7 +1264,9 @@ fn env_check(
         let mut skip_value = false;
         let program_path = words.first().is_some_and(|w| w.contains(['/', '\\']));
         let loads = env_file_loads(&cmd.words, stdin_free);
-        let removes = ENV_REMOVERS.contains(&program.as_str());
+        let overwrites = ENV_REMOVERS.contains(&program.as_str())
+            || ENV_OVERWRITERS.contains(&program.as_str())
+            || edits_in_place(&program, &words);
         let dests = if ENV_RELOCATORS.contains(&program.as_str()) {
             relocation_destinations(&words)
         } else {
@@ -670,16 +1287,48 @@ fn env_check(
             if loads.contains(&i) {
                 continue;
             }
-            if let Some(hit) = env_word_hit(word, &cwds, &homes, policy) {
-                if removes || dests.contains(&i) {
-                    write.get_or_insert(hit);
-                } else {
-                    return Ok(Some(EnvUse::Read(hit)));
+            let Some(found) = hit(word, &cwds) else {
+                continue;
+            };
+            let dd_out = program == "dd" && word.starts_with("of=");
+            if overwrites || dests.contains(&i) || dd_out {
+                usage.write.get_or_insert(found);
+            } else {
+                if program == "mv" {
+                    usage.write.get_or_insert(found.clone());
                 }
+                usage.read.get_or_insert(found);
             }
         }
     }
-    Ok(write.map(EnvUse::Write))
+    Ok(usage)
+}
+
+/// Whether `program` edits its file operands in place: `sed -i`/`--in-place` (also `-i.bak`
+/// and clusters such as `-ni`), `perl -i`/`-pi`, `ruby -i`. A switch cluster is read up to its
+/// first switch that takes a value (`-Mstrict` is not `-i`).
+pub(crate) fn edits_in_place(program: &str, words: &[&str]) -> bool {
+    let short_i = |w: &str, takes_value: &str| {
+        w.strip_prefix('-')
+            .filter(|rest| !rest.starts_with('-'))
+            .is_some_and(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphabetic() && !takes_value.contains(*c))
+                    .any(|c| c == 'i')
+            })
+    };
+    match program {
+        "sed" | "gsed" => words
+            .iter()
+            .skip(1)
+            .any(|w| w.starts_with("--in-place") || short_i(w, "efl")),
+        "perl" | "ruby" => words
+            .iter()
+            .skip(1)
+            .take_while(|w| w.starts_with('-'))
+            .any(|w| short_i(w, "eEMmIxlCdDFVrS")),
+        _ => false,
+    }
 }
 
 /// A credential path among `files`, which the command reads outside its words (a `NAME=`
@@ -1084,7 +1733,8 @@ fn env_word_hit(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy)
     if word.len() > 4096 {
         return None;
     }
-    for piece in pieces(word) {
+    // The most specific piece first (`of=.env` names `.env`, `HEAD:.env` too).
+    for piece in pieces(word).into_iter().rev() {
         if piece.starts_with('-') && !piece.contains('=') {
             continue;
         }

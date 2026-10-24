@@ -685,6 +685,9 @@ pub struct Parsed {
     /// Input redirect targets (`< F`, `3< F`, `<> F`), which [`SimpleCommand::words`] drops:
     /// checked as reads.
     pub input_files: Vec<String>,
+    /// Output redirect targets (`> F`, `>> F`, `>| F`, `<> F`), other than a descriptor: the
+    /// files the command line writes through a redirect.
+    pub output_files: Vec<String>,
 }
 
 /// Record that a command runs a file or stdin as code: after a family write, that is a
@@ -1128,6 +1131,9 @@ impl Lexer<'_> {
             let descriptor = target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
             if first == '<' && !descriptor {
                 self.out.input_files.push(target.text.clone());
+            }
+            if writes && !descriptor {
+                self.out.output_files.push(target.text.clone());
             }
             if writes && !is_harmless_target(&target.text) {
                 cmd.writes_file = true;
@@ -2332,6 +2338,18 @@ mod tests {
         );
         assert!(p.commands[0].writes_file);
         assert_eq!(cmds("solana transfer X 1 &>/dev/null")[0].len(), 4);
+    }
+
+    #[test]
+    fn output_redirect_targets_are_collected() {
+        assert_eq!(parse("echo A=1 >> .env").output_files, v(&[".env"]));
+        assert_eq!(
+            parse("printf x >.env.local 2>&1").output_files,
+            v(&[".env.local"])
+        );
+        assert_eq!(parse("cat <> .env").output_files, v(&[".env"]));
+        assert!(parse("cat .env 2>&1 < in").output_files.is_empty());
+        assert_eq!(parse("sh -c 'echo x > .env'").output_files, v(&[".env"]));
     }
 
     #[test]

@@ -993,8 +993,9 @@ mod tests {
     #[test]
     fn exclusions_cover_every_record_at_home_and_stay_short_in_a_project() {
         let base = grep_exclusions(Path::new("/tmp/some/project"));
-        // The two `**/…` list records (wallet extension stores) join the short list.
-        assert_eq!(base.len(), GREP_EXCLUDED.len() + 2);
+        // The `**/…` list records not already in the short list (the dotenvx key files and the
+        // wallet extension stores) join it.
+        assert_eq!(base.len(), GREP_EXCLUDED.len() + 5);
         let home = grep_exclusions(Path::new("/"));
         assert!(home.len() > base.len());
         for c in lists::credentials()

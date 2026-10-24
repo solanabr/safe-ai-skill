@@ -7,8 +7,8 @@
 //! sets it wins. [`SandboxState::On`] additionally needs a supported platform: macOS, or Linux
 //! with `bwrap` at a fixed system path; never native Windows.
 //!
-//! This is **declared configuration, not a runtime proof**. Its only effects: the user-scope
-//! raw `.env` opt-in works only while `On`, and the tier label reads `(hooks only)` otherwise.
+//! This is **declared configuration, not a runtime proof**. Its only effects: the tier label
+//! reads `(hooks only)` when it is not `On`, and the `doctor` snippet.
 
 use std::path::{Path, PathBuf};
 

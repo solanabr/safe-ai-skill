@@ -152,11 +152,9 @@ pub fn report(home: Option<&Path>, cwd: &Path) -> String {
         out.push_str(&serde_json::to_string_pretty(&snippet).unwrap_or_default());
         out.push('\n');
     }
-    out.push_str(if crate::gates::envread::OPT_IN_AVAILABLE {
-        "\nenv files: use `safe-ai-skill env keys|set|unset` instead of raw reads; `safe-ai-skill tier --env-read ask` (user scope, needs the sandbox on) restores prompted raw reads.\n"
-    } else {
-        "\nenv files: use `safe-ai-skill env keys|set|unset` instead of raw reads (raw reads are denied at every tier; the raw read opt-in is not available in this build).\n"
-    });
+    out.push_str(
+        "\nenv files: project `.env`/`.env.*` follow the tier (raw reads open at off, relaxed and medium and denied at high; writes denied at medium); `safe-ai-skill tier --env-read deny` denies the raw reads at every tier. Other env files (`.envrc`, `*.env`, `.dev.vars`, env files outside the project) stay read-denied. `safe-ai-skill env keys|set|unset` work at every tier.\n",
+    );
     if !MEDIUM_DENY_READ.is_empty() {
         out.push_str(&format!(
             "\nadd for a Medium or High sandbox (host tokens: denying them also stops subprocess `gh`, `npm install` from a private registry, `git push` over a credential file, `docker pull`, and cargo/pypi/gem publish from reading their own login): {}\n",

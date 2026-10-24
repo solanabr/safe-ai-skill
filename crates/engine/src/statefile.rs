@@ -47,6 +47,10 @@ const VERSION: u64 = 1;
 /// Name of the MAC key file inside the data dir.
 pub const KEY_FILE: &str = "key";
 
+/// Written next to a state key this engine creates (1.2.0 and later), so a key without it was
+/// made by an earlier engine ([`crate::migrate::env_tier_notice`]).
+pub const KEY_ERA_MARKER: &str = "env-tier-1.2.0.seen";
+
 /// Key length in bytes.
 const KEY_LEN: usize = 32;
 
@@ -462,6 +466,7 @@ fn load_or_create_key(dir: &Path) -> Result<(Vec<u8>, bool), EngineError> {
                     .map_err(|e| Error::Other(format!("OS random source: {e}")))?;
                 f.write_all(&key)?;
                 f.sync_all()?;
+                let _ = std::fs::write(dir.join(KEY_ERA_MARKER), b"1\n");
                 return Ok((key.to_vec(), true));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -865,7 +870,14 @@ pub(crate) mod tests {
         names.sort();
         assert_eq!(
             names,
-            [GEN_INDEX, "grants.json", KEY_FILE, "spend.json", STATE_LOCK],
+            [
+                KEY_ERA_MARKER,
+                GEN_INDEX,
+                "grants.json",
+                KEY_FILE,
+                "spend.json",
+                STATE_LOCK
+            ],
             "the first store also starts the spend ledger"
         );
         let _ = std::fs::remove_dir_all(&dir.path);
@@ -1045,7 +1057,13 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        let mut want = vec![GEN_INDEX, "grants.json", KEY_FILE, "spend.json"];
+        let mut want = vec![
+            KEY_ERA_MARKER,
+            GEN_INDEX,
+            "grants.json",
+            KEY_FILE,
+            "spend.json",
+        ];
         // The non-unix lock is an O_EXCL file removed on release; the flock file stays.
         if cfg!(unix) {
             want.push(STATE_LOCK);

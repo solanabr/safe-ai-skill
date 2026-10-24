@@ -4,8 +4,8 @@
 //! `{v: 1, global?: {tier, env_read?}, projects: {<root>: {tier, env_read?}}}`, keyed by the
 //! canonical git toplevel ([`crate::policy::tier::project_root`]). Its only writer is
 //! `safe-ai-skill tier` (the deprecated `mode` is an alias): raising the tier or tightening
-//! `env_read` applies at once ([`plan`] → [`Plan::Immediate`]); lowering, or loosening
-//! `env_read` (`deny < ask < tier`), is parked as a [`crate::confirm::PendingKind::Tier`]
+//! `env_read` to `deny` applies at once ([`plan`] → [`Plan::Immediate`]); lowering, or loosening
+//! `env_read` back to `tier` (`deny < tier`), is parked as a [`crate::confirm::PendingKind::Tier`]
 //! entry and applied by [`apply`] only after the user's whole-prompt confirmation.
 //!
 //! Gates read it through [`user_choice`]: nothing unless the file authenticates and the data
@@ -65,7 +65,7 @@ impl Default for TierFile {
 pub struct Entry {
     /// The tier.
     pub tier: Tier,
-    /// Raw project env reads, when chosen.
+    /// Raw project env reads, when chosen (`deny`; a retired 1.1.0 `ask` loads as `tier`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_read: Option<EnvRead>,
     /// When it was set (epoch seconds; informational).
@@ -227,7 +227,7 @@ fn before_after(dir: &DataDir, change: &Change) -> ((Tier, EnvRead), (Tier, EnvR
             );
             (current, (global_tier, global_env))
         }
-        None => ((global_tier, global_env), (BASE, EnvRead::Deny)),
+        None => ((global_tier, global_env), (BASE, EnvRead::Tier)),
     };
     let after = if change.clear {
         fallback
@@ -253,8 +253,8 @@ pub fn plan(dir: &DataDir, change: &Change) -> Plan {
     }
 }
 
-/// Whether the entry `change` clears holds a tier above [`BASE`] or an `env_read` other than
-/// `deny`.
+/// Whether the entry `change` clears holds a tier above [`BASE`] or `env_read: deny` (both
+/// tighten, so clearing them loosens).
 fn clears_a_raise(dir: &DataDir, change: &Change) -> bool {
     let Loaded::Valid(file) = load(dir) else {
         return false;
@@ -263,7 +263,7 @@ fn clears_a_raise(dir: &DataDir, change: &Change) -> bool {
         Some(key) => file.projects.get(key),
         None => file.global.as_ref(),
     };
-    entry.is_some_and(|e| e.tier > BASE || e.env_read.is_some_and(|r| r != EnvRead::Deny))
+    entry.is_some_and(|e| e.tier > BASE || e.env_read == Some(EnvRead::Deny))
 }
 
 /// Write `change` into `tier.json`. The caller decided it may apply ([`plan`], or a confirmed
@@ -299,6 +299,39 @@ pub fn apply(dir: &DataDir, change: &Change, now: u64) -> Result<(), EngineError
         (_, None) => {}
     }
     statefile::store(dir, TIER_FILE, &file)
+}
+
+/// Whether the stored `tier.json` names the retired 1.1.0 `env_read: ask` anywhere.
+fn names_retired_env_read(dir: &DataDir) -> bool {
+    let Loaded::Valid(raw) = statefile::load::<Value>(dir, TIER_FILE) else {
+        return false;
+    };
+    let retired = |entry: &Value| {
+        entry
+            .get("env_read")
+            .and_then(Value::as_str)
+            .is_some_and(EnvRead::is_retired)
+    };
+    raw.get("global").is_some_and(retired)
+        || raw
+            .get("projects")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.values().any(retired))
+}
+
+/// Rewrite a `tier.json` that names the retired `env_read: ask` (it loads as `tier`, the
+/// default, and is stored as `tier`). Nothing else changes. Returns whether it rewrote the
+/// file; only an authenticated file in a trusted data dir is touched.
+pub fn rewrite_retired_env_read(dir: &DataDir) -> Result<bool, EngineError> {
+    if dir.is_unresolved() || !dir.trusted || !names_retired_env_read(dir) {
+        return Ok(false);
+    }
+    let _lock = FileLock::acquire(&dir.path, LOCK_FILE)?;
+    let Loaded::Valid(file) = load(dir) else {
+        return Ok(false);
+    };
+    statefile::store(dir, TIER_FILE, &file)?;
+    Ok(true)
 }
 
 /// A one-line description of `change` for the pending summary and the confirmation echo.
@@ -464,14 +497,24 @@ mod tests {
             Plan::NoChange
         );
         assert_eq!(
-            plan(&dir, &global(None, Some(EnvRead::Ask))),
-            Plan::NeedsConfirm
+            plan(&dir, &global(None, Some(EnvRead::Deny))),
+            Plan::Immediate
         );
         assert_eq!(
-            plan(&dir, &global(None, Some(EnvRead::Deny))),
+            plan(&dir, &global(None, Some(EnvRead::Tier))),
             Plan::NoChange
         );
-        apply(&dir, &global(Some(Tier::High), None), 1).unwrap();
+        apply(&dir, &global(None, Some(EnvRead::Deny)), 1).unwrap();
+        assert_eq!(
+            plan(&dir, &global(None, Some(EnvRead::Tier))),
+            Plan::NeedsConfirm
+        );
+        let clear_deny = Change {
+            clear: true,
+            ..global(None, None)
+        };
+        assert_eq!(plan(&dir, &clear_deny), Plan::NeedsConfirm);
+        apply(&dir, &global(Some(Tier::High), Some(EnvRead::Tier)), 1).unwrap();
         assert_eq!(
             plan(&dir, &global(Some(Tier::Medium), None)),
             Plan::NeedsConfirm
@@ -508,10 +551,42 @@ mod tests {
     fn env_read_only_change_keeps_the_scope_tier() {
         let dir = tmp_data("tierstate_envonly");
         apply(&dir, &global(Some(Tier::Medium), None), 1).unwrap();
-        apply(&dir, &global(None, Some(EnvRead::Ask)), 2).unwrap();
+        apply(&dir, &global(None, Some(EnvRead::Deny)), 2).unwrap();
         let c = user_choice(&dir, Path::new("/x"));
         assert_eq!(c.tier, Some((Tier::Medium, TierSource::UserGlobal)));
-        assert_eq!(c.env_read, Some(EnvRead::Ask));
+        assert_eq!(c.env_read, Some(EnvRead::Deny));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_retired_ask_is_rewritten_as_tier_once() {
+        let dir = tmp_data("tierstate_retired");
+        let file = TierFile {
+            global: Some(Entry {
+                tier: Tier::Medium,
+                env_read: None,
+                set_at: 1,
+            }),
+            ..TierFile::default()
+        };
+        let legacy = json!({
+            "v": 1,
+            "global": {"tier": "medium", "env_read": "ask", "set_at": 1},
+            "projects": {"/p": {"tier": "high", "env_read": "deny", "set_at": 1}},
+        });
+        statefile::store(&dir, TIER_FILE, &legacy).unwrap();
+        let c = user_choice(&dir, Path::new("/x"));
+        assert_eq!(c.env_read, Some(EnvRead::Tier));
+        assert!(rewrite_retired_env_read(&dir).unwrap());
+        assert!(!rewrite_retired_env_read(&dir).unwrap());
+        let Loaded::Valid(raw) = statefile::load::<Value>(&dir, TIER_FILE) else {
+            panic!("tier.json must stay authenticated");
+        };
+        assert_eq!(raw["global"]["env_read"], "tier");
+        assert_eq!(raw["global"]["tier"], "medium");
+        assert_eq!(raw["projects"]["/p"]["env_read"], "deny");
+        statefile::store(&dir, TIER_FILE, &file).unwrap();
+        assert!(!rewrite_retired_env_read(&dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

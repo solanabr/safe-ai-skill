@@ -25,8 +25,8 @@
 # Assertions (a PASS/FAIL line each; exit 1 when any FAIL):
 #   1 no pack moved or deleted by NEW (packs OLD already quarantined are reported, not counted)
 #   2 NEW exits 0 and prints hook JSON or nothing, WARN-only (no deny/block/ask/defer, continue not false)
-#   3 grants and mode survive, by NEW's rules (see below); for 1.1.x also: the migration
-#     notice once, grants pending, a raw .env read still denied
+#   3 grants and mode survive, by NEW's rules (see below); for 1.1.x/1.2.x also: the migration
+#     notice once, grants pending, a raw .env read open at relaxed (1.2.0: it follows the tier)
 #   4 NEW wrote nothing into proj/ or the home skills dir
 #   5 `git status` of proj is unchanged by NEW
 #   6 control run: NEW on the pristine project moves nothing and stays WARN-only
@@ -35,11 +35,12 @@
 # Grants and mode are version-aware, keyed on `NEW_BIN --version`:
 #   1.0.x  state is unchanged: grants.json and mode.json byte-identical, `mode` still reports
 #          the profile OLD set, `status` still lists the grant unexpired.
-#   1.1.x  OLD sets the 1.0 default profile `strict`. State is authenticated (HMAC) and
+#   1.1.x, 1.2.x  OLD sets the 1.0 default profile `strict`. State is authenticated (HMAC) and
 #          relaxations are prompt-nonce confirmed, so the first NEW session migrates once:
 #          each unexpired v1 grant becomes a pending request (its id named in the notice, none
 #          live in `status`), `strict` becomes tier `relaxed` with its one-line notice, and a
-#          second NEW session prints neither. A raw Read of the project's `.env` is still denied.
+#          second NEW session prints neither. A raw Read of the project's `.env` has no opinion
+#          at relaxed (1.2.0: project .env reads follow the tier, denied only at high).
 #   other  checked as 1.0.x, with a notice.
 #
 # Env: R2_KEEP=1 keeps the scratch tree (it is kept on FAIL anyway).
@@ -182,7 +183,7 @@ g -C "$proj" commit -q --allow-empty -m "fixture" >/dev/null 2>&1 || note "git c
 # ---------------------------------------------------------------- OLD: state + session
 new_ver="$(eng "$NEW_BIN" --version | sed -n 's/^safe-ai-skill \([0-9][0-9A-Za-z.+-]*\)$/\1/p' | head -n 1)"
 [ -n "$new_ver" ] || new_ver=unknown
-case "$new_ver" in 1.1.*) old_profile=strict ;; *) old_profile=autopilot ;; esac
+case "$new_ver" in 1.1.*|1.2.*) old_profile=strict ;; *) old_profile=autopilot ;; esac
 printf '== OLD session (%s) ==\n' "$OLD_BIN"
 eng "$OLD_BIN" allow --scope swap --for 24h --max-tx 1 --budget 5 >"$snap/old-allow.out"
 eng "$OLD_BIN" allow --scope transfer --for 2h --max-tx 0.5 --budget 2 --to 11111111111111111111111111111112 >>"$snap/old-allow.out"
@@ -266,7 +267,7 @@ fi
 
 # 3 grants and mode, by the NEW version's rules (see the header).
 case "$new_ver" in
-  1.1.*)
+  1.1.*|1.2.*)
     s3=ok
     msg="$(jq -r '.systemMessage // empty' "$snap/new-session.out" 2>/dev/null || true)"
     printf '%s' "$msg" | grep -q "1.0 grant $grant_id kept as pending request" ||
@@ -285,9 +286,9 @@ case "$new_ver" in
     fi
     env_out="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Read","tool_input":{"file_path":"%s/.env"}}\n' "$proj" "$proj" |
       eng "$NEW_BIN" gate-read | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null || true)"
-    [ "$env_out" = deny ] || s3="$s3; a raw Read of .env gave '${env_out:-no opinion}', expected deny"
+    [ -z "$env_out" ] || s3="$s3; a raw Read of .env gave '$env_out', expected no opinion at relaxed"
     if [ "$s3" = ok ]; then
-      pass "3 [1.1 rules] tier line and migration notice once (grant $grant_id pending, strict -> relaxed), 0 live grants, .env read denied"
+      pass "3 [1.1 rules] tier line and migration notice once (grant $grant_id pending, strict -> relaxed), 0 live grants, .env read open at relaxed"
     else
       fail "3 [1.1 rules] $s3"
     fi

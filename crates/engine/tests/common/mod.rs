@@ -137,7 +137,7 @@ impl Run {
 ///   entry in the plugin data dir (requires [`Invocation::plugin_data`]). With `test-hooks`
 ///   the binary trusts that dir, so any tier and `env_read` apply as the user's choice.
 ///   Without it the dir is untrusted: a tier at or above Relaxed is set through the raise-only
-///   `SAFE_AI_SKILL_TIER` instead, and `Tier::Off` or a loosened `env_read` panic (they need
+///   `SAFE_AI_SKILL_TIER` instead, and `Tier::Off` or `env_read: deny` panic (they need
 ///   `--features test-hooks`).
 /// - [`Invocation::sandbox`] sets, with `test-hooks`, the engine's sandbox override; without it a
 ///   `<cwd>/.claude/settings.local.json` (requires [`Invocation::cwd`] = the payload cwd; on
@@ -239,8 +239,8 @@ impl<'a> Invocation<'a> {
                 }
                 _ => {}
             }
-            if self.env_read.is_some_and(|e| e != EnvRead::Deny) {
-                panic!("a loosened env_read through the binary needs --features test-hooks");
+            if self.env_read == Some(EnvRead::Deny) {
+                panic!("env_read: deny through the binary needs --features test-hooks");
             }
         }
         if let Some(mode) = self.sandbox {
@@ -326,6 +326,7 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("SAFE_AI_SKILL_HOME");
         // The CLI resolves the hooks' data dir from these and HOME: never the real one.
         cmd.env_remove("CLAUDE_PLUGIN_DATA");
+        cmd.env_remove("CLAUDE_PROJECT_DIR");
         cmd.env_remove("CLAUDE_CONFIG_DIR");
         cmd.env_remove("CLAUDE_CODE_VERSION");
         cmd.env_remove("CLAUDE_CODE_EXECPATH");
