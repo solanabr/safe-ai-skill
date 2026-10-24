@@ -220,6 +220,49 @@ enum Install {
     Ambiguous,
 }
 
+/// Other data dirs that hold state (a `key`) but are not `current`: the Claude Code plugin's
+/// dir and every standalone location (`SAFE_AI_SKILL_DATA`, the passwd-home default, the
+/// `XDG_DATA_HOME`/`LOCALAPPDATA` and `HOME` ones). Reported so state is never forked or
+/// dropped silently (installing the plugin later, a launcher with another environment).
+pub fn other_state_dirs(current: &DataDir) -> Vec<PathBuf> {
+    let mut env = Env::from_lookup(|k| std::env::var_os(k));
+    env.passwd_home = passwd_home();
+    other_state_dirs_in(&env, &current.path)
+}
+
+fn other_state_dirs_in(env: &Env, current: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for root in env.discovery_roots() {
+        if let Install::One(dir) = pick_install_dir(&root) {
+            candidates.push(dir);
+        }
+    }
+    candidates.extend(env.standalone.clone());
+    candidates.extend(env.passwd_standalone());
+    candidates.extend(env.data_home.as_ref().map(|r| r.join(STANDALONE_NAME)));
+    candidates.extend(
+        env.env_home
+            .as_deref()
+            .map(|h| data_root_under(h).join(STANDALONE_NAME)),
+    );
+    let current = canonical_lenient(current);
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in candidates {
+        let Some(canon) = canonical_lenient(&dir) else {
+            continue;
+        };
+        if Some(&canon) == current.as_ref() || seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon);
+        if dir.join("key").is_file() {
+            out.push(dir);
+        }
+    }
+    out
+}
+
 /// The platform data root under `home`.
 fn data_root_under(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -348,13 +391,6 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
     if env.home_root().is_some_and(|r| strictly_inside(&r)) {
         return true;
     }
-    if env
-        .passwd_standalone()
-        .and_then(|d| canonical_lenient(&d))
-        .is_some_and(|d| d == canon)
-    {
-        return true;
-    }
 
     // Env-settable locations are allow-listed: under the passwd home, and not inside the
     // project or cwd.
@@ -374,11 +410,20 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
         .collect();
     let in_session = |p: &Path| session_dirs.iter().any(|d| p.starts_with(d));
 
-    // The standalone dir placed by the environment (no Claude Code plugin dir in play).
+    // The standalone dir (no Claude Code plugin dir in play): strictly inside the passwd home,
+    // reached through no symlink below it, and in no project or repository. A session started
+    // in the home (or above it) does not make the default dir part of the project.
     if env.plugin_data.is_none()
         && env.standalone_dir().and_then(|d| canonical_lenient(&d)) == Some(canon.clone())
     {
-        return canon != home && canon.starts_with(&home) && !in_session(&canon);
+        let in_project = session_dirs
+            .iter()
+            .any(|d| !home.starts_with(d) && canon.starts_with(d));
+        return canon != home
+            && canon.starts_with(&home)
+            && !in_project
+            && !symlink_below(path, &home)
+            && !in_repository(&canon, &home);
     }
 
     // `$CLAUDE_CONFIG_DIR`: the config dir must be under the passwd home, and neither it nor
@@ -390,6 +435,47 @@ fn is_trusted(path: &Path, env: &Env, cwd: Option<&Path>) -> bool {
         return false;
     };
     cfg.starts_with(&home) && !in_session(&cfg) && !in_session(&canon) && strictly_inside(&cfg_root)
+}
+
+/// Whether some component of `path` below `home` (canonical) is a symlink; `true` when no
+/// ancestor of `path` is the home.
+fn symlink_below(path: &Path, home: &Path) -> bool {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(d) => d.join(path),
+            Err(_) => return true,
+        }
+    };
+    // The ancestor of `path` that is the home, however it is spelled (`/var` → `/private/var`).
+    let Some(base) = abs
+        .ancestors()
+        .find(|a| canonical_lenient(a).is_some_and(|c| c == home))
+    else {
+        return true;
+    };
+    let Ok(rel) = abs.strip_prefix(base) else {
+        return true;
+    };
+    let mut at = base.to_path_buf();
+    for comp in rel.components() {
+        at.push(comp);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Whether `dir` (canonical) lies in a git repository below `home`: a `.git` in it or in an
+/// ancestor strictly inside `home`. A repository at the home itself (dotfiles) does not count.
+fn in_repository(dir: &Path, home: &Path) -> bool {
+    dir.ancestors()
+        .take_while(|a| *a != home && a.starts_with(home))
+        .any(|a| a.join(".git").exists())
 }
 
 /// The effective user's home from the OS user database (`getpwuid_r`).
@@ -886,6 +972,76 @@ mod tests {
         assert!(d.trusted, "trusted even when the cwd is the home");
         let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&fake);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_standalone_dir_is_untrusted() {
+        let home = tmp("salink");
+        let target = home.join("proj").join(".state");
+        std::fs::create_dir_all(&target).unwrap();
+        let root = data_root_under(&home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&target, root.join(STANDALONE_NAME)).unwrap();
+        let d = resolve(&env_home(&home), None).unwrap();
+        assert_eq!(d.path, root.join(STANDALONE_NAME));
+        assert!(!d.trusted, "the default dir is a symlink");
+        // A link on a parent component counts too.
+        let home2 = tmp("salink2");
+        let real_root = home2.join("elsewhere");
+        std::fs::create_dir_all(real_root.join(STANDALONE_NAME)).unwrap();
+        let root2 = data_root_under(&home2);
+        std::fs::create_dir_all(root2.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_root, &root2).unwrap();
+        assert!(!resolve(&env_home(&home2), None).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&home2);
+    }
+
+    #[test]
+    fn a_standalone_dir_inside_a_repository_or_project_is_untrusted() {
+        let home = tmp("sarepo");
+        let repo = home.join("code").join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let env = Env {
+            standalone: Some(repo.join("state")),
+            ..env_home(&home)
+        };
+        assert!(
+            !resolve(&env, None).unwrap().trusted,
+            "inside a git repository"
+        );
+        // A dotfiles repository at the home itself does not count.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let d = resolve(&env_home(&home), Some(&home)).unwrap();
+        assert!(d.trusted, "default dir, session in the home");
+        let project = home.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        let in_project = Env {
+            standalone: Some(project.join("s")),
+            project_dir: Some(project.clone()),
+            ..env_home(&home)
+        };
+        assert!(!resolve(&in_project, None).unwrap().trusted);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn other_state_dirs_are_reported() {
+        let home = tmp("others");
+        let standalone = data_root_under(&home).join(STANDALONE_NAME);
+        std::fs::create_dir_all(&standalone).unwrap();
+        std::fs::write(standalone.join("key"), b"k").unwrap();
+        let plugin = data_root(&home).join("safe-ai-skill-stbr");
+        std::fs::create_dir_all(&plugin).unwrap();
+        let env = env_home(&home);
+        // The plugin dir is in use; the standalone one still holds state.
+        assert_eq!(other_state_dirs_in(&env, &plugin), vec![standalone.clone()]);
+        assert!(
+            other_state_dirs_in(&env, &standalone).is_empty(),
+            "no key in the plugin dir"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
