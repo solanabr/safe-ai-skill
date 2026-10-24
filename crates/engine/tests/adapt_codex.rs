@@ -300,7 +300,10 @@ fn a_workdir_in_the_payload_is_where_relative_paths_resolve() {
 #[test]
 fn claude_settings_and_the_engine_binary_are_protected() {
     let w = World::new("adapt-settings");
-    let engine = common::bin().to_string();
+    let engine_path = std::path::Path::new(common::bin());
+    let engine = engine_path.display().to_string();
+    let wrapper = engine_path.with_file_name("safe-ai-skill-codex");
+    let wrapper = wrapper.display();
     for header in [
         "*** Update File: .claude/settings.local.json".to_string(),
         "*** Add File: .claude/settings.json".to_string(),
@@ -309,14 +312,14 @@ fn claude_settings_and_the_engine_binary_are_protected() {
             w.home.path().display()
         ),
         format!("*** Delete File: {engine}"),
-        format!("*** Add File: {engine}-codex"),
+        format!("*** Add File: {wrapper}"),
     ] {
         let run = w.codex("gate-tamper", "apply_patch", patch(&[&header]));
         assert_eq!(codex_label(&run), "deny", "{header}");
     }
     for command in [
-        format!("rm -f {engine}"),
-        format!("cp /tmp/x {engine}"),
+        format!("rm -f {}", common::sh_path(engine_path)),
+        format!("cp /tmp/x {}", common::sh_path(engine_path)),
         "echo '{}' > .claude/settings.local.json".to_string(),
     ] {
         let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
@@ -413,14 +416,14 @@ fn directory_glob_cd_find_and_git_writes_to_protected_files_deny() {
     std::fs::create_dir_all(w.proj.join(".codex")).unwrap();
     std::fs::write(w.proj.join(".codex/hooks.json"), "{}").unwrap();
     let engine = std::path::Path::new(common::bin());
-    let bin_dir = engine.parent().unwrap().display().to_string();
+    let bin_dir = common::sh_path(engine.parent().unwrap());
     for command in [
         format!("mv {bin_dir} {bin_dir}.off"),
         format!("rm -rf {bin_dir}"),
         format!("rm {bin_dir}/safe-ai-*"),
         format!("rm {bin_dir}/safe-ai-skil?"),
         format!("find {bin_dir} -name 'safe*' -delete"),
-        format!("chmod -x {}", engine.display()),
+        format!("chmod -x {}", common::sh_path(engine)),
         "mv .codex .codex.off".to_string(),
         "rm -rf .codex".to_string(),
         "mv ~/.codex ~/.codex.bak".to_string(),

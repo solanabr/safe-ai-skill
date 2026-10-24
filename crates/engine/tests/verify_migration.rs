@@ -13,6 +13,9 @@
 //! - grants, the v1 lockfile and the v1 quarantine are left byte for byte as they were, and
 //!   nothing moves.
 
+// The fixture is v1.0.0 state recorded with unix paths (keys are `/`-joined canonical paths).
+#![cfg(unix)]
+
 mod common;
 
 use common::{Invocation, Run, TempDir};

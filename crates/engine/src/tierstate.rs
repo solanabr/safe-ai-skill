@@ -392,8 +392,14 @@ mod tests {
         }
     }
 
+    /// An absolute project root on this platform (payloads refuse relative ones).
     fn root() -> String {
-        "/work/proj".to_string()
+        if cfg!(windows) {
+            r"C:\work\proj"
+        } else {
+            "/work/proj"
+        }
+        .to_string()
     }
 
     #[test]
@@ -489,7 +495,7 @@ mod tests {
             clear: false,
         };
         apply(&dir, &project, 2).unwrap();
-        let c = user_choice(&dir, Path::new("/work/proj"));
+        let c = user_choice(&dir, Path::new(&root()));
         assert_eq!(c.tier, Some((Tier::High, TierSource::UserProject)));
         assert_eq!(c.env_read, Some(EnvRead::Deny));
         let s = user_choice(&dir, Path::new("/work/sibling"));

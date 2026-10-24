@@ -7,9 +7,12 @@
 mod common;
 
 use std::path::Path;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use common::{permission_decision, Invocation, Run, TempDir};
+use common::TempDir;
+#[cfg(unix)]
+use common::{permission_decision, Invocation, Run};
 use safe_ai_skill::context::{Context, Network};
 use safe_ai_skill::gate::GateMeta;
 use safe_ai_skill::gates::bash;
@@ -571,6 +574,7 @@ fn round3_rows_ask_as_hard_guard_from_both_hooks() {
     }
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_round3_rows_ask_in_the_secrets_hook() {
     let bin = stub_solana(MAINNET_STUB);
@@ -662,6 +666,7 @@ fn round4_ask_rows_ask_as_hard_guard_from_both_hooks() {
     assert!(d.reason().contains("expansion"), "{d:?}");
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_round4_rows_in_the_secrets_hook() {
     let bin = stub_solana(MAINNET_STUB);
@@ -719,6 +724,7 @@ fn probe_rows_ask_in_gate_bash_too() {
 // End to end: stub `solana`, Anchor.toml, timeouts, deadline, prefilter hook.
 // ---------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 /// A dir holding an executable `solana` stub running `body`.
 fn stub_solana(body: &str) -> TempDir {
     let dir = TempDir::new("stub-bin");
@@ -732,6 +738,7 @@ fn stub_solana(body: &str) -> TempDir {
     dir
 }
 
+#[cfg(unix)]
 /// Run `sub` on `command` with `bin` first on `PATH` and `cwd` as the hook cwd.
 fn run_hook(sub: &str, command: &str, bin: &Path, cwd: &Path, extra: &[(&str, &str)]) -> Run {
     let data = TempDir::new("parse-data");
@@ -756,6 +763,7 @@ fn run_hook(sub: &str, command: &str, bin: &Path, cwd: &Path, extra: &[(&str, &s
     inv.run()
 }
 
+#[cfg(unix)]
 /// The emitted decision label, or `None` for no opinion.
 fn label(run: &Run) -> Option<String> {
     assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
@@ -765,9 +773,11 @@ fn label(run: &Run) -> Option<String> {
     permission_decision(&run.json())
 }
 
+#[cfg(unix)]
 const MAINNET_STUB: &str =
     "echo \"Config File: x\"\necho \"RPC URL: https://api.mainnet-beta.solana.com\"";
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_anchor_toml_does_not_override_the_cli_config_for_solana() {
     let bin = stub_solana(MAINNET_STUB);
@@ -801,6 +811,7 @@ fn e2e_anchor_toml_does_not_override_the_cli_config_for_solana() {
     assert_eq!(label(&run), None, "{}", run.stdout);
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_slow_solana_config_is_unknown_within_its_timeout() {
     let bin = stub_solana("sleep 30");
@@ -819,6 +830,7 @@ fn e2e_slow_solana_config_is_unknown_within_its_timeout() {
     assert!(run.stdout.contains("unidentified"), "{}", run.stdout);
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_deadline_env_has_a_floor() {
     // 200 ms is below the 2 s floor: the gate still gets 2 s, and asks.
@@ -838,6 +850,7 @@ fn e2e_deadline_env_has_a_floor() {
     assert!(elapsed < Duration::from_secs(6), "took {elapsed:?}");
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_deadline_does_not_turn_a_deny_into_an_ask() {
     // A mainnet `--final` deploy is denied without touching the slow CLI; the shortest
@@ -854,6 +867,7 @@ fn e2e_deadline_does_not_turn_a_deny_into_an_ask() {
     assert_eq!(label(&run).as_deref(), Some("deny"), "{}", run.stdout);
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_probe_rows_ask_in_the_secrets_hook() {
     let bin = stub_solana(MAINNET_STUB);
@@ -869,6 +883,7 @@ fn e2e_probe_rows_ask_in_the_secrets_hook() {
     }
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_deadline_cannot_be_loosened() {
     // A larger value is ignored (8 s stays the bound); the run itself is fast.
@@ -884,6 +899,7 @@ fn e2e_deadline_cannot_be_loosened() {
     assert_eq!(label(&run).as_deref(), Some("ask"));
 }
 
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_secrets_hook_prefilters_indirection() {
     let bin = stub_solana(MAINNET_STUB);

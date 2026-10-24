@@ -142,7 +142,7 @@ impl World {
             self.decision(
                 "gate-bash-secrets",
                 "Bash",
-                serde_json::json!({"command": format!("cat {}/SKILL.md", dir.display())}),
+                serde_json::json!({"command": format!("cat {}/SKILL.md", common::sh_path(&dir))}),
                 tier,
             ),
         ]

@@ -47,9 +47,9 @@ impl World {
     }
 
     fn cfg(&self, rel: &str) -> String {
-        let base = self.cfg.path().to_str().unwrap();
+        let base = common::sh_path(self.cfg.path());
         if rel.is_empty() {
-            base.to_string()
+            base
         } else {
             format!("{base}/{rel}")
         }

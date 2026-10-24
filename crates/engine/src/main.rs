@@ -2548,9 +2548,11 @@ mod tests {
 
     #[test]
     fn deadline_keeps_a_deny_already_decided() {
-        assert!(matches!(deadline_decision("r"), Decision::Ask { .. }));
+        // Under CI (a headless signal) the fallback ask is itself a deny.
+        let fallback = headless::apply(Decision::Ask { reason: "r".into() }, headless::detect());
+        assert_eq!(deadline_decision("r"), fallback);
         record_decision(&Decision::Allow);
-        assert!(matches!(deadline_decision("r"), Decision::Ask { .. }));
+        assert_eq!(deadline_decision("r"), fallback);
         record_decision(&Decision::Deny {
             reason: "mainnet --final".into(),
         });

@@ -185,6 +185,7 @@ fn allow_parks_a_pending_entry_and_grants_nothing() {
     assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[]), "ask");
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
     let sb = Sandbox::new("relax-confirm");
@@ -218,6 +219,7 @@ fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
         .contains("nothing confirmed"));
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn a_nonce_outside_the_users_prompt_never_confirms() {
     let sb = Sandbox::new("relax-elsewhere");
@@ -414,6 +416,7 @@ fn a_deleted_spend_ledger_exhausts_the_budget() {
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "ask");
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn v1_state_is_migrated_once_and_listed_at_session_start() {
     let sb = Sandbox::new("relax-migrate");
@@ -472,6 +475,7 @@ fn v1_state_is_migrated_once_and_listed_at_session_start() {
 // Fix round 1: the agent never sees the code
 // ---------------------------------------------------------------------------------------
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
     // The exact attack: the agent runs `allow`, then pipes a fake UserPromptSubmit into
@@ -533,6 +537,7 @@ fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
     }
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn pending_notice_needs_a_post_tool_use_bash_payload() {
     let sb = Sandbox::new("relax-notice-shape");
@@ -549,6 +554,7 @@ fn pending_notice_needs_a_post_tool_use_bash_payload() {
     assert_eq!(sb.code_shown().len(), 8);
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn the_code_is_announced_once_in_system_message_only() {
     let sb = Sandbox::new("relax-announce");
@@ -572,6 +578,7 @@ fn the_code_is_announced_once_in_system_message_only() {
         .contains(&code));
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn a_request_made_outside_a_tool_call_is_announced_at_the_next_prompt() {
     let sb = Sandbox::new("relax-terminal");
@@ -649,6 +656,7 @@ fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
 // No confirmation or announcement in a headless session (nested `claude -p`)
 // ---------------------------------------------------------------------------------------
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn a_headless_session_neither_announces_nor_confirms() {
     let sb = Sandbox::new("relax-headless");
@@ -709,6 +717,7 @@ impl Sandbox {
     }
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn another_session_neither_sees_nor_confirms_a_request() {
     let sb = Sandbox::new("relax-other-session");
@@ -739,6 +748,7 @@ fn another_session_neither_sees_nor_confirms_a_request() {
     );
 }
 
+#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
 fn a_request_made_in_a_session_belongs_to_it_from_the_start() {
     let sb = Sandbox::new("relax-bound");

@@ -249,7 +249,7 @@ impl World {
             bash: outcome(self.pre(
                 "gate-bash-secrets",
                 "Bash",
-                serde_json::json!({"command": format!("cat {}/SKILL.md", pack.display())}),
+                serde_json::json!({"command": format!("cat {}/SKILL.md", common::sh_path(&pack))}),
                 tier,
             )),
         }
@@ -383,7 +383,7 @@ fn an_unscanned_pack_is_denied_from_stored_state_like_a_block() {
             .pre(
                 "gate-bash-secrets",
                 "Bash",
-                serde_json::json!({"command": format!("cat {}/SKILL.md", pack.display())}),
+                serde_json::json!({"command": format!("cat {}/SKILL.md", common::sh_path(&pack))}),
                 tier,
             )
             .0;
