@@ -350,12 +350,16 @@ pub enum DataDirReach {
 /// `$CLAUDE_PLUGIN_DATA`; the homes' (and `$CLAUDE_CONFIG_DIR`'s) `plugins/data` are known
 /// parents. `None` when `dir` neither is in one nor contains one.
 pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
-    let full = normalize(dir, homes.first().map(String::as_str));
-    let rooted = if full.starts_with('/') {
-        full.trim_end_matches('/').to_string()
-    } else {
-        format!("/{}", full.trim_end_matches('/'))
+    // Every side is rooted the same way: a drive path (`c:/…`) gets a leading `/` too.
+    let root = |p: &str| {
+        let p = p.trim_end_matches('/');
+        if p.starts_with('/') {
+            p.to_string()
+        } else {
+            format!("/{p}")
+        }
     };
+    let rooted = root(&normalize(dir, homes.first().map(String::as_str)));
     let below = |parent: &str, child: &str| {
         parent == "/" || child == parent || child.starts_with(&format!("{parent}/"))
     };
@@ -376,7 +380,7 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
         std::env::var(var)
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .map(|v| normalize(&v, None).trim_end_matches('/').to_string())
+            .map(|v| root(&normalize(&v, None)))
     };
     if let Some(data) = env_dir("CLAUDE_PLUGIN_DATA") {
         if below(&data, &rooted) {
@@ -386,7 +390,7 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
             return Some(DataDirReach::Above);
         }
     }
-    for config in config_dirs() {
+    for config in config_dirs().iter().map(|c| root(c)) {
         let inside = rooted
             .strip_prefix(&format!("{config}/plugins/data/"))
             .is_some_and(|rest| rest.starts_with("safe-ai-skill-"));
@@ -396,16 +400,11 @@ pub fn data_dir_reach(dir: &str, homes: &[String]) -> Option<DataDirReach> {
     }
     let parents = homes
         .iter()
-        .map(|h| {
-            format!(
-                "{}/.claude/plugins/data",
-                normalize(h, None).trim_end_matches('/')
-            )
-        })
+        .map(|h| format!("{}/.claude/plugins/data", root(&normalize(h, None))))
         .chain(
             config_dirs()
                 .into_iter()
-                .map(|c| format!("{c}/plugins/data")),
+                .map(|c| format!("{}/plugins/data", root(&c))),
         );
     for parent in parents {
         if below(&rooted, &parent) {
