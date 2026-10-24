@@ -45,6 +45,10 @@ Holes neither layer closes from inside a project:
 
 **What 1.0.1 listed as known limitations, in 1.1.0.** Output redaction works at every tier, on successful tool results only (failed ones are a known hole, above). A directory-wide Grep gets credential exclusions (above). A Solana command behind a wrapper or `FOO=1` prefix is parsed and gated (`gate-bash` now runs for every Bash call); one written to a file in one call and run in a later one is still not seen. Writes to `.env` through Bash, and exfiltration to unlisted or listed hosts and raw IPs, are still open (above).
 
+### Codex and opencode (experimental)
+
+The Codex and opencode adapters ([docs/adapters.md](docs/adapters.md)) run the same gates on those clients' hook calls, with known gaps on top of the holes above: neither client can ask, so every `ask` is a deny; neither has Claude Code's sandbox, so its sandbox-dependent rows count as off; confirmations work only in a Claude Code session; Codex runs a call whose hook command cannot start, and its `write_stdin` can feed an interactive session the gates never see (interactive starts are denied, not all of them are recognised); an opencode plugin that fails to load is skipped silently, and plugins that run after it can change a call's args. Both adapters deny agent writes to their hook config, the engine, Claude Code's settings and the shell startup files, judged on the command's words. Neither adapter is part of the support contract yet.
+
 ### Recommended setup
 
 Use one of these alongside the plugin:
