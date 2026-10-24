@@ -7,8 +7,9 @@
 //!
 //! 1. hard-deny class or key-material content: `deny`, never relaxed by any glob or setting;
 //! 2. `allow_read_globs` match: readable (a `.env.schema` still passes its content guard);
-//! 3. env class (`.env`, `.env.*`, templates and schemas not allow-listed, …): `deny` with the
-//!    `safe-ai-skill env` commands, or `ask` under the user's `safe-ai-skill tier --env-read ask`;
+//! 3. env class (`.env`, `.env.*`, templates and schemas not allow-listed, …): the tier rule of
+//!    [`envread`] (project `.env`/`.env.*` open below High; other env files and `env_read: deny`
+//!    denied, with the `safe-ai-skill env` commands);
 //! 4. `deny_read_globs` match: `deny`;
 //! 5. `id.json` / `*.pem` / `*.key` that cannot be read (or a `*.pem`/`*.key` too large to scan):
 //!    `deny`;
@@ -119,7 +120,8 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     }
 
     if verdicts.contains(&Verdict::Env) {
-        return env_verdict(path, policy, varlock_hint(cwd, &raw));
+        let project = envread::is_project_env(path, cwd);
+        return env_verdict(path, project, policy, varlock_hint(cwd, &raw));
     }
     if let Some(Verdict::PolicyDeny(what)) = verdicts
         .iter()
@@ -291,17 +293,17 @@ fn hard_deny(what: &str) -> Decision {
     }
 }
 
-/// The verdict for a raw read of an env-class file, by tier, `env_read` and sandbox
-/// ([`envread::verdict`]): `deny` with the `safe-ai-skill env` commands by default.
-pub fn env_verdict(file: &str, policy: &Policy, varlock: bool) -> Decision {
-    envread::decision(policy, env_reason(file, varlock))
+/// The verdict for a raw read of an env-class file, by tier, `env_read` and whether it is a
+/// project env file ([`envread::verdict`]); a deny names the `safe-ai-skill env` commands.
+pub fn env_verdict(file: &str, project: bool, policy: &Policy, varlock: bool) -> Decision {
+    envread::decision(policy, project, env_reason(file, varlock))
 }
 
 /// The actionable env-class message (spec D3.3, D3.8.6). `varlock` adds the varlock hint.
 pub fn env_reason(file: &str, varlock: bool) -> String {
     let label = shell_label(file);
     let mut out = format!(
-        "safe-ai-skill: {label} is an env file; raw reads are blocked so secret values stay out of the transcript. Use instead:\n  \
+        "safe-ai-skill: {label} is an env file; this raw read is blocked so its secret values stay out of the transcript. Use instead:\n  \
          safe-ai-skill env keys {label}    (lists keys, values masked)\n  \
          printf %s '<value>' | safe-ai-skill env set {label} KEY    (value on stdin, never in argv)\n  \
          safe-ai-skill env unset {label} KEY"
@@ -462,12 +464,14 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
                 .into(),
         });
     }
-    // An env glob the user's opt-in leaves open (no opinion) still gets the key-material
-    // exclusion, minus the env-file globs it opted into.
+    // An env glob the tier leaves open (no opinion) still gets the key-material exclusion and
+    // keeps excluding every env file that is not a project `.env`/`.env.*`. The root must be
+    // inside the project: a search there cannot reach another project's env files.
     let mut keep_env = false;
     if glob_targets_secrets(glob) {
         let first = glob.split_whitespace().next().unwrap_or(glob);
-        let verdict = env_verdict(first, policy, varlock_hint(cwd, &real));
+        let project = real.starts_with(crate::policy::tier::project_root(cwd));
+        let verdict = env_verdict(first, project, policy, varlock_hint(cwd, &real));
         if !matches!(verdict, Decision::Defer) {
             return ReadVerdict::Decide(verdict);
         }
@@ -504,14 +508,12 @@ fn grep_exclusion_as(dir: &Path, given: &Path) -> String {
     format!("!{{{}}}", alts.join(","))
 }
 
-/// [`grep_exclusion`] without the env-file globs, for an opted-in env Grep.
+/// [`grep_exclusion`] without the project env globs (`**/.env`, `**/.env.*`), for an env Grep
+/// the tier leaves open.
 fn grep_exclusion_keeping_env(dir: &Path, given: &Path) -> String {
     let alts: Vec<String> = credpaths::grep_exclusions_as(dir, given)
         .iter()
-        .filter(|g| {
-            let last = g.rsplit('/').next().unwrap_or(g);
-            secretpath::classify(last) != Class::Env
-        })
+        .filter(|g| !matches!(g.as_str(), "**/.env" | "**/.env.*"))
         .map(|g| case_insensitive(g))
         .collect();
     format!("!{{{}}}", alts.join(","))
@@ -686,9 +688,15 @@ fn collect_path_strings<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a st
         Value::Array(items) => items
             .iter()
             .all(|v| collect_path_strings(v, depth + 1, out)),
+        // Shell code under an executor key (`code`, `command`, …) holding whitespace is judged
+        // as code by `mcpexec`, not as one path (`cat .env` is not a file named so).
         Value::Object(map) => map
-            .values()
-            .all(|v| collect_path_strings(v, depth + 1, out)),
+            .iter()
+            .filter(|(k, v)| {
+                !(matches!(k.as_str(), "code" | "command" | "cmd" | "script")
+                    && v.as_str().is_some_and(|s| s.contains(char::is_whitespace)))
+            })
+            .all(|(_, v)| collect_path_strings(v, depth + 1, out)),
         _ => true,
     }
 }
@@ -710,6 +718,13 @@ mod tests {
         decide_path(path, &here(), &policy())
     }
 
+    /// A policy at tier High, where project env reads deny too.
+    fn high() -> Policy {
+        let mut p = policy();
+        p.runtime.tier = crate::policy::tier::Tier::High;
+        p
+    }
+
     #[test]
     fn deny_solana_tree_and_keypairs() {
         assert!(matches!(
@@ -725,7 +740,7 @@ mod tests {
     #[test]
     fn deny_dotenv_with_actionable_reason() {
         for p in [".env", "/srv/app/.env.local"] {
-            let d = decide(p);
+            let d = decide_path(p, &here(), &high());
             assert!(matches!(d, Decision::Deny { .. }), "{p}");
             assert!(
                 d.reason().contains(&format!("safe-ai-skill env keys {p}")),
@@ -769,7 +784,10 @@ mod tests {
         assert_eq!(decide(".env.schema"), Decision::Defer);
         assert_eq!(decide("/proj/sub/.env.schema"), Decision::Defer);
         for name in [".env.schema.bak", ".env.schema.local", ".env.local"] {
-            assert!(matches!(decide(name), Decision::Deny { .. }), "{name}");
+            assert!(
+                matches!(decide_path(name, &here(), &high()), Decision::Deny { .. }),
+                "{name}"
+            );
         }
     }
 
@@ -805,20 +823,39 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "env-read-opt-in")]
     #[test]
-    fn env_read_ask_policy() {
+    fn project_env_reads_follow_the_tier() {
+        use crate::policy::tier::{EnvRead, Tier};
+        let dir = std::env::temp_dir().join(format!("sas-envtier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".env"), "K=v\n").unwrap();
+        std::fs::write(dir.join(".envrc"), "export K=v\n").unwrap();
         let mut p = policy();
-        p.runtime.env_read = crate::policy::tier::EnvRead::Ask;
-        p.runtime.sandbox = crate::sandbox::SandboxState::On;
+        for tier in [Tier::Off, Tier::Relaxed, Tier::Medium] {
+            p.runtime.tier = tier;
+            assert_eq!(decide_path(".env", &dir, &p), Decision::Defer, "{tier:?}");
+            assert!(matches!(
+                decide_path(".envrc", &dir, &p),
+                Decision::Deny { .. }
+            ));
+            assert!(matches!(
+                decide_path("x-keypair.json", &dir, &p),
+                Decision::Deny { .. }
+            ));
+        }
+        p.runtime.tier = Tier::High;
         assert!(matches!(
-            decide_path(".env", &here(), &p),
-            Decision::Ask { .. }
-        ));
-        assert!(matches!(
-            decide_path("x-keypair.json", &here(), &p),
+            decide_path(".env", &dir, &p),
             Decision::Deny { .. }
         ));
+        p.runtime.tier = Tier::Relaxed;
+        p.runtime.env_read = EnvRead::Deny;
+        assert!(matches!(
+            decide_path(".env", &dir, &p),
+            Decision::Deny { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -905,16 +942,20 @@ mod tests {
         let mut out = Vec::new();
         assert!(collect_path_strings(&v, 0, &mut out));
         out.sort_unstable();
-        assert_eq!(out, vec![".env", "a.txt", "b c", "cat .env | head"]);
+        assert_eq!(out, vec![".env", "a.txt", "b c"]);
     }
 
     #[test]
     fn mcp_paths_with_spaces_are_checked() {
         let v = serde_json::json!({ "path": "my dir/.env" });
         assert!(matches!(
-            decide_mcp_args(Some(&v), &here(), &policy()),
+            decide_mcp_args(Some(&v), &here(), &high()),
             Decision::Deny { .. }
         ));
+        assert_eq!(
+            decide_mcp_args(Some(&v), &here(), &policy()),
+            Decision::Defer
+        );
     }
 
     #[test]
@@ -934,11 +975,11 @@ mod tests {
         let v = serde_json::json!({ "a": vec!["x"; MAX_MCP_PATHS + 1], "b": ".env" });
         let first = serde_json::json!({ "0": ".env", "a": vec!["x"; MAX_MCP_PATHS + 1] });
         assert!(matches!(
-            decide_mcp_args(Some(&first), &here(), &policy()),
+            decide_mcp_args(Some(&first), &here(), &high()),
             Decision::Deny { .. }
         ));
         assert!(!matches!(
-            decide_mcp_args(Some(&v), &here(), &policy()),
+            decide_mcp_args(Some(&v), &here(), &high()),
             Decision::Defer
         ));
         let mut deep = serde_json::json!(".env");

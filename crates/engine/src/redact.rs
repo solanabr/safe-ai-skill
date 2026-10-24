@@ -47,15 +47,17 @@ pub fn contains_marker(text: &str) -> bool {
 }
 
 /// The PostToolUse redact decision for one hook payload: [`scrub_response`], except that the
-/// response of an opted-in raw env Read skips the value scrub (D8 v2 spec §2), since a
-/// value-scrubbed copy would be written back over the real values by the next Edit or Write.
+/// response of a raw env Read the tier permits (a project `.env`/`.env.*` at Off, Relaxed or
+/// Medium, [`crate::gates::envread`]) skips the value scrub, since a value-scrubbed copy would
+/// be written back over the real values by the next Edit or Write.
 /// Pattern redaction (keys, seeds, PEM, vendor tokens) still applies to it at every tier; the
 /// write gate refuses to write a redaction marker back into an env file. The exemption is
 /// verified here, not inferred from the response having arrived: the tool is `Read`, both the
 /// requested file and the response's file are env class (by name or resolved target), and the
-/// read gate, re-run on the request with this `policy` (its runtime tier, `env_read` and
-/// sandbox), lets it through (no opinion, or an ask the user approved). When the read gate
-/// crashed or was bypassed on a read it would deny, the response is scrubbed.
+/// read gate, re-run on the request with this `policy` (its runtime tier and `env_read`), lets
+/// it through (no opinion, or an ask the user approved). When the read gate crashed or was
+/// bypassed on a read it would deny, the response is scrubbed. Bash output (`cat .env`) is
+/// always value-scrubbed: only the Read tool's response feeds an Edit.
 pub fn scrub_tool_response(
     input: &HookInput,
     response: &Value,

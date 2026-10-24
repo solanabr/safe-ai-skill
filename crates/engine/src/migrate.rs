@@ -272,6 +272,21 @@ pub fn mode_to_tier(dir: &DataDir, now: u64) -> Vec<String> {
     lines
 }
 
+/// The one-time line for a `tier.json` that held the retired 1.1.0 `env_read: ask`.
+pub const RETIRED_ENV_READ_LINE: &str = "secrets env_read ask was retired in 1.2.0 and is now \
+     `tier`: project .env and .env.* reads follow the tier (open at off, relaxed and medium, \
+     denied at high); run `safe-ai-skill tier --env-read deny` to deny them at every tier";
+
+/// Rewrite a `tier.json` that holds the retired `env_read: ask` as `tier` (1.2.0), once: the
+/// rewritten file no longer names it. Returns the notice line when it did.
+pub fn retired_env_read(dir: &DataDir, now: u64) -> Vec<String> {
+    let _ = now;
+    match tierstate::rewrite_retired_env_read(dir) {
+        Ok(true) => vec![RETIRED_ENV_READ_LINE.to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// Rename a 1.0 file to `<name>.<suffix>`.
 fn rename_to(path: &Path, suffix: &str) {
     let mut aside = path.as_os_str().to_owned();

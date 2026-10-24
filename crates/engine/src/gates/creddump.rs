@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::shell::{self, SimpleCommand, Word};
 use crate::gate::Verdict;
-use crate::gates::{credpaths, read, secretpath};
+use crate::gates::{credpaths, envread, read, secretpath};
 use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -86,8 +86,10 @@ const MAX_GLOB_MATCHES: usize = 256;
 /// Most alternatives a brace group expands to.
 const MAX_BRACE: usize = 64;
 
-/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Credential reads and
-/// project env reads are tier-independent; an env-file write follows the env-write tier rule.
+/// The verdict for a Bash `command` run in `cwd`; `None` is no opinion. Credential reads are
+/// tier-independent; an env-file read follows the env-read tier rule ([`envread`], denied at
+/// every tier when the command line also reaches the network), an env-file write the
+/// env-write tier rule.
 pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict> {
     let parsed = shell::parse(command);
     if let Some(what) = parsed.commands.iter().find_map(reader) {
@@ -150,32 +152,91 @@ fn inspect(
         .arg_files
         .iter()
         .chain(&parsed.input_files)
-        .chain(&code)
         .cloned()
         .collect();
-    let Some(usage) = env_check(&parsed.commands, &named, cwd, policy, stdin_free)? else {
-        return Ok(None);
-    };
-    Ok(match usage {
-        EnvUse::Read(file) => {
-            let hint = read::varlock_hint(cwd, &cwd.join(&file));
-            match read::env_verdict(&file, policy, hint) {
+    let code_writes = !code.is_empty() && crate::gates::envwrite::code_writes(command);
+    let usage = env_check(
+        &parsed.commands,
+        &EnvInputs {
+            named: &named,
+            code: &code,
+            code_writes,
+            outputs: &parsed.output_files,
+        },
+        cwd,
+        policy,
+        stdin_free,
+    )?;
+    let mut verdicts: Vec<Option<Verdict>> = Vec::new();
+    if let Some(hit) = &usage.read {
+        if reaches_network(parsed, command) {
+            return Ok(Some(envread::to_network(&hit.file)));
+        }
+        let varlock = read::varlock_hint(cwd, &cwd.join(&hit.file));
+        verdicts.push(
+            match read::env_verdict(&hit.file, hit.project, policy, varlock) {
                 Decision::Deny { reason } => Some(Verdict::Deny(reason)),
                 Decision::Ask { reason } => Some(Verdict::Ask(reason)),
                 _ => None,
-            }
-        }
-        EnvUse::Write(file) => crate::gates::envwrite::bash_write(&file, tier),
-    })
+            },
+        );
+    }
+    if let Some(hit) = &usage.write {
+        verdicts.push(crate::gates::envwrite::bash_write(
+            &hit.file,
+            hit.project,
+            tier,
+        ));
+    }
+    Ok(verdicts.into_iter().flatten().max_by_key(|v| match v {
+        Verdict::Deny(_) => 3,
+        Verdict::Ask(_) => 2,
+        Verdict::Allow(_) => 1,
+        Verdict::NoOpinion => 0,
+    }))
 }
 
-/// How a command uses a project env file it names.
+/// Whether the command line can send data off the machine: it runs a network program
+/// ([`envread::NETWORK_PROGRAMS`]), or it runs interpreter code that shows network use.
+fn reaches_network(parsed: &shell::Parsed, command: &str) -> bool {
+    let has_code = !parsed.stdin_code.is_empty()
+        || parsed.commands.iter().any(|c| {
+            AWKS.contains(&c.program().as_str()) || shell::interpreter_at(&c.words).is_some()
+        });
+    parsed
+        .commands
+        .iter()
+        .any(|c| envread::is_network_program(&c.program()))
+        || (has_code && envread::code_reaches_network(command))
+}
+
+/// One env file a command uses: the file as named, and whether it is a project env file from
+/// every effective cwd ([`envread::is_project_env`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EnvUse {
-    /// Its contents can reach the output: the env-read verdict.
-    Read(String),
-    /// It is moved, removed or overwritten: the env-write tier rule.
-    Write(String),
+struct EnvHit {
+    file: String,
+    project: bool,
+}
+
+/// How a command line uses the env files it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EnvUse {
+    /// The first file whose contents can reach the output: the env-read verdict.
+    read: Option<EnvHit>,
+    /// The first file moved, removed, overwritten or edited in place: the env-write tier rule.
+    write: Option<EnvHit>,
+}
+
+/// The files a command line names outside its words.
+struct EnvInputs<'a> {
+    /// `xargs -a` files and input redirect targets: reads.
+    named: &'a [String],
+    /// Paths named in interpreter code: reads, and writes too when `code_writes`.
+    code: &'a [String],
+    /// The command line's code shows a file write ([`crate::gates::envwrite::code_writes`]).
+    code_writes: bool,
+    /// Output redirect targets: writes.
+    outputs: &'a [String],
 }
 
 /// Programs whose words naming an env file are not a raw read: the env CLI itself and
@@ -198,8 +259,11 @@ const ENV_REMOVERS: &[&str] = &["rm", "unlink", "shred"];
 
 /// Programs whose last positional (or `-t` value) is a destination and the rest are sources:
 /// an env file as the destination is a write, as a source a read (it relocates the secret to a
-/// name anything can read).
+/// name anything can read), and for `mv` a write too (the file is gone).
 const ENV_RELOCATORS: &[&str] = &["mv", "cp", "ln", "rsync", "install"];
+
+/// Programs that overwrite every file operand without printing it: a write.
+const ENV_OVERWRITERS: &[&str] = &["tee", "truncate"];
 
 /// Build tools a `dotenv`/`dotenvx` wrapper may run with the loaded environment.
 const ENV_BUILD_TOOLS: &[&str] = &["next", "vite", "anchor", "cargo", "make"];
@@ -598,32 +662,50 @@ fn relocation_destinations(words: &[&str]) -> Vec<usize> {
     out
 }
 
-/// The first word of a non-metadata command that names a project env file (the env gate's
-/// definition, [`read::is_env_file`]): any program, the word resolved like a credential path
-/// (pieces after `=`/`:`, braces, `~`, every cwd), a wildcard expanded against the filesystem
-/// (dotfiles only by a literal leading dot, as the shell does) and matched lexically against
-/// env names. A search's pattern and a `find` with no `-exec` (it prints names) are skipped.
+/// How a command line uses env files (the env gate's definition, [`read::is_env_file`]): each
+/// non-metadata command's words, resolved like a credential path (pieces after `=`/`:`,
+/// braces, `~`, every cwd), a wildcard expanded against the filesystem (dotfiles only by a
+/// literal leading dot, as the shell does) and matched lexically against env names, plus the
+/// files named outside the words ([`EnvInputs`]). A search's pattern and a `find` with no
+/// `-exec` (it prints names) are skipped. A word is a write for a remover, a relocator's
+/// destination (and `mv`'s source), `tee`/`truncate`, `dd of=`, and an in-place edit (`sed -i`,
+/// `perl -i`, `ruby -i`); otherwise a read.
 fn env_check(
     commands: &[SimpleCommand],
-    named: &[String],
+    inputs: &EnvInputs<'_>,
     hook_cwd: &Path,
     policy: &Policy,
     stdin_free: bool,
-) -> Result<Option<EnvUse>, TooComplex> {
+) -> Result<EnvUse, TooComplex> {
     let homes = crate::gates::secretpath::homes_resolved();
     let mut cwds: Vec<PathBuf> = vec![hook_cwd.to_path_buf()];
-    if named.len() > MAX_WORDS {
+    let total = inputs.named.len() + inputs.code.len() + inputs.outputs.len();
+    if total > MAX_WORDS {
         return Err(TooComplex);
     }
-    if let Some(hit) = named
+    let mut usage = EnvUse::default();
+    let hit = |word: &str, cwds: &[PathBuf]| {
+        env_word_hit(word, cwds, &homes, policy).map(|file| {
+            let project = cwds.iter().all(|c| envread::is_project_env(&file, c));
+            EnvHit { file, project }
+        })
+    };
+    usage.read = inputs
+        .named
         .iter()
-        .find_map(|f| env_word_hit(f, &cwds, &homes, policy))
-    {
-        return Ok(Some(EnvUse::Read(hit)));
+        .chain(inputs.code)
+        .find_map(|f| hit(f, &cwds));
+    if inputs.code_writes {
+        usage.write = inputs.code.iter().find_map(|f| hit(f, &cwds));
+    }
+    if usage.write.is_none() {
+        usage.write = inputs.outputs.iter().find_map(|f| hit(f, &cwds));
     }
     let mut budget = MAX_WORDS;
-    let mut write: Option<String> = None;
     for cmd in commands {
+        if usage.read.is_some() && usage.write.is_some() {
+            break;
+        }
         let program = cmd.program();
         if matches!(program.as_str(), "cd" | "pushd") {
             track_cd(cmd, &mut cwds);
@@ -649,7 +731,9 @@ fn env_check(
         let mut skip_value = false;
         let program_path = words.first().is_some_and(|w| w.contains(['/', '\\']));
         let loads = env_file_loads(&cmd.words, stdin_free);
-        let removes = ENV_REMOVERS.contains(&program.as_str());
+        let overwrites = ENV_REMOVERS.contains(&program.as_str())
+            || ENV_OVERWRITERS.contains(&program.as_str())
+            || edits_in_place(&program, &words);
         let dests = if ENV_RELOCATORS.contains(&program.as_str()) {
             relocation_destinations(&words)
         } else {
@@ -670,16 +754,48 @@ fn env_check(
             if loads.contains(&i) {
                 continue;
             }
-            if let Some(hit) = env_word_hit(word, &cwds, &homes, policy) {
-                if removes || dests.contains(&i) {
-                    write.get_or_insert(hit);
-                } else {
-                    return Ok(Some(EnvUse::Read(hit)));
+            let Some(found) = hit(word, &cwds) else {
+                continue;
+            };
+            let dd_out = program == "dd" && word.starts_with("of=");
+            if overwrites || dests.contains(&i) || dd_out {
+                usage.write.get_or_insert(found);
+            } else {
+                if program == "mv" {
+                    usage.write.get_or_insert(found.clone());
                 }
+                usage.read.get_or_insert(found);
             }
         }
     }
-    Ok(write.map(EnvUse::Write))
+    Ok(usage)
+}
+
+/// Whether `program` edits its file operands in place: `sed -i`/`--in-place` (also `-i.bak`
+/// and clusters such as `-ni`), `perl -i`/`-pi`, `ruby -i`. A switch cluster is read up to its
+/// first switch that takes a value (`-Mstrict` is not `-i`).
+pub(crate) fn edits_in_place(program: &str, words: &[&str]) -> bool {
+    let short_i = |w: &str, takes_value: &str| {
+        w.strip_prefix('-')
+            .filter(|rest| !rest.starts_with('-'))
+            .is_some_and(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphabetic() && !takes_value.contains(*c))
+                    .any(|c| c == 'i')
+            })
+    };
+    match program {
+        "sed" | "gsed" => words
+            .iter()
+            .skip(1)
+            .any(|w| w.starts_with("--in-place") || short_i(w, "efl")),
+        "perl" | "ruby" => words
+            .iter()
+            .skip(1)
+            .take_while(|w| w.starts_with('-'))
+            .any(|w| short_i(w, "eEMmIxlCdDFVrS")),
+        _ => false,
+    }
 }
 
 /// A credential path among `files`, which the command reads outside its words (a `NAME=`
@@ -1084,7 +1200,8 @@ fn env_word_hit(word: &str, cwds: &[PathBuf], homes: &[String], policy: &Policy)
     if word.len() > 4096 {
         return None;
     }
-    for piece in pieces(word) {
+    // The most specific piece first (`of=.env` names `.env`, `HEAD:.env` too).
+    for piece in pieces(word).into_iter().rev() {
         if piece.starts_with('-') && !piece.contains('=') {
             continue;
         }

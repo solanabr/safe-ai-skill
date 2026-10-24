@@ -323,12 +323,14 @@ fn a_lower_tier_needs_confirmation_and_a_higher_one_does_not() {
     let run = sb.cli(&["tier", "off"]);
     assert_pending_without_code(&run);
     assert!(sb.state("tier.json").is_none());
-    let run = sb.cli(&["tier", "--env-read", "ask"]);
-    assert_pending_without_code(&run);
 
     let run = sb.cli(&["tier", "high"]);
     assert_eq!(run.json()["status"], "set", "{}", run.stdout);
     assert!(sb.state("tier.json").unwrap().contains("\"mac\""));
+    // Tightening env_read applies at once; loosening it back waits for a confirmation.
+    let run = sb.cli(&["tier", "--env-read", "deny"]);
+    assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+    assert_pending_without_code(&sb.cli(&["tier", "--env-read", "tier"]));
     // Changes compare against the stored file (trusted or not): back down from high is a
     // lowering again, and restating it changes nothing.
     assert_pending_without_code(&sb.cli(&["tier", "relaxed"]));
@@ -338,6 +340,7 @@ fn a_lower_tier_needs_confirmation_and_a_higher_one_does_not() {
     for bad in [
         &["tier", "disabled"][..],
         &["tier", "--env-read", "allow"],
+        &["tier", "--env-read", "ask"],
         &["tier", "high", "--clear"],
     ] {
         let run = sb.cli(bad);
@@ -369,7 +372,7 @@ fn tier_with_no_argument_shows_the_resolution() {
         .json();
     assert_eq!(v["tier"], "relaxed");
     assert_eq!(v["source"], "default");
-    assert_eq!(v["env_read"], "deny");
+    assert_eq!(v["env_read"], "tier");
     assert!(v["line"]
         .as_str()
         .unwrap()

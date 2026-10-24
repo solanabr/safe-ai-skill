@@ -26,7 +26,7 @@
 #   1 no pack moved or deleted by NEW (packs OLD already quarantined are reported, not counted)
 #   2 NEW exits 0 and prints hook JSON or nothing, WARN-only (no deny/block/ask/defer, continue not false)
 #   3 grants and mode survive, by NEW's rules (see below); for 1.1.x also: the migration
-#     notice once, grants pending, a raw .env read still denied
+#     notice once, grants pending, a raw .env read open at relaxed (1.2.0: it follows the tier)
 #   4 NEW wrote nothing into proj/ or the home skills dir
 #   5 `git status` of proj is unchanged by NEW
 #   6 control run: NEW on the pristine project moves nothing and stays WARN-only
@@ -39,7 +39,8 @@
 #          relaxations are prompt-nonce confirmed, so the first NEW session migrates once:
 #          each unexpired v1 grant becomes a pending request (its id named in the notice, none
 #          live in `status`), `strict` becomes tier `relaxed` with its one-line notice, and a
-#          second NEW session prints neither. A raw Read of the project's `.env` is still denied.
+#          second NEW session prints neither. A raw Read of the project's `.env` has no opinion
+#          at relaxed (1.2.0: project .env reads follow the tier, denied only at high).
 #   other  checked as 1.0.x, with a notice.
 #
 # Env: R2_KEEP=1 keeps the scratch tree (it is kept on FAIL anyway).
@@ -285,9 +286,9 @@ case "$new_ver" in
     fi
     env_out="$(printf '{"hook_event_name":"PreToolUse","cwd":"%s","tool_name":"Read","tool_input":{"file_path":"%s/.env"}}\n' "$proj" "$proj" |
       eng "$NEW_BIN" gate-read | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null || true)"
-    [ "$env_out" = deny ] || s3="$s3; a raw Read of .env gave '${env_out:-no opinion}', expected deny"
+    [ -z "$env_out" ] || s3="$s3; a raw Read of .env gave '$env_out', expected no opinion at relaxed"
     if [ "$s3" = ok ]; then
-      pass "3 [1.1 rules] tier line and migration notice once (grant $grant_id pending, strict -> relaxed), 0 live grants, .env read denied"
+      pass "3 [1.1 rules] tier line and migration notice once (grant $grant_id pending, strict -> relaxed), 0 live grants, .env read open at relaxed"
     else
       fail "3 [1.1 rules] $s3"
     fi

@@ -1274,12 +1274,19 @@ fn run_env_in_terminal(dir: &Path, args: &[&str], stdin: &str, tier: &str) -> Ru
 }
 
 #[test]
-fn agent_set_and_unset_are_refused_at_medium_and_high() {
+fn agent_set_and_unset_are_refused_at_medium() {
     let t = TempDir::new("env-tier");
     let d = t.path();
     let env = d.join(".env");
     fs::write(&env, "A=1\nB=2\n").unwrap();
-    for tier in ["medium", "high"] {
+    // At High a project `.env` stays writable (its reads are denied); another env file does not.
+    let envrc = d.join(".envrc");
+    fs::write(&envrc, "A=1\n").unwrap();
+    let r = run_env_as_agent(d, &["set", ".envrc", "A"], Some("v"), "high", "CLAUDECODE");
+    assert_eq!(r.code, Some(1), "{}", r.stderr);
+    assert!(r.stderr.contains("tier high"), "{}", r.stderr);
+    assert_eq!(read(&envrc), "A=1\n");
+    for tier in ["medium"] {
         for marker in [
             "CLAUDECODE",
             "CLAUDE_PROJECT_DIR",

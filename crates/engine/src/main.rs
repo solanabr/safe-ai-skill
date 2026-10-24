@@ -1273,6 +1273,7 @@ fn cmd_verify_session() -> ExitCode {
     // ledger is started (or repaired), which creates the key on a first run.
     let mut migrated = migrate::run(&dir, now);
     migrated.extend(migrate::mode_to_tier(&dir, now));
+    migrated.extend(migrate::retired_env_read(&dir, now));
     let spend_state = spend::ledger_state(&plugin_data);
     let _ = SpendLedger::load(&plugin_data);
 
@@ -2182,10 +2183,10 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
     cmd_tier(rest)
 }
 
-/// `tier [<name>] [--project] [--env-read deny|ask|tier] | --clear [--project]` — show the
-/// tier (no argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising
-/// the tier or tightening `env_read` applies at once; lowering or loosening is parked for the
-/// user's whole-prompt confirmation (the code reaches the user alone).
+/// `tier [<name>] [--project] [--env-read deny|tier] | --clear [--project]` — show the tier (no
+/// argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising the tier or
+/// tightening `env_read` to `deny` applies at once; lowering, or loosening it back to `tier`, is
+/// parked for the user's whole-prompt confirmation (the code reaches the user alone).
 fn cmd_tier(rest: &[String]) -> ExitCode {
     let cwd = process_cwd();
     let Some(dir) = cli_state_dir("tier", &cwd) else {
@@ -2199,15 +2200,28 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         match arg.as_str() {
             "--project" => project = true,
             "--clear" => clear = true,
-            "--env-read" => match args.next().map(|v| EnvRead::parse(v)) {
-                Some(Some(v)) => env_read = Some(v),
-                _ => return cli_error("tier", "--env-read: expected deny|ask|tier"),
-            },
-            a if a.starts_with('-') || name.is_some() => return cli_error(
-                "tier",
-                "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|ask|tier] \
+            "--env-read" => {
+                match args.next() {
+                    Some(v) if EnvRead::is_retired(v) => return cli_error(
+                        "tier",
+                        "--env-read ask was removed in 1.2.0: project .env reads follow the tier \
+                         (open at off/relaxed/medium, denied at high); --env-read deny denies \
+                         them at every tier",
+                    ),
+                    Some(v) => match EnvRead::parse(v) {
+                        Some(v) => env_read = Some(v),
+                        None => return cli_error("tier", "--env-read: expected deny|tier"),
+                    },
+                    None => return cli_error("tier", "--env-read: expected deny|tier"),
+                }
+            }
+            a if a.starts_with('-') || name.is_some() => {
+                return cli_error(
+                    "tier",
+                    "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|tier] \
                      | tier --clear [--project]",
-            ),
+                )
+            }
             a => name = Some(a),
         }
     }
@@ -2230,9 +2244,6 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         clear,
     };
     let summary = tierstate::summary(&change);
-    if let Some(note) = env_read.and_then(safe_ai_skill::gates::envread::inactive_note) {
-        let _ = writeln!(std::io::stderr(), "safe-ai-skill tier: {note}");
-    }
     match tierstate::plan(&dir, &change) {
         Plan::NeedsConfirm => park_pending(
             "tier",

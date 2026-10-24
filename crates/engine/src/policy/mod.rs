@@ -50,7 +50,7 @@ swap:
     - "So11111111111111111111111111111111111111112"
     - "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 secrets:
-  env_read: deny
+  env_read: tier
   deny_read_globs:
     - "**/*-keypair.json"
     - "~/.superstack/config.json"
@@ -205,10 +205,11 @@ pub struct SwapPolicy {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SecretsPolicy {
-    /// Raw reads of env-class files (`.env`, `.env.*`, `*.env`, `.envrc`, …): `deny` (default,
-    /// served by `safe-ai-skill env`), `ask` or `tier`. Loosening it is the user's alone
-    /// (`safe-ai-skill tier --env-read`, [`tier::EnvRead`]); a project may only tighten it.
-    /// Hard-deny classes (keypairs, private keys, the Solana config tree) are never affected.
+    /// Raw reads of project env files (`.env`, `.env.*` inside the project): `tier` (default:
+    /// open at Off/Relaxed/Medium, denied at High) or `deny` (denied at every tier). The user
+    /// sets it with `safe-ai-skill tier --env-read` ([`tier::EnvRead`]); a project may only
+    /// tighten it. Other env files and hard-deny classes (keypairs, private keys, the Solana
+    /// config tree) are never affected.
     pub env_read: String,
     /// Extra globs whose reads are denied, on top of the built-in classes
     /// (`gates::secretpath`).
@@ -349,7 +350,7 @@ impl Default for SwapPolicy {
 impl Default for SecretsPolicy {
     fn default() -> Self {
         SecretsPolicy {
-            env_read: "deny".into(),
+            env_read: "tier".into(),
             deny_read_globs: vec![
                 "**/*-keypair.json".into(),
                 "~/.superstack/config.json".into(),
@@ -594,8 +595,8 @@ impl Policy {
 
     /// A conservative policy used when configuration cannot be trusted.
     ///
-    /// Every soft-gated action resolves to `ask`: caps are tiny, mainnet is `ask`, and all
-    /// hard guards are present.
+    /// Every soft-gated action resolves to `ask`: caps are tiny, mainnet is `ask`, raw project
+    /// env reads are denied (`env_read: deny`), and all hard guards are present.
     pub fn fail_closed() -> Policy {
         Policy {
             version: 1,
@@ -610,7 +611,10 @@ impl Policy {
             },
             mcp: McpPolicy::default(),
             swap: SwapPolicy::default(),
-            secrets: SecretsPolicy::default(),
+            secrets: SecretsPolicy {
+                env_read: "deny".into(),
+                ..SecretsPolicy::default()
+            },
             redact: TogglePolicy { enabled: true },
             audit: TogglePolicy { enabled: true },
             catalog: CatalogPolicy::default(),
@@ -676,17 +680,16 @@ fn base_tier(base: &Yaml, notes: &mut Vec<String>) -> Tier {
     Tier::Relaxed
 }
 
-/// The plugin default policy's `secrets.env_read` is pinned to `deny`: raw env reads loosen only
-/// through the user's confirmed `tier.json` (`safe-ai-skill tier --env-read`). Anything else
-/// is ignored with a note.
+/// The plugin default policy's `secrets.env_read` must be a known word (`tier`, the default, or
+/// the tightening `deny`). Anything else (the retired `ask` included) is ignored with a note and
+/// `tier` applies.
 fn pin_base_env_read(policy: &mut Policy) {
-    if EnvRead::parse(&policy.secrets.env_read) != Some(EnvRead::Deny) {
+    if EnvRead::parse(&policy.secrets.env_read).is_none() {
         policy.ignored_overrides.push(
-            "secrets.env_read: the plugin default policy may only say deny (loosen it with \
-             `safe-ai-skill tier --env-read`, confirmed by you); deny applies"
+            "secrets.env_read: the plugin default policy may only say tier or deny; tier applies"
                 .to_string(),
         );
-        policy.secrets.env_read = "deny".to_string();
+        policy.secrets.env_read = "tier".to_string();
     }
 }
 
@@ -985,14 +988,19 @@ mod tests {
         assert_eq!(off.base_tier, Tier::Relaxed);
         assert!(off.ignored_overrides.iter().any(|n| n.starts_with("tier:")));
         let env = Policy::from_sources(
-            &DEFAULT_POLICY_YAML.replace("env_read: deny", "env_read: tier"),
+            &DEFAULT_POLICY_YAML.replace("env_read: tier", "env_read: ask"),
             None,
         );
-        assert_eq!(env.secrets.env_read, "deny");
+        assert_eq!(env.secrets.env_read, "tier");
         assert!(env
             .ignored_overrides
             .iter()
             .any(|n| n.starts_with("secrets.env_read")));
+        let deny = Policy::from_sources(
+            &DEFAULT_POLICY_YAML.replace("env_read: tier", "env_read: deny"),
+            None,
+        );
+        assert_eq!(deny.secrets.env_read, "deny");
         let bad = with("tier: turbo");
         assert_eq!(bad.base_tier, Tier::Relaxed);
         assert!(bad.ignored_overrides.iter().any(|n| n.starts_with("tier:")));

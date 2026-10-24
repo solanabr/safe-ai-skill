@@ -141,7 +141,7 @@ fn nothing_selected_is_relaxed() {
     let r = w.resolve(&[]);
     assert_eq!(
         (r.tier, r.source, r.env_read),
-        (Tier::Relaxed, TierSource::Base, EnvRead::Deny)
+        (Tier::Relaxed, TierSource::Base, EnvRead::Tier)
     );
     assert!(r.notes.is_empty(), "{:?}", r.notes);
 }
@@ -441,7 +441,7 @@ fn an_untrusted_data_dir_selects_nothing() {
     let off = tierstate::Change {
         project: None,
         tier: Some(Tier::Off),
-        env_read: Some(EnvRead::Tier),
+        env_read: Some(EnvRead::Deny),
         clear: false,
     };
     tierstate::apply(&w.dir(), &off, 0).unwrap();
@@ -450,7 +450,7 @@ fn an_untrusted_data_dir_selects_nothing() {
         ..w.dir()
     };
     let r = w.resolve_in(w.proj.path(), &untrusted, &[]);
-    assert_eq!((r.tier, r.env_read), (Tier::Relaxed, EnvRead::Deny));
+    assert_eq!((r.tier, r.env_read), (Tier::Relaxed, EnvRead::Tier));
     assert!(noted(&r, "untrusted"), "{:?}", r.notes);
 }
 
@@ -458,23 +458,23 @@ fn an_untrusted_data_dir_selects_nothing() {
 // env_read
 // ---------------------------------------------------------------------------------------
 
+#[test]
+fn a_repo_env_read_deny_tightens_and_other_words_are_ignored() {
+    let w = World::new("tiers-envread");
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Tier);
+    w.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: deny\n");
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
+    w.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: ask\n");
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Tier);
+}
+
 #[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
 #[test]
-fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
-    let w = World::new("tiers-envread");
-    w.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: tier\n");
-    let policy = Policy::load(w.proj.path());
-    assert!(
-        policy
-            .ignored_overrides
-            .iter()
-            .any(|n| n.starts_with("secrets.env_read")),
-        "{:?}",
-        policy.ignored_overrides
-    );
-    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
-
+fn the_users_env_read_deny_applies_at_once_and_loosening_waits_for_confirmation() {
     let w = World::new("tiers-envread-user");
+    let run = w.cli(&["tier", "--env-read", "deny"]);
+    assert_eq!(run.json()["status"], "set", "{}", run.stdout);
+    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
     let run = w.cli(&["tier", "--env-read", "tier"]);
     assert_eq!(run.json()["status"], "pending", "{}", run.stdout);
     assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
@@ -484,16 +484,48 @@ fn env_read_tier_in_the_repo_is_ignored_and_the_users_waits_for_confirmation() {
         .stdout
         .contains("you confirmed"));
     assert_eq!(w.resolve(&[]).env_read, EnvRead::Tier);
-    // Tightening applies at once.
-    let deny = tierstate::Change {
-        project: None,
-        tier: None,
-        env_read: Some(EnvRead::Deny),
-        clear: false,
+    let run = w.cli(&["tier", "--env-read", "ask"]);
+    assert_eq!(run.json()["status"], "error", "{}", run.stdout);
+}
+
+/// A 1.1.0 `tier.json` holding `env_read: ask` is rewritten as `tier` at the first SessionStart,
+/// with a one-time notice; `deny` is kept.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_stored_env_read_ask_is_migrated_once_with_a_notice() {
+    let w = World::new("tiers-envread-migrate");
+    let legacy = json!({
+        "v": 1,
+        "global": {"tier": "relaxed", "env_read": "ask", "set_at": 1},
+        "projects": {"/elsewhere": {"tier": "high", "env_read": "deny", "set_at": 1}},
+    });
+    safe_ai_skill::statefile::store(&w.dir(), tierstate::TIER_FILE, &legacy).unwrap();
+    let session = || {
+        let run = Invocation::new(&["verify", "session"])
+            .plugin_data(w.data.path())
+            .home(w.home.path())
+            .cwd(w.proj.path())
+            .env(safe_ai_skill::datadir::TEST_TRUST_ENV, "1")
+            .stdin(
+                json!({"session_id":"it-tiers","hook_event_name":"SessionStart","source":"startup","cwd": w.proj.path()})
+                    .to_string(),
+            )
+            .run();
+        run.stdout
     };
-    assert_eq!(tierstate::plan(&w.dir(), &deny), tierstate::Plan::Immediate);
-    tierstate::apply(&w.dir(), &deny, 0).unwrap();
-    assert_eq!(w.resolve(&[]).env_read, EnvRead::Deny);
+    let first = session();
+    assert!(
+        first.contains("env_read ask was retired in 1.2.0"),
+        "{first}"
+    );
+    assert!(!session().contains("retired"), "shown twice");
+    let safe_ai_skill::statefile::Loaded::Valid(raw) =
+        safe_ai_skill::statefile::load::<serde_json::Value>(&w.dir(), tierstate::TIER_FILE)
+    else {
+        panic!("tier.json must stay authenticated");
+    };
+    assert_eq!(raw["global"]["env_read"], "tier");
+    assert_eq!(raw["projects"]["/elsewhere"]["env_read"], "deny");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -591,14 +623,14 @@ fn builder_tier_selects_the_users_tier() {
                 .home(w.home.path())
                 .cwd(w.proj.path())
                 .tier(Tier::Off)
-                .env_read(EnvRead::Ask),
+                .env_read(EnvRead::Deny),
         );
         assert_eq!(
             (v["tier"].as_str(), v["source"].as_str()),
             (Some("off"), Some("your setting")),
             "{v}"
         );
-        assert_eq!(v["env_read"], "ask", "{v}");
+        assert_eq!(v["env_read"], "deny", "{v}");
     }
 }
 
@@ -641,7 +673,7 @@ fn evil_root(tier_line: &str, env_read: &str) -> TempDir {
     std::fs::create_dir_all(root.join("policy")).unwrap();
     let text = DEFAULT_POLICY_YAML
         .replace("tier: relaxed", tier_line)
-        .replace("env_read: deny", &format!("env_read: {env_read}"));
+        .replace("env_read: tier", &format!("env_read: {env_read}"));
     std::fs::write(root.join("policy/default.policy.yaml"), text).unwrap();
     root
 }
@@ -651,7 +683,7 @@ fn evil_root(tier_line: &str, env_read: &str) -> TempDir {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_spoofed_plugin_root_cannot_make_clear_immediate() {
-    let evil = evil_root("tier: high", "deny");
+    let evil = evil_root("tier: high", "tier");
     for project in [false, true] {
         let w = World::new("tiers-spoof");
         let cli = |args: &[&str], spoof: bool| {
@@ -678,11 +710,12 @@ fn a_spoofed_plugin_root_cannot_make_clear_immediate() {
     }
 }
 
-/// The plugin default policy is floored at relaxed and its env_read pinned to deny (review #2).
+/// The plugin default policy is floored at relaxed and its env_read must be a known word
+/// (review #2): the retired `ask` falls back to `tier`.
 #[test]
 fn the_plugin_default_policy_cannot_lower_or_open_env_reads() {
     let w = World::new("tiers-base-floor");
-    let evil = evil_root("tier: off", "tier");
+    let evil = evil_root("tier: off", "ask");
     let v = Invocation::new(&["tier"])
         .plugin_data(w.data.path())
         .home(w.home.path())
@@ -692,7 +725,7 @@ fn the_plugin_default_policy_cannot_lower_or_open_env_reads() {
         .json();
     assert_eq!(
         (v["tier"].as_str(), v["env_read"].as_str()),
-        (Some("relaxed"), Some("deny")),
+        (Some("relaxed"), Some("tier")),
         "{v}"
     );
     let notes = v["policy_notes"].to_string();

@@ -31,9 +31,12 @@ secrets:
   #   hard deny (never relaxable): *-keypair.json, ~/.config/solana/** except cli/config.yml,
   #     ~/.ssh/id_*, ~/.superstack/config.json, the varlock key store, any file whose content is a
   #     keypair or holds a private-key block, id.json / *.pem / *.key when unreadable;
-  #   env class (raw read denied, use `safe-ai-skill env keys|set|unset`): .env, .env.*, *.env,
-  #     .envrc, .dev.vars, .varlock-frozen-env, ~/.config/solana/cli/config.yml.
-  env_read: deny                      # loosen only with `safe-ai-skill tier --env-read ask|tier` (yours; needs the sandbox on)
+  #   project env (.env, .env.* inside the project): raw reads follow the tier (open at
+  #     off/relaxed/medium, denied at high), writes are denied at medium;
+  #   other env class (raw read denied, use `safe-ai-skill env keys|set|unset`): *.env, .envrc,
+  #     .dev.vars, .varlock-frozen-env, ~/.config/solana/cli/config.yml, env files outside the
+  #     project.
+  env_read: tier                      # `deny` denies project env reads at every tier (`safe-ai-skill tier --env-read deny`)
   deny_read_globs:                    # extra denies on top of the built-in classes
     - "**/*-keypair.json"
     - "~/.superstack/config.json"     # holds the plaintext Copilot JWT

@@ -23,6 +23,8 @@ struct Sandbox {
     user_env_read: Option<common::EnvRead>,
     /// The declared sandbox, when a test needs one.
     sandbox: Option<common::SandboxMode>,
+    /// Run at tier High (`SAFE_AI_SKILL_TIER`), where project env reads deny too.
+    high: bool,
 }
 
 impl Sandbox {
@@ -35,22 +37,20 @@ impl Sandbox {
             path: TempDir::new("d3-path"),
             user_env_read: None,
             sandbox: None,
+            high: false,
         }
     }
 
-    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`), with the
-    /// sandbox declared on (the opt-in applies only then, D8 v2 spec §1.4).
-    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
-    fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
-        self.user_env_read = Some(env_read);
-        self.sandbox = Some(common::SandboxMode::On);
+    /// Tier High: the project env read rows deny there, as every env row did before 1.2.0.
+    fn high(mut self) -> Self {
+        self.high = true;
         self
     }
 
-    /// The declared sandbox (with `test-hooks`, the engine override).
-    #[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
-    fn with_sandbox(mut self, mode: common::SandboxMode) -> Self {
-        self.sandbox = Some(mode);
+    /// The user's confirmed `env_read` (needs `--features test-hooks`, see `common`).
+    #[cfg(feature = "test-hooks")]
+    fn with_user_env_read(mut self, env_read: common::EnvRead) -> Self {
+        self.user_env_read = Some(env_read);
         self
     }
 
@@ -87,6 +87,9 @@ impl Sandbox {
         }
         if let Some(env_read) = self.user_env_read {
             inv = inv.env_read(env_read);
+        }
+        if self.high {
+            inv = inv.env("SAFE_AI_SKILL_TIER", "high");
         }
         if let Some(mode) = self.sandbox {
             inv = inv.cwd(self.project.path()).sandbox(mode);
@@ -155,7 +158,7 @@ fn keypair_json() -> String {
 
 #[test]
 fn read_env_class_variants_deny() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for path in [
         ".ENV",
         ".Env.Local",
@@ -204,7 +207,7 @@ fn read_hard_deny_trees_deny_even_when_missing() {
 #[cfg(unix)]
 #[test]
 fn read_symlinks_are_matched_on_the_resolved_path() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     sb.write(".env", "TOKEN=abcdefghijklmnop\n");
     let link = sb.project.join("notes.txt");
     std::os::unix::fs::symlink(sb.project.join(".env"), &link).unwrap();
@@ -307,7 +310,7 @@ fn read_pem_denies_private_keys_only() {
 
 #[test]
 fn read_deny_message_names_the_env_commands() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     let run = sb.pre("gate-read", "Read", json!({ "file_path": ".env.local" }));
     let why = reason(&run);
     assert!(why.contains("safe-ai-skill env keys .env.local"), "{why}");
@@ -324,7 +327,7 @@ fn read_deny_message_names_the_env_commands() {
 
 #[test]
 fn read_deny_message_mentions_varlock_only_with_a_schema() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     sb.write(".env.schema", "# @defaultSensitive=true\n# ---\nAPI_KEY=\n");
     let why = reason(&sb.pre("gate-read", "Read", json!({ "file_path": ".env" })));
     assert!(why.contains("varlock run -- <cmd>"), "{why}");
@@ -332,41 +335,34 @@ fn read_deny_message_mentions_varlock_only_with_a_schema() {
 }
 
 #[test]
-fn the_plugin_policy_cannot_loosen_env_read() {
-    // Pinned to deny: only the user's confirmed tier.json loosens it.
-    let sb = Sandbox::new().with_policy(|p| p.replace("env_read: deny", "env_read: ask"));
+fn the_plugin_policy_env_read_may_tighten_and_ignores_unknown_words() {
+    // The retired `ask` is not a word: `tier` applies (open at Relaxed).
+    let sb = Sandbox::new().with_policy(|p| p.replace("env_read: tier", "env_read: ask"));
+    assert_eq!(sb.read(".env"), "");
+    let sb = Sandbox::new().with_policy(|p| p.replace("env_read: tier", "env_read: deny"));
     assert_eq!(sb.read(".env"), "deny");
     assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
 }
 
-#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+#[cfg(feature = "test-hooks")]
 #[test]
-fn read_env_read_ask_policy_asks_for_env_but_not_hard_classes() {
-    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
-    assert_eq!(sb.read(".env"), "ask");
+fn the_users_env_read_deny_denies_env_and_hard_classes_always_deny() {
+    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Deny);
+    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
+    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "deny");
+    let sb = Sandbox::new();
+    assert_eq!(sb.read(".env"), "");
     assert_eq!(sb.read("~/.config/solana/id.json"), "deny");
     sb.write("k.json", &keypair_json());
     assert_eq!(sb.read("k.json"), "deny");
 }
 
-#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
-fn the_env_read_opt_in_is_suspended_without_the_sandbox() {
-    let sb = Sandbox::new()
-        .with_user_env_read(common::EnvRead::Ask)
-        .with_sandbox(common::SandboxMode::Off);
-    assert_eq!(sb.read(".env"), "deny");
-    assert_eq!(decision_label(&sb.bash("cat .env")), "deny");
-    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "deny");
-    let why = reason(&sb.bash("cat .env"));
-    assert!(why.contains("opt-in suspended: sandbox not on"), "{why}");
-}
-
-#[test]
-fn repo_cannot_set_env_read_ask() {
+fn a_repo_env_read_ask_is_ignored() {
     let sb = Sandbox::new();
     sb.write(".safe-ai-skill/policy.yaml", "secrets:\n  env_read: ask\n");
-    assert_eq!(sb.read(".env"), "deny");
+    assert_eq!(sb.read(".env"), "");
 }
 
 #[test]
@@ -416,7 +412,7 @@ const EXCLUSION_HEAD: &str = "!{**/.[eE][nN][vV],**/.[eE][nN][vV].*";
 
 #[test]
 fn grep_on_a_secret_file_or_secret_glob_denies() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     sb.write(".env", "A=1\n");
     for input in [
         json!({ "pattern": "KEY", "path": ".env" }),
@@ -490,7 +486,7 @@ fn glob_is_never_gated() {
 
 #[test]
 fn mcp_path_arguments_are_read_checked() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     sb.write(".env", "A=1\n");
     for (tool, input) in [
         (
@@ -529,7 +525,7 @@ fn mcp_prose_mentioning_env_has_no_opinion() {
 
 #[test]
 fn bash_readers_on_env_deny() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for cmd in [
         "sudo cat .env",
         "source .env",
@@ -566,7 +562,7 @@ fn bash_readers_on_env_deny() {
 
 #[test]
 fn bash_varlock_value_printing_commands_deny() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for cmd in [
         "varlock load --format json",
         "varlock load -f env",
@@ -612,18 +608,17 @@ fn bash_varlock_safe_commands_have_no_opinion_or_ask() {
     }
 }
 
-#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
 #[test]
-fn bash_env_read_ask_applies_to_readers_and_varlock() {
-    let sb = Sandbox::new().with_user_env_read(common::EnvRead::Ask);
-    assert_eq!(decision_label(&sb.bash("cat .env")), "ask");
-    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "ask");
+fn bash_readers_and_varlock_follow_the_tier_and_key_files_deny() {
+    let sb = Sandbox::new();
+    assert_eq!(decision_label(&sb.bash("cat .env")), "");
+    assert_eq!(decision_label(&sb.bash("varlock printenv K")), "");
     assert_eq!(decision_label(&sb.bash("cat wallet-keypair.json")), "deny");
 }
 
 #[test]
 fn bash_deny_message_mentions_varlock_run_with_a_schema_only() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     let plain = reason(&sb.bash("cat .env"));
     assert!(!plain.contains("varlock"), "{plain}");
     sb.write(".env.schema", "# ---\nK=\n");
@@ -638,7 +633,7 @@ fn bash_deny_message_mentions_varlock_run_with_a_schema_only() {
 #[test]
 fn bash_deny_message_mentions_varlock_when_installed() {
     use std::os::unix::fs::PermissionsExt;
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     let bin = sb.path.join("varlock");
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -653,7 +648,7 @@ fn bash_deny_message_mentions_varlock_when_installed() {
 const VALUE: &str = "hx_live_9f8e7d6c5b4a3210";
 
 fn env_sandbox() -> Sandbox {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     sb.write(
         ".env",
         &format!("HELIUS_API_KEY={VALUE}\nCLUSTER=devnet\nSHORT=abc\n"),
@@ -1028,7 +1023,7 @@ fn redact_value_pass_respects_token_boundaries_and_plain_identifiers() {
 
 #[test]
 fn bash_varlock_runner_forms_deny() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for cmd in [
         "pnpm varlock printenv K",
         "yarn run varlock printenv K",
@@ -1050,7 +1045,7 @@ fn bash_varlock_runner_forms_deny() {
 
 #[test]
 fn bash_more_reader_forms_deny() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for cmd in [
         "git -C sub show HEAD:.env",
         "git -c core.pager=cat show HEAD:.env",
@@ -1103,7 +1098,7 @@ fn redact_explicit_sensitive_passphrase_is_scrubbed() {
 
 #[test]
 fn bash_npx_call_script_is_parsed() {
-    let sb = Sandbox::new();
+    let sb = Sandbox::new().high();
     for cmd in [
         "npx -c 'varlock printenv K'",
         "npx --call 'varlock reveal K'",
