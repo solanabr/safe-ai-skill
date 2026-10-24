@@ -1,11 +1,15 @@
 # safe-ai-skill default policy — the FULL schema (kept equivalent to the embedded
-# DEFAULT_POLICY_YAML in crates/engine/src/policy.rs). A project's
+# DEFAULT_POLICY_YAML in crates/engine/src/policy/mod.rs). A project's
 # <cwd>/.safe-ai-skill/policy.yaml may only tighten it, field by field: caps take the lower
 # value, deny-lists add entries, allow-lists drop them; anything looser (and any profile
 # setting) is ignored and listed at SessionStart. Every field below has a serde default so a
 # partial override still parses.
 version: 1
-active_profile: strict    # strict | autopilot | paranoid | off; `safe-ai-skill mode` sets it; env SAFE_AI_SKILL_PROFILE may only pick a stricter one
+# Base tier (off < relaxed < medium < high). Your own choice lives in the authenticated
+# tier.json (`safe-ai-skill tier <t> [--project]`; lowering needs your prompt confirmation).
+# A project's `tier:` here, the kit's .claude/security.json and SAFE_AI_SKILL_TIER may only
+# raise it. Off is not "disabled": every deny still holds (SAFE_AI_SKILL_DISABLE=1 is the switch).
+tier: relaxed
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
@@ -13,16 +17,6 @@ spend:
   per_tx_sol_max: 1.0     # above → ask; above hard_max → deny
   hard_tx_sol_max: 10.0
   daily_sol_max: 5.0
-gates:                    # always ask regardless of caps
-  - mainnet_deploy
-  - program_upgrade
-  - set_authority         # solana program set-upgrade-authority, spl-token authorize
-  - account_close         # solana close, spl-token close
-hard_guards:              # scopes NO profile or grant may ever relax
-  - mainnet_deploy
-  - set_authority
-  - account_close
-  - secret_read
 mcp:
   # value-moving verbs matched in MCP tool names (expanded for heliusWrite staking + future tools)
   sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
@@ -32,17 +26,25 @@ swap:
   rugcheck_timeout_ms: 3000     # on timeout/API-down → ask (never hard-block on third-party uptime)
   trusted_mints: [ "So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" ]
 secrets:
-  deny_read_globs:
+  # Built-in classes (crates/engine/src/gates/secretpath.rs), matched case-insensitively on the
+  # raw and the symlink-resolved path:
+  #   hard deny (never relaxable): *-keypair.json, ~/.config/solana/** except cli/config.yml,
+  #     ~/.ssh/id_*, ~/.superstack/config.json, the varlock key store, any file whose content is a
+  #     keypair or holds a private-key block, id.json / *.pem / *.key when unreadable;
+  #   env class (raw read denied, use `safe-ai-skill env keys|set|unset`): .env, .env.*, *.env,
+  #     .envrc, .dev.vars, .varlock-frozen-env, ~/.config/solana/cli/config.yml.
+  env_read: deny                      # loosen only with `safe-ai-skill tier --env-read ask|tier` (yours; needs the sandbox on)
+  deny_read_globs:                    # extra denies on top of the built-in classes
     - "**/*-keypair.json"
-    - "**/id.json"
-    - "**/.env"
-    - "**/.env.*"
-    - "**/*.pem"
-    - "~/.config/solana/**"
     - "~/.superstack/config.json"     # holds the plaintext Copilot JWT
-  allow_read_globs:
+  key_material_extra_globs: []        # added to policy/shared/credentials.list (union only)
+  exfil_hosts_extra: []               # added to policy/shared/exfil-hosts.list (union only)
+  allow_read_globs:                   # readable despite the env class (never a hard-deny class)
     - "**/.env.example"
-    - "**/.env.schema"                # varlock schema: keys + decorators only; read gate sniffs it for key material
+    - "**/.env.sample"
+    - "**/.env.template"
+    - "**/.env.dist"
+    - "**/.env.schema"                # varlock schema: keys + decorators only; the read gate sniffs it
 redact: { enabled: true }
 audit:  { enabled: true }
 catalog:
@@ -69,13 +71,7 @@ supply_chain:
   verify_ext_submodules: true       # walk .claude/skills/ext/<name> as individual verifiable units
   ext_dir: ".claude/skills/ext"
   exec_install_scripts: ask         # runtime curl … | sh/bash gate: allow | ask | deny
-profiles:
-  strict: {}
-  autopilot:
-    relax_transfer: true
-    relax_swap: true
-    per_tx_sol_max: 2.0
-  paranoid:
-    ask_all: true
-  off:
-    disabled: true
+  on_block: deny                    # blocked skill packs: deny in place | move to quarantine
+# Hard guards (mainnet deploy, authority changes, account close, secret reads, irreversible
+# flags) are built into the gates: no tier, grant or policy relaxes them. To turn the
+# hooks off, set SAFE_AI_SKILL_DISABLE=1 (reported at SessionStart).

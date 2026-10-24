@@ -1,0 +1,539 @@
+{
+  "_doc": "Every benign input to every hooks.json subcommand: no opinion (empty stdout, exit 0). Headless `claude -p` must never see a defer or a blocking answer here (Review Focus 2). tests/conformance.rs also checks every hooks.json subcommand has a case and that every case here expects exactly this.",
+  "cases": [
+    {
+      "name": "gate-bash: solana balance --url devnet",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana balance --url devnet"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash: solana address",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana address"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash: solana config get",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana config get"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash: spl-token accounts",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "spl-token accounts"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash: anchor build",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "anchor build"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash: git status",
+      "args": [
+        "gate-bash"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "git status"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash-secrets: ls -la",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ls -la"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash-secrets: cargo build",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "cargo build"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash-secrets: git status",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "git status"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash-secrets: npm test",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm test"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-bash-secrets: solana balance --url devnet",
+      "args": [
+        "gate-bash-secrets"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "solana balance --url devnet"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-read: Read README.md",
+      "args": [
+        "gate-read"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Read",
+        "tool_input": {
+          "file_path": "README.md"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-read: Grep",
+      "args": [
+        "gate-read"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Grep",
+        "tool_input": {
+          "pattern": "fn main",
+          "path": "src"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-read: Glob",
+      "args": [
+        "gate-read"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Glob",
+        "tool_input": {
+          "pattern": "**/*.rs"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-mcp: docs lookup",
+      "args": [
+        "gate-mcp"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "mcp__context7__query-docs",
+        "tool_input": {
+          "libraryId": "/rust-lang/rust",
+          "query": "iterators"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-mcp: wallet balance",
+      "args": [
+        "gate-mcp"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "mcp__helius__heliusWallet",
+        "tool_input": {
+          "action": "getBalance",
+          "address": "Abc"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-tamper: Write a project source file",
+      "args": [
+        "gate-tamper"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Write",
+        "tool_input": {
+          "file_path": "{cwd}/src/lib.rs",
+          "content": "pub fn f() {}\n"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "redact: plain output",
+      "args": [
+        "redact"
+      ],
+      "stdin": {
+        "hook_event_name": "PostToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "echo hello"
+        },
+        "tool_response": {
+          "stdout": "hello world\n",
+          "stderr": "",
+          "interrupted": false,
+          "isImage": false
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "prompt-guard: plain prompt",
+      "args": [
+        "prompt-guard"
+      ],
+      "stdin": {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "prompt": "please run the tests"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-skill: skill invocation",
+      "args": [
+        "gate-skill"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Skill",
+        "tool_input": {
+          "skill": "superpowers:brainstorming",
+          "args": ""
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-prompt-expansion: plugin slash command",
+      "args": [
+        "gate-prompt-expansion"
+      ],
+      "stdin": {
+        "hook_event_name": "UserPromptExpansion",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "expansion_type": "slash_command",
+        "command_name": "review",
+        "command_args": "",
+        "command_source": "plugin",
+        "prompt": "/review"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "gate-prompt-expansion: typed slash command at UserPromptSubmit",
+      "args": [
+        "gate-prompt-expansion"
+      ],
+      "stdin": {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "prompt": "/review the diff"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "verify session: startup",
+      "args": [
+        "verify",
+        "session"
+      ],
+      "stdin": {
+        "hook_event_name": "SessionStart",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "source": "startup"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "verify session: resume",
+      "args": [
+        "verify",
+        "session"
+      ],
+      "stdin": {
+        "hook_event_name": "SessionStart",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "source": "resume"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "verify session: clear",
+      "args": [
+        "verify",
+        "session"
+      ],
+      "stdin": {
+        "hook_event_name": "SessionStart",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "source": "clear"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "verify session: compact",
+      "args": [
+        "verify",
+        "session"
+      ],
+      "stdin": {
+        "hook_event_name": "SessionStart",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "source": "compact"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "pending-notice: nothing pending",
+      "args": [
+        "pending-notice"
+      ],
+      "stdin": {
+        "hook_event_name": "PostToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "ls"
+        },
+        "tool_response": {
+          "stdout": "README.md"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "failure-notice: a failed command with no secret",
+      "args": [
+        "failure-notice"
+      ],
+      "stdin": {
+        "hook_event_name": "PostToolUseFailure",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "false"
+        },
+        "error": "Exit code 1"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    }
+  ]
+}

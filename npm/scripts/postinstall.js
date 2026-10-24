@@ -54,6 +54,8 @@ function detectPlatform() {
   if (os === "darwin" && arch === "x64")  return "darwin-x64";
   if (os === "linux"  && arch === "x64")  return "linux-x64";
   if (os === "linux"  && arch === "arm64") return "linux-arm64";
+  // Windows on ARM runs the x64 build under emulation.
+  if (os === "win32"  && (arch === "x64" || arch === "arm64")) return "windows-x64";
 
   return null;
 }
@@ -128,7 +130,8 @@ async function main() {
     process.exit(1);
   }
 
-  const binaryName = `safe-ai-skill-${plat}`;
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const binaryName = `safe-ai-skill-${plat}${exe}`;
   const binaryPath = path.join(BIN_DIR, binaryName);
   const binaryUrl  = `${RELEASE_BASE}/${binaryName}`;
   const sumsUrl    = `${RELEASE_BASE}/SHA256SUMS`;

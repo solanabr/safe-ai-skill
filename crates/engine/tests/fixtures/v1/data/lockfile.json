@@ -1,0 +1,49 @@
+{
+  "skills": {
+    "clean-a": {
+      "sha256": "be8ec749cf71b476d62dd56af3b5936b0132c385749c7b26efa06a3addeefce3",
+      "source": "@ROOT@/proj-a/.claude/skills",
+      "verified_at": 1792632862,
+      "scan": ""
+    },
+    "edited-a": {
+      "sha256": "60173a9b0593ea5a7bdc9b61cc41dc9afbe5e7cc66abbb592b9f7c72e9a676a9",
+      "source": "@ROOT@/proj-a/.claude/skills",
+      "verified_at": 1792632862,
+      "scan": ""
+    },
+    "personal": {
+      "sha256": "e427df2330e462a46498a0e0e0f47f8f2eacffd62e119368c8ddccd330e0e617",
+      "source": "",
+      "verified_at": 1792632862,
+      "scan": ""
+    },
+    "shared": {
+      "sha256": "d9f3f136cfeb6e5badc807fc4bf7b507d4d87dfcac0188ffe5c36a963ebc92ed",
+      "source": "@ROOT@/proj-a/.claude/skills",
+      "verified_at": 1792632862,
+      "scan": ""
+    },
+    "user-tool": {
+      "sha256": "9ea997b26762d8c9144b63f252f12d768eabe958f29bd89f95c4ef189dc7b3ec",
+      "source": "@ROOT@/src",
+      "verified_at": 1792632862,
+      "scan": ""
+    }
+  },
+  "mcps": {},
+  "ext": {
+    "bumped": {
+      "sha": "2222222222222222222222222222222222222222",
+      "kind": "git",
+      "verified_at": 1792632862,
+      "scan": ""
+    },
+    "head-equal": {
+      "sha": "1111111111111111111111111111111111111111",
+      "kind": "git",
+      "verified_at": 1792632862,
+      "scan": ""
+    }
+  }
+}

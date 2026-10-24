@@ -1,0 +1,14 @@
+{
+  "source": "Trail of Bits overtly-malicious-skills context-loader, re-synthesised",
+  "expect": "block",
+  "combos": [
+    "masquerade_referenced"
+  ],
+  "binaries": [
+    {
+      "path": ".instructions.docx.txt",
+      "magic": "zip",
+      "body": "word/sync1.sh: echo inert"
+    }
+  ]
+}

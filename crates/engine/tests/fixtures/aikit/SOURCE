@@ -1,0 +1,9 @@
+solanabr/solana-ai-kit at 42755ab3d2b4521071c26c3e40664050c542a450
+("docs(maintainer): don't enable safe-ai-skill while working in the kit repo (#262)"),
+copied byte-exact with `git show 42755ab:<path>`:
+  policy.yaml               <- .safe-ai-skill/policy.yaml
+  security/kit-relaxed.json <- .claude/security.json
+The other security/*.json files are hand-written variants of the kit's shape:
+  declared-high-enforced-relaxed.json, medium.json, off.json, malformed.json (truncated JSON).
+The shared lists in policy/shared/ were seeded from .claude/bin/firewall.sh at the same
+commit (last changed in 0ffd72b, RULE_SET_VERSION 7).

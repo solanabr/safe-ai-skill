@@ -1,0 +1,5 @@
+# LF everywhere: the shared lists are embedded with include_str! and checked against
+# MANIFEST sha256s, and test fixtures compare bytes, so a CRLF checkout (Windows
+# core.autocrlf) must not rewrite them.
+* text=auto eol=lf
+crates/engine/src/bip39_english.txt -text

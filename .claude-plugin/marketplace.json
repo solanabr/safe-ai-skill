@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "safe-ai-skill",
-      "version": "1.0.1",
+      "version": "1.1.0",
       "source": "./plugins/safe-ai-skill",
       "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions/deploys/secrets and verifies skills/MCPs."
     }

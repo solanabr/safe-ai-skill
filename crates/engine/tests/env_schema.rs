@@ -88,9 +88,10 @@ fn read_schema_has_no_opinion() {
     assert_eq!(read(proj.path(), proj.join(".env.schema")).0, "");
     assert_eq!(read(proj.path(), proj.join("sub/dir/.env.schema")).0, "");
     assert_eq!(read(proj.path(), ".env.schema").0, "");
-    // The glob match is case-sensitive, so the upper-case name never hit the deny list.
+    // The allow-list match is case-sensitive (an allow never widens by case folding), while
+    // the env class is not: an upper-case name is an env file (1.1.0, #7).
     write(&proj, ".ENV.SCHEMA", CLEAN_SCHEMA);
-    assert_eq!(read(proj.path(), proj.join(".ENV.SCHEMA")).0, "");
+    assert_eq!(read(proj.path(), proj.join(".ENV.SCHEMA")).0, "deny");
 }
 
 #[test]
@@ -274,12 +275,12 @@ fn missing_schema_has_no_opinion() {
 
 #[test]
 fn default_policy_allows_schema_and_aikit_overlay_keeps_it() {
-    let base = Policy::from_sources(DEFAULT_POLICY_YAML, None, None, None);
+    let base = Policy::from_sources(DEFAULT_POLICY_YAML, None);
     assert!(base
         .secrets
         .allow_read_globs
         .contains(&"**/.env.schema".to_string()));
-    let aikit = Policy::from_sources(DEFAULT_POLICY_YAML, Some(AIKIT_POLICY), None, None);
+    let aikit = Policy::from_sources(DEFAULT_POLICY_YAML, Some(AIKIT_POLICY));
     assert_eq!(
         aikit.secrets.allow_read_globs,
         base.secrets.allow_read_globs
@@ -289,7 +290,7 @@ fn default_policy_allows_schema_and_aikit_overlay_keeps_it() {
 #[test]
 fn repo_listing_only_env_example_removes_the_schema_allow() {
     let overlay = "secrets:\n  allow_read_globs: [\"**/.env.example\"]\n";
-    let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(overlay), None, None);
+    let p = Policy::from_sources(DEFAULT_POLICY_YAML, Some(overlay));
     assert_eq!(
         p.secrets.allow_read_globs,
         vec!["**/.env.example".to_string()]
@@ -309,5 +310,5 @@ fn deny_reason_for_env_local_is_unchanged() {
     let proj = project();
     let (label, reason) = read(proj.path(), proj.join(".env.local"));
     assert_eq!(label, "deny");
-    assert!(reason.contains("environment file"), "{reason}");
+    assert!(reason.contains("is an env file"), "{reason}");
 }

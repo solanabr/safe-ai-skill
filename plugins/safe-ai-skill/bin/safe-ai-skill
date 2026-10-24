@@ -4,22 +4,38 @@
 # Runs the prebuilt engine for this platform (bin/safe-ai-skill-<plat>) as a child,
 # forwarding all arguments and stdin, and maps the ways that can fail onto the hook
 # contract (spec D6.1):
-#   - Environment failure (no prebuilt for this platform, not an executable here, exit
-#     126/127): fail open with a notice. gate-bash keeps the Solana CLI surface at `ask`,
-#     SessionStart reports the firewall INACTIVE, every other hook exits 0 with one
+#   - Environment failure (no prebuilt for this platform, not an executable for this
+#     machine, no sha256 tool to verify it, exit 126/127): fail open with a notice.
+#     gate-bash keeps the Solana CLI surface at `ask` (a payload naming solana, spl-token,
+#     anchor or keygen, or holding $'…'; any other Bash call gets no opinion), gate-skill asks
+#     too, SessionStart reports the firewall INACTIVE, every other hook exits 0 with one
 #     stderr line.
-#   - Engine crash (signal, or exit not in {0,2,3}): gate-bash and gate-mcp exit 2
+#   - Tamper (the prebuilt's sha256 differs from the constant stamped below at release):
+#     the prebuilt never runs. gate-bash, gate-mcp and gate-skill exit 2, the other PreToolUse gates
+#     ask, SessionStart reports the firewall TAMPERED, the remaining hooks exit 0 with a
+#     stderr line, CLI subcommands exit 2.
+#   - Engine crash (signal, or exit not in {0,2,3}): gate-bash, gate-mcp and gate-skill exit 2
 #     (block); every other hook exits 0 with a stderr line, SessionStart with a notice.
 #   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
 #     project settings mention it (a repo can't disable the firewall); SessionStart
 #     reports either way.
+# Hooks capture the engine's output in memory, through pipes: no engine output ever
+# touches a file, where another process of the same user could rewrite a verdict.
 # CLI subcommands run the engine with live output and keep its exit status; an
 # environment failure exits 1. Nothing outside this directory is ever executed (no cargo
 # build, no $CLAUDE_PLUGIN_DATA binary), and nothing is cached, so a failed probe never
 # outlives the run that saw it.
 
 set -fu
+
+# sha256 of each prebuilt, stamped by scripts/stamp-shim.sh when release.yml vendors the
+# binaries. Empty: this release ships no prebuilt for that platform.
+sha256_darwin_arm64=c1aa1cf6a7c8edccf0a694a58e113e82147583e6dd3262c94734cd126353d6b2
+sha256_darwin_x64=f024cbed11af8e431b514b575ba68abc0de0a624fea9d3559306e852fed0326d
+sha256_linux_x64=0841177e292792483d1de26d8fbd94136f8cd5f6b8ff9d7c8245ccc9bf89fec4
+sha256_linux_arm64=3ca82dd64be0ae18898230a8d938b9c3f6e20f1adc31f80aa0218e8534c5890e
+sha256_windows_x64=
 
 case $0 in
   */*) self_dir=${0%/*} ;;
@@ -31,7 +47,11 @@ sub=${1:-}
 case $sub in
   gate-bash) kind=solana ;;
   gate-mcp) kind=mcp ;;
-  gate-* | redact | prompt-guard) kind=broad ;;
+  # A fail-open Skill gate would let a blocked pack's `!cmd` run (spec D6.2 as amended).
+  gate-skill) kind=skill ;;
+  # Hooks on events other than PreToolUse, where `ask` means nothing.
+  gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice) kind=other ;;
+  gate-*) kind=broad ;;
   verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
   *) kind=cli ;;
 esac
@@ -50,13 +70,14 @@ session_notice() {
   printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$1" "$1"
 }
 
-# Whether the committed project settings mention SAFE_AI_SKILL_DISABLE, so the env value
-# may come from the repo. A file grep can't read counts as a mention. A plain-text match
-# only stops the obvious case: a repo's settings env is trusted-code-equivalent.
+# Whether the committed project settings may set SAFE_AI_SKILL_DISABLE. Any SAFE_AI_SKILL
+# text counts, and so does any \u escape (JSON can spell the key without its plain text),
+# as does a file grep can't read. A text match only stops the obvious cases: a repo's
+# settings env is trusted-code-equivalent.
 disable_set_by_repo() {
   settings=${CLAUDE_PROJECT_DIR:-.}/.claude/settings.json
   [ -e "$settings" ] || return 1
-  grep -qF SAFE_AI_SKILL_DISABLE "$settings" 2>/dev/null
+  grep -qF -e SAFE_AI_SKILL -e '\u' "$settings" 2>/dev/null
   case $? in
     1) return 1 ;;
   esac
@@ -85,12 +106,14 @@ case $os in
   *) family=unsupported ;;
 esac
 case $family/$arch in
-  darwin/arm64 | darwin/aarch64) plat=darwin-arm64 ;;
-  darwin/x86_64 | darwin/amd64) plat=darwin-x64 ;;
-  linux/x86_64 | linux/amd64) plat=linux-x64 ;;
-  linux/aarch64 | linux/arm64) plat=linux-arm64 ;;
+  darwin/arm64 | darwin/aarch64) plat=darwin-arm64 want_sha=$sha256_darwin_arm64 ;;
+  darwin/x86_64 | darwin/amd64) plat=darwin-x64 want_sha=$sha256_darwin_x64 ;;
+  linux/x86_64 | linux/amd64) plat=linux-x64 want_sha=$sha256_linux_x64 ;;
+  linux/aarch64 | linux/arm64) plat=linux-arm64 want_sha=$sha256_linux_arm64 ;;
   # Windows on ARM runs the x64 build under emulation.
-  windows/x86_64 | windows/amd64 | windows/aarch64 | windows/arm64) plat=windows-x64 ;;
+  windows/x86_64 | windows/amd64 | windows/aarch64 | windows/arm64)
+    plat=windows-x64 want_sha=$sha256_windows_x64
+    ;;
   *) plat= ;;
 esac
 
@@ -102,16 +125,75 @@ case $label in
 esac
 
 # env_failure <reason> [<detail>]: the engine can't run here, so fail open with a notice.
-# <reason> is a fixed phrase (it goes into JSON); <detail> is for stderr only.
+# <reason> is a fixed phrase (it goes into JSON). <detail> goes to stderr, which Claude Code
+# keeps in its debug log for an exit-0 hook, and, reduced to a JSON-safe character set, into
+# the SessionStart systemMessage: the one place the user sees why.
 env_failure() {
   printf 'safe-ai-skill: firewall inactive on %s: %s%s\n' "$label" "$1" "${2:+: $2}" >&2
+  why=
+  if [ -n "${2:-}" ]; then
+    why=$(printf '%s' "$2" | tr -cd 'A-Za-z0-9 ._:/()=,+-' 2>/dev/null | cut -c1-200 2>/dev/null) || why=
+  fi
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
-    solana) ask_json "safe-ai-skill inactive on $label: $1; review this command manually" ;;
-    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
+    solana)
+      # gate-bash runs for every Bash call: keep the ask to the Solana surface. A payload
+      # grep can't read (exit 2, no grep) still asks.
+      grep -qiE "solana|spl-token|anchor|keygen|[$]'" 2>/dev/null
+      if [ $? -ne 1 ]; then
+        ask_json "safe-ai-skill inactive on $label: $1; review this command manually"
+      fi
+      ;;
+    skill) ask_json "safe-ai-skill inactive on $label: $1; review this skill call manually" ;;
+    session) session_notice "safe-ai-skill firewall INACTIVE on $label: $1${why:+ ($why)}. Solana CLI commands ask for manual review; the other gates are off.${repo_disable:+ $repo_note}" ;;
     cli) exit 1 ;;
   esac
   exit 0
+}
+
+# tampered: the prebuilt fails its sha256 check, so it never runs.
+tampered() {
+  printf 'safe-ai-skill: %s fails its sha256 check (tampered, or not the binary this release shipped); not running it\n' "${bin##*/}" >&2
+  case $kind in
+    solana | mcp | skill | cli) exit 2 ;;
+  esac
+  if [ -n "$strict" ]; then exit 2; fi
+  case $kind in
+    broad) ask_json "safe-ai-skill engine binary on $label fails its sha256 check (tampered?); review this call manually" ;;
+    session) session_notice "safe-ai-skill firewall TAMPERED on $label: the engine binary fails its sha256 check and was not run. Solana CLI and MCP calls are blocked, other tool calls ask for review. Reinstall the plugin.${repo_disable:+ $repo_note}" ;;
+  esac
+  exit 0
+}
+
+# sha256_ok <file>: whether <file> hashes to $want_sha. Returns 1 on a mismatch; an
+# environment failure when no sha256 tool exists or the tool fails. The tool is taken from
+# fixed system paths first, so a repo-set PATH can't stand in for it there; PATH is the
+# fallback (NixOS and the like). A `.sha-tools-from-path` file beside the shim (the test
+# harness's own plugin layout) skips the fixed paths; writing there is as good as rewriting
+# the shim, so it grants nothing new.
+sha256_ok() {
+  sha_tool=
+  if [ ! -e "$self_dir/.sha-tools-from-path" ]; then
+    for t in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/bin/shasum; do
+      if [ -z "$sha_tool" ] && [ -f "$t" ] && [ -x "$t" ]; then sha_tool=$t; fi
+    done
+  fi
+  if [ -z "$sha_tool" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha_tool=sha256sum
+    elif command -v shasum >/dev/null 2>&1; then
+      sha_tool=shasum
+    else
+      env_failure 'no sha256sum or shasum to verify the engine binary'
+    fi
+  fi
+  case $sha_tool in
+    *shasum) got=$("$sha_tool" -a 256 <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run' ;;
+    *) got=$("$sha_tool" <"$1" 2>/dev/null) || env_failure 'sha256 check failed to run' ;;
+  esac
+  got=${got%%[!0-9a-f]*}
+  if [ "${#got}" -ne 64 ]; then env_failure 'sha256 check failed to run'; fi
+  [ "$got" = "$want_sha" ]
 }
 
 # crashed <status>: the engine started and died, so block where a missed verdict is
@@ -119,7 +201,7 @@ env_failure() {
 crashed() {
   if [ "$1" -gt 128 ]; then how="signal $(($1 - 128))"; else how="exit $1"; fi
   case $kind in
-    solana | mcp)
+    solana | mcp | skill)
       printf 'safe-ai-skill: engine crashed (%s); %s blocked this call\n' "$how" "$sub" >&2
       exit 2
       ;;
@@ -132,19 +214,24 @@ crashed() {
   exit 0
 }
 
-# exec_format_ok <file>: whether the kernel can exec <file> on this OS. Anything else
-# fails execve with ENOEXEC, and POSIX shells then run the file as a shell script.
+# exec_format_ok <file>: whether the kernel can exec <file> on this machine. Anything
+# else fails execve with ENOEXEC, and POSIX shells then run the file as a shell script.
+# A Linux ELF must be 64-bit (EI_CLASS 2) for this machine (e_machine 0x3e or 0xb7).
 exec_format_ok() {
   command -v od >/dev/null 2>&1 || return 0
-  magic=$(od -A n -t x1 -N 4 "$1" 2>/dev/null) || return 0
-  IFS=' '
+  magic=$(od -A n -t x1 -N 20 "$1" 2>/dev/null) || return 0
+  IFS=' 	
+'
   # shellcheck disable=SC2086 # split od's output into one argument per byte
   set -- $magic
   case ${1:-}${2:-} in
     2321) return 0 ;; # "#!"
   esac
+  case $plat/${1:-}${2:-}${3:-}${4:-}/${5:-}/${19:-}${20:-} in
+    linux-x64/7f454c46/02/3e00 | linux-arm64/7f454c46/02/b700) return 0 ;;
+  esac
   case $family/${1:-}${2:-}${3:-}${4:-} in
-    linux/7f454c46 | darwin/cffaedfe | darwin/cefaedfe | darwin/cafebabe | darwin/cafebabf) return 0 ;;
+    darwin/cffaedfe | darwin/cefaedfe | darwin/cafebabe | darwin/cafebabf) return 0 ;;
     windows/4d5a*) return 0 ;;
   esac
   return 1
@@ -154,8 +241,8 @@ if [ -z "$plat" ]; then env_failure 'unsupported platform'; fi
 bin=$self_dir/safe-ai-skill-$plat$ext
 if [ ! -f "$bin" ]; then env_failure 'no engine binary for this platform'; fi
 if [ ! -x "$bin" ]; then env_failure 'engine binary is not executable'; fi
-# Note: in 1.0.1 the engine binary is not hash-pinned; only its platform and executable format are checked.
-if ! exec_format_ok "$bin"; then env_failure "engine binary is not a $family executable"; fi
+if ! sha256_ok "$bin"; then tampered; fi
+if ! exec_format_ok "$bin"; then env_failure "engine binary is not an executable for $label"; fi
 
 if [ "$kind" = cli ]; then
   "$bin" "$@"
@@ -168,6 +255,22 @@ fi
 
 nl='
 '
+
+# with_repo_note <engine stdout>: SessionStart reports an ignored repo-set DISABLE: prefixed
+# to the engine's systemMessage, added as one when it has none, or on its own when the
+# engine said nothing.
+with_repo_note() {
+  key='"systemMessage":"'
+  case $1 in
+    '' | '{}') session_notice "safe-ai-skill: $repo_note" ;;
+    *"$key"*) printf '%s%ssafe-ai-skill: %s\\n%s' "${1%%"$key"*}" "$key" "$repo_note" "${1#*"$key"}" ;;
+    '{"'*) printf '{"systemMessage":"safe-ai-skill: %s",%s' "$repo_note" "${1#?}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+note_repo=
+if [ -n "$repo_disable" ] && [ "$kind" = session ]; then note_repo=1; fi
+
 # run_engine <args...>: run the engine. Its stdout goes to ours, followed by "." (so
 # trailing newlines survive capture), or on 126/127 by a newline and the first line of
 # the start error. Its stderr is held back until it exits, so a failed start adds no
@@ -189,25 +292,16 @@ out=$(run_engine "$@") || status=$?
 case $status in
   0 | 2 | 3)
     out=${out%.}
-    # SessionStart reports an ignored repo-set DISABLE: prefixed to the engine's
-    # systemMessage, added as one when it has none, or on its own when the engine had
-    # nothing to say. On exit 2/3 the engine's verdict stands and stderr names it.
-    if [ -n "$repo_disable" ] && [ "$kind" = session ]; then
-      if [ "$status" != 0 ]; then
-        printf 'safe-ai-skill: %s\n' "$repo_note" >&2
-        printf '%s' "$out"
-        exit "$status"
-      fi
-      key='"systemMessage":"'
-      case $out in
-        '' | '{}') session_notice "safe-ai-skill: $repo_note" ;;
-        *"$key"*) printf '%s%ssafe-ai-skill: %s\\n%s' "${out%%"$key"*}" "$key" "$repo_note" "${out#*"$key"}" ;;
-        '{"'*) printf '{"systemMessage":"safe-ai-skill: %s",%s' "$repo_note" "${out#?}" ;;
-        *) printf '%s' "$out" ;;
-      esac
-      exit 0
+    # SessionStart reports an ignored repo-set DISABLE (with_repo_note). On exit 2/3 the
+    # engine's verdict stands and stderr names it.
+    if [ -n "$note_repo" ] && [ "$status" != 0 ]; then
+      printf 'safe-ai-skill: %s\n' "$repo_note" >&2
+      printf '%s' "$out"
+    elif [ -n "$note_repo" ]; then
+      with_repo_note "$out"
+    else
+      printf '%s' "$out"
     fi
-    printf '%s' "$out"
     exit "$status"
     ;;
   126 | 127) env_failure "engine could not start (exit $status)" "${out##*"$nl"}" ;;

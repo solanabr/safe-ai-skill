@@ -1,6 +1,6 @@
 [package]
 name = "safe-ai-skill"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 description = "safe-ai-skill security engine — runtime firewall + supply-chain verifier for Solana AI dev"
 license = "MIT"
@@ -18,9 +18,19 @@ path = "src/main.rs"
 name = "safe_ai_skill"
 path = "src/lib.rs"
 
+[features]
+# Test-only hooks (a crash trigger for the panic-ask path). Never enable for a release.
+test-hooks = []
+# The user-scope raw project-env read opt-in (`tier --env-read ask|tier`). Off until the
+# "project env file to network" exfil row exists (D8 v2 spec §2/§5): without it every raw
+# project-env read denies whatever `env_read` says.
+env-read-opt-in = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parsing must return the exact f64 that was serialized, or the state MAC
+# (computed over the stored value) fails on reload.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 glob = "0.3"
@@ -30,6 +40,16 @@ bs58 = "0.5"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 # Ed25519 session keypairs (Phase 3). rand_core for keygen in round-2.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# OS CSPRNG (`OsRng`) for confirmation nonces and the state MAC key. Already in the tree via
+# ed25519-dalek; the `getrandom` feature reuses the getrandom crate rustls/ring already build.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# zlib inflate for the read-only git object reader (`verify/gitobj.rs`, #10). Pure Rust, no
+# unsafe in the inflate path; already in Rust std's own dependency tree (backtrace symbolization).
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+# getpwuid_r (trusted home), geteuid, O_NOFOLLOW and flock. Already in the tree via getrandom.
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

@@ -10,17 +10,20 @@
 #   1. Actions → Release → Run workflow on release/vX.Y.Z, input `version`:
 #        preflight  dispatched from exactly refs/heads/release/v<version>; every
 #                   manifest is at that version; neither tag exists yet
-#        build      the four binaries, smoke-tested and attested (source ref
-#                   refs/heads/release/v<version>)
-#        vendor     commits them + SHA256SUMS on top of the built commit and
-#                   pushes it to release/vX.Y.Z (fast-forward only)
+#        build      the five binaries, smoke-tested; musl and Windows built
+#                   twice and compared byte for byte
+#        attest     signs their build provenance (the only job with id-token;
+#                   source ref refs/heads/release/v<version>)
+#        vendor     commits them, stamps their sha256 into the shim and
+#                   regenerates SHA256SUMS on top of the built commit, and pushes
+#                   it to release/vX.Y.Z (fast-forward only)
 #   2. The maintainer reviews the vendor commit, tags it vX.Y.Z and
 #      safe-ai-skill--vX.Y.Z, pushes both tags, and merges release/vX.Y.Z to
 #      main (CI's binary-version check passes only now).
 #   3. The vX.Y.Z push runs publish: it re-checks the tagged commit (versions,
-#      twin tag, checksums, attestations made by this workflow on
-#      release/vX.Y.Z), uploads exactly those binaries to the GitHub Release,
-#      then runs the npm install e2e against it.
+#      twin tag, checksums, stamped shim, every binary's version, attestations
+#      made by this workflow on release/vX.Y.Z), uploads exactly those binaries
+#      to the GitHub Release, then runs the npm install e2e against it.
 #
 # Targets (artifact names unchanged since 1.0.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -28,15 +31,28 @@
 # safe-ai-skill-darwin-x64    x86_64-apple-darwin         macos-15, macOS ≥ 10.12
 # safe-ai-skill-linux-x64     x86_64-unknown-linux-musl   ubuntu-24.04, static
 # safe-ai-skill-linux-arm64   aarch64-unknown-linux-musl  ubuntu-24.04-arm, static
+# safe-ai-skill-windows-x64.exe  x86_64-pc-windows-msvc   windows-2025, +crt-static
 #
 # Linux builds are static musl: 1.0.0's glibc build needed GLIBC_2.39 and exited
 # 127 on Ubuntu 22.04 / Debian 12, which left the firewall silently off. ring
 # compiles C, so musl-tools provides musl-gcc. ubuntu-24.04-arm is a native arm64
 # runner (free for public repositories).
 #
-# The build job can sign attestations (id-token + attestations write), so it
-# runs no third-party action and restores no cache: rustup is preinstalled on
-# GitHub's runners, and the toolchain is pinned below.
+# Windows (1.1.0 tier: Git Bash only, spec D5.3) links the C runtime statically
+# (+crt-static), so the .exe needs no VC++ redistributable, and links with
+# /Brepro (no timestamp) so it can rebuild byte-identically. The release smoke
+# checks the hard guards (scripts/gate-smoke.sh).
+#
+# Only the attest job can sign attestations (id-token + attestations write). It
+# checks out nothing and runs two actions, pinned by commit SHA: download the
+# build artifacts, attest them. Every action in this workflow is pinned by commit
+# SHA. The build job runs no third-party action and
+# restores no cache either: rustup is preinstalled on GitHub's runners, and the
+# toolchain is pinned below.
+#
+# Reproducibility: every build remaps the workspace and cargo home out of the
+# binary (--remap-path-prefix). The musl and Windows builds are then cleaned
+# and rebuilt, and the job fails unless both builds are byte-identical.
 #
 # Secrets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +80,11 @@ env:
   RUST_TOOLCHAIN: "1.98.1"
   MANIFEST: crates/engine/Cargo.toml
   BIN_NAME: safe-ai-skill
+  # Every shipped binary, as vendored into plugins/safe-ai-skill/bin/ and uploaded.
+  BINARIES: >-
+    safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64
+    safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64
+    safe-ai-skill-windows-x64.exe
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
@@ -98,7 +119,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Check version and tags
         env:
@@ -118,15 +139,16 @@ jobs:
             esac
           done
 
-  # ── 1. per-platform builds: smoke test + provenance attestation ───────────
+  # ── 1. per-platform builds: smoke test, reproducibility ────────────────────
   build:
     name: Build / ${{ matrix.artifact_name }}
     needs: preflight
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      id-token: write       # sign the build-provenance attestation
-      attestations: write   # store it
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -144,18 +166,30 @@ jobs:
           - artifact_name: safe-ai-skill-linux-x64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            repro: true
 
           - artifact_name: safe-ai-skill-linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
+            repro: true
+
+          - artifact_name: safe-ai-skill-windows-x64.exe
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+            # /Brepro: no link timestamp, so the clean rebuild can be byte-identical.
+            rustflags: -C target-feature=+crt-static -C link-arg=/Brepro
+            repro: true
 
     env:
       TARGET: ${{ matrix.target }}
       ARTIFACT: ${{ matrix.artifact_name }}
+      EXE: ${{ matrix.exe }}
+      EXTRA_RUSTFLAGS: ${{ matrix.rustflags }}
       VERSION: ${{ inputs.version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
         run: |
@@ -173,14 +207,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
+      # RUSTFLAGS replaces any target rustflags, so +crt-static rides along here.
       - name: Build release binary
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
+          set -euo pipefail
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$cargo_home=/cargo $EXTRA_RUSTFLAGS"
+          export RUSTFLAGS
+          echo "RUSTFLAGS=$RUSTFLAGS" >> "$GITHUB_ENV"
           cargo build --manifest-path "$MANIFEST" --release --locked --target "$TARGET"
-          cp "crates/engine/target/$TARGET/release/$BIN_NAME" "$ARTIFACT"
+          cp "crates/engine/target/$TARGET/release/$BIN_NAME$EXE" "$ARTIFACT"
+
+      - name: Reproducible — clean rebuild is byte-identical
+        if: matrix.repro
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          set -euo pipefail
+          cargo clean --manifest-path "$MANIFEST"
+          cargo build --manifest-path "$MANIFEST" --release --locked --target "$TARGET"
+          if ! cmp "$ARTIFACT" "crates/engine/target/$TARGET/release/$BIN_NAME$EXE"; then
+            echo "::error::$ARTIFACT differs between two clean builds of the same commit"
+            exit 1
+          fi
+          echo "$ARTIFACT: two clean builds are byte-identical"
 
       - name: Smoke — static, runs on alpine / debian:11 / ubuntu:20.04 (Linux)
         if: runner.os == 'Linux'
@@ -202,18 +258,60 @@ jobs:
             exit 1
           fi
 
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: ${{ matrix.artifact_name }}
+      # A dynamic CRT import names its DLL in the import table; crt-static leaves none.
+      - name: Smoke — static CRT, --version (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          if grep -a -i -o -E 'vcruntime[0-9]+[a-z_0-9]*\.dll|api-ms-win-crt-[a-z0-9-]+\.dll|msvcp[0-9]+\.dll' "$ARTIFACT" | sort -u | grep .; then
+            echo "::error::$ARTIFACT imports the dynamic C runtime; build with +crt-static"
+            exit 1
+          fi
+          got=$("./$ARTIFACT" --version | tr -d '\r')
+          if [ "$got" != "safe-ai-skill $VERSION" ]; then
+            echo "::error::$ARTIFACT --version says '$got', expected 'safe-ai-skill $VERSION'"
+            exit 1
+          fi
+          echo "$got"
+
+      - name: Gate smoke — hard guards hold (Windows)
+        if: runner.os == 'Windows'
+        run: sh scripts/gate-smoke.sh "./$ARTIFACT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
           if-no-files-found: error
           retention-days: 7
+
+  # ── 1. sign build provenance for exactly the built artifacts ───────────────
+  # The only job that can mint an OIDC token. No checkout, no repo code, two
+  # SHA-pinned actions.
+  attest:
+    name: Attest build provenance
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write       # sign the build-provenance attestation
+      attestations: write   # store it
+    steps:
+      - name: Download built binaries (from this run)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/safe-ai-skill-darwin-arm64
+            dist/safe-ai-skill-darwin-x64
+            dist/safe-ai-skill-linux-x64
+            dist/safe-ai-skill-linux-arm64
+            dist/safe-ai-skill-windows-x64.exe
 
   # ── 1. vendor the binaries into plugins/safe-ai-skill/bin/ on the branch ──
   # The committed plugin binaries are what the Claude marketplace install
@@ -222,7 +320,7 @@ jobs:
   # pushed fast-forward only, so a branch that moved during the run fails here.
   vendor:
     name: Vendor binaries (release branch)
-    needs: build
+    needs: [build, attest]
     runs-on: ubuntu-24.04
     permissions:
       contents: write        # push release/vX.Y.Z
@@ -231,7 +329,7 @@ jobs:
     steps:
       # The same commit the binaries were built from, not the branch head.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
@@ -239,24 +337,25 @@ jobs:
       # merge-multiple flattens every artifact into dist/ directly (no per-artifact
       # subdirs), so the binary filenames don't collide with directory names.
       - name: Download built binaries (from this run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist/
           merge-multiple: true
 
-      - name: Stage binaries + regenerate SHA256SUMS
+      # The shim refuses a prebuilt whose sha256 differs from its stamped constant
+      # (spec D6.1), so the stamp lands in the same commit as the binaries.
+      - name: Stage binaries, stamp the shim, regenerate SHA256SUMS
         run: |
           set -euo pipefail
           bindir=plugins/safe-ai-skill/bin
-          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            install -m 0755 "dist/safe-ai-skill-$p" "$bindir/safe-ai-skill-$p"
+          for f in $BINARIES; do
+            install -m 0755 "dist/$f" "$bindir/$f"
           done
-          # SHA256SUMS covers the shim + all four binaries (what verify-plugin-bin checks).
-          ( cd "$bindir" && sha256sum \
-              safe-ai-skill \
-              safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 \
-              safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
-              > SHA256SUMS && sha256sum -c SHA256SUMS )
+          sh scripts/stamp-shim.sh "$bindir"
+          sh scripts/stamp-shim.sh --check "$bindir"
+          # SHA256SUMS covers the stamped shim + every binary (what verify-plugin-bin checks).
+          # shellcheck disable=SC2086 # one word per file
+          ( cd "$bindir" && sha256sum safe-ai-skill $BINARIES > SHA256SUMS && sha256sum -c SHA256SUMS )
           sh scripts/check-binary-versions.sh "$bindir" "$VERSION"
 
       - name: Commit and push to release/v${{ inputs.version }}
@@ -289,7 +388,7 @@ jobs:
     env:
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Check the tagged commit
         env:
@@ -305,10 +404,21 @@ jobs:
             exit 1
           fi
           sh scripts/check-binary-versions.sh plugins/safe-ai-skill/bin "$version"
+          sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin
+          if [ -e plugins/safe-ai-skill/bin/.sha-tools-from-path ]; then
+            echo "::error::plugins/safe-ai-skill/bin/.sha-tools-from-path must not ship"
+            exit 1
+          fi
           cd plugins/safe-ai-skill/bin
           sha256sum -c SHA256SUMS
-          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            gh attestation verify "safe-ai-skill-$p" \
+          # The binary users get must be the version being tagged, not a stale vendor.
+          got=$(./safe-ai-skill-linux-x64 --version)
+          if [ "$got" != "safe-ai-skill $version" ]; then
+            echo "::error::committed safe-ai-skill-linux-x64 --version says '$got', expected 'safe-ai-skill $version'"
+            exit 1
+          fi
+          for f in $BINARIES; do
+            gh attestation verify "$f" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --source-ref "refs/heads/release/v${version}"
@@ -320,21 +430,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            cp "plugins/safe-ai-skill/bin/safe-ai-skill-$p" dist/
+          for f in $BINARIES; do
+            cp "plugins/safe-ai-skill/bin/$f" dist/
           done
-          ( cd dist && sha256sum \
-              safe-ai-skill-darwin-arm64 safe-ai-skill-darwin-x64 \
-              safe-ai-skill-linux-x64 safe-ai-skill-linux-arm64 \
-              > SHA256SUMS && cat SHA256SUMS )
+          # shellcheck disable=SC2086 # one word per file
+          ( cd dist && sha256sum $BINARIES > SHA256SUMS && cat SHA256SUMS )
+          set --
+          for f in $BINARIES; do set -- "$@" "dist/$f"; done
           gh release create "$TAG" \
             --verify-tag \
             --title "safe-ai-skill $TAG" \
             --generate-notes \
-            dist/safe-ai-skill-darwin-arm64 \
-            dist/safe-ai-skill-darwin-x64 \
-            dist/safe-ai-skill-linux-x64 \
-            dist/safe-ai-skill-linux-arm64 \
+            "$@" \
             dist/SHA256SUMS
 
   # A release created with GITHUB_TOKEN doesn't fire the `release` event, so the

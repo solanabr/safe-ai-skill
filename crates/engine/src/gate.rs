@@ -98,3 +98,137 @@ impl GateMeta {
         GateMeta::new(Scope::Other, true)
     }
 }
+
+/// What a gate concludes about a call (spec D1.1).
+///
+/// [`Verdict::NoOpinion`] emits nothing (empty stdout, exit 0) and leaves Claude Code's
+/// permission flow in charge; it is never sent as `defer`. [`Verdict::Allow`] requires an
+/// [`AllowReason`], and no code outside this crate can build one, so the only allows are the
+/// two D1.1 permits. Convert to [`crate::io::Decision`] to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// No opinion.
+    NoOpinion,
+    /// Prompt the user, with a reason.
+    Ask(String),
+    /// Block, with a reason.
+    Deny(String),
+    /// Permit, for one of the two permitted reasons.
+    Allow(AllowReason),
+}
+
+/// The only reasons a gate may allow a call.
+///
+/// Outside this crate neither variant can be constructed: [`GrantId`] has a private field and
+/// `WithinCapTestnet` is `#[non_exhaustive]`.
+///
+/// ```compile_fail
+/// use safe_ai_skill::gate::{AllowReason, Verdict};
+/// let _ = Verdict::Allow(AllowReason::WithinCapTestnet);
+/// ```
+///
+/// ```compile_fail
+/// use safe_ai_skill::gate::{AllowReason, GrantId, Verdict};
+/// let _ = Verdict::Allow(AllowReason::Grant(GrantId(String::from("g1"))));
+/// ```
+///
+/// Matching is unrestricted:
+///
+/// ```
+/// use safe_ai_skill::gate::{AllowReason, Verdict};
+/// fn why(v: &Verdict) -> &str {
+///     match v {
+///         Verdict::Allow(AllowReason::Grant(id)) => id.as_str(),
+///         Verdict::Allow(AllowReason::WithinCapTestnet { .. }) => "within cap",
+///         _ => "",
+///     }
+/// }
+/// assert_eq!(why(&Verdict::NoOpinion), "");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowReason {
+    /// (i) An authenticated, unexpired, in-budget grant matched.
+    Grant(GrantId),
+    /// (ii) A transfer within the spend caps on a positively identified
+    /// devnet/testnet/localnet.
+    #[non_exhaustive]
+    WithinCapTestnet,
+}
+
+/// Identifier of the grant behind an [`AllowReason::Grant`]; only the crate mints one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantId(String);
+
+impl GrantId {
+    /// Wrap the id of a grant that has been authenticated and matched.
+    pub(crate) fn new(id: impl Into<String>) -> GrantId {
+        GrantId(id.into())
+    }
+
+    /// The grant id.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Verdict {
+    /// Stable label for audit logs: `allow`/`ask`/`deny`, or `none` for no opinion.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Verdict::NoOpinion => "none",
+            Verdict::Ask(_) => "ask",
+            Verdict::Deny(_) => "deny",
+            Verdict::Allow(_) => "allow",
+        }
+    }
+}
+
+impl From<Verdict> for crate::io::Decision {
+    /// The render path: `NoOpinion` becomes `Defer`, which emits nothing.
+    fn from(v: Verdict) -> Self {
+        use crate::io::Decision;
+        match v {
+            Verdict::NoOpinion => Decision::Defer,
+            Verdict::Ask(reason) => Decision::Ask { reason },
+            Verdict::Deny(reason) => Decision::Deny { reason },
+            Verdict::Allow(_) => Decision::Allow,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{render_pretooluse, Decision};
+
+    #[test]
+    fn verdicts_convert_to_the_render_path() {
+        assert_eq!(Decision::from(Verdict::NoOpinion), Decision::Defer);
+        assert_eq!(render_pretooluse(&Verdict::NoOpinion.into()), None);
+        assert_eq!(
+            Decision::from(Verdict::Ask("r".into())),
+            Decision::Ask { reason: "r".into() }
+        );
+        assert_eq!(
+            Decision::from(Verdict::Deny("r".into())),
+            Decision::Deny { reason: "r".into() }
+        );
+        for reason in [
+            AllowReason::WithinCapTestnet,
+            AllowReason::Grant(GrantId::new("g1")),
+        ] {
+            assert_eq!(Decision::from(Verdict::Allow(reason)), Decision::Allow);
+        }
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(Verdict::NoOpinion.label(), "none");
+        assert_eq!(Verdict::Ask(String::new()).label(), "ask");
+        assert_eq!(Verdict::Deny(String::new()).label(), "deny");
+        assert_eq!(
+            Verdict::Allow(AllowReason::Grant(GrantId::new("g"))).label(),
+            "allow"
+        );
+    }
+}

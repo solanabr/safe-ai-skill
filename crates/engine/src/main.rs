@@ -7,17 +7,33 @@
 //! on bad input: a payload it cannot read (over 1 MiB or malformed) is an `ask` on every
 //! PreToolUse gate; empty stdin is no opinion except on `gate-bash`. An unknown or missing
 //! subcommand prints nothing on stdout and exits 3.
+//!
+//! Subcommands are registered in [`SUBCOMMANDS`]: adding one is one line there plus its
+//! handler.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{mpsc, Mutex};
+use std::time::Duration;
 
 use safe_ai_skill::audit::{self, AuditEntry};
-use safe_ai_skill::context::{self, Context};
+use safe_ai_skill::confirm::{self, PendingKind};
+use safe_ai_skill::context::Context;
+use safe_ai_skill::datadir::{self, DataDir};
+use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
+use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, tamper, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
-use safe_ai_skill::policy::Policy;
-use safe_ai_skill::{grants, mode, promptguard, redact, registry, relax, session, verify};
+use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
+use safe_ai_skill::policy::{self, Policy};
+use safe_ai_skill::spend::{self, SpendLedger};
+use safe_ai_skill::statefile::Loaded;
+use safe_ai_skill::tierstate::{self, Plan};
+use safe_ai_skill::{
+    adapt, grants, headless, migrate, notice, platform, promptguard, redact, registry, relax,
+    sandbox, session, verify,
+};
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
 const EXIT_USAGE: u8 = 3;
@@ -30,31 +46,195 @@ const OVERSIZED_REASON: &str =
 const MALFORMED_REASON: &str =
     "safe-ai-skill: hook input is malformed and was not inspected; review this call manually.";
 
+/// Bound on every PreToolUse gate (spec D1.3): past it the gate answers `ask`, well before
+/// Claude Code's hook timeout.
+const GATE_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Env var that may shorten (never lengthen) [`GATE_DEADLINE`], in milliseconds.
+const DEADLINE_ENV: &str = "SAFE_AI_SKILL_DEADLINE_MS";
+
+/// Lowest deadline [`DEADLINE_ENV`] can set outside unit tests.
+const DEADLINE_FLOOR: Duration = Duration::from_secs(2);
+
+/// Stack size of the gate worker thread.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reason for the `ask` when a gate panics.
+const CRASH_REASON: &str =
+    "safe-ai-skill: the gate failed while inspecting this call; review this call manually.";
+
+/// Reason for the `ask` when a gate misses its deadline.
+const DEADLINE_REASON: &str =
+    "safe-ai-skill: the gate did not finish within its time limit; review this call manually.";
+
+/// The PreToolUse gates run under [`GATE_DEADLINE`].
+const DEADLINE_GATES: &[&str] = &[
+    "gate-bash",
+    "gate-bash-secrets",
+    "gate-read",
+    "gate-mcp",
+    "gate-tamper",
+    "gate-skill",
+];
+
+/// The PreToolUse gates whose panic writes a hard-guard `ask` before the process ends
+/// (release builds abort on panic, so the deadline path never sees it).
+const PANIC_ASK_GATES: &[&str] = &[
+    "gate-bash",
+    "gate-bash-secrets",
+    "gate-read",
+    "gate-mcp",
+    "gate-tamper",
+    "gate-skill",
+];
+
+/// A subcommand handler: gets the arguments after the subcommand name.
+type Handler = fn(&[String]) -> ExitCode;
+
+/// The subcommand registry. A new subcommand is one line here. Names not listed exit 3
+/// ([`cmd_unknown`]).
+const SUBCOMMANDS: &[(&str, Handler)] = &[
+    ("gate-bash", |_| cmd_gate_bash()),
+    ("gate-bash-secrets", |_| cmd_gate_bash_secrets()),
+    ("gate-read", |_| cmd_gate_read()),
+    ("gate-mcp", |_| cmd_gate_mcp()),
+    ("gate-tamper", |_| cmd_gate_tamper()),
+    ("gate-skill", |_| cmd_gate_skill()),
+    ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
+    ("redact", |_| cmd_redact()),
+    ("failure-notice", |_| cmd_failure_notice()),
+    ("prompt-guard", |_| cmd_prompt_guard()),
+    ("pending-notice", |_| cmd_pending_notice()),
+    ("verify", cmd_verify),
+    ("add", cmd_add),
+    ("install", cmd_install),
+    ("registry", cmd_registry),
+    ("session", cmd_session),
+    ("allow", cmd_allow),
+    ("tier", cmd_tier),
+    ("mode", cmd_mode),
+    ("revoke", |_| cmd_revoke()),
+    ("status", |_| cmd_status()),
+    ("adapt", cmd_adapt),
+    ("env", safe_ai_skill::env::main),
+    ("doctor", safe_ai_skill::doctor::main),
+    ("--version", |_| cmd_version()),
+];
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let sub = args.get(1).map(String::as_str).unwrap_or("");
     let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
 
-    match sub {
-        "gate-bash" => cmd_gate_bash(),
-        "gate-bash-secrets" => cmd_gate_bash_secrets(),
-        "gate-read" => cmd_gate_read(),
-        "gate-mcp" => cmd_gate_mcp(),
-        "gate-tamper" => cmd_gate_tamper(),
-        "redact" => cmd_redact(),
-        "prompt-guard" => cmd_prompt_guard(),
-        "verify" => cmd_verify(rest),
-        "add" => cmd_add(rest),
-        "install" => cmd_install(rest),
-        "registry" => cmd_registry(rest),
-        "session" => cmd_session(rest),
-        "allow" => cmd_allow(rest),
-        "mode" => cmd_mode(rest),
-        "revoke" => cmd_revoke(),
-        "status" => cmd_status(),
-        "--version" => cmd_version(),
-        _ => cmd_unknown(sub),
+    if PANIC_ASK_GATES.contains(&sub) {
+        install_panic_ask();
     }
+    match SUBCOMMANDS.iter().find(|(name, _)| *name == sub) {
+        Some((name, handler)) if DEADLINE_GATES.contains(name) => {
+            run_with_deadline(gate_deadline(), *handler, rest.to_vec())
+        }
+        Some((_, handler)) => handler(rest),
+        None => cmd_unknown(sub),
+    }
+}
+
+/// [`GATE_DEADLINE`], shortened by [`DEADLINE_ENV`] when it is set lower.
+fn gate_deadline() -> Duration {
+    deadline_from(std::env::var(DEADLINE_ENV).ok().as_deref())
+}
+
+/// The deadline for a [`DEADLINE_ENV`] value: milliseconds, capped at [`GATE_DEADLINE`] and
+/// floored at [`DEADLINE_FLOOR`] (outside unit tests), so the environment cannot cut a gate
+/// short enough to turn its deny into the deadline's ask.
+fn deadline_from(value: Option<&str>) -> Duration {
+    let floor = if cfg!(test) {
+        Duration::ZERO
+    } else {
+        DEADLINE_FLOOR
+    };
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .map_or(GATE_DEADLINE, |d| d.clamp(floor, GATE_DEADLINE))
+}
+
+/// The decision the running gate reached, recorded before it audits and emits, so a
+/// deadline that fires in between still emits a deny as a deny.
+static DECIDED: Mutex<Option<Decision>> = Mutex::new(None);
+
+/// Record the gate's final decision for the deadline path.
+fn record_decision(decision: &Decision) {
+    if let Ok(mut slot) = DECIDED.lock() {
+        *slot = Some(decision.clone());
+    }
+}
+
+/// What the deadline emits: the gate's deny if it already reached one, else an `ask` with
+/// `reason` (a `deny` when headless).
+fn deadline_decision(reason: &str) -> Decision {
+    match DECIDED.lock().ok().and_then(|slot| slot.clone()) {
+        Some(deny @ Decision::Deny { .. }) => deny,
+        _ => headless::apply(
+            Decision::Ask {
+                reason: reason.to_string(),
+            },
+            headless::detect(),
+        ),
+    }
+}
+
+/// Run a gate under `budget`. Past it, or when the gate panics, emit an `ask` (the gate's
+/// deny if it already decided one; nothing if it already answered) and exit 0: no gate fails
+/// open.
+fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> ExitCode {
+    let reason = match within(budget, move || {
+        // Test-only crash trigger (the `test-hooks` feature is never built for release).
+        #[cfg(feature = "test-hooks")]
+        if std::env::var_os("SAFE_AI_SKILL_TEST_PANIC").is_some() {
+            panic!("safe-ai-skill test panic");
+        }
+        handler(&rest)
+    }) {
+        Ok(code) => return code,
+        Err(mpsc::RecvTimeoutError::Timeout) => DEADLINE_REASON,
+        Err(mpsc::RecvTimeoutError::Disconnected) => CRASH_REASON,
+    };
+    let _ = io::emit_pretooluse(&deadline_decision(reason));
+    std::process::exit(0)
+}
+
+/// On a panic, write the hard-guard `ask` (the gate's deny if it already reached one) before
+/// the default report and the abort. Best effort: a write error is ignored, and a decision
+/// already written is never followed by a second one.
+fn install_panic_ask() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
+        // Codex reads stdout only on exit 0, and a release build aborts after this hook: end
+        // here so the deny counts.
+        if adapt::is_codex() {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
+}
+
+/// Run `f` on a worker thread (8 MiB stack) and wait at most `budget` for it: `Timeout`
+/// when it is still running, `Disconnected` when it panicked or could not be started.
+fn within<T: Send + 'static>(
+    budget: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    if spawned.is_err() {
+        return Err(mpsc::RecvTimeoutError::Disconnected);
+    }
+    rx.recv_timeout(budget)
 }
 
 /// What `--version` prints. One literal, so the release's binary version check
@@ -68,12 +248,13 @@ fn cmd_version() -> ExitCode {
 }
 
 /// The plugin data dir for a CLI command run from the user's terminal: the hooks' dir
-/// ([`context::resolve_plugin_data_dir`]). When it can't be found, prints the guidance (JSON
-/// on stdout, a line on stderr) and returns `None`; state is never put anywhere else.
-fn cli_data_dir(command: &str) -> Option<PathBuf> {
-    match context::resolve_plugin_data_dir() {
+/// ([`datadir::data_dir_with_cwd`]). When it can't be found, prints the guidance (JSON on
+/// stdout, a line on stderr) and returns `None`; state is never put anywhere else.
+fn cli_state_dir(command: &str, cwd: &Path) -> Option<DataDir> {
+    match datadir::data_dir_with_cwd(Some(cwd)) {
         Ok(dir) => Some(dir),
         Err(e) => {
+            let e = format!("safe-ai-skill: {e}");
             let _ = writeln!(std::io::stderr(), "{e}");
             print_json(&serde_json::json!({
                 "command": command,
@@ -83,6 +264,11 @@ fn cli_data_dir(command: &str) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// [`cli_state_dir`] from the process cwd, as a path.
+fn cli_data_dir(command: &str) -> Option<PathBuf> {
+    cli_state_dir(command, &process_cwd()).map(|d| d.path)
 }
 
 /// Unknown or missing subcommand: nothing on stdout (a mis-wired hook has no opinion), the
@@ -118,41 +304,131 @@ fn ask_unreadable(why: Unreadable, input: &HookInput, raw: &[u8]) -> ExitCode {
         Unreadable::Empty | Unreadable::Malformed => MALFORMED_REASON,
     };
     let cwd = cwd_of(input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let ask = Decision::Ask {
         reason: reason.to_string(),
     };
-    let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &plugin_data);
-    write_audit(
-        &effective,
-        &plugin_data,
-        input,
-        raw,
-        "unreadable",
-        &decision,
-    );
+    let decision = relax::apply(ask, &GateMeta::unreadable(), &effective, &dir);
+    let decision = headless::apply(decision, effective.runtime.headless);
+    record_decision(&decision);
+    write_audit(&effective, &dir.path, input, raw, "unreadable", &decision);
     let _ = io::emit_pretooluse(&decision);
     ExitCode::SUCCESS
 }
 
-/// Load the policy for `cwd` and resolve it to its EFFECTIVE form (profile overlay applied).
-///
-/// The persistent runtime override written by `safe-ai-skill mode <profile>` (`mode.json`)
-/// replaces the policy's profile; the `SAFE_AI_SKILL_PROFILE` env var may then only select a
-/// stricter one (see [`Policy::load_with_mode`]). This is what makes `safe-ai-skill mode
-/// autopilot` actually take effect for every subsequent gate.
-fn load_effective_policy(cwd: &Path, plugin_data: &Path) -> Policy {
-    Policy::load_with_mode(cwd, mode::persisted(plugin_data).as_deref()).effective()
+/// Load the policy for `cwd` with its runtime tier context ([`load_runtime`]).
+fn load_effective_policy(cwd: &Path, dir: &DataDir) -> Policy {
+    load_runtime(cwd, dir).0
+}
+
+/// Load the policy for `cwd` and resolve the tier (the user's authenticated `tier.json` in a
+/// trusted data dir, raised by the kit, repo and env hints), the sandbox state of the project
+/// root and the headless rule ([`policy::load_runtime`]).
+fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
+    let root = tier::project_root(cwd);
+    policy::load_runtime(
+        cwd,
+        dir,
+        &|k| std::env::var(k).ok(),
+        // Claude Code's sandbox does not wrap a Codex process, and nothing in Codex stops the
+        // agent from editing the settings that declare it.
+        if adapt::is_codex() {
+            sandbox::SandboxState::Off
+        } else {
+            sandbox::state(&root)
+        },
+        headless::detect(),
+    )
+}
+
+/// The strictest of the tier gates' verdicts (`deny` > `ask`); `None` when none asks or
+/// denies. Tier gates only tighten: an `allow` from one is ignored.
+fn strictest(verdicts: impl IntoIterator<Item = Option<Verdict>>) -> Option<Verdict> {
+    verdicts
+        .into_iter()
+        .flatten()
+        .filter(|v| matches!(v, Verdict::Ask(_) | Verdict::Deny(_)))
+        .max_by_key(verdict_rank)
+}
+
+fn verdict_rank(v: &Verdict) -> u8 {
+    match v {
+        Verdict::NoOpinion => 0,
+        Verdict::Allow(_) => 1,
+        Verdict::Ask(_) => 2,
+        Verdict::Deny(_) => 3,
+    }
+}
+
+fn decision_rank(d: &Decision) -> u8 {
+    match d {
+        Decision::Defer => 0,
+        Decision::Allow => 1,
+        Decision::Ask { .. } => 2,
+        Decision::Deny { .. } => 3,
+    }
+}
+
+/// Join a tier gate's verdict with a gate's decision: an `ask` or `deny` from a tier gate wins
+/// when it is at least as strict, under a hard-guard meta, so no grant can relax it (on an ask
+/// tie the gate's grantable meta is dropped). A tier gate's `allow` is ignored: tier gates only
+/// tighten, and an allow outside a grant or the spend caps never comes from them.
+fn join_tier(
+    tier_verdict: Option<Verdict>,
+    decision: Decision,
+    meta: GateMeta,
+) -> (Decision, GateMeta) {
+    match tier_verdict {
+        Some(v @ (Verdict::Ask(_) | Verdict::Deny(_)))
+            if verdict_rank(&v) >= decision_rank(&decision) =>
+        {
+            (v.into(), GateMeta::new(Scope::SecretRead, true))
+        }
+        _ => (decision, meta),
+    }
+}
+
+/// A blocked-pack verdict as the tier has it act ([`verify::tier_action`]): `Some` when it
+/// still denies.
+fn blocked_pack(verdict: Verdict, tier: Tier) -> Option<Verdict> {
+    match verify::tier_action(verdict, tier) {
+        deny @ Verdict::Deny(_) => Some(deny),
+        _ => None,
+    }
+}
+
+/// The plugin data dir for a session rooted at `cwd`, resolved exactly as for a hook
+/// (`cwd` is the payload's, or the process cwd for the CLI). Unresolvable → the sentinel,
+/// which stores nothing and relaxes nothing.
+fn state_dir(cwd: &Path) -> DataDir {
+    datadir::data_dir_with_cwd(Some(cwd)).unwrap_or_else(|_| datadir::unresolved())
+}
+
+/// The process cwd, for CLI subcommands.
+fn process_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Resolve the session cwd from the hook payload, defaulting to the process cwd.
+///
+/// Under Codex a `tool_input.workdir` (where `exec_command` runs) is joined on when present.
 fn cwd_of(input: &HookInput) -> PathBuf {
-    input
+    let cwd = input
         .cwd
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let workdir = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.get("workdir"))
+        .and_then(|w| w.as_str())
+        .filter(|w| !w.is_empty());
+    match workdir {
+        Some(w) if adapt::is_codex() => cwd.join(w),
+        _ => cwd,
+    }
 }
 
 /// Run the full PreToolUse pipeline for a gate result: relax → audit → emit.
@@ -160,11 +436,16 @@ fn finish_pretooluse(
     natural: Decision,
     meta: &GateMeta,
     effective: &Policy,
-    plugin_data: &Path,
+    dir: &DataDir,
     input: &HookInput,
     raw: &[u8],
 ) -> ExitCode {
-    let decision = relax::apply(natural, meta, effective, plugin_data);
+    let plugin_data = dir.path.as_path();
+    let decision = relax::apply(natural, meta, effective, dir);
+    // Headless (contract §3.3): every remaining ask becomes a deny; a grant the user confirmed
+    // earlier has already become an allow above.
+    let decision = headless::apply(decision, effective.runtime.headless);
+    record_decision(&decision);
 
     // Commit-on-allow: once the FINAL (post-relaxation) decision for a transfer with a
     // known amount is `Allow`, debit the daily spend ledger. The gate evaluated the
@@ -173,7 +454,7 @@ fn finish_pretooluse(
     // they still count against the daily ledger here so the daily cap stays authoritative.
     if matches!(decision, Decision::Allow) && meta.scope == Scope::Transfer {
         if let Some(amount) = meta.amount_sol {
-            safe_ai_skill::spend::commit(plugin_data, amount);
+            spend::commit(plugin_data, amount);
         }
     }
 
@@ -276,12 +557,45 @@ fn cmd_gate_bash() -> ExitCode {
     let Some(command) = input.bash_command() else {
         return ask_unreadable(Unreadable::Malformed, &input, &raw);
     };
+    // A nested non-interactive Claude Code session (`claude -p`, a prompt on its stdin) runs
+    // with the user's hooks and state where nobody sees it: decided here too, so this
+    // `onFailure: block` entry asks (denies at High or headless) on its own.
+    let nested = tamper::decide_nested_claude(command);
+    // Wired unconditionally for every Bash call: nothing that could be solana-family, keygen,
+    // a wallet write or a nested session → no opinion, before any policy, list or state is
+    // loaded.
+    if matches!(nested, Decision::Defer) && !safe_ai_skill::gates::bash::may_concern(command) {
+        return ExitCode::SUCCESS;
+    }
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    // Too large or nested to parse in budget: a hard-guard ask, never the watchdog's.
+    if safe_ai_skill::gates::bash::over_work_cap(command) {
+        let (decision, meta) = safe_ai_skill::gates::bash::over_cap(&effective);
+        return finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw);
+    }
     let ctx = Context::build(command, &cwd);
     let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
-    finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
+    // Default-wallet destruction is joined here too, so the commands the fast path passes on
+    // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
+    // entry as well as from `gate-bash-secrets`.
+    let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
+    let nested_verdict = nested_claude_verdict(nested, effective.tier());
+    let (decision, meta) = join_tier(strictest([wallet_verdict, nested_verdict]), decision, meta);
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// [`tamper::decide_nested_claude`] as a tier verdict: its `ask` is a deny at High.
+fn nested_claude_verdict(decision: Decision, tier: Tier) -> Option<Verdict> {
+    match decision {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } if tier == Tier::High => {
+            Some(Verdict::Deny(format!("{reason} Denied at tier high.")))
+        }
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    }
 }
 
 fn cmd_gate_bash_secrets() -> ExitCode {
@@ -292,13 +606,37 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let command = input.bash_command().unwrap_or("");
-    let decision = safe_ai_skill::gates::secrets::decide(command, &cwd, &effective);
-    // Secret reads are always a hard guard.
-    let meta = GateMeta::new(Scope::SecretRead, true);
-    finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
+    let tier = effective.tier();
+    if adapt::is_codex() {
+        if let Some(deny) = codex_bash_writes(command, &cwd, &effective) {
+            let meta = GateMeta::new(Scope::Other, true);
+            return finish_pretooluse(deny, &meta, &effective, &dir, &input, &raw);
+        }
+    }
+    if let Some(deny) = blocked_pack(verify::enforce::bash_verdict(&dir, command, &cwd), tier) {
+        return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
+    }
+    // The D8 v2 tier gates (one call line each); the strictest joins the secrets decision.
+    let tier_verdict = strictest([
+        wallet::decide_bash(command, &cwd, &effective, tier),
+        creddump::decide(command, &cwd, &effective, tier),
+        envwrite::decide_cli(command, &cwd, &effective, tier),
+        exfil::decide_bash(command, &cwd, &effective, tier),
+    ]);
+    // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
+    // is decided here too, under the bash gate's own meta.
+    let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
+        safe_ai_skill::gates::secrets::decide(command, &cwd, &effective),
+        GateMeta::new(Scope::SecretRead, true),
+        command,
+        &cwd,
+        &effective,
+    );
+    let (decision, meta) = join_tier(tier_verdict, decision, meta);
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_gate_read() -> ExitCode {
@@ -309,15 +647,33 @@ fn cmd_gate_read() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
-    let path = input.read_path().unwrap_or("");
-    let decision = match safe_ai_skill::gates::read::decide(path, &effective) {
-        Decision::Defer => safe_ai_skill::gates::read::guard_env_schema(path, &cwd),
-        decided => decided,
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let tool = input.tool_name.as_deref().unwrap_or("Read");
+    if let Some(tool_input) = input.tool_input.as_ref() {
+        let pack = verify::enforce::read_verdict(&dir, tool, tool_input, &cwd);
+        if let Some(deny) = blocked_pack(pack, effective.tier()) {
+            return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
+        }
+    }
+    let verdict = read::decide_tool(tool, input.tool_input.as_ref(), &cwd, &effective);
+    let decision = match verdict {
+        read::ReadVerdict::Decide(decision) => decision,
+        read::ReadVerdict::Rewrite(updated) => {
+            write_audit(
+                &effective,
+                &dir.path,
+                &input,
+                &raw,
+                "secret_read_rewrite",
+                &Decision::Defer,
+            );
+            let _ = io::emit_updated_input(updated);
+            return ExitCode::SUCCESS;
+        }
     };
     let meta = GateMeta::new(Scope::SecretRead, true);
-    finish_pretooluse(decision, &meta, &effective, &plugin_data, &input, &raw)
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
 fn cmd_gate_mcp() -> ExitCode {
@@ -328,13 +684,226 @@ fn cmd_gate_mcp() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let tool = input.tool_name.clone().unwrap_or_default();
     let payload = input.mcp_payload();
+    // Path-like arguments get the read check first (`ctx_execute_file {path:".env"}`).
+    let secret = read::decide_mcp_args(payload, &cwd, &effective);
+    if !matches!(secret, Decision::Defer) {
+        let meta = GateMeta::new(Scope::SecretRead, true);
+        return finish_pretooluse(secret, &meta, &effective, &dir, &input, &raw);
+    }
     let ctx = Context::build("", &cwd);
+    let tier_verdict = exfil::decide_mcp(&tool, payload, &cwd, &effective, effective.tier());
     let (decision, meta) = safe_ai_skill::gates::mcp::decide(&tool, payload, &ctx, &effective);
-    finish_pretooluse(decision, &meta, &effective, &ctx.plugin_data, &input, &raw)
+    // An MCP call names no cluster: a value-moving or wallet ask is a counterparty action on
+    // an unidentified cluster, which tier High denies (as for the Bash family).
+    let decision = match decision {
+        Decision::Ask { reason } if effective.tier() == Tier::High => Decision::Deny {
+            reason: format!(
+                "{} — denied at tier high: an MCP call names no cluster, so it cannot be \
+                 identified as localnet or devnet",
+                reason.trim_end_matches(" — approve to proceed")
+            ),
+        },
+        other => other,
+    };
+    // Code the server runs gets the Bash checks, under a hard guard (no grant lifts it).
+    let (exec, exec_meta) = mcpexec::decide(payload, &cwd, &effective);
+    let (decision, meta) = if decision_rank(&exec) > decision_rank(&decision) {
+        (exec, exec_meta)
+    } else {
+        (decision, meta)
+    };
+    let (decision, meta) = join_tier(tier_verdict, decision, meta);
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// Emit a blocked-pack denial (a hard guard: no grant relaxes it).
+fn finish_blocked_pack(
+    verdict: Verdict,
+    effective: &Policy,
+    dir: &DataDir,
+    input: &HookInput,
+    raw: &[u8],
+) -> ExitCode {
+    let meta = GateMeta::new(Scope::Other, true);
+    finish_pretooluse(verdict.into(), &meta, effective, dir, input, raw)
+}
+
+/// PreToolUse `Skill`: deny a skill whose pack is blocked (re-hashed on the spot).
+fn cmd_gate_skill() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let input = match parsed {
+        Ok(input) => input,
+        Err(Unreadable::Empty) => return ExitCode::SUCCESS,
+        Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
+    };
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let verdict =
+        safe_ai_skill::gates::skill::decide(input.tool_input.as_ref(), &cwd, &dir, &effective);
+    let meta = GateMeta::new(Scope::Other, true);
+    finish_pretooluse(verdict.into(), &meta, &effective, &dir, &input, &raw)
+}
+
+/// `UserPromptExpansion` (and a raw `/name` in `UserPromptSubmit`): block a typed slash
+/// command whose skill pack is blocked. A typed `/name` never reaches the Skill tool.
+fn cmd_gate_prompt_expansion() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let payload = match (&parsed, serde_json::from_slice::<serde_json::Value>(&raw)) {
+        (Ok(_), Ok(payload)) => payload,
+        (Err(Unreadable::Empty), _) => return ExitCode::SUCCESS,
+        // Oversized or malformed: judge the raw head (a blocked slash command, or one whose
+        // name cannot be read while a pack in scope is blocked, is blocked).
+        _ => {
+            let cwd = verify::enforce::raw_cwd(&raw).unwrap_or_else(process_cwd);
+            let dir = state_dir(&cwd);
+            let effective = load_effective_policy(&cwd, &dir);
+            let block = verify::enforce::unreadable_prompt_verdict(&dir, &cwd, &effective, &raw);
+            let _ = io::emit_userpromptsubmit(block.as_deref());
+            return ExitCode::SUCCESS;
+        }
+    };
+    if verify::enforce::slash_skill_name(&payload).is_none() {
+        return ExitCode::SUCCESS;
+    }
+    let input = parsed.unwrap_or_default();
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let block = safe_ai_skill::gates::skill::decide_prompt(&payload, &cwd, &dir, &effective);
+    let _ = io::emit_userpromptsubmit(block.as_deref());
+    ExitCode::SUCCESS
+}
+
+/// Codex-only Bash checks: an interactive shell or REPL is denied (`write_stdin` would feed it
+/// unchecked), an `apply_patch` the shell runs (Codex intercepts it) gets the
+/// per-file patch checks, and writes to [`adapt::CodexTargets`] are denied. `Some` is the
+/// deny (or hard-guard ask) to emit.
+fn codex_bash_writes(command: &str, cwd: &Path, effective: &Policy) -> Option<Decision> {
+    if let Some(reason) = adapt::interactive_reason(command) {
+        return Some(Decision::Deny { reason });
+    }
+    let targets = adapt::CodexTargets::from_env();
+    if let Some(reason) = adapt::bash_reason(command, cwd, &targets) {
+        return Some(Decision::Deny { reason });
+    }
+    let paths = adapt::patch_paths_in_command(command);
+    if paths.is_empty() {
+        return None;
+    }
+    let protected = safe_ai_skill::gates::tamper::Protected::from_env();
+    match apply_patch_decision(&paths, cwd, effective, &protected) {
+        d @ (Decision::Deny { .. } | Decision::Ask { .. }) => Some(d),
+        _ => None,
+    }
+}
+
+/// The tamper and tier verdict on one file write (`file_path` / `notebook_path`).
+fn file_write_decision(
+    tool_input: Option<&serde_json::Value>,
+    cwd: &Path,
+    effective: &Policy,
+    protected: &safe_ai_skill::gates::tamper::Protected,
+) -> Decision {
+    let decision = safe_ai_skill::gates::tamper::decide_file(tool_input, cwd, protected);
+    let tier = effective.tier();
+    let tier_verdict = strictest([
+        wallet::decide_file(tool_input, cwd, effective, tier),
+        envwrite::decide_file(tool_input, cwd, effective, tier),
+    ]);
+    join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true)).0
+}
+
+/// The strictest verdict over the files an `apply_patch` patch touches: the tamper check (one
+/// resolution for all paths), the wallet and env-write tier gates per path, and under Codex the
+/// [`adapt::patch_target_reason`] targets. Over [`adapt::MAX_PATCH_PATHS`] files is a deny.
+fn apply_patch_decision(
+    paths: &[String],
+    cwd: &Path,
+    effective: &Policy,
+    protected: &safe_ai_skill::gates::tamper::Protected,
+) -> Decision {
+    if paths.len() > adapt::MAX_PATCH_PATHS {
+        return Decision::Deny {
+            reason: format!(
+                "safe-ai-skill: this patch touches {} files, more than the {} it inspects; \
+                 split it into smaller patches.",
+                paths.len(),
+                adapt::MAX_PATCH_PATHS
+            ),
+        };
+    }
+    if adapt::is_codex() {
+        let targets = adapt::CodexTargets::from_env();
+        if let Some(reason) = paths
+            .iter()
+            .find_map(|p| adapt::patch_target_reason(p, cwd, &targets))
+        {
+            return Decision::Deny { reason };
+        }
+    }
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let mut strictest = safe_ai_skill::gates::tamper::decide_paths(&refs, cwd, protected);
+    if matches!(strictest, Decision::Deny { .. }) {
+        return strictest;
+    }
+    let tier = effective.tier();
+    for path in paths {
+        let file = serde_json::json!({ "file_path": path });
+        let verdict = strictest_verdict_of(&file, cwd, effective, tier);
+        let (decision, _) = join_tier(verdict, Decision::Defer, GateMeta::new(Scope::Other, true));
+        if decision_rank(&decision) > decision_rank(&strictest) {
+            strictest = decision;
+        }
+    }
+    strictest
+}
+
+/// The wallet and env-write tier verdicts on one file write.
+fn strictest_verdict_of(
+    file: &serde_json::Value,
+    cwd: &Path,
+    effective: &Policy,
+    tier: Tier,
+) -> Option<Verdict> {
+    strictest([
+        wallet::decide_file(Some(file), cwd, effective, tier),
+        envwrite::decide_file(Some(file), cwd, effective, tier),
+    ])
+}
+
+/// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
+/// payload and answer in that client's output contract ([`adapt`]). An unknown client or a
+/// gate the client does not offer is a usage error (exit 3, nothing on stdout).
+fn cmd_adapt(rest: &[String]) -> ExitCode {
+    let client = rest.first().and_then(|c| adapt::client_named(c));
+    let gate = rest.get(1).map(String::as_str).unwrap_or("");
+    let handler = SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == gate)
+        .map(|(_, handler)| *handler);
+    let (Some(client), Some(handler), 2) = (client, handler, rest.len()) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "safe-ai-skill: usage: safe-ai-skill adapt codex <{}>",
+            adapt::CODEX_GATES.join("|")
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
+    if !adapt::CODEX_GATES.contains(&gate) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "safe-ai-skill: `{gate}` is not available through `adapt codex`"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    adapt::set(client);
+    install_panic_ask();
+    run_with_deadline(gate_deadline(), handler, Vec::new())
 }
 
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
@@ -346,63 +915,186 @@ fn cmd_gate_tamper() -> ExitCode {
         Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
     };
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
     let protected = safe_ai_skill::gates::tamper::Protected::from_env();
-    let decision =
-        safe_ai_skill::gates::tamper::decide_file(input.tool_input.as_ref(), &cwd, &protected);
-    // A tamper verdict is final: no grant or profile relaxes it, so it skips `relax::apply`.
-    write_audit(&effective, &plugin_data, &input, &raw, "tamper", &decision);
+    let tool_input = input.tool_input.as_ref();
+    let decision = if input.tool_name.as_deref() == Some("apply_patch") {
+        // Codex's `apply_patch` carries the patch text in `command`: judge every file it names.
+        let Some(patch) = tool_input
+            .and_then(|t| t.get("command"))
+            .and_then(|c| c.as_str())
+        else {
+            return ask_unreadable(Unreadable::Malformed, &input, &raw);
+        };
+        apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected)
+    } else {
+        file_write_decision(tool_input, &cwd, &effective, &protected)
+    };
+    // A tamper verdict is final: no grant or tier relaxes it, so it skips `relax::apply`.
+    let decision = headless::apply(decision, effective.runtime.headless);
+    record_decision(&decision);
+    write_audit(&effective, &dir.path, &input, &raw, "tamper", &decision);
     let _ = io::emit_pretooluse(&decision);
     ExitCode::SUCCESS
 }
 
 fn cmd_redact() -> ExitCode {
-    let Ok(input) = read_input().1 else {
+    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5).
+    let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
         return ExitCode::SUCCESS;
     };
-    let is_mcp = input
-        .tool_name
-        .as_deref()
-        .map(|t| t.starts_with("mcp__"))
-        .unwrap_or(false);
-    let text = input
-        .tool_output
-        .as_ref()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .or_else(|| input.tool_output.as_ref().map(|v| v.to_string()))
-        .unwrap_or_default();
-    let updated = redact::scrub(&text);
-    let _ = io::emit_posttooluse_redact(updated, is_mcp);
+    let Some(response) = input.tool_response.as_ref() else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let effective = load_effective_policy(&cwd, &state_dir(&cwd));
+    if !effective.redact.enabled {
+        return ExitCode::SUCCESS;
+    }
+    let values = safe_ai_skill::env::values::load(&cwd);
+    let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
+        &input, response, &values, &cwd, &effective,
+    ));
     ExitCode::SUCCESS
 }
 
+/// `failure-notice` — the PostToolUseFailure hook. Claude Code gives the model a failed tool's
+/// output unchanged: this event's only output is `additionalContext` (plus the common
+/// `systemMessage`), so it cannot be redacted. When the error text holds what `redact` would
+/// scrub, the model is told not to repeat or send it and the user is warned; names only, never
+/// a value. Otherwise, or on anything unreadable, no output.
+fn cmd_failure_notice() -> ExitCode {
+    let input = match io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 {
+        Ok(input) => input,
+        // Too large to scan: the model is told to treat it as possibly secret (this hook is
+        // wired to PostToolUseFailure only).
+        Err(Unreadable::Oversized) => {
+            print_json(&serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUseFailure",
+                    "additionalContext": "safe-ai-skill: the output of this failed tool call \
+                         was too large to check for secret material, and a failed call's output \
+                         cannot be redacted. Do not repeat, quote, store or send any key, token \
+                         or env value it may hold.",
+                },
+            }));
+            return ExitCode::SUCCESS;
+        }
+        Err(_) => return ExitCode::SUCCESS,
+    };
+    if input.hook_event_name.as_deref() != Some("PostToolUseFailure") {
+        return ExitCode::SUCCESS;
+    }
+    let Some(error) = input.error.as_deref().filter(|e| !e.is_empty()) else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let effective = load_effective_policy(&cwd, &state_dir(&cwd));
+    if !effective.redact.enabled {
+        return ExitCode::SUCCESS;
+    }
+    let values = safe_ai_skill::env::values::load(&cwd);
+    let response = serde_json::Value::String(error.to_string());
+    if redact::scrub_tool_response(&input, &response, &values, &cwd, &effective).is_none() {
+        return ExitCode::SUCCESS;
+    }
+    let tool = input.tool_name.as_deref().unwrap_or("tool");
+    print_json(&serde_json::json!({
+        "systemMessage": format!(
+            "safe-ai-skill: the failed {tool} call's output held secret material (an env value \
+             or key) and reached the model unredacted: Claude Code cannot replace the output of \
+             a failed tool call. Rotate the value if this session's transcript can leave this \
+             machine."
+        ),
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "additionalContext": "safe-ai-skill: the error output of this failed tool call \
+                 contains secret material (an env value or key) that could not be redacted. Do \
+                 not repeat, quote, store, or send it anywhere; refer to it only by its name.",
+        },
+    }));
+    ExitCode::SUCCESS
+}
+
+/// `prompt-guard` — the UserPromptSubmit hook: block a prompt carrying a raw secret, else
+/// handle a `safe-ai-skill confirm <nonce>` prompt (spec D4.1). The nonce is read from the
+/// UserPromptSubmit `prompt` alone ([`confirm::user_prompt`]).
 fn cmd_prompt_guard() -> ExitCode {
     let Ok(input) = read_input().1 else {
         return ExitCode::SUCCESS;
     };
     let prompt = input.prompt.clone().unwrap_or_default();
-    let block = promptguard::check(&prompt);
-    let _ = io::emit_userpromptsubmit(block.as_deref());
+    if let Some(block) = promptguard::check(&prompt) {
+        let _ = io::emit_userpromptsubmit(Some(&block));
+        return ExitCode::SUCCESS;
+    }
+    let Some(user_prompt) = confirm::user_prompt(&input) else {
+        return ExitCode::SUCCESS;
+    };
+    let dir = state_dir(&cwd_of(&input));
+    let now = now_secs();
+    let session = hook_session(&input);
+    let outcome = relax::confirm_prompt(&dir, user_prompt, now, session.as_deref());
+    // Codes for requests made outside a Bash tool call (a terminal, `!` mode): shown to the
+    // user only, in the systemMessage.
+    let codes = relax::announce(&dir, now, session.as_deref());
+    let mut out = match (outcome, &codes) {
+        (Some(o), _) => o.hook_output(),
+        (None, Some(_)) => serde_json::json!({}),
+        (None, None) => return ExitCode::SUCCESS,
+    };
+    if let (Some(codes), Some(map)) = (codes, out.as_object_mut()) {
+        let msg = match map.get("systemMessage").and_then(|m| m.as_str()) {
+            Some(prev) => format!("{prev}\n{codes}"),
+            None => codes,
+        };
+        map.insert("systemMessage".to_string(), serde_json::Value::String(msg));
+    }
+    print_json(&out);
+    ExitCode::SUCCESS
+}
+
+/// The Claude Code session a hook runs in: the payload's `session_id`, else
+/// `CLAUDE_CODE_SESSION_ID` (Claude Code sets both to the same value for hooks).
+fn hook_session(input: &HookInput) -> Option<String> {
+    input
+        .session_id
+        .clone()
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// `pending-notice` — the PostToolUse (Bash) hook that shows the user the confirmation code
+/// of a request the tool call just made. The code goes in `systemMessage` only (never
+/// `additionalContext`), and each request is announced once. Nothing pending → no output.
+/// `pending-notice` — the PostToolUse hook on Bash: show the user (in `systemMessage` only) the
+/// codes of requests a Bash call just made. Anything but a PostToolUse/Bash payload gets nothing.
+fn cmd_pending_notice() -> ExitCode {
+    let Ok(input) = read_input().1 else {
+        return ExitCode::SUCCESS;
+    };
+    if input.hook_event_name.as_deref() != Some("PostToolUse")
+        || input.tool_name.as_deref() != Some("Bash")
+    {
+        return ExitCode::SUCCESS;
+    }
+    let dir = state_dir(&cwd_of(&input));
+    if let Some(codes) = relax::announce(&dir, now_secs(), hook_session(&input).as_deref()) {
+        print_json(&serde_json::json!({ "systemMessage": codes }));
+    }
     ExitCode::SUCCESS
 }
 
 fn cmd_verify(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("session");
+    let arg = rest.get(1).map(String::as_str).unwrap_or("");
     match action {
         "session" => cmd_verify_session(),
-        "approve" => cmd_verify_approve(rest.get(1).map(String::as_str).unwrap_or("")),
-        "check" => {
-            let target = rest.get(1).map(String::as_str).unwrap_or("");
-            let report = verify::pipeline_dir(Path::new(target), None);
-            print_json(&serde_json::json!({
-                "command": "verify check",
-                "target": target,
-                "verdict": verify::verdict(&report).label(),
-                "findings": report.findings,
-            }));
-            ExitCode::SUCCESS
-        }
+        "approve" => cmd_verify_request("approve", arg),
+        "trust" => cmd_verify_request("trust", arg),
+        "check" => cmd_verify_check(arg),
         _ => {
             print_json(&serde_json::json!({ "error": "unknown verify subcommand" }));
             ExitCode::SUCCESS
@@ -410,7 +1102,161 @@ fn cmd_verify(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `verify session` — the SessionStart supply-chain sweep (report-only, nothing is moved).
+/// `verify check <dir>` — grade one directory as the SessionStart sweep grades a pack it sees
+/// for the first time, at the current tier, listing every finding. Pins and changes nothing.
+fn cmd_verify_check(target: &str) -> ExitCode {
+    let ctx = check_context();
+    match verify::check::check_dir(Path::new(target), target, &ctx) {
+        Ok(check) => {
+            print_json(&serde_json::json!({
+                "command": "verify check",
+                "target": target,
+                "tier": ctx.tier.label(),
+                "state": check.state.label(),
+                "reason": reason_json(check.reason),
+                "verdict": check.verdict.label(),
+                "findings": check.findings,
+                "report": check.report,
+                "dependencies": verify::deppin::inventory_json(Path::new(target)),
+            }));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            print_json(&serde_json::json!({
+                "command": "verify check",
+                "target": target,
+                "error": e,
+            }));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// What `verify check`, `add` and `install` grade a directory against: the tier, trust and
+/// `packs.lock` of the session rooted at the process cwd.
+fn check_context() -> verify::check::CheckContext {
+    let cwd = process_cwd();
+    let dir = state_dir(&cwd);
+    let (effective, _) = load_runtime(&cwd, &dir);
+    verify::check::CheckContext::load(&dir, &verify::project_root(&cwd), effective.tier())
+}
+
+/// The `add` / `install` confirmation flags.
+#[derive(Clone, Copy)]
+struct Confirm {
+    /// `--yes` or `--force`: take a pack with warnings.
+    yes: bool,
+    /// `--force`: also take a pack the tier denies, or a combination BLOCK at any tier.
+    force: bool,
+}
+
+impl Confirm {
+    fn from_args(rest: &[String]) -> Self {
+        let force = rest.iter().any(|a| a == "--force");
+        Confirm {
+            yes: force || rest.iter().any(|a| a == "--yes"),
+            force,
+        }
+    }
+
+    /// Whether `add` / `install` take a pack graded `check`: a clean one always, one with
+    /// warnings with `--yes`, and one the tier denies or a blocked one (a combination rule,
+    /// whatever the tier, Off included) only with `--force`.
+    fn takes(self, check: &verify::check::Check) -> bool {
+        if check.verdict == verify::Verdict::Block
+            || check.state == verify::state::PackStatus::Blocked
+        {
+            return self.force;
+        }
+        match check.verdict {
+            verify::Verdict::Pass => true,
+            _ => self.yes,
+        }
+    }
+}
+
+/// A `reason` label for JSON (`null` when there is none).
+fn reason_json(reason: Option<verify::state::Reason>) -> serde_json::Value {
+    reason.map_or(serde_json::Value::Null, |r| serde_json::json!(r.label()))
+}
+
+/// Grade one skill dir for `install`: the original content is listed in `flagged`, the telemetry
+/// preamble of its `SKILL.md` neutralized (unless the project's `packs.lock` pins the pack, which
+/// the edit would break: then it is left as is and listed in `kept`), and the result graded
+/// again. `Ok` with the final check when the pack is taken, `Err` with its `held` entry.
+fn grade_for_install(
+    dir: &Path,
+    name: &str,
+    ctx: &verify::check::CheckContext,
+    confirm: Confirm,
+    flagged: &mut Vec<serde_json::Value>,
+    kept: &mut Vec<serde_json::Value>,
+) -> Result<verify::check::Check, serde_json::Value> {
+    let error = |e: String| serde_json::json!({ "skill": name, "error": e });
+    let history = verify::history::scan(dir);
+    let pre = verify::check::check_dir_with(dir, name, ctx, &history).map_err(error)?;
+    flagged.extend(tagged_findings(name, &pre));
+
+    let skill_md = dir.join("SKILL.md");
+    if let Ok(body) = std::fs::read_to_string(&skill_md) {
+        let (cleaned, changed) = verify::neutralize_telemetry(&body);
+        if changed && ctx.lock_pinned(dir) {
+            kept.push(serde_json::json!({
+                "skill": name,
+                "reason": format!(
+                    "its telemetry preamble was left in place: {} pins this content, and \
+                     editing it would break that pin",
+                    verify::state::PACKS_LOCK
+                ),
+            }));
+        } else if changed {
+            let _ = std::fs::write(&skill_md, cleaned);
+        }
+    }
+
+    // The verdict the install gate uses, on the neutralized content: a skill whose only danger
+    // was the removed telemetry preamble installs cleanly.
+    let check = verify::check::check_dir_with(dir, name, ctx, &history).map_err(error)?;
+    if confirm.takes(&check) {
+        return Ok(check);
+    }
+    Err(serde_json::json!({
+        "skill": name,
+        "state": check.state.label(),
+        "reason": reason_json(check.reason),
+        "verdict": check.verdict.label(),
+        "findings": check.findings.len(),
+        "report": check.report,
+    }))
+}
+
+/// `check`'s findings as `install` lists them, each tagged with its skill.
+fn tagged_findings(skill: &str, check: &verify::check::Check) -> Vec<serde_json::Value> {
+    check
+        .findings
+        .iter()
+        .map(|f| {
+            let mut v = serde_json::json!(f);
+            if let Some(map) = v.as_object_mut() {
+                map.insert("skill".to_string(), serde_json::json!(skill));
+            }
+            v
+        })
+        .collect()
+}
+
+/// The v1 lockfile `scan` mark of a pinned check: `high` keeps an unreviewed pack unreviewed
+/// when the sweep carries the pin over.
+fn pin_scan(state: verify::state::PackStatus) -> &'static str {
+    match state {
+        verify::state::PackStatus::Blocked | verify::state::PackStatus::Unreviewed => "high",
+        verify::state::PackStatus::Warned => "medium",
+        verify::state::PackStatus::Clean => "",
+    }
+}
+
+/// `verify session` — the SessionStart supply-chain sweep (state v2; blocked packs are denied
+/// in place by the gates, nothing moves unless `supply_chain.on_block: move`).
 ///
 /// Runs [`verify::run_session`] (skill packs + the project `.mcp.json`) and emits the
 /// SessionStart report (`systemMessage` for the user + `additionalContext` for the model) — or
@@ -419,20 +1265,83 @@ fn cmd_verify_session() -> ExitCode {
     // SessionStart hooks may carry a cwd on stdin; fall back to the process cwd.
     let input = read_input().1.unwrap_or_default();
     let cwd = cwd_of(&input);
-    let plugin_data = context::plugin_data_dir();
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let dir = state_dir(&cwd);
+    let plugin_data = dir.path.clone();
+    let now = now_secs();
 
-    let mut res = verify::run_session(&plugin_data, &cwd, &effective);
+    // 1.0 state is migrated once, before anything creates the state key; then the spend
+    // ledger is started (or repaired), which creates the key on a first run.
+    let mut migrated = migrate::run(&dir, now);
+    migrated.extend(migrate::mode_to_tier(&dir, now));
+    let spend_state = spend::ledger_state(&plugin_data);
+    let _ = SpendLedger::load(&plugin_data);
 
-    // Overrides the policy ratchet refused (project overlay, looser profile env var): shown to
-    // the user and given to the model.
-    if let Some(notice) = effective.ignored_notice() {
+    let (effective, resolution) = load_runtime(&cwd, &dir);
+    let mut res = verify::run_session(&dir, &cwd, &effective);
+
+    // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
+    // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
+    // user and given to the model.
+    let root = tier::project_root(&cwd);
+    let loosenings = notice::loosenings(&notice::Inputs {
+        dir: &dir,
+        root: &root,
+        spend: spend_state,
+        migrated: &migrated,
+        sandbox: sandbox::declared(&root),
+        now,
+    });
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings]
+        .into_iter()
+        .flatten()
+        .chain(platform::session_notices())
+        .collect();
+    // The tier line leads whenever there is anything to say, or the tier is not the plain
+    // default; a clean default session stays silent.
+    let plain_default = resolution.tier == Tier::Relaxed
+        && resolution.source == tier::TierSource::Base
+        && resolution.notes.is_empty();
+    let quiet = plain_default
+        && notices.is_empty()
+        && res.system_message.is_empty()
+        && res.additional_context.is_empty();
+    if !quiet {
+        let tier_text = std::iter::once(notice::tier_line(&resolution, &effective.runtime))
+            .chain(resolution.notes.iter().map(|n| format!(" - {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for field in [&mut res.system_message, &mut res.additional_context] {
+            *field = if field.is_empty() {
+                tier_text.clone()
+            } else {
+                format!("{tier_text}\n{field}")
+            };
+        }
+    }
+    // Then install and platform notices (duplicate install, old Claude Code, Windows scope).
+    for text in notices {
         for field in [&mut res.system_message, &mut res.additional_context] {
             if !field.is_empty() {
                 field.push('\n');
             }
-            field.push_str(&notice);
+            field.push_str(&text);
         }
+    }
+    // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
+    // user's systemMessage only.
+    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&codes);
+    }
+
+    // One-time tip (per project) when env files exist without a `.env.schema` (spec D3.8.6).
+    if let Some(tip) = safe_ai_skill::env::schema_tip(&cwd, &dir.path) {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&tip);
     }
 
     if let Some(out) = res.hook_output() {
@@ -441,60 +1350,69 @@ fn cmd_verify_session() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `verify approve <name>` — accept a pack: restore one an earlier version quarantined, or
-/// re-pin a drifted one where it is.
-fn cmd_verify_approve(name: &str) -> ExitCode {
-    if name.is_empty() {
+/// `verify approve <name|path>` / `verify trust <path>`: create a pending request and print its
+/// id, never a code. Nothing changes until the user types the code safe-ai-skill shows them as
+/// their next prompt (spec D4.1); the UserPromptSubmit hook then applies it
+/// ([`verify::apply_confirmed`]).
+fn cmd_verify_request(action: &str, target: &str) -> ExitCode {
+    let command = format!("verify {action}");
+    if target.is_empty() {
+        let usage = if action == "trust" {
+            "usage: verify trust <pack dir>"
+        } else {
+            "usage: verify approve <skill-name | pack dir>"
+        };
         print_json(&serde_json::json!({
-            "command": "verify approve",
+            "command": command,
             "status": "error",
-            "error": "usage: verify approve <skill-name>",
+            "error": usage,
         }));
         return ExitCode::SUCCESS;
     }
-    let Some(plugin_data) = cli_data_dir("verify approve") else {
+    let cwd = process_cwd();
+    let Some(dir) = cli_state_dir(&command, &cwd) else {
         return ExitCode::FAILURE;
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    // `.gitmodules` and the swept roots resolve at the repo root, from any subdirectory.
-    let project = verify::project_root(&cwd);
-    let effective = load_effective_policy(&project, &plugin_data);
-
-    match verify::approve(&plugin_data, &project, name, &effective) {
-        Ok(approval) => {
+    let request = if action == "trust" {
+        verify::request_trust(&dir, Path::new(target))
+    } else {
+        let project = verify::project_root(&cwd);
+        let effective = load_effective_policy(&project, &dir);
+        verify::request_approve(&dir, &cwd, target, &effective)
+    };
+    match request {
+        Ok(req) => {
             audit_event(
-                &plugin_data,
-                "verify_approve",
-                "approve",
-                &format!("skill={name}"),
+                &dir.path,
+                &format!("verify_{action}_requested"),
+                "pending",
+                &format!("target={target}"),
             );
-            let (key, value) = match approval {
-                verify::Approval::Restored(path) => {
-                    ("restored_to", serde_json::json!(path.display().to_string()))
-                }
-                verify::Approval::PinnedInPlace(paths) => (
-                    "pinned_in_place",
-                    serde_json::json!(paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()),
-                ),
-            };
-            let mut out = serde_json::json!({
-                "command": "verify approve",
-                "status": "approved",
-                "skill": name,
-            });
-            if let Some(map) = out.as_object_mut() {
-                map.insert(key.to_string(), value);
-            }
-            print_json(&out);
+            // The request id only: the code reaches the user alone, in a hook `systemMessage`.
+            let message = format!(
+                "Pending request {} created: {}. Nothing has changed yet. safe-ai-skill will show \
+                 YOU (not the agent) a confirmation code; type it as your entire next prompt in \
+                 Claude Code to approve (valid {} minutes after it is shown).",
+                req.id,
+                req.summary,
+                confirm::TTL_SECS / 60
+            );
+            let _ = writeln!(std::io::stderr(), "{message}");
+            print_json(&serde_json::json!({
+                "command": command,
+                "status": "pending",
+                "target": target,
+                "request": req.id,
+                "summary": req.summary,
+                "data_dir_trusted": dir.trusted,
+                "message": message,
+            }));
         }
         Err(e) => {
             print_json(&serde_json::json!({
-                "command": "verify approve",
+                "command": command,
                 "status": "error",
-                "skill": name,
+                "target": target,
                 "error": e.to_string(),
             }));
         }
@@ -508,7 +1426,8 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // `add` is a user-invoked install, so the (otherwise isolated) network steps are allowed:
     // an `--online` flag (default on for `add`) lets provenance hit the npm/osv registries.
     let online = !rest.iter().any(|a| a == "--offline");
-    let force = rest.iter().any(|a| a == "--yes" || a == "--force");
+    let confirm = Confirm::from_args(rest);
+    let force = confirm.yes;
 
     if source.is_empty() {
         print_json(&serde_json::json!({
@@ -528,7 +1447,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // custody, …), force the class decision (`ask`/`deny`) and refuse to emit the install
     // command — the verify pipeline never even runs. A `deny` blocks outright; an `ask` holds
     // unless `--yes`.
-    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(&plugin_data, source) {
+    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(source) {
         let blocked = decision == "deny" || (decision == "ask" && !force);
         if blocked {
             audit_event(
@@ -561,22 +1480,46 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         );
     }
 
-    // mcp → npm package provenance (+ osv); skill/repo → directory/source heuristics.
+    // mcp → npm package provenance (+ osv); a local skill/repo dir → the sweep's rule engine at
+    // the current tier, plus the provenance of its source; any other source → provenance only.
+    let local = verify::expand_home(source);
+    let add_error = |e: String| {
+        print_json(&serde_json::json!({
+            "command": "add",
+            "kind": kind,
+            "source": source,
+            "status": "error",
+            "error": e,
+        }));
+        ExitCode::FAILURE
+    };
+    let looks_local = ["./", "../", "/", "~"]
+        .iter()
+        .any(|p| source.starts_with(p))
+        || source == "."
+        || source == "..";
+    if kind != "mcp" && looks_local && !local.is_dir() {
+        return add_error(format!("{source}: no such local directory"));
+    }
+    let mut checked: Option<verify::check::Check> = None;
     let report = match kind {
         "mcp" => verify::pipeline_npm(source, online),
-        _ => {
-            let dir = verify::expand_home(source);
-            if dir.is_dir() {
-                verify::pipeline_dir(&dir, Some(source))
-            } else {
-                // A non-local source (e.g. a GitHub URL): provenance-only, no tree to scan.
-                verify::pipeline_npm(source, online)
+        _ if local.is_dir() => {
+            let ctx = check_context().for_install();
+            match verify::check::check_dir(&local, source, &ctx) {
+                Ok(check) => checked = Some(check),
+                Err(e) => return add_error(e),
             }
+            verify::provenance::resolve(source)
         }
+        _ => verify::pipeline_npm(source, online),
     };
 
-    let verdict = verify::verdict(&report);
-    let findings: Vec<serde_json::Value> = report
+    let verdict = match &checked {
+        Some(check) => check.verdict.max(verify::verdict(&report)),
+        None => verify::verdict(&report),
+    };
+    let provenance: Vec<serde_json::Value> = report
         .findings
         .iter()
         .map(|f| {
@@ -591,18 +1534,31 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     // The underlying install command emitted on pass (or warn + confirm).
     let install_cmd = underlying_install_cmd(kind, source);
 
-    let (status, proceed) = match verdict {
-        verify::Verdict::Block => ("blocked", false),
-        // Warn proceeds only with an explicit confirm flag; default is the safe refusal.
-        verify::Verdict::Warn => {
+    // A pack the tier denies, or a combination BLOCK at any tier, proceeds only with `--force`.
+    let pack_blocked = checked
+        .as_ref()
+        .is_some_and(|c| c.state == verify::state::PackStatus::Blocked);
+    // A provenance BLOCK (or an npm/URL source's) is never overridden.
+    let source_blocked = verify::verdict(&report) == verify::Verdict::Block;
+    let (status, proceed) =
+        if verdict == verify::Verdict::Block && (source_blocked || checked.is_none()) {
+            ("blocked", false)
+        } else if pack_blocked || verdict == verify::Verdict::Block {
+            if confirm.force {
+                ("force_proceed", true)
+            } else {
+                ("blocked", false)
+            }
+        } else if verdict == verify::Verdict::Warn {
+            // Warn proceeds only with an explicit confirm flag; default is the safe refusal.
             if force {
                 ("warn_proceed", true)
             } else {
                 ("warn_hold", false)
             }
-        }
-        verify::Verdict::Pass => ("pass", true),
-    };
+        } else {
+            ("pass", true)
+        };
 
     if proceed {
         audit_event(
@@ -613,16 +1569,31 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         );
     }
 
-    print_json(&serde_json::json!({
+    let mut out = serde_json::json!({
         "command": "add",
         "kind": kind,
         "source": source,
         "verdict": verdict.label(),
         "status": status,
-        "findings": findings,
         "proceed": proceed,
         "run": if proceed { serde_json::Value::String(install_cmd) } else { serde_json::Value::Null },
-    }));
+    });
+    if let Some(map) = out.as_object_mut() {
+        match &checked {
+            // The pack: the sweep's state, findings and report; the source: its provenance.
+            Some(check) => {
+                map.insert("state".into(), serde_json::json!(check.state.label()));
+                map.insert("reason".into(), reason_json(check.reason));
+                map.insert("findings".into(), serde_json::json!(check.findings));
+                map.insert("report".into(), serde_json::json!(check.report));
+                map.insert("provenance".into(), serde_json::json!(provenance));
+            }
+            None => {
+                map.insert("findings".into(), serde_json::json!(provenance));
+            }
+        }
+    }
+    print_json(&out);
     ExitCode::SUCCESS
 }
 
@@ -635,12 +1606,9 @@ fn cmd_add(rest: &[String]) -> ExitCode {
 /// from [`registry::Registry::decision_for_kind`]. Returns `None` when there is no catalog, no
 /// matching entry, or the entry is not high-risk — in which case `add` proceeds to its normal
 /// verify pipeline. Never panics; a missing/unparseable catalog yields `None`.
-fn resolve_high_risk_target(
-    plugin_data: &Path,
-    source: &str,
-) -> Option<(String, &'static str, &'static str)> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let policy = load_effective_policy(&cwd, plugin_data);
+fn resolve_high_risk_target(source: &str) -> Option<(String, &'static str, &'static str)> {
+    let cwd = process_cwd();
+    let policy = load_effective_policy(&cwd, &state_dir(&cwd));
     let reg_path = cwd.join(&policy.catalog.registry_path);
     let reg = registry::Registry::load(&reg_path).ok()?;
 
@@ -707,10 +1675,10 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 
 /// `install` — hub-agnostic secure skills installer / in-place verifier.
 ///
-/// Runs the intrinsic verification pipeline over each skill directory in a LOCAL source,
-/// neutralizes any telemetry preamble in its `SKILL.md`, and installs ONLY the skills that
-/// pass. There is NO hardcoded download URL: the remote `skills.tar.gz` tarball path is
-/// retired (decision 2026-06-16). The source is always local.
+/// Grades each skill directory in a LOCAL source as the SessionStart sweep would at the
+/// current tier ([`verify::check`]), neutralizes any telemetry preamble in its `SKILL.md`, and
+/// installs ONLY the skills that pass. There is NO hardcoded download URL: the remote
+/// `skills.tar.gz` tarball path is retired (decision 2026-06-16). The source is always local.
 ///
 /// - `--from <dir-or-tarball>`: install from a local extracted directory or a local
 ///   `.tar.gz`/`.tgz`. A local directory is used directly; a local tarball is extracted via
@@ -724,9 +1692,10 @@ fn underlying_install_cmd(kind: &str, source: &str) -> String {
 ///   touches the user's home. `--from`/`--home` are independent and composable. Ignored in the
 ///   verify-in-place (no `--from`) mode, which never copies.
 ///
-/// Never widens `settings.json`. A skill with a High finding is held unless `--yes`.
+/// Never widens `settings.json`. A skill the tier would deny is held; one with warnings (a HIGH
+/// below tier high included) is held unless `--yes`.
 fn cmd_install(rest: &[String]) -> ExitCode {
-    let force = rest.iter().any(|a| a == "--yes" || a == "--force");
+    let confirm = Confirm::from_args(rest);
     let Some(plugin_data) = cli_data_dir("install") else {
         return ExitCode::FAILURE;
     };
@@ -739,7 +1708,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
 
     // No `--from`: verify the current project's `.claude/skills` in place (no download/copy).
     if from.is_none() {
-        return install_verify_in_place(&plugin_data, force);
+        return install_verify_in_place(&plugin_data, confirm);
     }
 
     // Stage under a unique temp dir we own (never /tmp directly; honor TMPDIR).
@@ -799,6 +1768,8 @@ fn cmd_install(rest: &[String]) -> ExitCode {
     let mut installed: Vec<String> = Vec::new();
     let mut held: Vec<serde_json::Value> = Vec::new();
     let mut flagged: Vec<serde_json::Value> = Vec::new();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let ctx = check_context().for_install();
 
     for dir in skill_dirs_under(&extract_dir) {
         let name = match dir.file_name().and_then(|n| n.to_str()) {
@@ -806,47 +1777,16 @@ fn cmd_install(rest: &[String]) -> ExitCode {
             None => continue,
         };
 
-        // Scan the ORIGINAL (pre-neutralization) content first so the telemetry curl and
-        // any other danger are reported to the user. Then neutralize the telemetry preamble
-        // in SKILL.md before the installed copy is written.
-        let pre_report = verify::pipeline_dir(&dir, None);
-        for f in &pre_report.findings {
-            flagged.push(serde_json::json!({
-                "skill": name,
-                "severity": verify::severity_label(f.severity),
-                "kind": f.kind,
-                "detail": f.detail,
-            }));
-        }
-
-        // Neutralize telemetry in SKILL.md before scanning/installing.
-        let skill_md = dir.join("SKILL.md");
-        if let Ok(body) = std::fs::read_to_string(&skill_md) {
-            let (cleaned, changed) = verify::neutralize_telemetry(&body);
-            if changed {
-                let _ = std::fs::write(&skill_md, cleaned);
+        // The original content's findings are listed, then its telemetry preamble is
+        // neutralized before the installed copy is written.
+        let check = match grade_for_install(&dir, &name, &ctx, confirm, &mut flagged, &mut kept) {
+            Ok(check) => check,
+            Err(entry) => {
+                held.push(entry);
+                continue;
             }
-        }
-
-        // Re-scan the neutralized content: this is the verdict the install gate uses, so a
-        // skill whose ONLY danger was the (now-removed) telemetry preamble installs cleanly.
-        let report = verify::pipeline_dir(&dir, None);
-        let verdict = verify::verdict(&report);
-
-        let proceed = match verdict {
-            verify::Verdict::Pass => true,
-            verify::Verdict::Warn => force,
-            verify::Verdict::Block => false,
         };
-
-        if !proceed {
-            held.push(serde_json::json!({
-                "skill": name,
-                "verdict": verdict.label(),
-                "findings": report.findings.len(),
-            }));
-            continue;
-        }
+        let verdict = check.verdict;
 
         let dest = install_root.join(&name);
         if dest.exists() {
@@ -876,11 +1816,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
                 sha256: hash,
                 source: pin_source,
                 verified_at: now_secs(),
-                scan: report
-                    .max_severity()
-                    .map(verify::severity_label)
-                    .unwrap_or("")
-                    .to_string(),
+                scan: pin_scan(check.state).to_string(),
                 origin: verify::lockfile::ORIGIN_INSTALL.to_string(),
             },
         );
@@ -903,6 +1839,7 @@ fn cmd_install(rest: &[String]) -> ExitCode {
         "installed": installed,
         "held": held,
         "flagged": flagged,
+        "not_neutralized": kept,
         "install_root": install_root.display().to_string(),
     }));
     ExitCode::SUCCESS
@@ -922,9 +1859,9 @@ fn install_err(msg: &str) -> ExitCode {
 ///
 /// No download, no copy: each immediate skill subdirectory under `<cwd>/.claude/skills` is
 /// scanned (and its telemetry preamble neutralized in place), then pinned (TOFU) in the
-/// lockfile. A High finding holds the skill (reported, not installed) unless `--yes`. This is
-/// the post-`install.sh` audit path for the kit's project layout.
-fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
+/// lockfile. A skill the tier would deny is held; one with warnings is held unless `--yes`.
+/// This is the post-`install.sh` audit path for the kit's project layout.
+fn install_verify_in_place(plugin_data: &Path, confirm: Confirm) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let skills_root = cwd.join(".claude").join("skills");
     if !skills_root.is_dir() {
@@ -938,6 +1875,8 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
     let mut verified: Vec<String> = Vec::new();
     let mut held: Vec<serde_json::Value> = Vec::new();
     let mut flagged: Vec<serde_json::Value> = Vec::new();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let ctx = check_context().for_install();
 
     for dir in skill_dirs_under(&skills_root) {
         let name = match dir.file_name().and_then(|n| n.to_str()) {
@@ -945,39 +1884,13 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
             None => continue,
         };
 
-        let pre_report = verify::pipeline_dir(&dir, None);
-        for f in &pre_report.findings {
-            flagged.push(serde_json::json!({
-                "skill": name,
-                "severity": verify::severity_label(f.severity),
-                "kind": f.kind,
-                "detail": f.detail,
-            }));
-        }
-
-        let skill_md = dir.join("SKILL.md");
-        if let Ok(body) = std::fs::read_to_string(&skill_md) {
-            let (cleaned, changed) = verify::neutralize_telemetry(&body);
-            if changed {
-                let _ = std::fs::write(&skill_md, cleaned);
+        let check = match grade_for_install(&dir, &name, &ctx, confirm, &mut flagged, &mut kept) {
+            Ok(check) => check,
+            Err(entry) => {
+                held.push(entry);
+                continue;
             }
-        }
-
-        let report = verify::pipeline_dir(&dir, None);
-        let verdict = verify::verdict(&report);
-        let proceed = match verdict {
-            verify::Verdict::Pass => true,
-            verify::Verdict::Warn => force,
-            verify::Verdict::Block => false,
         };
-        if !proceed {
-            held.push(serde_json::json!({
-                "skill": name,
-                "verdict": verdict.label(),
-                "findings": report.findings.len(),
-            }));
-            continue;
-        }
 
         let hash = verify::lockfile::hash_tree(&dir);
         lock.pin_skill(
@@ -986,11 +1899,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
                 sha256: hash,
                 source: skills_root.display().to_string(),
                 verified_at: now_secs(),
-                scan: report
-                    .max_severity()
-                    .map(verify::severity_label)
-                    .unwrap_or("")
-                    .to_string(),
+                scan: pin_scan(check.state).to_string(),
                 origin: verify::lockfile::ORIGIN_IN_PLACE.to_string(),
             },
         );
@@ -1012,6 +1921,7 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
         "verified": verified,
         "held": held,
         "flagged": flagged,
+        "not_neutralized": kept,
         "skills_root": skills_root.display().to_string(),
     }));
     ExitCode::SUCCESS
@@ -1031,11 +1941,12 @@ fn install_verify_in_place(plugin_data: &Path, force: bool) -> ExitCode {
 /// run on a project that has not opted into the catalog.
 fn cmd_registry(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("list");
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let Some(plugin_data) = cli_data_dir("registry") else {
+    let cwd = process_cwd();
+    let Some(dir) = cli_state_dir("registry", &cwd) else {
         return ExitCode::FAILURE;
     };
-    let policy = load_effective_policy(&cwd, &plugin_data);
+    let plugin_data = dir.path.clone();
+    let policy = load_effective_policy(&cwd, &dir);
     let reg_path = cwd.join(&policy.catalog.registry_path);
 
     if action != "verify" && action != "list" {
@@ -1139,7 +2050,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 fn cmd_session(rest: &[String]) -> ExitCode {
     let action = rest.first().map(String::as_str).unwrap_or("status");
-    let Some(plugin_data) = cli_data_dir("session") else {
+    let Some(dir) = cli_state_dir("session", &process_cwd()) else {
         return ExitCode::FAILURE;
     };
     let result = match action {
@@ -1150,125 +2061,249 @@ fn cmd_session(rest: &[String]) -> ExitCode {
                 .and_then(|i| rest.get(i + 1))
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(0.0);
-            session::init(cap, &plugin_data).unwrap_or_default()
+            session::init(cap, &dir).unwrap_or_default()
         }
-        _ => session::status(&plugin_data).unwrap_or_default(),
+        _ => session::status(&dir).unwrap_or_default(),
     };
     print_json(&serde_json::json!({ "command": "session", "action": action, "result": result }));
     ExitCode::SUCCESS
 }
 
-fn cmd_allow(rest: &[String]) -> ExitCode {
-    // Parse --scope --for --max-tx --budget --programs --to --danger, build a grant, and
-    // persist it. Creating a grant is an authority-granting action, so it is always audited.
-    let scope = flag_value(rest, "--scope").unwrap_or_default();
-    let for_dur = flag_value(rest, "--for").unwrap_or_default();
-    let max_tx = flag_value(rest, "--max-tx")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let budget = flag_value(rest, "--budget")
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.0);
-    let programs = flag_value(rest, "--programs").unwrap_or_default();
-    let to = flag_value(rest, "--to").unwrap_or_default();
-    let danger = rest.iter().any(|a| a == "--danger");
-
-    let Some(plugin_data) = cli_data_dir("allow") else {
-        return ExitCode::FAILURE;
-    };
-    let now = now_secs();
-
-    let grant = match grants::Grant::from_args(
-        &scope, &for_dur, max_tx, budget, &programs, &to, danger, now,
-    ) {
-        Some(g) => g,
-        None => {
-            print_json(&serde_json::json!({
-                "command": "allow",
-                "status": "error",
-                "error": "could not parse --scope / --for; expected e.g. --scope swap --for 30m",
-            }));
-            return ExitCode::SUCCESS;
-        }
-    };
-
-    let mut store = grants::load(&plugin_data);
-    let grant_id = grant.id.clone();
-    let grant_scope = grant.scope.label();
-    let grant_expiry = grant.expires_at;
-    store.grants.push(grant);
-    let _ = grants::save(&plugin_data, &store);
-
-    // Audit the grant creation.
-    audit_event(
-        &plugin_data,
-        "grant_create",
-        "allow",
-        &format!(
-            "scope={grant_scope} max_tx={max_tx} budget={budget} expires_at={grant_expiry} danger={danger}"
-        ),
-    );
-
+/// A CLI argument error: JSON on stdout, exit 1.
+fn cli_error(command: &str, error: &str) -> ExitCode {
     print_json(&serde_json::json!({
-        "command": "allow",
-        "status": "granted",
-        "id": grant_id,
-        "scope": grant_scope,
-        "for": for_dur,
-        "max_tx_sol": max_tx,
-        "budget_sol": budget,
-        "programs": programs,
-        "to": to,
-        "danger": danger,
-        "expires_at": grant_expiry,
+        "command": command,
+        "status": "error",
+        "error": error,
+    }));
+    ExitCode::FAILURE
+}
+
+/// Park a relaxing action for confirmation (spec D4.1). The output names the request but
+/// carries **no code**: safe-ai-skill shows the code to the user alone, in a `systemMessage`
+/// (the PostToolUse `pending-notice` hook, or the next prompt or session start).
+fn park_pending(
+    command: &str,
+    dir: &DataDir,
+    kind: PendingKind,
+    summary: &str,
+    payload: serde_json::Value,
+) -> ExitCode {
+    let id = match confirm::create_pending(dir, kind, summary, payload) {
+        Ok(id) => id,
+        Err(e) => return cli_error(command, &format!("could not record the request: {e}")),
+    };
+    let minutes = confirm::TTL_SECS / 60;
+    let mut message = format!(
+        "Pending request {id} created: {summary}. Nothing has changed yet. safe-ai-skill will \
+         show YOU (not the agent) a confirmation code; type it as your entire next prompt in \
+         Claude Code to approve (valid {minutes} minutes after it is shown)."
+    );
+    if !dir.trusted {
+        message.push_str(
+            " Warning: the plugin data dir is not in a trusted location, so this will not take \
+             effect even once confirmed.",
+        );
+    }
+    let _ = writeln!(std::io::stderr(), "{message}");
+    audit_event(&dir.path, kind_label(kind), "pending", summary);
+    print_json(&serde_json::json!({
+        "command": command,
+        "status": "pending",
+        "request": id.as_str(),
+        "summary": summary,
+        "data_dir_trusted": dir.trusted,
+        "message": message,
     }));
     ExitCode::SUCCESS
 }
 
-fn cmd_mode(rest: &[String]) -> ExitCode {
-    let Some(plugin_data) = cli_data_dir("mode") else {
+/// Audit classification of a pending kind.
+fn kind_label(kind: PendingKind) -> &'static str {
+    match kind {
+        PendingKind::Grant => "grant_create",
+        PendingKind::Mode | PendingKind::Tier => "tier_set",
+        PendingKind::Trust => "verify_trust",
+        PendingKind::Approve => "verify_approve",
+    }
+}
+
+/// `allow --scope <s> --for <dur> [--max-tx N] [--budget N] [--programs a,b] [--to a,b]
+/// [--danger]` — request a grant. It is only parked; the user confirms it with the prompt
+/// nonce. An unknown scope (including the removed `other`) is an error.
+fn cmd_allow(rest: &[String]) -> ExitCode {
+    let scope = flag_value(rest, "--scope").unwrap_or_default();
+    let for_dur = flag_value(rest, "--for").unwrap_or_default();
+    let amount = |flag: &str| -> Result<f64, String> {
+        match flag_value(rest, flag) {
+            None => Ok(0.0),
+            Some(v) => v
+                .parse::<f64>()
+                .map_err(|_| format!("{flag}: expected a SOL amount")),
+        }
+    };
+    let (max_tx, budget) = match (amount("--max-tx"), amount("--budget")) {
+        (Ok(m), Ok(b)) => (m, b),
+        (Err(e), _) | (_, Err(e)) => return cli_error("allow", &e),
+    };
+    let programs = flag_value(rest, "--programs").unwrap_or_default();
+    let to = flag_value(rest, "--to").unwrap_or_default();
+    let danger = rest.iter().any(|a| a == "--danger");
+
+    let request = match grants::GrantRequest::from_args(
+        &scope, &for_dur, max_tx, budget, &programs, &to, danger,
+    ) {
+        Ok(r) => r,
+        Err(e) => return cli_error("allow", &e),
+    };
+    let payload = match serde_json::to_value(&request) {
+        Ok(v) => v,
+        Err(e) => return cli_error("allow", &e.to_string()),
+    };
+    let Some(dir) = cli_state_dir("allow", &process_cwd()) else {
         return ExitCode::FAILURE;
     };
-    match rest.first() {
-        Some(profile) => match mode::set(&plugin_data, profile) {
-            Ok(()) => {
-                audit_event(
-                    &plugin_data,
-                    "mode_set",
-                    "mode",
-                    &format!("active_profile={profile}"),
-                );
-                print_json(&serde_json::json!({
-                    "command": "mode",
-                    "status": "set",
-                    "active_profile": profile,
-                }));
-            }
-            Err(e) => {
-                print_json(&serde_json::json!({
-                    "command": "mode",
-                    "status": "error",
-                    "error": e.to_string(),
-                }));
-            }
-        },
-        None => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let current = load_effective_policy(&cwd, &plugin_data).active_profile;
-            print_json(&serde_json::json!({ "command": "mode", "active_profile": current }));
+    park_pending(
+        "allow",
+        &dir,
+        PendingKind::Grant,
+        &request.summary(),
+        payload,
+    )
+}
+
+/// `mode [<name>]` — deprecated alias of [`cmd_tier`] (profile names are tier aliases).
+fn cmd_mode(rest: &[String]) -> ExitCode {
+    let _ = writeln!(
+        std::io::stderr(),
+        "safe-ai-skill: `mode` is deprecated; use `safe-ai-skill tier` (strict/autopilot = \
+         relaxed, paranoid = high)."
+    );
+    cmd_tier(rest)
+}
+
+/// `tier [<name>] [--project] [--env-read deny|ask|tier] | --clear [--project]` — show the
+/// tier (no argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising
+/// the tier or tightening `env_read` applies at once; lowering or loosening is parked for the
+/// user's whole-prompt confirmation (the code reaches the user alone).
+fn cmd_tier(rest: &[String]) -> ExitCode {
+    let cwd = process_cwd();
+    let Some(dir) = cli_state_dir("tier", &cwd) else {
+        return ExitCode::FAILURE;
+    };
+    let mut name: Option<&str> = None;
+    let mut env_read: Option<EnvRead> = None;
+    let (mut project, mut clear) = (false, false);
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--project" => project = true,
+            "--clear" => clear = true,
+            "--env-read" => match args.next().map(|v| EnvRead::parse(v)) {
+                Some(Some(v)) => env_read = Some(v),
+                _ => return cli_error("tier", "--env-read: expected deny|ask|tier"),
+            },
+            a if a.starts_with('-') || name.is_some() => return cli_error(
+                "tier",
+                "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|ask|tier] \
+                     | tier --clear [--project]",
+            ),
+            a => name = Some(a),
         }
     }
+    let tier = match name.map(Tier::parse) {
+        Some(None) => return cli_error("tier", &tierstate::unknown_tier().to_string()),
+        Some(Some(t)) => Some(t),
+        None => None,
+    };
+    if clear && (tier.is_some() || env_read.is_some()) {
+        return cli_error("tier", "--clear takes no tier or --env-read");
+    }
+    if tier.is_none() && env_read.is_none() && !clear {
+        return print_tier(&cwd, &dir, "tier");
+    }
+    let root = tier::project_root(&cwd);
+    let change = tierstate::Change {
+        project: project.then(|| tierstate::root_key(&root)),
+        tier,
+        env_read,
+        clear,
+    };
+    let summary = tierstate::summary(&change);
+    if let Some(note) = env_read.and_then(safe_ai_skill::gates::envread::inactive_note) {
+        let _ = writeln!(std::io::stderr(), "safe-ai-skill tier: {note}");
+    }
+    match tierstate::plan(&dir, &change) {
+        Plan::NeedsConfirm => park_pending(
+            "tier",
+            &dir,
+            PendingKind::Tier,
+            &summary,
+            tierstate::to_payload(&change),
+        ),
+        Plan::NoChange => {
+            print_json(&serde_json::json!({
+                "command": "tier",
+                "status": "unchanged",
+                "summary": summary,
+            }));
+            ExitCode::SUCCESS
+        }
+        Plan::Immediate => match tierstate::apply(&dir, &change, now_secs()) {
+            Ok(()) => {
+                audit_event(&dir.path, "tier_set", "tier", &summary);
+                let (effective, resolution) = load_runtime(&cwd, &dir);
+                print_json(&serde_json::json!({
+                    "command": "tier",
+                    "status": "set",
+                    "summary": summary,
+                    "tier": resolution.tier.label(),
+                    "line": notice::tier_line(&resolution, &effective.runtime),
+                    "data_dir_trusted": dir.trusted,
+                }));
+                ExitCode::SUCCESS
+            }
+            Err(e) => cli_error("tier", &e.to_string()),
+        },
+    }
+}
+
+/// Print the effective tier for `cwd`: where it comes from, the user's choice, `env_read`,
+/// the sandbox state, and every ignored hint.
+fn print_tier(cwd: &Path, dir: &DataDir, command: &str) -> ExitCode {
+    let (effective, resolution) = load_runtime(cwd, dir);
+    print_json(&serde_json::json!({
+        "command": command,
+        "tier": resolution.tier.label(),
+        "source": resolution.source.label(),
+        "user": resolution.user.label(),
+        "user_source": resolution.user_source.label(),
+        "env_read": resolution.env_read.label(),
+        "sandbox": effective.runtime.sandbox.label(),
+        "headless": effective.runtime.headless,
+        "line": notice::tier_line(&resolution, &effective.runtime),
+        "notes": resolution.notes,
+        "policy_notes": effective.ignored_overrides,
+        "tier_state": tier_state_label(dir),
+        "data_dir_trusted": dir.trusted,
+    }));
     ExitCode::SUCCESS
 }
 
+/// `revoke` — clear every grant (tightening, so it takes effect at once).
 fn cmd_revoke() -> ExitCode {
-    let Some(plugin_data) = cli_data_dir("revoke") else {
+    let Some(dir) = cli_state_dir("revoke", &process_cwd()) else {
         return ExitCode::FAILURE;
     };
-    let cleared = grants::load(&plugin_data).grants.len();
-    let _ = grants::save(&plugin_data, &grants::Grants::default());
+    let cleared = match grants::load(&dir) {
+        Loaded::Valid(g) => g.grants.len(),
+        _ => 0,
+    };
+    if let Err(e) = grants::save(&dir, &grants::Grants::default()) {
+        return cli_error("revoke", &e.to_string());
+    }
     audit_event(
-        &plugin_data,
+        &dir.path,
         "grant_revoke",
         "revoke",
         &format!("cleared={cleared}"),
@@ -1281,16 +2316,40 @@ fn cmd_revoke() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The label of a state file's authentication result.
+fn state_label<T>(loaded: &Loaded<T>) -> &'static str {
+    match loaded {
+        Loaded::Valid(_) => "valid",
+        Loaded::Missing => "missing",
+        Loaded::Tampered => "failed authentication",
+    }
+}
+
+/// [`state_label`] for `tier.json`, or `deleted` when it was stored before.
+fn tier_state_label(dir: &DataDir) -> &'static str {
+    if tierstate::deleted(dir) {
+        "deleted"
+    } else {
+        state_label(&tierstate::load(dir))
+    }
+}
+
 fn cmd_status() -> ExitCode {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let Some(plugin_data) = cli_data_dir("status") else {
+    let cwd = process_cwd();
+    let Some(dir) = cli_state_dir("status", &cwd) else {
         return ExitCode::FAILURE;
     };
-    let effective = load_effective_policy(&cwd, &plugin_data);
+    let plugin_data = dir.path.clone();
+    let (effective, resolution) = load_runtime(&cwd, &dir);
 
-    // Live grants with derived remaining-budget / time-left.
+    // Grants with derived remaining-budget / time-left (authenticated file only).
     let now = now_secs();
-    let live = grants::load(&plugin_data);
+    let loaded = grants::load(&dir);
+    let grants_state = state_label(&loaded);
+    let live = match loaded {
+        Loaded::Valid(g) => g,
+        _ => grants::Grants::default(),
+    };
     let grants_view: Vec<serde_json::Value> = live
         .grants
         .iter()
@@ -1310,9 +2369,10 @@ fn cmd_status() -> ExitCode {
         .collect();
 
     // Today's spend against the effective caps.
-    let ledger = safe_ai_skill::spend::SpendLedger::load(&plugin_data);
+    let ledger = SpendLedger::load(&plugin_data);
     let spend_view = serde_json::json!({
-        "today_sol": ledger.total_sol,
+        "today_sol": if ledger.is_exhausted() { serde_json::Value::Null } else { serde_json::json!(ledger.total_sol) },
+        "exhausted": ledger.is_exhausted(),
         "per_tx_sol_max": effective.spend.per_tx_sol_max,
         "hard_tx_sol_max": effective.spend.hard_tx_sol_max,
         "daily_sol_max": effective.spend.daily_sol_max,
@@ -1321,9 +2381,18 @@ fn cmd_status() -> ExitCode {
     print_json(&serde_json::json!({
         "command": "status",
         "plugin_data": plugin_data.display().to_string(),
-        "active_profile": effective.active_profile,
+        "tier": resolution.tier.label(),
+        "tier_source": resolution.source.label(),
+        "tier_line": notice::tier_line(&resolution, &effective.runtime),
+        "tier_notes": resolution.notes,
+        "env_read": resolution.env_read.label(),
+        "sandbox": effective.runtime.sandbox.label(),
+        "data_dir_trusted": dir.trusted,
+        "grants_state": grants_state,
+        "tier_state": tier_state_label(&dir),
         "grants": grants_view,
         "spend": spend_view,
+        "pending": confirm::pending_list(&dir, now),
         "recent_audit": recent_audit_lines(&plugin_data, 5),
     }));
     ExitCode::SUCCESS
@@ -1360,4 +2429,138 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 /// Print a JSON value as a single line to stdout.
 fn print_json(value: &serde_json::Value) {
     println!("{}", serde_json::to_string(value).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn within_returns_a_fast_result() {
+        assert_eq!(within(Duration::from_secs(5), || 7), Ok(7));
+    }
+
+    #[test]
+    fn within_times_out_on_a_slow_path() {
+        let started = Instant::now();
+        let r = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(5));
+            7
+        });
+        assert_eq!(r, Err(mpsc::RecvTimeoutError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn worker_has_a_large_stack() {
+        // Deep recursion that overflows a 2 MiB default stack but fits in 8 MiB.
+        fn depth(n: u32) -> u32 {
+            let pad = [n as u8; 4096];
+            if n == 0 {
+                u32::from(pad[0])
+            } else {
+                depth(n - 1).wrapping_add(u32::from(std::hint::black_box(&pad)[1]))
+            }
+        }
+        assert!(within(Duration::from_secs(10), || depth(1000)).is_ok());
+    }
+
+    #[test]
+    fn within_reports_a_panic() {
+        let r: Result<u8, _> = within(Duration::from_secs(5), || panic!("boom"));
+        assert_eq!(r, Err(mpsc::RecvTimeoutError::Disconnected));
+    }
+
+    #[test]
+    fn deadline_env_only_shortens() {
+        assert_eq!(deadline_from(None), GATE_DEADLINE);
+        assert_eq!(deadline_from(Some("250")), Duration::from_millis(250));
+        assert_eq!(deadline_from(Some("999999999")), GATE_DEADLINE);
+        assert_eq!(deadline_from(Some("soon")), GATE_DEADLINE);
+    }
+
+    fn trusted_dir_with_transfer_grant(tag: &str) -> DataDir {
+        let path = std::env::temp_dir().join(format!("main_join_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let dir = DataDir {
+            path,
+            trusted: true,
+        };
+        let grant = grants::Grant {
+            id: "g1".into(),
+            scope: Scope::Transfer,
+            programs: Vec::new(),
+            to: Vec::new(),
+            max_tx_sol: 10.0,
+            budget_sol: 10.0,
+            spent_sol: 0.0,
+            expires_at: u64::MAX,
+            danger: false,
+        };
+        let all = grants::Grants {
+            grants: vec![grant],
+        };
+        grants::save(&dir, &all).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_tier_gate_ask_is_never_relaxed_by_a_grant() {
+        let dir = trusted_dir_with_transfer_grant("tie");
+        let policy = Policy::from_sources(policy::DEFAULT_POLICY_YAML, None);
+        let mut grantable = GateMeta::new(Scope::Transfer, false);
+        grantable.amount_sol = Some(0.5);
+        let gate_ask = || Decision::Ask {
+            reason: "transfer over cap".into(),
+        };
+        // Without a tier verdict the grant relaxes the gate's own ask.
+        let (d, m) = join_tier(None, gate_ask(), grantable.clone());
+        assert_eq!(relax::apply(d, &m, &policy, &dir), Decision::Allow);
+        // A tier-gate ask on a tie keeps the ask (and denies headless).
+        let stub = Some(Verdict::Ask("exfil host".into()));
+        for headless in [false, true] {
+            let (d, m) = join_tier(stub.clone(), gate_ask(), grantable.clone());
+            assert!(m.hard_guard);
+            let out = headless::apply(relax::apply(d, &m, &policy, &dir), headless);
+            let want = if headless { "deny" } else { "ask" };
+            assert_eq!(out.label(), want, "headless={headless}");
+            assert!(out.reason().starts_with("exfil host"), "{out:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_tier_gate_allow_is_ignored() {
+        let dir = trusted_dir_with_transfer_grant("allow");
+        let allow = || {
+            let mut meta = GateMeta::new(Scope::Transfer, false);
+            meta.amount_sol = Some(0.1);
+            relax::apply_verdict(Verdict::Ask("x".into()), &meta, &Policy::default(), &dir)
+        };
+        assert!(matches!(allow(), Verdict::Allow(_)));
+        assert_eq!(strictest([Some(Verdict::NoOpinion), None]), None);
+        assert_eq!(strictest([Some(allow())]), None);
+        let (d, _) = join_tier(Some(allow()), Decision::Defer, GateMeta::unknown());
+        assert_eq!(d, Decision::Defer);
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn deadline_keeps_a_deny_already_decided() {
+        // The fallback is an ask, which headless (CI sets `CI`) turns into a deny.
+        let fallback = if headless::detect() { "deny" } else { "ask" };
+        assert_eq!(deadline_decision("r").label(), fallback);
+        record_decision(&Decision::Allow);
+        assert_eq!(deadline_decision("r").label(), fallback);
+        record_decision(&Decision::Deny {
+            reason: "mainnet --final".into(),
+        });
+        assert_eq!(
+            deadline_decision("r"),
+            Decision::Deny {
+                reason: "mainnet --final".into()
+            }
+        );
+    }
 }

@@ -4,7 +4,7 @@
 //! carries a telemetry preamble (outbound POST) plus a fixture `.mcp.json` pinned to `@latest` —
 //! and drives `safe-ai-skill install --from <fixture> --home <tmphome>` fully offline (no network, real
 //! home untouched). Asserts the hub-agnostic local install contract:
-//!   - the telemetry curl is flagged HIGH and reported,
+//!   - the telemetry curl is flagged (a documentation WARN, as the sweep grades it),
 //!   - the INSTALLED `SKILL.md` has the telemetry preamble neutralized,
 //!   - `@latest` MCP entries are flagged (via the `verify session` sweep),
 //!   - the sandbox `settings.json` permissions were NOT widened,
@@ -86,19 +86,21 @@ fn run_install() -> (serde_json::Value, TempDir, TempDir) {
 }
 
 #[test]
-fn telemetry_flagged_high() {
+fn telemetry_flagged_as_a_doc_warning() {
     let (v, _home, _data) = run_install();
     let flagged = v["flagged"].as_array().expect("flagged array");
-    let has_high_telemetry = flagged.iter().any(|f| {
-        f["severity"] == "high"
-            && f["kind"]
-                .as_str()
-                .map(|k| k.contains("telemetry"))
-                .unwrap_or(false)
+    // A fenced block in SKILL.md is documentation: the rule engine caps it at WARN, like the
+    // SessionStart sweep.
+    let telemetry = flagged.iter().any(|f| {
+        f["skill"] == "deploy-to-mainnet"
+            && f["rule"] == "telemetry_post"
+            && f["sev"] == "warn"
+            && f["ctx"] == "doc"
+            && f["path"] == "SKILL.md"
     });
     assert!(
-        has_high_telemetry,
-        "install did not flag the telemetry curl as HIGH: {flagged:?}"
+        telemetry,
+        "install did not flag the telemetry curl: {flagged:?}"
     );
 }
 

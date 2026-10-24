@@ -1,0 +1,67 @@
+# onchain-verbs.list — on-chain verbs by recoverability (contract §1.2, spec §3).
+#
+# Columns: class cluster argv...
+#   class:   irreversible (Class U: destroys the capability even for its owner) |
+#            recoverable (Class C: moves value or capability to a counterparty)
+#   cluster: any (decide whatever the cluster) | net (the decision depends on the cluster)
+#   argv:    tokens after wrapper normalisation. Literal tokens and * (exactly one token)
+#            match in order from the program name; [--flag] = that flag present anywhere
+#            after the verb. A row matches a command that starts with its tokens.
+# irreversible net: deny on mainnet or any cluster not positively identified as
+# localnet/devnet (testnet and Unknown included), ask on identified localnet/devnet; never
+# relaxed by grant, tier, repo or env. A consumer without a cluster resolver denies.
+# irreversible any: default-wallet destruction (solana-keygen new|recover with --force and
+# no -o, or -o naming the default wallet / CLI keypair_path): deny on every cluster.
+# recoverable net: plugin semantics (caps, grants, mainnet/Unknown ask, High deny).
+# solana program close is irreversible in every form (a program or a buffer, with or without
+# --bypass-warning, --buffers): the argv cannot tell a program from a buffer, so no grant
+# lifts it. Records are sorted (LC_ALL=C) and unique.
+#
+# Union of the kit's DENY_IRREVERSIBLE_ONCHAIN capability-destroying shapes (firewall.sh at
+# kit commit 42755ab, last changed in 0ffd72b, rule set 7) and the safe-ai-skill set. The
+# kit's counterparty entries (solana transfer|close|authorize|withdraw-from-nonce-account)
+# are recoverable, not Class U.
+
+irreversible any solana-keygen new [--force]
+irreversible any solana-keygen new [-f]
+irreversible any solana-keygen recover [--force]
+irreversible any solana-keygen recover [-f]
+irreversible net anchor deploy [--final]
+irreversible net anchor idl close
+irreversible net anchor idl erase-authority
+irreversible net anchor program close
+irreversible net anchor program deploy [--final]
+irreversible net anchor program set-upgrade-authority [--final]
+irreversible net anchor program upgrade [--final]
+irreversible net anchor program write-buffer [--final]
+irreversible net solana close-vote-account
+irreversible net solana program close
+irreversible net solana program deploy [--final]
+irreversible net solana program set-upgrade-authority [--final]
+irreversible net solana program upgrade [--final]
+irreversible net solana program write-buffer [--final]
+irreversible net solana program-v4 * [--final]
+irreversible net solana program-v4 finalize
+irreversible net spl-token authorize [--disable]
+irreversible net spl-token burn
+irreversible net spl-token close
+irreversible net spl-token close-mint
+recoverable net anchor deploy
+recoverable net anchor idl set-authority
+recoverable net anchor program deploy
+recoverable net anchor program upgrade
+recoverable net anchor program write-buffer
+recoverable net anchor upgrade
+recoverable net solana program deploy
+recoverable net solana program extend
+recoverable net solana program set-upgrade-authority
+recoverable net solana program upgrade
+recoverable net solana program write-buffer
+recoverable net solana program-v4 deploy
+recoverable net solana transfer
+recoverable net solana withdraw-from-nonce-account
+recoverable net solana withdraw-from-vote-account
+recoverable net solana withdraw-stake
+recoverable net spl-token authorize
+recoverable net spl-token gc
+recoverable net spl-token transfer

@@ -29,7 +29,7 @@ case "$(uname -s)/$(uname -m)" in
 esac
 
 fail=0
-for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64 windows-x64.exe; do
   f="${bindir}/safe-ai-skill-${p}"
   if [ ! -f "${f}" ]; then
     echo "check-binary-versions: ${f} is missing" >&2

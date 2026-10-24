@@ -14,13 +14,13 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 #   SAFE_AI_SKILL_BIN_DIR=/usr/local/bin sh install.sh
-#   SAFE_AI_SKILL_VERSION=1.0.1 sh install.sh
+#   SAFE_AI_SKILL_VERSION=1.1.0 sh install.sh
 
 set -eu
 
 REPO="solanabr/safe-ai-skill"
 # Default version — scripts/check-versions.sh keeps it equal to every manifest.
-VERSION="${SAFE_AI_SKILL_VERSION:-1.0.1}"
+VERSION="${SAFE_AI_SKILL_VERSION:-1.1.0}"
 TAG="v${VERSION}"
 RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 BIN_DIR="${SAFE_AI_SKILL_BIN_DIR:-${HOME}/.local/bin}"
@@ -51,6 +51,13 @@ detect_platform() {
       case "${arch}" in
         x86_64) echo "linux-x64" ;;
         aarch64 | arm64) echo "linux-arm64" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    # Git Bash / MSYS2 / Cygwin. Windows on ARM runs the x64 build under emulation.
+    MINGW* | MSYS* | CYGWIN*)
+      case "${arch}" in
+        x86_64 | amd64 | aarch64 | arm64) echo "windows-x64" ;;
         *) return 1 ;;
       esac
       ;;
@@ -90,7 +97,9 @@ sha256_of() {
 
 plat="$(detect_platform)" || fatal "unsupported platform $(uname -s)/$(uname -m). Install via: cargo install safe-ai-skill"
 
-binary_name="safe-ai-skill-${plat}"
+ext=""
+case "${plat}" in windows-*) ext=".exe" ;; esac
+binary_name="safe-ai-skill-${plat}${ext}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
 
@@ -112,7 +121,7 @@ if [ "${actual}" != "${expected}" ]; then
 fi
 
 mkdir -p "${BIN_DIR}"
-install_path="${BIN_DIR}/safe-ai-skill"
+install_path="${BIN_DIR}/safe-ai-skill${ext}"
 cp "${tmp_dir}/${binary_name}" "${install_path}"
 chmod 0755 "${install_path}"
 
