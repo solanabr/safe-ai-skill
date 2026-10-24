@@ -81,6 +81,12 @@ pub fn decide_tool(tool: &str, input: Option<&Value>, cwd: &Path, policy: &Polic
 
 /// Judge a read of `path` (see the module docs for precedence).
 pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
+    decide_path_with(path, cwd, policy, true)
+}
+
+/// [`decide_path`]; without `unknown`, content on an unopened share is not asked about (a Grep
+/// root there gets the exclusions instead).
+fn decide_path_with(path: &str, cwd: &Path, policy: &Policy, unknown: bool) -> Decision {
     if path.trim().is_empty() {
         return Decision::Defer;
     }
@@ -133,7 +139,8 @@ pub fn decide_path(path: &str, cwd: &Path, policy: &Policy) -> Decision {
     }
     // A file on a network share that is not looked up: its content is unknown, and it could be
     // a keypair under any name.
-    if sniffed == Sniffed::Unreadable
+    if unknown
+        && sniffed == Sniffed::Unreadable
         && (crate::localfs::is_foreign(&raw) || crate::localfs::is_foreign(file))
     {
         return unknown_content(policy);
@@ -480,7 +487,7 @@ fn decide_grep(input: Option<&Value>, cwd: &Path, policy: &Policy) -> ReadVerdic
     // It may be a file too: its name rules still deny (its unknown content is covered by the
     // exclusions when it is a directory, and asked about by a Read).
     if foreign {
-        if let deny @ Decision::Deny { .. } = decide_path(path, cwd, policy) {
+        if let deny @ Decision::Deny { .. } = decide_path_with(path, cwd, policy, false) {
             return ReadVerdict::Decide(deny);
         }
     }
