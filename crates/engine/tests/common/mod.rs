@@ -73,6 +73,21 @@ impl TempDir {
         TempDir { path }
     }
 
+    /// [`TempDir::new`], but outside every home directory: on Windows the temp dir lies in the
+    /// user's profile (`C:\Users\<u>\AppData\Local\Temp`), where the credential gates
+    /// rightly treat a directory as part of a home, so this one is under Cargo's
+    /// `CARGO_TARGET_TMPDIR` instead.
+    pub fn outside_home(tag: &str) -> Self {
+        let base = if cfg!(windows) {
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        } else {
+            std::env::temp_dir()
+        };
+        let path = base.join(format!("safe-ai-skill-it-{tag}-{}", unique()));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        TempDir { path }
+    }
+
     /// The directory path.
     pub fn path(&self) -> &Path {
         &self.path

@@ -107,8 +107,12 @@ fn run_case(case: &Value) -> Outcome {
         Err(e) => panic!("write stdin: {e}"),
     }
     let out = child.wait_with_output().unwrap();
+    let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if cfg!(windows) && args.len() >= 2 && args[..2] == ["verify", "session"] {
+        stdout = common::without_windows_notice(&stdout);
+    }
     Outcome {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stdout,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         code: out.status.code(),
     }

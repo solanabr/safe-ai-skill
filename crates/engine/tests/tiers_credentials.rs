@@ -25,9 +25,13 @@ struct World {
 
 impl World {
     fn new(tag: &str) -> World {
+        World::with_project(tag, TempDir::new(&format!("{tag}-proj")))
+    }
+
+    fn with_project(tag: &str, proj: TempDir) -> World {
         let w = World {
             home: TempDir::new(&format!("{tag}-home")),
-            proj: TempDir::new(&format!("{tag}-proj")),
+            proj,
             data: TempDir::new(&format!("{tag}-data")),
         };
         std::fs::create_dir_all(w.proj.join(".git")).unwrap();
@@ -426,7 +430,8 @@ fn grep_inside_a_credential_store_denies() {
 
 #[test]
 fn grep_in_a_project_keeps_the_short_exclusion_list() {
-    let w = World::new("cp-grep-proj");
+    // A project inside a home (the Windows temp dir is) gets the full list.
+    let w = World::with_project("cp-grep-proj", TempDir::outside_home("cp-grep-proj-proj"));
     std::fs::create_dir_all(w.proj.join("src")).unwrap();
     for tier in tiers() {
         let run = grep(&w, tier, json!({ "pattern": "fn", "path": "src" }));
