@@ -6,6 +6,12 @@
 # verifies its SHA-256 against the release's published SHA256SUMS, and installs
 # it to $SAFE_AI_SKILL_BIN_DIR (default: ~/.local/bin).
 #
+# From 1.2.0 a release also ships the plugin's POSIX shim (safe-ai-skill-shim). On
+# macOS and Linux it is installed as `safe-ai-skill`, with the binary beside it as
+# `safe-ai-skill-<platform>`: the shim checks the binary against the sha256 stamped in
+# it and is the entry point Codex hooks need (it turns an engine failure into a block).
+# A release without it, and Windows, get the binary alone as `safe-ai-skill`.
+#
 # This mirrors the npm postinstall path (npm/scripts/postinstall.js). It is the
 # checksum-verified alternative to `curl <url> | bash`: it FAILS LOUDLY and
 # installs nothing on a checksum mismatch or download error. A broken silent
@@ -122,10 +128,36 @@ fi
 
 mkdir -p "${BIN_DIR}"
 install_path="${BIN_DIR}/safe-ai-skill${ext}"
-cp "${tmp_dir}/${binary_name}" "${install_path}"
-chmod 0755 "${install_path}"
 
-err "installed safe-ai-skill ${VERSION} → ${install_path} (checksum verified)."
+# place <src> <dest>: copy to a temp file beside <dest>, make it executable, then rename it
+# over <dest>. A running hook never sees a half-written file, and a signed macOS binary is
+# never rewritten in place.
+place() {
+  tmp_file="$(dirname "$2")/.$(basename "$2").install.$$"
+  cp "$1" "${tmp_file}" || fatal "could not write ${tmp_file}."
+  chmod 0755 "${tmp_file}" || fatal "could not chmod ${tmp_file}."
+  mv -f "${tmp_file}" "$2" || fatal "could not install $2."
+}
+
+shim_expected=""
+case "${plat}" in
+  windows-*) ;;
+  *) shim_expected="$(grep " safe-ai-skill-shim\$" "${tmp_dir}/SHA256SUMS" | awk '{print $1}' | head -n1)" ;;
+esac
+if [ -n "${shim_expected}" ]; then
+  download "${RELEASE_BASE}/safe-ai-skill-shim" "${tmp_dir}/safe-ai-skill-shim" \
+    || fatal "could not download ${RELEASE_BASE}/safe-ai-skill-shim."
+  shim_actual="$(sha256_of "${tmp_dir}/safe-ai-skill-shim")"
+  [ "${shim_actual}" = "${shim_expected}" ] \
+    || fatal "checksum mismatch for safe-ai-skill-shim. Do NOT use it; the artifact may be tampered."
+  # The binary first, so the shim never points at a missing or older one.
+  place "${tmp_dir}/${binary_name}" "${BIN_DIR}/${binary_name}"
+  place "${tmp_dir}/safe-ai-skill-shim" "${install_path}"
+  err "installed safe-ai-skill ${VERSION} → ${install_path} (shim) + ${BIN_DIR}/${binary_name} (checksums verified)."
+else
+  place "${tmp_dir}/${binary_name}" "${install_path}"
+  err "installed safe-ai-skill ${VERSION} → ${install_path} (checksum verified)."
+fi
 
 case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;

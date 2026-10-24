@@ -879,34 +879,34 @@ fn strictest_verdict_of(
     ])
 }
 
-/// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
-/// payload and answer in that client's output contract ([`adapt`]). An unknown client or a
-/// gate the client does not offer is a usage error (exit 3, nothing on stdout).
+/// `adapt <client> <entry> [flags]` (experimental): run one hook on another client's payload
+/// and answer in that client's output contract ([`adapt`]). An unknown client or an entry the
+/// client does not offer is a usage error (exit 3, nothing on stdout).
 fn cmd_adapt(rest: &[String]) -> ExitCode {
+    use adapt::codex::Route;
     let client = rest.first().and_then(|c| adapt::client_named(c));
-    let gate = rest.get(1).map(String::as_str).unwrap_or("");
-    let handler = SUBCOMMANDS
-        .iter()
-        .find(|(name, _)| *name == gate)
-        .map(|(_, handler)| *handler);
-    let (Some(client), Some(handler), 2) = (client, handler, rest.len()) else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: usage: safe-ai-skill adapt codex <{}>",
-            adapt::CODEX_GATES.join("|")
-        );
+    let entry = rest.get(1).map(String::as_str).unwrap_or("");
+    let flags = rest.get(2..).unwrap_or_default();
+    let route = match client {
+        Some(adapt::Client::Codex) => adapt::codex::route(entry, flags),
+        _ => None,
+    };
+    let (Some(client), Some(route)) = (client, route) else {
+        let _ = writeln!(std::io::stderr(), "{}", adapt::codex::usage());
         return ExitCode::from(EXIT_USAGE);
     };
-    if !adapt::CODEX_GATES.contains(&gate) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: `{gate}` is not available through `adapt codex`"
-        );
-        return ExitCode::from(EXIT_USAGE);
-    }
     adapt::set(client);
-    install_panic_ask();
-    run_with_deadline(gate_deadline(), handler, Vec::new())
+    match route {
+        Route::Gate(gate) => {
+            let Some((_, handler)) = SUBCOMMANDS.iter().find(|(name, _)| *name == gate) else {
+                return ExitCode::from(EXIT_USAGE);
+            };
+            install_panic_ask();
+            run_with_deadline(gate_deadline(), *handler, Vec::new())
+        }
+        Route::SessionStart => cmd_verify_session(),
+        Route::RedactBlock => cmd_redact(),
+    }
 }
 
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
@@ -943,8 +943,12 @@ fn cmd_gate_tamper() -> ExitCode {
 }
 
 fn cmd_redact() -> ExitCode {
-    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5).
+    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5), except under
+    // the opt-in Codex route, where a result that cannot be scanned is withheld.
     let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
+        if adapt::is_codex() {
+            let _ = io::emit_value(Some(adapt::codex::withheld()));
+        }
         return ExitCode::SUCCESS;
     };
     let Some(response) = input.tool_response.as_ref() else {
@@ -956,9 +960,14 @@ fn cmd_redact() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let values = safe_ai_skill::env::values::load(&cwd);
-    let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
-        &input, response, &values, &cwd, &effective,
-    ));
+    let updated = redact::scrub_tool_response(&input, response, &values, &cwd, &effective);
+    // Codex PostToolUse cannot rewrite a result: the opt-in route blocks it instead, with the
+    // redacted text as the reason the model sees.
+    let _ = if adapt::is_codex() {
+        io::emit_value(adapt::codex::redact_block(updated))
+    } else {
+        io::emit_posttooluse_redact(updated)
+    };
     ExitCode::SUCCESS
 }
 
@@ -1282,7 +1291,14 @@ fn cmd_verify_session() -> ExitCode {
     let _ = SpendLedger::load(&plugin_data);
 
     let (effective, resolution) = load_runtime(&cwd, &dir);
-    let mut res = verify::run_session(&dir, &cwd, &effective);
+    // The sweep reads Claude Code's skill dirs and `.mcp.json`; Codex loads neither, so under
+    // Codex it is not run (pinning or moving Claude Code's packs from a Codex session would
+    // only change another client's state). The report says what is and is not checked.
+    let mut res = if adapt::is_codex() {
+        verify::SessionResult::default()
+    } else {
+        verify::run_session(&dir, &cwd, &effective)
+    };
 
     // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
     // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
@@ -1293,13 +1309,34 @@ fn cmd_verify_session() -> ExitCode {
         root: &root,
         spend: spend_state,
         migrated: &migrated,
-        sandbox: sandbox::declared(&root),
+        // The Claude Code sandbox line is about Claude Code; Codex runs under its own sandbox.
+        sandbox: if adapt::is_codex() {
+            sandbox::Declared::On
+        } else {
+            sandbox::declared(&root)
+        },
         now,
     });
-    let notices: Vec<String> = [effective.ignored_notice(), loosenings]
+    // The platform notices are about Claude Code's install and tools.
+    let platform_notices = if adapt::is_codex() {
+        Vec::new()
+    } else {
+        platform::session_notices()
+    };
+    let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
         .into_iter()
         .flatten()
-        .chain(platform::session_notices())
+        .chain(platform_notices)
+        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+            format!(
+                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+                 {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
+                 use (key included) or delete it.",
+                d.display(),
+                dir.path.display()
+            )
+        }))
         .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
@@ -1333,8 +1370,14 @@ fn cmd_verify_session() -> ExitCode {
         }
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
-    // user's systemMessage only.
-    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
+    // user's systemMessage only. Never under Codex: a code is confirmed through Claude Code's
+    // UserPromptSubmit hook, and announcing it here would only spend it.
+    let announced = if adapt::is_codex() {
+        None
+    } else {
+        relax::announce(&dir, now, hook_session(&input).as_deref())
+    };
+    if let Some(codes) = announced {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
         }
@@ -2403,6 +2446,10 @@ fn cmd_status() -> ExitCode {
         "env_read": resolution.env_read.label(),
         "sandbox": effective.runtime.sandbox.label(),
         "data_dir_trusted": dir.trusted,
+        "other_state_dirs": datadir::other_state_dirs(&dir)
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>(),
         "grants_state": grants_state,
         "tier_state": tier_state_label(&dir),
         "grants": grants_view,

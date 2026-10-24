@@ -40,6 +40,7 @@ ALLOW='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":
 DENY='{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"mainnet deploy"}}'
 SESSION='{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
 SESSION_MSG='{"systemMessage":"engine notice","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"engine context"}}'
+BLOCK='{"decision":"block","reason":"redacted text"}'
 payload=$work/payload
 printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"}}' >"$payload"
 payload_text=$(cat "$payload")
@@ -121,7 +122,9 @@ engine() {
     garbage) printf '\001\002\003\004\necho %s\n' "'$ALLOW'" >"$1" && chmod +x "$1" ;;
     empty) : >"$1" && chmod +x "$1" ;;
     noexec) mk "$1" 'echo ran' && chmod -x "$1" ;;
-    deny) mk "$1" "printf '%s' '$DENY'" ;;
+    deny) mk "$1" "printf '%s\\n' '$DENY'" ;;
+    deny2) mk "$1" "printf '%s\\n%s\\n' '$DENY' '$ALLOW'" ;;
+    block) mk "$1" "printf '%s\\n' '$BLOCK'" ;;
     # An ELF header, elf:<EI_CLASS>:<e_machine lo>:<e_machine hi> in octal, whose body, if a
     # shell ever ran the file as a script, would leave a mark.
     elf:*)
@@ -327,7 +330,105 @@ env_case() {
   for p in $decoys; do engine "$bin_dir/safe-ai-skill-$p" ok; done
 }
 
+expect_codex_deny() {
+  expect_json 'list(d) == ["hookSpecificOutput"]
+    and d["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    and d["hookSpecificOutput"]["permissionDecision"] == "deny"
+    and d["hookSpecificOutput"]["permissionDecisionReason"].strip() != ""'
+}
+expect_codex_block() {
+  expect_json 'sorted(d) == ["decision", "reason"] and d["decision"] == "block"
+    and d["reason"].strip() != ""'
+}
+
+# Codex hooks (`adapt codex …`): Codex runs a call whose hook fails, so every failure is a
+# deny (PreToolUse) or a block (the opt-in redaction), printed with exit 0.
+codex_matrix() {
+  for b in deny silent; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" "$b"
+    t "codex: an engine $b answer passes through"
+    run adapt codex gate-bash
+    expect_rc 0
+    case $b in
+      deny) expect_out "$DENY" ;;
+      silent) expect_no_out ;;
+    esac
+    expect_ran safe-ai-skill-linux-x64
+  done
+  for b in ok planted deny2 garbage exit:1 exit:2 exit:3 exit:134 kill; do
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" "$b"
+    t "codex: engine $b denies with exit 0"
+    run adapt codex gate-bash-secrets
+    expect_rc 0
+    expect_codex_deny
+    fresh
+    engine "$bin_dir/safe-ai-skill-linux-x64" "$b"
+    t "codex redact: engine $b blocks with exit 0"
+    run adapt codex redact --block-with-redaction
+    expect_rc 0
+    expect_codex_block
+  done
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" block
+  t "codex redact: an engine block passes through"
+  run adapt codex redact --block-with-redaction
+  expect_rc 0
+  expect_out "$BLOCK"
+  for sc in missing sunos nouname exit127 noexec; do
+    env_case "$sc"
+    t "codex: $sc denies with exit 0"
+    run adapt codex gate-mcp
+    expect_rc 0
+    expect_codex_deny
+    t "codex session-start: $sc reports INACTIVE with the Codex effect"
+    run adapt codex session-start
+    expect_rc 0
+    expect_notice INACTIVE
+    expect_notice 'Codex hooks check is blocked'
+  done
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" deny
+  stamp
+  engine "$bin_dir/safe-ai-skill-linux-x64" planted
+  no_stamp=1
+  t "codex: a tampered engine never runs and denies"
+  run adapt codex gate-tamper
+  expect_rc 0
+  expect_codex_deny
+  expect_not_ran safe-ai-skill-linux-x64
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" deny
+  e_disable=1
+  t "codex: SAFE_AI_SKILL_DISABLE=1 does not turn the Codex hooks off"
+  run adapt codex gate-bash
+  expect_rc 0
+  expect_out "$DENY"
+  expect_ran safe-ai-skill-linux-x64
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  t "codex: a mistyped adapt entry denies"
+  run adapt codx gate-bash
+  expect_rc 0
+  expect_codex_deny
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" exit:3
+  t "codex: a usage error says the hook entry is misconfigured"
+  run adapt codex gate-bash
+  expect_rc 0
+  expect_json '"misconfigured" in d["hookSpecificOutput"]["permissionDecisionReason"]'
+  env_case missing
+  e_strict=1
+  t "codex: strict still answers Codex with a deny"
+  run adapt codex gate-bash
+  expect_rc 0
+  expect_codex_deny
+}
+
 matrix() {
+  codex_matrix
+
   # Dispatch: each platform runs its own prebuilt, with args and stdin intact.
   for spec in Darwin/arm64/darwin-arm64 Darwin/x86_64/darwin-x64 Linux/x86_64/linux-x64 \
     Linux/aarch64/linux-arm64 Linux/arm64/linux-arm64 \

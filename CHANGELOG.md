@@ -15,11 +15,37 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **Other env files stay denied.** `*.env`, `.envrc`, `.dev.vars`, `.varlock-frozen-env`, the Solana CLI config, and any env file outside the project keep 1.1.0's rule: raw reads denied at every tier, writes denied at Medium and High. Key material and credential stores are unchanged (denied at every tier).
 - **`env_read` is `tier` (default) or `deny`.** `safe-ai-skill tier --env-read deny` denies project env reads at every tier (applies at once; going back to `tier` needs your confirmation); a repo's `secrets.env_read: deny` tightens it for its project. The 1.1.0 opt-in is gone: the `env-read-opt-in` cargo feature and its sandbox condition are removed, `--env-read ask` is refused, and a stored `env_read: ask` is rewritten as `tier` at the first 1.2.0 SessionStart with a one-time notice. A stored `deny` is kept. An install that existed before 1.2.0 and never chose `env_read` gets a one-time SessionStart line about the change. A policy that fails to load (fail-closed) uses `deny`.
 - **Redaction keeps the values of a permitted read.** The Read tool's response to a raw read the tier permits is not value-scrubbed (pattern redaction for keys, seeds and tokens still applies), so an Edit can't write `«redacted:KEY»` over a real value; Bash output is still value-scrubbed, and writing a redaction marker into an env file is denied at every tier.
+- **Codex hooks run through the shim; the `safe-ai-skill-codex` wrapper is gone (#26).** The `adapters/codex/hooks.json` template now runs `safe-ai-skill adapt codex <entry>`. Here `safe-ai-skill` is the plugin's POSIX shim, which checks the engine's sha256 and turns any engine failure, garbage answer or second line into Codex's deny JSON with exit 0, as the wrapper did. To migrate, replace `safe-ai-skill-codex <gate>` with `safe-ai-skill adapt codex <gate>` in your `hooks.json` and re-approve with `/hooks`. An old wrapper left next to the new shim keeps working until then.
+- **`install.sh` installs the shim in front of the engine** on macOS and Linux, for releases that ship it (from 1.2.0). The shim goes to `safe-ai-skill` and the engine to `safe-ai-skill-<platform>` beside it, both checked against `SHA256SUMS`. Windows, and older releases, still get the bare engine. The release publishes the stamped shim as `safe-ai-skill-shim`.
+- **The CLI and the Codex hooks work without the Claude Code plugin.** When no Claude Code plugin data dir exists, state lives in a standalone dir:
+  - `$SAFE_AI_SKILL_DATA`, else `safe-ai-skill-data` under `~/Library/Application Support` (macOS), `$XDG_DATA_HOME` or `~/.local/share` (other unix), or `%LOCALAPPDATA%` (Windows).
+  - Tiers, grants and the audit log work there, under the usual trust rules. The dir must be strictly inside your passwd home, reached through no symlink below it, and not inside a git repository or the project; otherwise its state can only tighten.
+  - The Claude Code plugin's dir still wins whenever it exists, so there is one set of state.
+  - Before, the CLI exited 1 asking for `CLAUDE_PLUGIN_DATA`, and Codex hooks ran with nothing relaxed or audited.
 
 ### Changes
 
 - `gates/envread.rs` decides by `(tier, env_read, project)`; `is_project_env` resolves the path inside the project root. `gates/envwrite.rs` splits project and other env files and takes Bash writes from `creddump`, which now tells reads from writes (`sed -i`, redirects, `tee`, `mv`, write calls in code) and denies an env read beside a network command. The shell parser records output redirect targets.
 - The shared corpus `plugin` column, `tests/tiers_env.rs`, `tests/tiers_matrix.rs`, the README tier table and its golden test, SECURITY.md and `docs/tiers.md` follow the new rows.
+- **Codex session start.** A `SessionStart` hook (`adapt codex session-start`) reports the tier and state in Codex's output shape. It says that Codex skills and MCP servers are not scanned. The Claude Code supply-chain sweep is not run there, because Codex loads neither its skill dirs nor its `.mcp.json`. It never announces a confirmation code, because codes are confirmed only in Claude Code; the request waits for a Claude Code session. Confirmations remain impossible under Codex.
+- **Opt-in redaction for Codex.** `adapt codex redact --block-with-redaction` on PostToolUse blocks a result that holds secrets and gives the model the redacted text as the reason. A result too large to scan is withheld. Codex PostToolUse can only block, so the model sees such a result as a failed call. It is off by default, and the cost is documented in `docs/adapters.md`.
+- **More interactive starts are denied under Codex**, because `write_stdin` would feed them unchecked (versioned names, `busybox`, runners such as `uv run`/`npx`, `env -S` and `find -exec` count too):
+  - shells fed only by the terminal (`cat | bash`, `bash /dev/stdin`, `bash -s`, `bash < /dev/tty`);
+  - read/eval loops;
+  - `xargs` into a shell;
+  - interpreters that execute their input (`perl -ne 'system $_'`, `awk '{system($0)}'`);
+  - `script`, `tmux`, `screen` and other multiplexers;
+  - `ssh host` without a command, `su`, `sudo -i|-s`;
+  - interactive `docker`/`kubectl` `exec`/`run`, `docker compose exec`, `nix-shell`, `socat … EXEC:`;
+  - command or process substitutions of a terminal reader (`bash -c "$(cat)"`, `bash <(cat)`).
+- **Codex self-protection widened.** Under Codex, writes to the login-shell startup files that `$SHELL -lc` reads (`~/.zshenv`, `~/.zprofile`, `~/.bash_profile`, `~/.profile`, fish `config.fish` and `conf.d`) are denied. So are recursive removes and moves of a directory above the data dir. Option arguments of `git clean -e` / `git stash -m` are no longer read as paths, and `--pathspec-from-file` counts as path-less. A bare `rm config.toml` is denied only when a Codex `config.toml` that defines hooks exists. `SAFE_AI_SKILL_DISABLE` does not apply to Codex hooks. `find -exec` with a plain reader (`grep`, `cat`, …, without options like `--pre`) is not treated as destructive.
+- **`safe-ai-skill doctor --codex`** runs each configured Codex hook as Codex would and fails on one that cannot start, times out or answers wrongly. Codex runs the call when a hook command cannot start, so the template's PreToolUse commands now end in a `|| printf` deny fallback. Run `doctor --codex` after every update.
+- **Forked state is reported.** `session-start` and `status` (`other_state_dirs`) name any other data dir that still holds state, for example after installing the Claude Code plugin over a standalone dir.
+- The audit log's directory is created with mode 0700, like the state files.
+
+### Documentation
+
+- `docs/adapters.md` now verifies the hook contract against Codex `rust-v0.164.0` and covers the shim install, the standalone data dir, confirmations under Codex, session start, opt-in redaction and the remaining gaps.
 
 ## [1.1.0] — Unreleased
 

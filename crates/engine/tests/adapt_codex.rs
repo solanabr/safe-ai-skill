@@ -217,6 +217,9 @@ fn usage_errors_exit_3_with_no_output() {
         &["adapt", "codex", "redact"],
         &["adapt", "codex", "gate-nope"],
         &["adapt", "codex", "gate-bash", "extra"],
+        &["adapt", "codex", "session-start", "extra"],
+        &["adapt", "codex", "redact", "--block"],
+        &["adapt", "codex", "redact", "--block-with-redaction", "x"],
     ] {
         let run = w.run(args, body.clone());
         assert_eq!(run.code, Some(3), "{args:?}");
@@ -224,32 +227,54 @@ fn usage_errors_exit_3_with_no_output() {
     }
 }
 
-/// The shipped template wires only gates `adapt codex` offers, through the wrapper.
+/// The shipped template runs every entry through the shim (`safe-ai-skill adapt codex …`):
+/// each offered gate on PreToolUse, `session-start` on SessionStart, and no PostToolUse
+/// redaction (it is opt-in).
 #[test]
-fn codex_hooks_template_names_offered_gates() {
+fn codex_hooks_template_names_offered_entries() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../adapters/codex/hooks.json"
     );
     let text = std::fs::read_to_string(path).expect("read adapters/codex/hooks.json");
     let v: Value = serde_json::from_str(&text).expect("template is JSON");
-    let groups = v["hooks"]["PreToolUse"]
-        .as_array()
-        .expect("PreToolUse groups");
-    let mut gates = Vec::new();
-    for group in groups {
-        for hook in group["hooks"].as_array().expect("hooks array") {
-            let command = hook["command"].as_str().expect("command");
-            let gate = command
-                .strip_prefix("safe-ai-skill-codex ")
-                .unwrap_or_else(|| panic!("unexpected command {command}"));
-            assert!(safe_ai_skill::adapt::CODEX_GATES.contains(&gate), "{gate}");
-            gates.push(gate.to_string());
+    let hooks = v["hooks"].as_object().expect("hooks object");
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (event, groups) in hooks {
+        for group in groups.as_array().expect("groups") {
+            for hook in group["hooks"].as_array().expect("hooks array") {
+                let command = hook["command"].as_str().expect("command");
+                let (head, fallback) = match command.split_once(" || ") {
+                    Some((h, f)) => (h, Some(f)),
+                    None => (command, None),
+                };
+                let entry = head
+                    .strip_prefix("safe-ai-skill adapt codex ")
+                    .unwrap_or_else(|| panic!("unexpected command {command}"));
+                if event == "PreToolUse" {
+                    let fallback = fallback.expect("a PreToolUse entry fails closed in the shell");
+                    assert!(
+                        fallback.contains(r#""permissionDecision":"deny""#),
+                        "{fallback}"
+                    );
+                }
+                let timeout = hook["timeout"].as_u64().expect("timeout");
+                assert!(timeout > 8, "{entry}: the engine bounds itself at 8 s");
+                seen.push((event.clone(), entry.to_string()));
+            }
+        }
+    }
+    for (event, entry) in &seen {
+        match event.as_str() {
+            "PreToolUse" => assert!(safe_ai_skill::adapt::CODEX_GATES.contains(&entry.as_str())),
+            "SessionStart" => assert_eq!(entry, "session-start"),
+            other => panic!("unexpected event {other}"),
         }
     }
     for gate in safe_ai_skill::adapt::CODEX_GATES {
-        assert!(gates.iter().any(|g| g == gate), "{gate} not wired");
+        assert!(seen.iter().any(|(_, g)| g == gate), "{gate} not wired");
     }
+    assert!(seen.iter().any(|(e, _)| e == "SessionStart"));
 }
 
 #[test]
@@ -470,4 +495,228 @@ fn protected_paths_in_interpreter_code_deny() {
     let command = format!("python3 -c \"import os;os.remove('{engine}')\"");
     let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
     assert_eq!(codex_label(&run), "deny");
+}
+
+/// Destructive `find` and path-less `git clean` / `git stash -u` whose root holds Codex hook
+/// config stay denied (the gate does not evaluate `find` tests or read git's index); a root
+/// that holds none, a plain reader and `rm config.toml` without hook config pass.
+#[test]
+fn cleanups_beside_a_codex_dir() {
+    let w = World::new("adapt-fp");
+    for dir in [w.home.join(".codex"), w.proj.join(".codex")] {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hooks.json"), "{}").unwrap();
+        std::fs::write(dir.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+    }
+    std::fs::create_dir_all(w.proj.join("src")).unwrap();
+    for command in [
+        "find src -delete",
+        "find src -name '*.tmp' -exec rm {} +",
+        "find . -name '*.rs' -exec grep -l unsafe {} +",
+        "rm config.toml",
+        "rm -f ./config.toml",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "", "{command}: {}", run.stdout);
+    }
+    for command in [
+        "find . -name '*.tmp' -delete",
+        "find . -name 'h\\ooks.json' -delete",
+        "find ~/.codex -path '/*' -delete",
+        "find ~ -path '/*/.codex/*' -delete",
+        "find $HOME/.codex -path '/*' -exec rm {} +",
+        "find . -name hooks.json -exec rg --pre rm x {} \\;",
+        "find ~/.codex -exec rg --pre=rm x {} +",
+        "find . -exec grep --pre rm x {} +",
+        "find . -name .codex -exec rm -rf {} +",
+        "find . -delete",
+        "rm hooks.json",
+        "cp evil config.toml",
+        "git clean -fd",
+        "git clean -n",
+        "git clean -fdx -e-n",
+        "git clean -fdx -e -n",
+        "git clean -fdx -e foo",
+        "git stash -u -m n",
+        "git stash push -u -m -n",
+        "git stash push -u",
+        "git checkout --pathspec-from-file=list",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    // A config.toml that defines hooks is hook config: removing it turns gates off.
+    std::fs::write(
+        w.proj.join(".codex/config.toml"),
+        "[[hooks.PreToolUse]]\nmatcher = \"^Bash$\"\n",
+    )
+    .unwrap();
+    let run = w.codex(
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": "rm config.toml" }),
+    );
+    assert_eq!(codex_label(&run), "deny");
+}
+
+/// Login-shell startup files: Codex runs hooks through `$SHELL -lc`, so a write there could
+/// switch them off.
+#[test]
+fn login_shell_startup_files_are_protected() {
+    let w = World::new("adapt-rc");
+    for command in [
+        "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.zshenv",
+        "echo 'PATH=/tmp/evil:$PATH' >> ~/.profile",
+        "rm ~/.bash_profile",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+    }
+    let run = w.codex(
+        "gate-tamper",
+        "apply_patch",
+        patch(&[&format!(
+            "*** Add File: {}/.zprofile",
+            w.home.path().display()
+        )]),
+    );
+    assert_eq!(codex_label(&run), "deny");
+    let run = w.codex(
+        "gate-bash-secrets",
+        "Bash",
+        json!({ "command": "source ~/.zprofile" }),
+    );
+    assert_eq!(codex_label(&run), "");
+}
+
+/// An oversized result under the opt-in redaction is withheld, not passed unscanned.
+#[test]
+fn oversized_results_are_withheld_under_redaction() {
+    let w = World::new("adapt-redact-big");
+    let big = "x".repeat(safe_ai_skill::redact::MAX_SCAN_BYTES + 1);
+    let body = json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+                      "cwd": w.proj.path(), "tool_input": {"command": "cat big"},
+                      "tool_response": big})
+    .to_string();
+    let run = w.run(
+        &["adapt", "codex", "redact", "--block-with-redaction"],
+        body,
+    );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.json()["decision"], "block", "{}", run.stdout);
+}
+
+#[test]
+fn more_interactive_start_forms_deny() {
+    let w = World::new("adapt-shells");
+    for command in [
+        "cat | bash",
+        "bash /dev/stdin",
+        "python3 /dev/stdin",
+        "bash < /dev/tty",
+        "script -q /dev/null",
+        "while read l; do eval \"$l\"; done",
+        "xargs -I{} sh -c {}",
+        "perl -ne 'system $_'",
+        "tmux",
+        "screen",
+        "ssh host",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "deny", "{command}");
+        assert!(reason(&run).contains("write_stdin"), "{}", run.stdout);
+    }
+    for command in [
+        "ssh host uptime",
+        "tmux ls",
+        "cat script.sh | bash",
+        "find . -name '*.md' | xargs wc -l",
+    ] {
+        let run = w.codex("gate-bash-secrets", "Bash", json!({ "command": command }));
+        assert_eq!(codex_label(&run), "", "{command}: {}", run.stdout);
+    }
+}
+
+/// Without the Claude Code plugin the standalone data dir holds the state, and Codex sessions
+/// may not write it.
+#[test]
+fn the_standalone_data_dir_is_used_and_protected() {
+    let home = TempDir::new("adapt-standalone-home");
+    let proj = TempDir::new("adapt-standalone-proj");
+    let data = common::standalone_data(home.path());
+    let no_tools = TempDir::new("adapt-path");
+    let run = |body: String| {
+        Invocation::new(&["adapt", "codex", "gate-tamper"])
+            .home(home.path())
+            .cwd(proj.path())
+            .env("PATH", no_tools.path().to_str().unwrap())
+            .stdin(body)
+            .run()
+    };
+    let payload = |header: String| {
+        json!({
+            "cwd": proj.path(), "hook_event_name": "PreToolUse", "tool_name": "apply_patch",
+            "tool_input": patch(&[&header]),
+        })
+        .to_string()
+    };
+    let deny = run(payload(format!(
+        "*** Add File: {}",
+        data.join("tier.json").display()
+    )));
+    assert_eq!(codex_label(&deny), "deny", "{}", deny.stdout);
+    assert!(
+        data.join("audit.jsonl").is_file(),
+        "the gate audits into the standalone dir"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&data).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "created private");
+    }
+    let ok = run(payload("*** Add File: src/lib.rs".to_string()));
+    assert_eq!(codex_label(&ok), "");
+}
+
+/// Session start under Codex reports in Codex's shape and never announces a confirmation code
+/// (codes are confirmed through Claude Code, so announcing one here would spend it).
+#[cfg(unix)]
+#[test]
+fn session_start_reports_without_announcing_codes() {
+    let w = World::new("adapt-session");
+    let made = Invocation::new(&["tier", "off"])
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.proj.path())
+        .run();
+    assert!(made.stdout.contains("request"), "{}", made.stdout);
+    let body = json!({
+        "session_id": "019a0000-0000-7000-8000-000000000000", "transcript_path": null,
+        "cwd": w.proj.path(), "hook_event_name": "SessionStart", "model": "gpt-5-codex",
+        "permission_mode": "default", "source": "startup",
+    })
+    .to_string();
+    let run = w.run(&["adapt", "codex", "session-start"], body.clone());
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(
+        !run.stdout.contains("safe-ai-skill confirm"),
+        "{}",
+        run.stdout
+    );
+    if !run.stdout.trim().is_empty() {
+        let v = run.json();
+        assert!(v
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|k| k == "systemMessage" || k == "hookSpecificOutput"));
+    }
+    // The request is still waiting for a Claude Code session to announce it.
+    let claude = w.run(&["verify", "session"], body);
+    assert!(
+        claude.stdout.contains("safe-ai-skill confirm"),
+        "{}",
+        claude.stdout
+    );
 }
