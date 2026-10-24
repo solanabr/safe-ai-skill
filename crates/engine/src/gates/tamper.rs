@@ -178,8 +178,15 @@ const MUTATING_SUBCOMMANDS: &[&str] = &["grant", "revoke", "confirm"];
 
 /// Hook-only subcommands: run through Bash they could replay a forged hook payload (a fake
 /// UserPromptSubmit to `prompt-guard`, a fake PostToolUse to `pending-notice`). Every `gate-*`
-/// subcommand is hook-only too.
-const HOOK_SUBCOMMANDS: &[&str] = &["pending-notice", "prompt-guard", "redact", "failure-notice"];
+/// subcommand is hook-only too, and so is `adapt` (another client's hooks; its
+/// `session-start` pins packs like `verify session`).
+const HOOK_SUBCOMMANDS: &[&str] = &[
+    "pending-notice",
+    "prompt-guard",
+    "redact",
+    "failure-notice",
+    "adapt",
+];
 
 /// Real subcommands: a cache-path word followed by one of these is the binary being run, not a
 /// path being written. Mutating ones are denied before this list is consulted.
@@ -206,6 +213,7 @@ const SUBCOMMANDS: &[&str] = &[
     "mode",
     "tier",
     "env",
+    "adapt",
     "--version",
 ];
 
@@ -1884,6 +1892,8 @@ mod tests {
             "safe-ai-skill gate-prompt-expansion",
             "safe-ai-skill verify session",
             "safe-ai-skill confirm 12345678",
+            "safe-ai-skill adapt codex session-start",
+            "echo '{}' | safe-ai-skill adapt codex redact --block-with-redaction",
         ] {
             assert_deny(cmd);
         }

@@ -159,7 +159,7 @@ const GIT_REWRITES: &[&str] = &[
 ];
 
 /// [`scan`] with the files to protect given (the Codex adapter's self-protection: the
-/// `safe-ai-skill` binary and wrapper, Codex hook config, Claude Code settings). On top of the
+/// `safe-ai-skill` shim and engines, Codex hook config, Claude Code settings). On top of the
 /// wallet gate's deletes, moves, overwrites, globs, ancestors and `cd` tracking it reads
 /// `chmod`/`chown`, `find -delete|-exec` and work-tree-rewriting `git` subcommands.
 pub fn clobber_of(command: &str, cwd: &Path, files: &[PathBuf]) -> Option<String> {
@@ -203,8 +203,7 @@ fn extended_clobber(
     };
     match program.as_str() {
         "find" => {
-            let acts = ["-delete", "-exec", "-execdir", "-ok", "-okdir"];
-            if !words.iter().any(|w| acts.contains(&w.text.as_str())) {
+            if !find_is_destructive(&words) {
                 return None;
             }
             let mut starts: Vec<Word> = words
@@ -212,6 +211,7 @@ fn extended_clobber(
                 .take_while(|w| !w.text.starts_with(['-', '(', '!']))
                 .map(|w| (*w).clone())
                 .collect();
+            let expr = &words[starts.len()..];
             if let (true, Some(first)) = (starts.is_empty(), cmd.words.first()) {
                 let mut dot = first.clone();
                 dot.text = ".".into();
@@ -219,9 +219,16 @@ fn extended_clobber(
                 dot.splits = false;
                 starts.push(dot);
             }
+            let tests = FindTests::parse(expr);
             starts
                 .iter()
-                .find_map(&hit)
+                .find_map(|start| {
+                    let t = hit(start)?;
+                    match &tests {
+                        Some(tests) if tests.spares(start, dirs, homes, wallets) => None,
+                        _ => Some(t),
+                    }
+                })
                 .map(|t| format!("`find` deletes or runs a command on {t}"))
         }
         "git" => {
@@ -251,13 +258,21 @@ fn extended_clobber(
                             "-u" | "--include-untracked" | "-a" | "--all"
                         )
                     }));
-            if untracked && paths.is_empty() {
-                // A path-less clean or untracked stash sweeps the whole tree: deny when a
-                // protected file exists under a directory it may run in.
+            let dry_run = sub == "clean"
+                && rest.iter().any(|w| {
+                    w.text == "--dry-run"
+                        || (w.text.starts_with('-')
+                            && !w.text.starts_with("--")
+                            && w.text.contains('n'))
+                });
+            if untracked && paths.is_empty() && !dry_run {
+                // A path-less clean or untracked stash sweeps the untracked files of the whole
+                // tree: deny when a protected file the git index does not list exists under a
+                // directory it may run in.
                 return dirs
                     .known
                     .iter()
-                    .find_map(|dir| wallets.existing_under(dir))
+                    .find_map(|dir| wallets.existing_untracked_under(dir))
                     .map(|t| format!("`git {sub}` may remove {t}"));
             }
             None
@@ -266,6 +281,215 @@ fn extended_clobber(
             .iter()
             .find_map(hit)
             .map(|t| format!("`{program}` changes {t}")),
+    }
+}
+
+/// Commands a `find -exec` may run that only read the file.
+const FIND_READERS: &[&str] = &[
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "cat",
+    "head",
+    "tail",
+    "ls",
+    "stat",
+    "file",
+    "wc",
+    "sha256sum",
+    "shasum",
+    "md5sum",
+    "md5",
+    "cksum",
+    "echo",
+    "printf",
+    "test",
+    "[",
+    "basename",
+    "dirname",
+    "readlink",
+    "realpath",
+    "du",
+    "diff",
+    "cmp",
+    "jq",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+];
+
+/// Whether a `find` deletes (`-delete`) or runs a command on what it finds that is not a
+/// plain reader (`-exec rm {} +`, but not `-exec grep -l x {} +`).
+fn find_is_destructive(words: &[&Word]) -> bool {
+    words
+        .iter()
+        .enumerate()
+        .any(|(i, w)| match w.text.as_str() {
+            "-delete" => true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => words.get(i + 1).is_none_or(|c| {
+                let program = c.text.rsplit('/').next().unwrap_or(&c.text);
+                !FIND_READERS.contains(&program)
+            }),
+            _ => false,
+        })
+}
+
+/// The tests of a `find` expression made only of ANDed tests the gate can evaluate: name and
+/// path globs, `-type`, depth limits. Other tests (size, times, owners) only narrow further,
+/// so ignoring them keeps the evaluation conservative.
+#[derive(Debug, Default)]
+struct FindTests {
+    names: Vec<String>,
+    paths: Vec<String>,
+    types: Option<String>,
+    min_depth: usize,
+    max_depth: Option<usize>,
+}
+
+/// `find` tests and options that take one argument the evaluation ignores.
+const FIND_ONE_ARG: &[&str] = &[
+    "-newer",
+    "-anewer",
+    "-cnewer",
+    "-size",
+    "-mtime",
+    "-atime",
+    "-ctime",
+    "-mmin",
+    "-amin",
+    "-cmin",
+    "-user",
+    "-group",
+    "-uid",
+    "-gid",
+    "-perm",
+    "-links",
+    "-inum",
+    "-samefile",
+    "-lname",
+    "-ilname",
+    "-newermt",
+    "-newerct",
+    "-newerat",
+    "-fstype",
+    "-used",
+    "-printf",
+    "-fprint",
+    "-fprint0",
+    "-fls",
+    "-context",
+    "-files0-from",
+];
+
+impl FindTests {
+    /// `None` when the expression has an `-o`, `!`, group, `,`, `-prune` or regex test, which
+    /// this evaluation does not follow.
+    fn parse(expr: &[&Word]) -> Option<FindTests> {
+        let mut tests = FindTests::default();
+        let mut i = 0;
+        while let Some(w) = expr.get(i) {
+            let arg = || expr.get(i + 1).map(|a| a.text.to_ascii_lowercase());
+            match w.text.as_str() {
+                "-o" | "-or" | "!" | "-not" | "(" | ")" | "," | "-prune" | "-regex" | "-iregex" => {
+                    return None
+                }
+                "-name" | "-iname" => tests.names.push(arg()?),
+                "-path" | "-ipath" | "-wholename" | "-iwholename" => tests.paths.push(arg()?),
+                "-type" | "-xtype" => tests.types = Some(arg()?),
+                "-maxdepth" => tests.max_depth = Some(arg()?.parse().ok()?),
+                "-mindepth" => tests.min_depth = arg()?.parse().ok()?,
+                "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                    while expr.get(i).is_some_and(|a| a.text != ";" && a.text != "+") {
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                "-fprintf" => i += 1,
+                t if FIND_ONE_ARG.contains(&t) => {}
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+            i += 2;
+        }
+        Some(tests)
+    }
+
+    fn restricts(&self) -> bool {
+        !self.names.is_empty()
+            || !self.paths.is_empty()
+            || self.types.is_some()
+            || self.min_depth > 0
+            || self.max_depth.is_some()
+    }
+
+    /// Whether the entry at `depth` below the start (named `name`, shown by find as `shown`, a
+    /// file or a directory) passes every test.
+    fn matches(&self, name: &str, shown: &str, depth: usize, is_file: bool) -> bool {
+        depth >= self.min_depth
+            && self.max_depth.is_none_or(|m| depth <= m)
+            && self.types.as_deref().is_none_or(|t| {
+                t.split(',').any(|t| {
+                    if is_file {
+                        t == "f" || t == "l"
+                    } else {
+                        t == "d"
+                    }
+                })
+            })
+            && self.names.iter().all(|p| glob_match(p, name))
+            && self.paths.iter().all(|p| glob_match(p, shown))
+    }
+
+    /// Whether, from `start`, no protected file below it (nor a directory on the way to one, for
+    /// a recursive `-exec rm -r`) passes the tests. `false` whenever the protected files cannot
+    /// all be placed lexically under the start.
+    fn spares(&self, start: &Word, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -> bool {
+        if !self.restricts() {
+            return false;
+        }
+        let resolved = dirs.resolve_all(&start.text, homes);
+        if resolved.is_empty() {
+            return false;
+        }
+        let shown_start = start.text.trim_end_matches('/').to_ascii_lowercase();
+        resolved.iter().all(|dir| {
+            let base = key(dir);
+            let prefix = format!("{base}/");
+            let start_name = base.rsplit('/').next().unwrap_or("").to_string();
+            let mut under = wallets
+                .paths
+                .iter()
+                .filter_map(|(p, _)| {
+                    if *p == base {
+                        Some("")
+                    } else {
+                        p.strip_prefix(&prefix)
+                    }
+                })
+                .peekable();
+            if under.peek().is_none() {
+                return false;
+            }
+            under.all(|rel| {
+                let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty()).collect();
+                (0..=comps.len()).all(|depth| {
+                    let name = match depth {
+                        0 => start_name.as_str(),
+                        d => comps[d - 1],
+                    };
+                    let shown = std::iter::once(shown_start.as_str())
+                        .chain(comps[..depth].iter().copied())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    !self.matches(name, &shown, depth, depth == comps.len())
+                })
+            })
+        })
     }
 }
 
@@ -450,12 +674,20 @@ impl Wallets {
         }
     }
 
-    /// A protected file that exists below `dir`, if any.
-    fn existing_under(&self, dir: &Path) -> Option<String> {
+    /// A protected file that exists below `dir` and that no git index lists (tracked files
+    /// survive `git clean` and `git stash -u`), if any. Any doubt about the index counts as
+    /// untracked.
+    fn existing_untracked_under(&self, dir: &Path) -> Option<String> {
         let prefix = format!("{}/", key(dir));
         self.paths
             .iter()
-            .find(|(p, shown)| p.starts_with(&prefix) && Path::new(shown).exists())
+            .filter(|(p, shown)| p.starts_with(&prefix) && Path::new(shown).exists())
+            .find(|(_, shown)| {
+                crate::verify::gittracked::tracking(Path::new(shown))
+                    != crate::verify::gittracked::Tracking::Tracked(
+                        crate::verify::gittracked::INDEX_LISTS_IT,
+                    )
+            })
             .map(|(_, shown)| shown.clone())
     }
 

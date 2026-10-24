@@ -876,34 +876,34 @@ fn strictest_verdict_of(
     ])
 }
 
-/// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
-/// payload and answer in that client's output contract ([`adapt`]). An unknown client or a
-/// gate the client does not offer is a usage error (exit 3, nothing on stdout).
+/// `adapt <client> <entry> [flags]` (experimental): run one hook on another client's payload
+/// and answer in that client's output contract ([`adapt`]). An unknown client or an entry the
+/// client does not offer is a usage error (exit 3, nothing on stdout).
 fn cmd_adapt(rest: &[String]) -> ExitCode {
+    use adapt::codex::Route;
     let client = rest.first().and_then(|c| adapt::client_named(c));
-    let gate = rest.get(1).map(String::as_str).unwrap_or("");
-    let handler = SUBCOMMANDS
-        .iter()
-        .find(|(name, _)| *name == gate)
-        .map(|(_, handler)| *handler);
-    let (Some(client), Some(handler), 2) = (client, handler, rest.len()) else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: usage: safe-ai-skill adapt codex <{}>",
-            adapt::CODEX_GATES.join("|")
-        );
+    let entry = rest.get(1).map(String::as_str).unwrap_or("");
+    let flags = rest.get(2..).unwrap_or_default();
+    let route = match client {
+        Some(adapt::Client::Codex) => adapt::codex::route(entry, flags),
+        _ => None,
+    };
+    let (Some(client), Some(route)) = (client, route) else {
+        let _ = writeln!(std::io::stderr(), "{}", adapt::codex::usage());
         return ExitCode::from(EXIT_USAGE);
     };
-    if !adapt::CODEX_GATES.contains(&gate) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: `{gate}` is not available through `adapt codex`"
-        );
-        return ExitCode::from(EXIT_USAGE);
-    }
     adapt::set(client);
-    install_panic_ask();
-    run_with_deadline(gate_deadline(), handler, Vec::new())
+    match route {
+        Route::Gate(gate) => {
+            let Some((_, handler)) = SUBCOMMANDS.iter().find(|(name, _)| *name == gate) else {
+                return ExitCode::from(EXIT_USAGE);
+            };
+            install_panic_ask();
+            run_with_deadline(gate_deadline(), *handler, Vec::new())
+        }
+        Route::SessionStart => cmd_verify_session(),
+        Route::RedactBlock => cmd_redact(),
+    }
 }
 
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
@@ -953,9 +953,14 @@ fn cmd_redact() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let values = safe_ai_skill::env::values::load(&cwd);
-    let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
-        &input, response, &values, &cwd, &effective,
-    ));
+    let updated = redact::scrub_tool_response(&input, response, &values, &cwd, &effective);
+    // Codex PostToolUse cannot rewrite a result: the opt-in route blocks it instead, with the
+    // redacted text as the reason the model sees.
+    let _ = if adapt::is_codex() {
+        io::emit_value(adapt::codex::redact_block(updated))
+    } else {
+        io::emit_posttooluse_redact(updated)
+    };
     ExitCode::SUCCESS
 }
 
@@ -1288,13 +1293,24 @@ fn cmd_verify_session() -> ExitCode {
         root: &root,
         spend: spend_state,
         migrated: &migrated,
-        sandbox: sandbox::declared(&root),
+        // The Claude Code sandbox line is about Claude Code; Codex runs under its own sandbox.
+        sandbox: if adapt::is_codex() {
+            sandbox::Declared::On
+        } else {
+            sandbox::declared(&root)
+        },
         now,
     });
+    // The platform notices are about Claude Code's install and tools.
+    let platform_notices = if adapt::is_codex() {
+        Vec::new()
+    } else {
+        platform::session_notices()
+    };
     let notices: Vec<String> = [effective.ignored_notice(), loosenings]
         .into_iter()
         .flatten()
-        .chain(platform::session_notices())
+        .chain(platform_notices)
         .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
@@ -1328,8 +1344,14 @@ fn cmd_verify_session() -> ExitCode {
         }
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
-    // user's systemMessage only.
-    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
+    // user's systemMessage only. Never under Codex: a code is confirmed through Claude Code's
+    // UserPromptSubmit hook, and announcing it here would only spend it.
+    let announced = if adapt::is_codex() {
+        None
+    } else {
+        relax::announce(&dir, now, hook_session(&input).as_deref())
+    };
+    if let Some(codes) = announced {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
         }
