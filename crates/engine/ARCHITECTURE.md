@@ -18,8 +18,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
-All four are green: `cargo test` = **314 passed** as of the solana-ai-kit foundation pass
-(`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean).
+All four must be green before a commit (`cargo clippy --all-targets -- -D warnings` and
+`cargo fmt --check` clean, `cargo test` passing).
 
 Dependencies (resolved, FROZEN in `Cargo.toml`): `serde 1`, `serde_json 1`, `serde_yaml
 0.9`, `sha2 0.10`, `glob 0.3`, `walkdir 2`, `bs58 0.5`, `ed25519-dalek 2` (`rand_core`),
@@ -88,7 +88,7 @@ needed dep, don't add it), `src/main.rs`, `src/lib.rs`, `src/policy.rs`. The `Re
 For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp`):
 
 ```
-stdin → HookInput::parse
+stdin → io::read_payload                           # bytes (≤ 1 MiB + 1) + parse or Unreadable
       → Policy::load(cwd) → .effective()           # active-profile overlay applied
       → Context::build(command, cwd)               # network resolution
       → gate::decide(...) -> (Decision, GateMeta)  # PURE
@@ -97,26 +97,67 @@ stdin → HookInput::parse
       → io::emit_pretooluse(final_decision)         # authoritative JSON; exit 0
 ```
 
-`Defer` from a gate is emitted as `permissionDecision: "defer"` (let the default stand).
-Unknown/missing subcommand → `emit_pretooluse(Allow)` (never block a hook on dispatch error).
+`Defer` from a gate emits nothing (empty stdout, exit 0): no opinion leaves Claude Code's normal
+permission flow in charge. It is never emitted as `permissionDecision: "defer"`, which Claude Code
+treats as "stop this tool call".
+A payload the engine cannot read is an `ask` on every PreToolUse gate (`gate-read`,
+`gate-bash-secrets`, `gate-mcp`, `gate-bash`): the model shapes `tool_input`, so it can force
+either kind. `Unreadable::Oversized` is over 1 MiB and never parsed. `Unreadable::Malformed` is
+bad JSON or UTF-8, a lone surrogate escape (`"\ud800"`, as `JSON.stringify` emits it), or nesting
+past serde's recursion limit (about 128 levels, a few hundred bytes). Only `Unreadable::Empty`
+(whitespace-only stdin, which Claude Code never sends) is no opinion on the broad gates; `gate-bash`
+(the Solana surface) asks on it too, and when the payload has no `tool_input.command`. These asks
+run under the hard-guard `GateMeta::unreadable()`, so no grant relaxes them, and are audited with
+classification `unreadable` and the sha256 of the bytes received (the first 1 MiB + 1 when
+oversized). `redact` and `prompt-guard` have no opinion on any unreadable payload.
+Unknown/missing subcommand → empty stdout, error on stderr, exit 3. `--version` prints
+`safe-ai-skill <version>` (no hook JSON).
 Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` unchanged.
+
+---
+
+## Platform shim (`plugins/safe-ai-skill/bin/safe-ai-skill`)
+
+`hooks.json` runs the POSIX sh shim, which execs the prebuilt `safe-ai-skill-<plat>` beside it
+(never `cargo build`, never a binary outside its own directory) and maps failures onto the hook
+contract:
+
+- **Environment failure** (no prebuilt for the platform, not an executable here, exit 126/127):
+  fail open with a notice. `gate-bash` answers `ask` for the Solana surface, SessionStart reports
+  the firewall INACTIVE, every other hook exits 0 with one stderr line.
+- **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash` and `gate-mcp` exit 2 (block);
+  the rest exit 0 with a stderr line.
+- `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
+  turns the hooks off, but is ignored in strict mode or when the committed project
+  `.claude/settings.json` mentions it; SessionStart reports either way.
+- The Solana `gate-bash` entries set `onFailure: block`, the others `continue`. `onFailure`
+  needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
+  never blocks.
+
+CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
 
 ---
 
 ## Decision → JSON shapes
 
 - **PreToolUse**:
-  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny|defer"[,"permissionDecisionReason":"…"]}}`
-  (reason key omitted for `allow`/`defer`).
-- **PostToolUse redact**: `{}` (no change) or `{"updatedToolOutput":"…"}` /
+  `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow|ask|deny"[,"permissionDecisionReason":"…"]}}`
+  (reason key omitted for `allow`); `Defer` → no output.
+- **PostToolUse redact** (intended shape; not active in 1.0.1, see `redact` above): no output (no change) or `{"updatedToolOutput":"…"}` /
   `{"updatedMCPToolOutput":"…"}` (mcp tools).
-- **UserPromptSubmit**: `{}` (allow) or `{"decision":"block","reason":"…"}`.
-- **SessionStart**:
-  `{"hookSpecificOutput":{"hookEventName":"SessionStart","reloadSkills":bool[,"additionalContext":"…"]}}`.
+- **UserPromptSubmit**: no output (allow) or `{"decision":"block","reason":"…"}`.
+- **SessionStart** (`verify::SessionResult::hook_output`, report-only): no output when there is
+  nothing to report, else `{["systemMessage":"…",]["hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"…"}]}`
+  (each part only when non-empty).
 
 ---
 
-## State files (under `${CLAUDE_PLUGIN_DATA}`, fallback `~/.safe-ai-skill`)
+## State files (under `${CLAUDE_PLUGIN_DATA}`)
+
+From a terminal where `CLAUDE_PLUGIN_DATA` is unset, the CLI resolves the hooks' dir: under
+`$CLAUDE_CONFIG_DIR/plugins/data/` (or `~/.claude/plugins/data/`) `safe-ai-skill-safe-ai-skill`,
+then `safe-ai-skill-stbr`, else the only `safe-ai-skill-*` dir; otherwise it exits 1 asking for
+`CLAUDE_PLUGIN_DATA`. State is never written to `~/.safe-ai-skill` or the cwd.
 
 | File | Producer | Purpose |
 |---|---|---|
@@ -126,7 +167,7 @@ Hard guards (`GateMeta::hard_guard == true`) are passed through `relax::apply` u
 | `grants.json` | `grants` (round-2) | active scoped grants |
 | `mode.json` | `mode` (round-2) | runtime active-profile override |
 | `lockfile.json` | `verify::lockfile` (round-2) | TOFU content pins |
-| `quarantine/<name>` | `verify` (round-2) | drifted/unverified skill dirs |
+| `quarantine/<name>` | 1.0.0 `verify` (legacy) | skill dirs 1.0.0 moved; 1.0.1 never writes here. `verify approve <name>` restores one, `verify session` lists leftovers |
 | `session/<id>.json` | `session` (round-2) | ephemeral session keypairs (0600) |
 
 ---
@@ -150,24 +191,25 @@ pub struct HookInput {
     pub source: Option<String>,
 }
 impl HookInput {
-    pub fn from_stdin() -> Self;
     pub fn parse(raw: &str) -> Self;
     pub fn bash_command(&self) -> Option<&str>;
     pub fn read_path(&self) -> Option<&str>;
     pub fn mcp_payload(&self) -> Option<&serde_json::Value>;
 }
 
+pub const MAX_STDIN_BYTES: usize;                // 1 MiB
+pub enum Unreadable { Empty, Oversized, Malformed }
+pub fn read_payload(reader: impl std::io::Read) -> (Vec<u8>, Result<HookInput, Unreadable>);
+
 pub enum Decision { Allow, Ask { reason: String }, Deny { reason: String }, Defer }
 impl Decision { pub fn label(&self) -> &'static str; pub fn reason(&self) -> &str; }
 
-pub fn render_pretooluse(d: &Decision) -> serde_json::Value;
+pub fn render_pretooluse(d: &Decision) -> Option<serde_json::Value>;  // Defer → None
 pub fn emit_pretooluse(d: &Decision) -> std::io::Result<()>;
-pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> serde_json::Value;
+pub fn render_posttooluse_redact(updated: Option<String>, mcp: bool) -> Option<serde_json::Value>;  // no change → None
 pub fn emit_posttooluse_redact(updated: Option<String>, mcp: bool) -> std::io::Result<()>;
-pub fn render_userpromptsubmit(block: Option<&str>) -> serde_json::Value;
+pub fn render_userpromptsubmit(block: Option<&str>) -> Option<serde_json::Value>;  // pass → None
 pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()>;
-pub fn render_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> serde_json::Value;
-pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) -> std::io::Result<()>;
 ```
 > The `render_*` functions are the pure JSON builders the `emit_*` functions wrap; tests
 > assert against `render_*` so stdout never needs capturing.
@@ -175,7 +217,7 @@ pub fn emit_sessionstart(additional_context: Option<&str>, reload_skills: bool) 
 ### `policy`
 ```rust
 pub const DEFAULT_POLICY_YAML: &str;     // embedded default (literal; crate is standalone)
-pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE"
+pub const PROFILE_ENV: &str;             // "SAFE_AI_SKILL_PROFILE" — may only pick a stricter profile
 
 pub struct Policy {
     pub version: u32, pub active_profile: String,
@@ -186,6 +228,8 @@ pub struct Policy {
     pub catalog: CatalogPolicy,             // NEW (solana-ai-kit milestone)
     pub supply_chain: SupplyChainPolicy,
     pub profiles: std::collections::BTreeMap<String, ProfileOverlay>,
+    pub ignored_overrides: Vec<String>,     // refused project/env overrides (serde-skipped)
+    // private, serde-skipped: caps the project lowered; scan dirs it added
 }
 pub struct NetworkPolicy { pub default: String, pub mainnet: String }
 pub struct SpendPolicy { pub per_tx_sol_max: f64, pub hard_tx_sol_max: f64, pub daily_sol_max: f64 }
@@ -218,21 +262,45 @@ pub struct ProfileOverlay {
 }
 
 impl Policy {
-    pub fn load(cwd: &Path) -> Policy;          // deep-merge + fail-closed + env profile override
+    pub fn load(cwd: &Path) -> Policy;          // load_with_mode(cwd, None)
+    // Reads the plugin default, <cwd>/.safe-ai-skill/policy.yaml and PROFILE_ENV, calls
+    // from_sources, then keeps project-added scan dirs only if they resolve on disk inside cwd.
+    pub fn load_with_mode(cwd: &Path, persisted_profile: Option<&str>) -> Policy;
+    // Pure (no env, no fs): base + ratcheted project overlay + profile resolution. Project scan
+    // dirs get the text check only; on-disk confinement happens in load_with_mode alone.
+    pub fn from_sources(base_src: &str, project_src: Option<&str>,
+                        persisted_profile: Option<&str>, env_profile: Option<&str>) -> Policy;
     pub fn fail_closed() -> Policy;             // conservative; every soft gate → ask
     pub fn is_fail_closed(&self) -> bool;
     pub fn is_hard_guard(&self, scope_label: &str) -> bool;
-    pub fn effective(&self) -> Policy;          // apply active profile overlay
+    pub fn effective(&self) -> Policy;          // apply active profile overlay, then re-clamp project caps
     pub fn active_overlay(&self) -> ProfileOverlay;
+    pub fn ignored_notice(&self) -> Option<String>; // SessionStart block listing ignored_overrides
 }
 ```
-**Fail-closed guarantee:** any unrecoverable parse error in `load` returns `fail_closed()`
-(caps zero, mainnet `ask`, profile `strict`, all hard guards present). A malformed *project
-override* is ignored (base default still applies).
+**Fail-closed guarantee:** an unparsable plugin default returns `fail_closed()` (caps zero,
+mainnet `ask`, profile `strict`, all hard guards present). A *project override* that is not
+valid YAML (or not a mapping) is ignored; one with ill-typed values fails closed through the
+ratchet, so no other field ends up looser than the base. Either way it is noted.
+
+**Project ratchet (D1.10).** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
+tighten the base, field by field: caps take the lower value (and still bind under any
+profile); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
+`network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`, `gates`,
+`hard_guards`, `mcp.sensitive_name_pattern` alternatives) add entries; allow-lists
+(`secrets.allow_read_globs`, `swap.trusted_mints`) drop them; toggles can only turn on;
+`verify_skills_dirs` keeps every base dir and may add dirs strictly inside the project
+(lexically in `from_sources`, then canonicalized on disk in `load_with_mode`). Fields with no
+safe direction stay fixed: `catalog`, `swap.rugcheck_timeout_ms`, `supply_chain.ext_dir`,
+`supply_chain.verify_ext_submodules`. `active_profile` / `profiles` are ignored. Every refused
+change lands in `ignored_overrides`, which `verify session` appends to the SessionStart
+`additionalContext`; the notes never echo repo text.
 
 **Profiles:** `strict` (no-op), `autopilot` (relax_transfer/swap + per_tx cap 2.0),
-`paranoid` (ask_all), `off` (disabled). `effective()` applies cap overrides; the boolean
-flags are consumed by gates / `relax`. Hard guards are never relaxed.
+`paranoid` (ask_all), `off` (disabled). The active profile is the `safe-ai-skill mode` choice
+(`mode.json`) if set, else the plugin default's; `PROFILE_ENV` may then only pick a stricter
+one (`off` < `autopilot` < `strict` < `paranoid`). `effective()` applies cap overrides; the
+boolean flags are consumed by gates / `relax`. Hard guards are never relaxed.
 
 **On-disk ⇄ embedded equivalence (FROZEN invariant).** The on-disk
 `plugins/safe-ai-skill/policy/default.policy.yaml` is now the **full schema** (incl.
@@ -263,7 +331,7 @@ pub struct Context { pub network: Network, pub plugin_data: PathBuf, pub project
 impl Context { pub fn build(command: &str, cwd: &Path) -> Context; }
 
 pub fn resolve_network(command: &str, cwd: &Path) -> Network;  // flag>env>Anchor.toml>cached solana config
-pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA} | ~/.safe-ai-skill
+pub fn plugin_data_dir() -> PathBuf;                            // ${CLAUDE_PLUGIN_DATA}
 pub fn project_dir(cwd: &Path) -> PathBuf;
 ```
 Fully implemented (not a stub). Never panics; `Unknown` on failure.
@@ -281,6 +349,7 @@ pub struct GateMeta {
 impl GateMeta {
     pub fn new(scope: Scope, hard_guard: bool) -> Self;
     pub fn unknown() -> Self;   // Scope::Other, not a hard guard
+    pub fn unreadable() -> Self;   // Scope::Other, hard guard (unreadable-payload asks)
 }
 ```
 
@@ -299,25 +368,42 @@ pub fn append(entry: &AuditEntry, plugin_data: &Path) -> std::io::Result<()>;
 ### `gates` (STUBS — return safe defaults)
 ```rust
 pub fn gates::bash::decide(command: &str, ctx: &Context, policy: &Policy) -> (Decision, GateMeta);   // (Defer, unknown)
-pub fn gates::secrets::decide(command: &str, policy: &Policy) -> Decision;                            // Defer
+pub fn gates::secrets::decide(command: &str, cwd: &Path, policy: &Policy) -> Decision;                // Defer
 pub fn gates::read::decide(path: &str, policy: &Policy) -> Decision;                                  // Defer
 pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, ctx: &Context, policy: &Policy) -> (Decision, GateMeta); // (Defer, unknown)
+pub fn gates::tamper::decide_bash(command: &str, protected: &Protected) -> Decision;                  // Deny | Ask | Defer
+pub fn gates::tamper::decide_bash_within(command: &str, protected: &Protected, budget: &mut Budget) -> Decision; // Deny | Ask | Defer
+pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &Path, protected: &Protected) -> Decision; // Deny | Defer
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
+> `tamper` is the self-grant tripwire (spec D4.3): `secrets::decide` runs `decide_bash_within`
+> first (with the hook payload's `cwd` as the session directory), sharing one work `Budget`
+> (units plus a 2 s deadline) with its own scan; exhausting it asks ("command too complex to
+> inspect"), never no opinion. `gate-tamper`
+> (`Write|Edit|MultiEdit|NotebookEdit`) runs `decide_file`, audits as `tamper`, and skips
+> `relax::apply`.
 
-### `redact` / `promptguard` (STUBS)
+### `redact` / `promptguard`
 ```rust
 pub fn redact::scrub(text: &str) -> Option<String>;       // None
 pub fn promptguard::check(prompt: &str) -> Option<String>; // None
 ```
 
-### `spend` / `rugcheck` (STUBS)
+`redact::scrub` is implemented, but the PostToolUse hook is inert in 1.0.1 (fixed in 1.1.0): `cmd_redact`
+reads `tool_output` while Claude Code sends `tool_response`, the emitted JSON lacks the
+`hookSpecificOutput.updatedToolOutput` envelope, and the `hooks.json` matcher (`Bash|Read|Grep`) excludes MCP
+tools. No output is redacted.
+
+### `spend` / `rugcheck`
 ```rust
 pub struct spend::SpendLedger { pub day: u64, pub total_sol: f64 }
 pub fn spend::record_and_check(plugin_data: &Path, sol_amount: f64, policy: &Policy) -> Decision;  // Defer
 pub fn rugcheck::check_mint(mint: &str, policy: &Policy) -> Decision;                              // Defer
 ```
+
+`rugcheck::check_mint` (trusted mints, score threshold) is implemented but has no callers in 1.0.1: `gate-mcp`
+records the mint, and swap tool calls get `ask`. `swap.rugcheck*` and `swap.trusted_mints` have no effect yet.
 
 ### Relaxation trio (STUBS — one round-2 agent)
 ```rust
@@ -335,7 +421,7 @@ pub fn grants::debit(plugin_data: &Path, grant_id: &str, sol_amount: f64) -> std
 pub fn grants::cleanup_expired(plugin_data: &Path) -> usize;
 
 // mode
-pub fn mode::get(plugin_data: &Path) -> Option<String>;
+pub fn mode::persisted(plugin_data: &Path) -> Option<String>;  // mode.json only; what load_with_mode takes
 pub fn mode::set(plugin_data: &Path, profile: &str) -> std::io::Result<()>;
 
 // relax  (called by main.rs after every gate)
@@ -358,12 +444,22 @@ pub fn verify::provenance::resolve(source: &str) -> Report;    // empty
 pub fn verify::osv::query(pkg: &str, version: &str) -> Report; // empty
 pub fn verify::lockfile::hash_tree(path: &Path) -> String;     // ""
 
-// NEW — per-ext-submodule discovery (STUB; round-2 Agent B implements + integrates).
-// Returns each `ext/<name>` dir under `skills_dir` as an individual verifiable unit. STUB
-// returns an empty vec; `run_session` behavior is UNCHANGED (still treats ext/ as one unit)
-// until Agent B wires this in (per-submodule git-SHA pin/drift).
-pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;  // []
+// Per-ext-submodule discovery: each `ext/<name>` dir under `skills_dir` is its own verifiable
+// unit (git-SHA pin/drift), walked by `run_session`; empty when `verify_ext_submodules` is off.
+pub fn verify::ext_submodules(skills_dir: &Path, policy: &Policy) -> Vec<PathBuf>;
+pub fn verify::run_session(plugin_data: &Path, project_dir: &Path, policy: &Policy) -> SessionResult;
+pub fn verify::approve(plugin_data: &Path, project_dir: &Path, name: &str, policy: &Policy) -> std::io::Result<Approval>;
 ```
+
+**`verify session` is report-only.** `run_session` sweeps each root in `supply_chain.verify_skills_dirs`
+(project `.claude/skills`; `~/.claude/skills` only when a project overlay opts in to it, the one out-of-project dir
+`keep_scan_dirs` accepts, canonicalised by `confine_project_dirs`; except packs `install --from`
+put there, which carry an install marker in their pin) plus each `ext/<name>` submodule as its
+own unit, and the project `.mcp.json`. A never-seen pack is pinned (TOFU) and reported only
+if it has a High finding. A drifted pack keeps its old pin and is reported (WARN, High findings
+at `path:line`) every session until `verify approve <name>` re-pins it in place. Nothing is
+moved or disabled, and a clean sweep prints nothing. `approve` also restores a pack 1.0.0 moved into
+`quarantine/` (never over an existing directory).
 
 ### `registry` (NEW — opt-in catalog; STUBS, round-2 Agent A)
 ```rust
@@ -386,25 +482,27 @@ entry against `policy.catalog.high_risk_classes` (id match or case-insensitive k
 against safety/description/tags) and returns the matching class `kind`. `risk_class` is `None`
 until classified. Round-2 Agent A fills the three stub bodies + tests.
 
-### `squads` / `session` (STUBS)
+### `squads` / `session`
 ```rust
 pub fn squads::upgrade_authority_advisory(program: &str, ctx: &Context) -> Option<String>;  // None
 pub fn session::init(cap_sol: f64, plugin_data: &Path) -> error::Result<String>;            // Ok("")
 pub fn session::status(plugin_data: &Path) -> error::Result<String>;                        // Ok("no active session")
 ```
 
+`squads::upgrade_authority_advisory` has no callers in 1.0.1; no Squads routing happens.
+
 ---
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `redact` · `prompt-guard` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `redact` · `prompt-guard` ·
 `verify session|check|approve` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`mode [<profile>]` · `revoke` · `status`.
+`mode [<profile>]` · `revoke` · `status` · `--version`.
 
-Gate subcommands emit the authoritative PreToolUse decision; the rest print a JSON result line.
-Unknown subcommand → `emit_pretooluse(Allow)`.
+Gate subcommands emit the authoritative PreToolUse decision (nothing for no opinion); the rest
+print a JSON result line. Unknown or missing subcommand → empty stdout, stderr message, exit 3.
 
 **`install` (replaces `bootstrap`; remote tarball path REMOVED).** Hub-agnostic, LOCAL
 source only — there is no hardcoded download URL (the remote `skills.tar.gz` + the

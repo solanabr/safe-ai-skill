@@ -19,7 +19,7 @@ pub struct AuditEntry {
     pub session_id: String,
     /// Tool name that triggered the gate.
     pub tool: String,
-    /// Action classification (scope label).
+    /// Action classification (scope label, or `unreadable` for an unparsed payload).
     pub classification: String,
     /// Final decision label (`allow`/`ask`/`deny`/`defer`).
     pub decision: String,

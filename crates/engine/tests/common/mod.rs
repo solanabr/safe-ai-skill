@@ -154,13 +154,20 @@ impl<'a> Invocation<'a> {
         cmd.env_remove("SAFE_AI_SKILL_PROFILE");
         cmd.env_remove("ANCHOR_PROVIDER_URL");
         cmd.env_remove("SAFE_AI_SKILL_HOME");
+        // The CLI resolves the hooks' data dir from these and HOME: never the real one.
+        cmd.env_remove("CLAUDE_PLUGIN_DATA");
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
 
         if let Some(pd) = self.plugin_data {
             cmd.env("CLAUDE_PLUGIN_DATA", pd);
         }
-        if let Some(home) = self.home {
-            cmd.env("HOME", home);
-        }
+        match self.home {
+            Some(home) => cmd.env("HOME", home),
+            None => cmd.env(
+                "HOME",
+                std::env::temp_dir().join("safe-ai-skill-it-no-home"),
+            ),
+        };
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
@@ -195,4 +202,21 @@ pub fn permission_decision(v: &serde_json::Value) -> Option<String> {
         .get("permissionDecision")?
         .as_str()
         .map(str::to_string)
+}
+
+/// The `permissionDecision` a PreToolUse gate run emitted, or `""` when it printed nothing
+/// (no opinion: empty stdout, exit 0). Panics on a non-zero exit or on any other output.
+pub fn decision_label(run: &Run) -> String {
+    assert_eq!(
+        run.code,
+        Some(0),
+        "gate exited {:?}\n--- stderr ---\n{}",
+        run.code,
+        run.stderr
+    );
+    if run.stdout.is_empty() {
+        return String::new();
+    }
+    permission_decision(&run.json())
+        .unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
 }

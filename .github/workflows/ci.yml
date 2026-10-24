@@ -19,8 +19,11 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 env:
-  RUST_TOOLCHAIN: stable
+  RUST_TOOLCHAIN: "1.98.1"   # same pin as release.yml; bump both together
   MANIFEST: crates/engine/Cargo.toml
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -107,15 +110,17 @@ jobs:
           mkdir -p npm/bin
           cp "$bin" "npm/bin/safe-ai-skill-${{ matrix.plat }}"
           node --check npm/bin/cli.js
+          export CLAUDE_PLUGIN_DATA="$RUNNER_TEMP/plugin-data"
+          mkdir -p "$CLAUDE_PLUGIN_DATA"
           out=$(node npm/bin/cli.js status)
           echo "$out"
           echo "$out" | grep -q '"command":"status"'
 
-  # ── cross-build (the two non-native shipped targets, build-only) ──────────
+  # ── cross-build (darwin-x64, build-only) ──────────────────────────────────
   # release.yml ships four binaries; the build-test matrix above only builds +
-  # tests the two NATIVE targets. Foreign-arch tests can't run on these runners,
-  # so here we BUILD darwin-x64 and linux-arm64 to catch compile regressions on
-  # those targets before a release tag — mirroring release.yml's target setup.
+  # tests the two NATIVE targets and linux-musl below covers both Linux ones.
+  # Foreign-arch tests can't run on these runners, so here we BUILD darwin-x64
+  # to catch compile regressions on that target before a release tag.
   cross-build:
     name: Cross-build / ${{ matrix.target }}
     needs: lint
@@ -126,10 +131,6 @@ jobs:
         include:
           - target: x86_64-apple-darwin       # darwin-x64
             os: macos-15
-            use_cross: false
-          - target: aarch64-unknown-linux-gnu  # linux-arm64
-            os: ubuntu-latest
-            use_cross: true                    # cross handles the aarch64-linux sysroot
 
     steps:
       - uses: actions/checkout@v4
@@ -151,17 +152,120 @@ jobs:
           restore-keys: |
             cargo-cross-${{ runner.os }}-${{ matrix.target }}-
 
-      - name: Install cross (aarch64-linux only)
-        if: ${{ matrix.use_cross }}
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - name: Build
+        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --locked --target ${{ matrix.target }}
 
-      - name: Build (cargo)
-        if: ${{ !matrix.use_cross }}
-        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --target ${{ matrix.target }}
+  # ── Linux release targets: static musl build + container smoke ────────────
+  # Builds the two Linux targets exactly as release.yml does (preinstalled
+  # rustup, pinned toolchain, --locked, musl-gcc for ring's C code), then proves
+  # each binary is static and runs on alpine, debian:11 and ubuntu:20.04.
+  linux-musl:
+    name: Linux static (musl) / ${{ matrix.target }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl    # linux-x64
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl   # linux-arm64 (native arm64 runner)
+            os: ubuntu-24.04-arm
 
-      - name: Build (cross)
-        if: ${{ matrix.use_cross }}
-        run: cross build --manifest-path ${{ env.MANIFEST }} --release --target ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if ! command -v rustup >/dev/null; then
+            echo "::error::rustup is not preinstalled on this runner image (release.yml relies on it)"
+            exit 1
+          fi
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-musl-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-musl-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build (release, --locked)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --manifest-path ${{ env.MANIFEST }} --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke — static, runs on alpine / debian:11 / ubuntu:20.04
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/engine/Cargo.toml | head -n1)
+          sh scripts/smoke-static-linux.sh "crates/engine/target/$TARGET/release/safe-ai-skill" "$version"
+
+  # ── committed binaries carry release.yml build provenance ─────────────────
+  # SHA256SUMS sits next to the binaries it hashes, so it only catches
+  # accidents. Every committed binary must have a build-provenance attestation
+  # from this repo's release.yml, run on release/v<version> for the version in
+  # plugin.json (release.yml builds and vendors there; docs/RELEASING.md).
+  verify-attestations:
+    name: Verify binary provenance
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: gh attestation verify (committed binaries)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The canonical repo, so CI on a fork checks against upstream's attestations.
+          RELEASE_REPO: solanabr/safe-ai-skill
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            plugins/safe-ai-skill/.claude-plugin/plugin.json | head -n1)
+          cd plugins/safe-ai-skill/bin
+          for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            gh attestation verify "safe-ai-skill-$p" \
+              --repo "$RELEASE_REPO" \
+              --signer-workflow "$RELEASE_REPO/.github/workflows/release.yml" \
+              --source-ref "refs/heads/release/v${version}"
+          done
+
+  # ── committed binaries are the manifest version ───────────────────────────
+  # Required check. hooks.json and the shim must never reach main ahead of the
+  # binaries they call: a 1.0.0 engine answers `allow` to subcommands it doesn't
+  # know. Each runner runs its native binary (--version) and checks the others
+  # embed "safe-ai-skill <version>". Fails until release.yml has vendored the
+  # binaries for the version in plugin.json.
+  binary-versions:
+    name: Binary versions / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scripts/check-binary-versions.sh
+        run: sh scripts/check-binary-versions.sh
 
   # ── plugin binary checksum + shim syntax ─────────────────────────────────
   verify-plugin-bin:
@@ -184,6 +288,26 @@ jobs:
       - name: Shim passes sh -n (syntax check)
         run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill
 
+  # ── shim failure contract (fake uname + fake engines, no build) ─────────
+  # /bin/sh is dash on Ubuntu and bash 3.2 on macOS; the script also runs dash and
+  # bash --posix wherever they exist.
+  shim-tests:
+    name: Shim tests / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (shim + test)
+        if: runner.os == 'Linux'
+        run: shellcheck plugins/safe-ai-skill/bin/safe-ai-skill scripts/test-shim.sh
+
+      - name: scripts/test-shim.sh
+        run: sh scripts/test-shim.sh
+
   # ── package + script checks (npm wrapper, install.sh, version consistency) ─
   package-checks:
     name: Package + script checks
@@ -197,12 +321,18 @@ jobs:
           node --check npm/scripts/postinstall.js
 
       - name: shellcheck (install.sh + scripts)
-        run: shellcheck install.sh scripts/check-versions.sh
+        run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh
 
       - name: sh -n (install.sh + scripts)
         run: |
           sh -n install.sh
           sh -n scripts/check-versions.sh
+          sh -n scripts/check-binary-versions.sh
+          sh -n scripts/smoke-static-linux.sh
+          sh -n scripts/test-smoke-static-linux.sh
+
+      - name: smoke-static-linux.sh logic (stubbed readelf + docker)
+        run: sh scripts/test-smoke-static-linux.sh
 
       - name: Version consistency across manifests
         run: sh scripts/check-versions.sh

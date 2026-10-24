@@ -1,16 +1,19 @@
-//! Policy loading, deep-merge, profiles, and fail-closed behavior.
+//! Policy loading, project ratchet, profiles, and fail-closed behavior.
 //!
 //! The base policy mirrors `default.policy.yaml` and is embedded as
-//! [`DEFAULT_POLICY_YAML`] so the crate compiles standalone. [`Policy::load`] merges a
-//! project override over the default and FAILS CLOSED on any unrecoverable parse error.
+//! [`DEFAULT_POLICY_YAML`] so the crate compiles standalone. [`Policy::load`] ratchets a
+//! project override over the default — it may only tighten it, see the ratchet section at the
+//! end of this file — and FAILS CLOSED on any unrecoverable parse error.
 //!
 //! The relaxation layer is configured here: [`Policy::active_profile`] selects a
 //! [`ProfileOverlay`] (`strict`/`autopilot`/`paranoid`/`off`) applied by
 //! [`Policy::effective`]. [`Policy::hard_guards`] lists scopes that NO profile or grant
 //! may relax.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fmt::Display;
+use std::path::{Component, Path};
 
 use serde::Deserialize;
 use serde_yaml::Value as Yaml;
@@ -56,6 +59,7 @@ secrets:
     - "~/.superstack/config.json"
   allow_read_globs:
     - "**/.env.example"
+    - "**/.env.schema"
 redact:
   enabled: true
 audit:
@@ -90,7 +94,6 @@ catalog:
       ids: []
 supply_chain:
   verify_skills_dirs:
-    - "~/.claude/skills"
     - ".claude/skills"
   flag_unpinned_mcp: true
   flag_telemetry_curl: true
@@ -109,7 +112,8 @@ profiles:
     disabled: true
 "#;
 
-/// Environment variable that overrides [`Policy::active_profile`].
+/// Environment variable that may select a profile stricter than the active one; a looser or
+/// unknown value is ignored and noted (see [`Policy::load_with_mode`]).
 pub const PROFILE_ENV: &str = "SAFE_AI_SKILL_PROFILE";
 
 fn default_version() -> u32 {
@@ -120,7 +124,7 @@ fn default_profile() -> String {
 }
 
 /// Top-level policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Policy {
     /// Schema version.
@@ -153,10 +157,20 @@ pub struct Policy {
     pub supply_chain: SupplyChainPolicy,
     /// Named profile overlays.
     pub profiles: BTreeMap<String, ProfileOverlay>,
+    /// Overrides that would have loosened the policy and were refused: project overlay fields
+    /// and a looser [`PROFILE_ENV`]. Listed by [`Policy::ignored_notice`] at SessionStart.
+    #[serde(skip)]
+    pub ignored_overrides: Vec<String>,
+    /// Spend caps the project overlay lowered, re-applied by [`Policy::effective`].
+    #[serde(skip)]
+    project_caps: ProjectCaps,
+    /// Scan dirs the project overlay added, confined on disk by [`Policy::load_with_mode`].
+    #[serde(skip)]
+    project_scan_dirs: Vec<String>,
 }
 
 /// Network gating policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct NetworkPolicy {
     /// Assumed network when none can be resolved.
@@ -166,7 +180,7 @@ pub struct NetworkPolicy {
 }
 
 /// Spend caps in SOL.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SpendPolicy {
     /// Per-transaction soft cap; above → ask.
@@ -178,7 +192,7 @@ pub struct SpendPolicy {
 }
 
 /// MCP gating policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct McpPolicy {
     /// Regex-like alternation of sensitive tool-name substrings.
@@ -186,7 +200,7 @@ pub struct McpPolicy {
 }
 
 /// Swap / rugcheck policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SwapPolicy {
     /// Whether to query rugcheck before allowing swaps.
@@ -200,7 +214,7 @@ pub struct SwapPolicy {
 }
 
 /// Secret-read glob policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SecretsPolicy {
     /// Globs whose reads are denied.
@@ -210,7 +224,7 @@ pub struct SecretsPolicy {
 }
 
 /// A boolean feature toggle.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TogglePolicy {
     /// Whether the feature is enabled.
@@ -218,7 +232,7 @@ pub struct TogglePolicy {
 }
 
 /// Supply-chain verification settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SupplyChainPolicy {
     /// Directories scanned for installed skills.
@@ -247,7 +261,7 @@ pub struct SupplyChainPolicy {
 /// safe-ai-skill parses it to (a) audit installed-vs-registry and (b) force `ask`/`deny` on entries
 /// matching a [`HighRiskClass`] (e.g. `phantom-mcp` wallet signing, `x402-proxy-mcp` BIP-39
 /// key custody, `curl … | bash` installer scripts).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct CatalogPolicy {
     /// Path (relative to the project) of the opt-in registry catalog.
@@ -261,7 +275,7 @@ pub struct CatalogPolicy {
 /// A catalog entry is classified into this class when its id is in [`HighRiskClass::ids`]
 /// OR any of [`HighRiskClass::keywords`] appears (case-insensitively) in the entry's
 /// safety/description/tag text. A match forces [`HighRiskClass::decision`] (`ask`/`deny`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct HighRiskClass {
     /// Machine-stable class label (e.g. `wallet_signing`, `key_custody`, `installer_script`).
@@ -287,7 +301,7 @@ fn default_exec_install_scripts() -> String {
 /// A profile overlay applied onto the base policy by [`Policy::effective`].
 ///
 /// All fields are optional; only the set fields override the base.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ProfileOverlay {
     /// When `true`, transfers within caps become `Allow` instead of `Ask`.
@@ -300,6 +314,32 @@ pub struct ProfileOverlay {
     pub disabled: bool,
     /// Optional per-transaction cap override for this profile.
     pub per_tx_sol_max: Option<f64>,
+}
+
+/// Spend caps a project overlay lowered (`None` = untouched).
+///
+/// [`Policy::effective`] re-applies them after the profile overlay, so a profile may raise
+/// the trusted caps but never past a project's.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ProjectCaps {
+    per_tx_sol_max: Option<f64>,
+    hard_tx_sol_max: Option<f64>,
+    daily_sol_max: Option<f64>,
+}
+
+impl ProjectCaps {
+    /// Lower each cap in `spend` to the project's, where it set one.
+    fn clamp(&self, spend: &mut SpendPolicy) {
+        for (cap, project) in [
+            (&mut spend.per_tx_sol_max, self.per_tx_sol_max),
+            (&mut spend.hard_tx_sol_max, self.hard_tx_sol_max),
+            (&mut spend.daily_sol_max, self.daily_sol_max),
+        ] {
+            if let Some(project) = project {
+                *cap = cap.min(project);
+            }
+        }
+    }
 }
 
 impl Default for NetworkPolicy {
@@ -354,7 +394,7 @@ impl Default for SecretsPolicy {
                 "~/.config/solana/**".into(),
                 "~/.superstack/config.json".into(),
             ],
-            allow_read_globs: vec!["**/.env.example".into()],
+            allow_read_globs: vec!["**/.env.example".into(), "**/.env.schema".into()],
         }
     }
 }
@@ -368,7 +408,7 @@ impl Default for TogglePolicy {
 impl Default for SupplyChainPolicy {
     fn default() -> Self {
         SupplyChainPolicy {
-            verify_skills_dirs: vec!["~/.claude/skills".into(), ".claude/skills".into()],
+            verify_skills_dirs: vec![".claude/skills".into()],
             flag_unpinned_mcp: true,
             flag_telemetry_curl: true,
             verify_ext_submodules: true,
@@ -463,6 +503,9 @@ impl Default for Policy {
             catalog: CatalogPolicy::default(),
             supply_chain: SupplyChainPolicy::default(),
             profiles: default_profiles(),
+            ignored_overrides: Vec::new(),
+            project_caps: ProjectCaps::default(),
+            project_scan_dirs: Vec::new(),
         }
     }
 }
@@ -497,41 +540,117 @@ fn default_profiles() -> BTreeMap<String, ProfileOverlay> {
 }
 
 impl Policy {
+    /// [`Policy::load_with_mode`] with no persisted profile.
+    pub fn load(cwd: &Path) -> Policy {
+        Policy::load_with_mode(cwd, None)
+    }
+
     /// Load the effective base policy for a project.
     ///
     /// Order: parse `${CLAUDE_PLUGIN_ROOT}/policy/default.policy.yaml` if present, else the
-    /// embedded [`DEFAULT_POLICY_YAML`]; then deep-merge `<cwd>/.safe-ai-skill/policy.yaml`
-    /// over it. Any unrecoverable parse error → [`Policy::fail_closed`] (every soft gate
-    /// becomes `ask`). The `active_profile` is then overridden by the [`PROFILE_ENV`] env var
-    /// if set.
+    /// embedded [`DEFAULT_POLICY_YAML`]; then ratchet `<cwd>/.safe-ai-skill/policy.yaml` over
+    /// it, which may only tighten it. An unparsable base → [`Policy::fail_closed`] (every
+    /// soft gate becomes `ask`). The active profile is `persisted_profile` (the user's
+    /// `safe-ai-skill mode` choice) when given, else the base one; the [`PROFILE_ENV`] env var
+    /// may then only select a stricter profile. Scan dirs the project added are kept only when
+    /// they resolve, on disk, to a directory strictly inside `cwd`.
     ///
     /// Note: this returns the *base* policy. Call [`Policy::effective`] to apply the active
     /// profile overlay before gating.
-    pub fn load(cwd: &Path) -> Policy {
+    pub fn load_with_mode(cwd: &Path, persisted_profile: Option<&str>) -> Policy {
         let base_src = plugin_default_src().unwrap_or_else(|| DEFAULT_POLICY_YAML.to_string());
-        let mut base: Yaml = match serde_yaml::from_str(&base_src) {
+        let project_src =
+            std::fs::read_to_string(cwd.join(".safe-ai-skill").join("policy.yaml")).ok();
+        let env_profile = std::env::var(PROFILE_ENV).ok();
+        let mut policy = Policy::from_sources(
+            &base_src,
+            project_src.as_deref(),
+            persisted_profile,
+            env_profile.as_deref(),
+        );
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+        policy.confine_project_dirs(cwd, home.as_deref().map(Path::new));
+        policy
+    }
+
+    /// Re-check the scan dirs the project overlay added against the filesystem. The ratchet
+    /// checks the text only, so a committed symlink (`up -> ..`) would pass it and sweep
+    /// whatever it points at. Each dir becomes its canonical path when it is a directory
+    /// strictly inside the canonical `root`, so the sweep scans exactly what was checked;
+    /// otherwise it is dropped (and noted when it resolves outside). The one opt-in outside the
+    /// project, [`USER_SKILLS_DIR`], is kept as the canonical `<home>/.claude/skills`.
+    fn confine_project_dirs(&mut self, root: &Path, home: Option<&Path>) {
+        let added = std::mem::take(&mut self.project_scan_dirs);
+        if added.is_empty() {
+            return;
+        }
+        let canonical_root = std::fs::canonicalize(root).ok();
+        let mut outside = false;
+        for dir in added {
+            let (resolved, within) = if is_user_skills(&dir) {
+                let resolved =
+                    home.and_then(|h| std::fs::canonicalize(h.join(".claude/skills")).ok());
+                let within = resolved.is_some();
+                (resolved, within)
+            } else {
+                let resolved = std::fs::canonicalize(root.join(&dir)).ok();
+                let within = match (&canonical_root, &resolved) {
+                    (Some(r), Some(path)) => path != r && path.starts_with(r),
+                    _ => false,
+                };
+                (resolved, within)
+            };
+            // A dir that does not resolve has nothing to sweep: drop it quietly.
+            outside |= resolved.is_some() && !within;
+            let keep = resolved
+                .filter(|path| within && path.is_dir())
+                .and_then(|path| path.to_str().map(str::to_string));
+            let dirs = &mut self.supply_chain.verify_skills_dirs;
+            if let Some(slot) = dirs.iter().position(|d| *d == dir) {
+                match keep {
+                    Some(path) => dirs[slot] = path,
+                    None => {
+                        dirs.remove(slot);
+                    }
+                }
+            }
+        }
+        let note = SCAN_DIRS_OUTSIDE.to_string();
+        if outside && !self.ignored_overrides.contains(&note) {
+            self.ignored_overrides.push(note);
+        }
+    }
+
+    /// Build a policy from its sources without touching the environment or the filesystem.
+    ///
+    /// `base_src` is the trusted default policy YAML; `project_src` a project's overlay, which
+    /// may only tighten it; `persisted_profile` and `env_profile` select the profile as in
+    /// [`Policy::load_with_mode`]. Every refused override is noted in
+    /// [`Policy::ignored_overrides`]. Scan dirs the project adds get only the text check here:
+    /// confining them on disk (symlinks) happens in [`Policy::load_with_mode`] alone.
+    pub fn from_sources(
+        base_src: &str,
+        project_src: Option<&str>,
+        persisted_profile: Option<&str>,
+        env_profile: Option<&str>,
+    ) -> Policy {
+        let base: Yaml = match serde_yaml::from_str(base_src) {
             Ok(y) => y,
             Err(_) => return Policy::fail_closed(),
         };
-
-        let override_path = cwd.join(".safe-ai-skill").join("policy.yaml");
-        if let Ok(text) = std::fs::read_to_string(&override_path) {
-            if let Ok(overlay) = serde_yaml::from_str::<Yaml>(&text) {
-                base = merge_yaml(base, overlay);
-            }
-            // A malformed override is ignored: the base policy still applies.
-        }
-
-        let mut policy: Policy = match serde_yaml::from_value(base) {
+        let mut policy: Policy = match serde_yaml::from_value(base.clone()) {
             Ok(p) => p,
             Err(_) => return Policy::fail_closed(),
         };
 
-        if let Ok(profile) = std::env::var(PROFILE_ENV) {
-            if !profile.trim().is_empty() {
-                policy.active_profile = profile;
-            }
+        if let Some(text) = project_src {
+            apply_project_overlay(&mut policy, &base, text);
         }
+
+        let (profile, refused) =
+            resolve_profile(&policy.active_profile, persisted_profile, env_profile);
+        policy.active_profile = profile;
+        policy.ignored_overrides.extend(refused);
         policy
     }
 
@@ -577,6 +696,9 @@ impl Policy {
                 m.insert("strict".to_string(), ProfileOverlay::default());
                 m
             },
+            ignored_overrides: Vec::new(),
+            project_caps: ProjectCaps::default(),
+            project_scan_dirs: Vec::new(),
         }
     }
 
@@ -596,18 +718,33 @@ impl Policy {
     /// gates should evaluate against.
     ///
     /// `strict` (or an unknown profile name) is a no-op. `autopilot` may raise
-    /// `per_tx_sol_max`. `paranoid`/`off` set advisory flags consumed by the relaxation
-    /// layer and gates. Hard guards are unaffected.
+    /// `per_tx_sol_max`, never above a cap the project overlay lowered. `paranoid`/`off` set
+    /// advisory flags consumed by the relaxation layer and gates. Hard guards are unaffected.
     pub fn effective(&self) -> Policy {
         let mut out = self.clone();
-        let overlay = match self.profiles.get(&self.active_profile) {
-            Some(o) => o.clone(),
-            None => return out, // unknown profile → strict
-        };
-        if let Some(cap) = overlay.per_tx_sol_max {
+        // An unknown profile has no overlay → strict.
+        if let Some(cap) = self
+            .profiles
+            .get(&self.active_profile)
+            .and_then(|o| o.per_tx_sol_max)
+        {
             out.spend.per_tx_sol_max = cap;
         }
+        self.project_caps.clamp(&mut out.spend);
         out
+    }
+
+    /// The SessionStart notice listing [`Policy::ignored_overrides`]; `None` when there are
+    /// none.
+    pub fn ignored_notice(&self) -> Option<String> {
+        if self.ignored_overrides.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "safe-ai-skill did not apply these policy overrides ({PROJECT_POLICY} and \
+             {PROFILE_ENV} may only tighten the policy):\n - {}",
+            self.ignored_overrides.join("\n - ")
+        ))
     }
 
     /// The active profile overlay (empty/default when unknown).
@@ -641,6 +778,442 @@ fn merge_yaml(base: Yaml, overlay: Yaml) -> Yaml {
             Yaml::Mapping(base_map)
         }
         (_, overlay) => overlay,
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Project overlay ratchet (D1.10)
+//
+// `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only tighten the base policy,
+// field by field. Each refused change becomes an `ignored_overrides` note. Notes name the
+// field and echo only trusted values (base policy, known words, numbers): they reach the
+// model at SessionStart, so repo text never goes in them.
+// ---------------------------------------------------------------------------------------
+
+/// A project's policy overlay, relative to the project root.
+const PROJECT_POLICY: &str = ".safe-ai-skill/policy.yaml";
+
+/// Known profiles from loosest to strictest. [`PROFILE_ENV`] may only move right.
+const PROFILE_STRICTNESS: [&str; 4] = ["off", "autopilot", "strict", "paranoid"];
+
+/// The skill scan dirs, and the note for project dirs that leave the project.
+const SCAN_DIRS: &str = "supply_chain.verify_skills_dirs";
+const SCAN_DIRS_OUTSIDE: &str = "supply_chain.verify_skills_dirs: dirs outside the project ignored";
+
+/// Fold a project's overlay `text` into `policy` (parsed from `base`), keeping only what
+/// tightens it.
+fn apply_project_overlay(policy: &mut Policy, base: &Yaml, text: &str) {
+    let mut overlay = match serde_yaml::from_str::<Yaml>(text) {
+        Ok(Yaml::Mapping(map)) => map,
+        Ok(Yaml::Null) => return, // empty or comments only
+        parsed => {
+            let why = if parsed.is_ok() {
+                "not a YAML mapping"
+            } else {
+                "not valid YAML"
+            };
+            policy
+                .ignored_overrides
+                .push(format!("{PROJECT_POLICY}: {why}; ignored"));
+            return;
+        }
+    };
+
+    // Profile selection belongs to the user, never to the repo.
+    for key in ["active_profile", "profiles"] {
+        if let Some(asked) = overlay.remove(key) {
+            let current = base.get(key).cloned().unwrap_or(Yaml::Null);
+            if merge_yaml(current.clone(), asked) != current {
+                policy.ignored_overrides.push(format!(
+                    "{key}: a project may not select or define profiles"
+                ));
+            }
+        }
+    }
+
+    match serde_yaml::from_value::<Policy>(merge_yaml(base.clone(), Yaml::Mapping(overlay))) {
+        Ok(asked) => {
+            let notes = ratchet(policy, &asked);
+            policy.ignored_overrides.extend(notes);
+        }
+        Err(_) => {
+            // An ill-typed overlay fails closed, as before, but only where that tightens.
+            // The notes compare against the fail-closed stand-in, not the repo: drop them.
+            let _ = ratchet(policy, &Policy::fail_closed());
+            policy.ignored_overrides.push(format!(
+                "{PROJECT_POLICY}: a value has the wrong type; failing closed (spend caps 0)"
+            ));
+        }
+    }
+}
+
+/// Tighten `policy` with every field of `asked` (the base deep-merged with the overlay)
+/// that tightens it. Returns a note per refused change. Profiles are handled by the caller.
+fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
+    let mut notes = Vec::new();
+    let n = &mut notes;
+
+    keep_mainnet_default(
+        "network.default",
+        &mut policy.network.default,
+        &asked.network.default,
+        n,
+    );
+    keep_stricter(
+        "network.mainnet",
+        &mut policy.network.mainnet,
+        &asked.network.mainnet,
+        n,
+    );
+
+    let (spend, caps) = (&mut policy.spend, &mut policy.project_caps);
+    for (path, cap, project, wanted) in [
+        (
+            "spend.per_tx_sol_max",
+            &mut spend.per_tx_sol_max,
+            &mut caps.per_tx_sol_max,
+            asked.spend.per_tx_sol_max,
+        ),
+        (
+            "spend.hard_tx_sol_max",
+            &mut spend.hard_tx_sol_max,
+            &mut caps.hard_tx_sol_max,
+            asked.spend.hard_tx_sol_max,
+        ),
+        (
+            "spend.daily_sol_max",
+            &mut spend.daily_sol_max,
+            &mut caps.daily_sol_max,
+            asked.spend.daily_sol_max,
+        ),
+    ] {
+        if keep_min(path, cap, wanted, n) {
+            *project = Some(wanted);
+        }
+    }
+
+    keep_union("gates", &mut policy.gates, &asked.gates, n);
+    keep_union(
+        "hard_guards",
+        &mut policy.hard_guards,
+        &asked.hard_guards,
+        n,
+    );
+    keep_pattern(
+        "mcp.sensitive_name_pattern",
+        &mut policy.mcp.sensitive_name_pattern,
+        &asked.mcp.sensitive_name_pattern,
+        n,
+    );
+
+    let swap = &mut policy.swap;
+    keep_on("swap.rugcheck", &mut swap.rugcheck, asked.swap.rugcheck, n);
+    keep_min(
+        "swap.rugcheck_max_score",
+        &mut swap.rugcheck_max_score,
+        asked.swap.rugcheck_max_score,
+        n,
+    );
+    // A timed-out rugcheck asks where a bad score denies, so a shorter timeout turns denies
+    // into asks, and a longer one risks the hook timing out (no opinion): no safe direction.
+    keep_fixed(
+        "swap.rugcheck_timeout_ms",
+        &swap.rugcheck_timeout_ms,
+        &asked.swap.rugcheck_timeout_ms,
+        n,
+    );
+    keep_subset(
+        "swap.trusted_mints",
+        &mut swap.trusted_mints,
+        &asked.swap.trusted_mints,
+        n,
+    );
+
+    keep_union(
+        "secrets.deny_read_globs",
+        &mut policy.secrets.deny_read_globs,
+        &asked.secrets.deny_read_globs,
+        n,
+    );
+    keep_subset(
+        "secrets.allow_read_globs",
+        &mut policy.secrets.allow_read_globs,
+        &asked.secrets.allow_read_globs,
+        n,
+    );
+
+    keep_on(
+        "redact.enabled",
+        &mut policy.redact.enabled,
+        asked.redact.enabled,
+        n,
+    );
+    keep_on(
+        "audit.enabled",
+        &mut policy.audit.enabled,
+        asked.audit.enabled,
+        n,
+    );
+    // Catalog classes match first-wins and short-circuit the MCP gate, so even an added
+    // keyword can turn a rugcheck `deny` into an `ask`: the catalog is not overridable.
+    keep_fixed("catalog", &policy.catalog, &asked.catalog, n);
+
+    let chain = &mut policy.supply_chain;
+    let asked_chain = &asked.supply_chain;
+    let added_dirs = keep_scan_dirs(
+        &mut chain.verify_skills_dirs,
+        &asked_chain.verify_skills_dirs,
+        n,
+    );
+    keep_on(
+        "supply_chain.flag_unpinned_mcp",
+        &mut chain.flag_unpinned_mcp,
+        asked_chain.flag_unpinned_mcp,
+        n,
+    );
+    keep_on(
+        "supply_chain.flag_telemetry_curl",
+        &mut chain.flag_telemetry_curl,
+        asked_chain.flag_telemetry_curl,
+        n,
+    );
+    keep_fixed(
+        "supply_chain.verify_ext_submodules",
+        &chain.verify_ext_submodules,
+        &asked_chain.verify_ext_submodules,
+        n,
+    );
+    keep_fixed(
+        "supply_chain.ext_dir",
+        &chain.ext_dir,
+        &asked_chain.ext_dir,
+        n,
+    );
+    keep_stricter(
+        "supply_chain.exec_install_scripts",
+        &mut chain.exec_install_scripts,
+        &asked_chain.exec_install_scripts,
+        n,
+    );
+    policy.project_scan_dirs = added_dirs;
+
+    notes
+}
+
+/// Lower `current` to `asked` when that tightens it; returns whether it moved.
+fn keep_min<T: PartialOrd + Copy + Display>(
+    path: &str,
+    current: &mut T,
+    asked: T,
+    notes: &mut Vec<String>,
+) -> bool {
+    match asked.partial_cmp(current) {
+        Some(Ordering::Less) => {
+            *current = asked;
+            true
+        }
+        Some(Ordering::Equal) => false,
+        _ => {
+            notes.push(format!(
+                "{path}: kept at {current} (a project may only lower it)"
+            ));
+            false
+        }
+    }
+}
+
+/// Turn `current` on when asked; refuse turning it off.
+fn keep_on(path: &str, current: &mut bool, asked: bool, notes: &mut Vec<String>) {
+    if asked {
+        *current = true;
+    } else if *current {
+        notes.push(format!("{path}: kept on (a project may not turn it off)"));
+    }
+}
+
+/// Rank of a decision word, `allow` < `ask` < `deny`; `None` for any other word.
+fn decision_rank(word: &str) -> Option<u8> {
+    match word {
+        "allow" => Some(0),
+        "ask" => Some(1),
+        "deny" => Some(2),
+        _ => None,
+    }
+}
+
+/// Move the decision `current` toward `deny` when asked; refuse any other change.
+fn keep_stricter(path: &str, current: &mut String, asked: &str, notes: &mut Vec<String>) {
+    if asked == current {
+        return;
+    }
+    // Gates read an unknown word as `ask`.
+    let rank = decision_rank(current).unwrap_or(1);
+    match decision_rank(asked).map(|r| r.cmp(&rank)) {
+        Some(Ordering::Greater) => *current = asked.to_string(),
+        Some(Ordering::Equal) => {}
+        _ => notes.push(format!(
+            "{path}: kept at {current} (a project may only move it toward deny)"
+        )),
+    }
+}
+
+/// Keep every entry of `current` and add the asked ones (deny-lists: more is tighter).
+fn keep_union(path: &str, current: &mut Vec<String>, asked: &[String], notes: &mut Vec<String>) {
+    note_dropped(path, current, asked, notes);
+    for entry in asked {
+        if !current.contains(entry) {
+            current.push(entry.clone());
+        }
+    }
+}
+
+/// Keep only the entries of `current` that `asked` also lists (allow-lists: fewer is
+/// tighter).
+fn keep_subset(path: &str, current: &mut Vec<String>, asked: &[String], notes: &mut Vec<String>) {
+    if asked.iter().any(|e| !current.contains(e)) {
+        notes.push(format!(
+            "{path}: additions ignored (a project may only remove entries)"
+        ));
+    }
+    current.retain(|e| asked.contains(e));
+}
+
+/// [`keep_union`] for skill scan dirs, except an added dir must stay inside the project:
+/// sweeping `~`, `/`, `..` or the project root itself would treat unrelated dirs as packs.
+/// The one exception is the user-scope [`USER_SKILLS_DIR`], which a project may opt in to.
+/// The project's order comes first, since `verify approve` restores into the first dir.
+/// Returns the added dirs; [`Policy::load_with_mode`] re-checks them on disk.
+fn keep_scan_dirs(
+    current: &mut Vec<String>,
+    asked: &[String],
+    notes: &mut Vec<String>,
+) -> Vec<String> {
+    note_dropped(SCAN_DIRS, current, asked, notes);
+    let mut dirs: Vec<String> = Vec::new();
+    let mut added = Vec::new();
+    let mut outside = false;
+    for dir in asked {
+        if dirs.contains(dir) {
+            continue;
+        }
+        if current.contains(dir) {
+            dirs.push(dir.clone());
+        } else if is_inside_project(dir) || is_user_skills(dir) {
+            dirs.push(dir.clone());
+            added.push(dir.clone());
+        } else {
+            outside = true;
+        }
+    }
+    for dir in current.iter() {
+        if !dirs.contains(dir) {
+            dirs.push(dir.clone());
+        }
+    }
+    *current = dirs;
+    if outside {
+        notes.push(SCAN_DIRS_OUTSIDE.to_string());
+    }
+    added
+}
+
+/// Note the entries of `current` that `asked` leaves out; they stay.
+fn note_dropped(path: &str, current: &[String], asked: &[String], notes: &mut Vec<String>) {
+    let dropped: Vec<String> = current
+        .iter()
+        .filter(|e| !asked.contains(e))
+        .map(|e| format!("`{e}`"))
+        .collect();
+    if !dropped.is_empty() {
+        notes.push(format!(
+            "{path}: kept {} (a project may only add entries)",
+            dropped.join(", ")
+        ));
+    }
+}
+
+/// The only scan dir outside the project a project overlay may add: user-scope skills.
+const USER_SKILLS_DIR: &str = "~/.claude/skills";
+
+/// Whether `dir` spells [`USER_SKILLS_DIR`] (a trailing `/` allowed).
+fn is_user_skills(dir: &str) -> bool {
+    dir.trim_end_matches('/') == USER_SKILLS_DIR
+}
+
+/// Whether `dir` is, as text, a relative path below the project root. Symlinks are checked
+/// on disk by [`Policy::load_with_mode`].
+fn is_inside_project(dir: &str) -> bool {
+    let components = || Path::new(dir).components();
+    !dir.starts_with('~')
+        && components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        && components().any(|c| matches!(c, Component::Normal(_)))
+}
+
+/// Move the assumed network only to mainnet: assuming mainnet asks more, never less.
+fn keep_mainnet_default(path: &str, current: &mut String, asked: &str, notes: &mut Vec<String>) {
+    if asked == current {
+        return;
+    }
+    if matches!(asked, "mainnet" | "mainnet-beta") {
+        *current = asked.to_string();
+    } else {
+        notes.push(format!(
+            "{path}: kept at {current} (a project may only change it to mainnet)"
+        ));
+    }
+}
+
+/// [`keep_union`] over the alternatives of an `a|b|c` name pattern.
+fn keep_pattern(path: &str, current: &mut String, asked: &str, notes: &mut Vec<String>) {
+    if asked == current {
+        return;
+    }
+    let alternatives = |pattern: &str| -> Vec<String> {
+        pattern
+            .split('|')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut merged = alternatives(current);
+    keep_union(path, &mut merged, &alternatives(asked), notes);
+    *current = merged.join("|");
+}
+
+/// A field with no tighter direction: a project may not change it.
+fn keep_fixed<T: PartialEq>(path: &str, current: &T, asked: &T, notes: &mut Vec<String>) {
+    if asked != current {
+        notes.push(format!("{path}: a project may not change it"));
+    }
+}
+
+/// Pick the active profile: the user's `persisted` choice replaces `base`, then `env` (which
+/// a repo's `.claude/settings.json` can set) may only select a stricter profile. Returns the
+/// profile and a note when `env` was refused.
+fn resolve_profile(
+    base: &str,
+    persisted: Option<&str>,
+    env: Option<&str>,
+) -> (String, Option<String>) {
+    let current = persisted
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(base);
+    let env = match env.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => e,
+        None => return (current.to_string(), None),
+    };
+    let rank = |profile: &str| PROFILE_STRICTNESS.iter().position(|p| *p == profile);
+    match (rank(current), rank(env)) {
+        (Some(floor), Some(asked)) if asked >= floor => (env.to_string(), None),
+        _ if env == current => (current.to_string(), None),
+        _ => (
+            current.to_string(),
+            Some(format!(
+                "{PROFILE_ENV}: kept profile `{current}` (it may only select a stricter one)"
+            )),
+        ),
     }
 }
 

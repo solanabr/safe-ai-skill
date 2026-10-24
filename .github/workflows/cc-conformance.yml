@@ -1,0 +1,90 @@
+# Live Claude Code conformance — safe-ai-skill
+#
+# Runs scripts/cc-conformance.sh in plugin mode: headless `claude -p` (haiku) sessions in
+# throwaway projects with this checkout's plugin loaded through --plugin-dir, asserting how a real
+# Claude Code treats the plugin's hooks (denials, onFailure, SessionStart notice, Grep rewrite,
+# blocked skills). Runners have no sandbox, so the SessionStart case runs here too.
+#
+# Every run calls the Anthropic API (secret ANTHROPIC_API_KEY) and costs money, so it never runs
+# on push or PR — only on demand. Transcripts are uploaded as artifacts (the isolated HOME is not).
+
+name: Claude Code conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      claude_code_version:
+        description: "Claude Code version to install (minimum 2.1.295)"
+        required: true
+        default: "2.1.304"
+      cases:
+        description: "Comma-separated case names (empty = all; scripts/cc-conformance.sh --list)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  conformance:
+    name: conformance / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code
+        env:
+          CC_VERSION: ${{ inputs.claude_code_version }}
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${CC_VERSION}"
+          claude --version
+
+      - name: Run conformance cases
+        timeout-minutes: 40
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CASES: ${{ inputs.cases }}
+          DISABLE_AUTOUPDATER: "1"
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "secret ANTHROPIC_API_KEY is not set" >&2
+            exit 1
+          fi
+          if [ -n "$CASES" ]; then set -- --only "$CASES"; fi
+          scripts/cc-conformance.sh --mode plugin --keep --strict "$@"
+
+      - name: Check transcripts for the API key
+        id: leakcheck
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Lists matching files, never the key. The isolated HOME is not uploaded, so not checked.
+          if [ -n "$ANTHROPIC_API_KEY" ] &&
+            grep -rlF --exclude-dir=home -- "$ANTHROPIC_API_KEY" "$RUNNER_TEMP"/cc-conformance.* 2>/dev/null; then
+            echo "ANTHROPIC_API_KEY found in the files above; not uploading transcripts" >&2
+            exit 1
+          fi
+
+      - name: Upload transcripts
+        if: always() && steps.leakcheck.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-conformance-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/cc-conformance.*
+            !${{ runner.temp }}/cc-conformance.*/home
+          if-no-files-found: ignore

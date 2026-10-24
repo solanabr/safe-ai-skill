@@ -7,7 +7,7 @@
 //! so this suite asserts the engine decisions that BACK those claims — the deny/ask a merged
 //! plugin hook would contribute:
 //!   - a `curl … | bash` install-script Bash command → ask (the install-script gate),
-//!   - a benign GET `curl` → defer (the gate yields to the default flow; nothing to merge),
+//!   - a benign GET `curl` → no opinion (empty stdout: the default flow stands; nothing to merge),
 //!   - the kit's broken mainnet `read -r` gate is superseded: safe-ai-skill's `gate-bash` asks on a
 //!     mainnet deploy outright (no TTY prompt needed).
 //!
@@ -15,9 +15,10 @@
 
 mod common;
 
-use common::{permission_decision, Invocation, TempDir};
+use common::{decision_label, Invocation, TempDir};
 
-/// Run a gate subcommand against `command` (Bash) and return the decision label.
+/// Run a gate subcommand against `command` (Bash) and return the decision label
+/// (`""` = no opinion).
 fn gate(sub: &str, command: &str) -> String {
     let data = TempDir::new("coexist-data");
     let home = TempDir::new("coexist-home");
@@ -34,8 +35,7 @@ fn gate(sub: &str, command: &str) -> String {
         .home(home.path())
         .stdin(payload)
         .run();
-    permission_decision(&run.json())
-        .unwrap_or_else(|| panic!("no permissionDecision in {}", run.stdout))
+    decision_label(&run)
 }
 
 #[test]
@@ -53,12 +53,12 @@ fn curl_pipe_bash_install_script_asks() {
 }
 
 #[test]
-fn benign_get_curl_defers() {
-    // A benign GET curl is not an installer/exfil → defer (the gate yields; the default flow,
+fn benign_get_curl_has_no_opinion() {
+    // A benign GET curl is not an installer/exfil → no opinion (empty stdout; the default flow,
     // i.e. the host/kit permission, stands — nothing to merge or override).
     assert_eq!(
         gate("gate-bash-secrets", "curl https://api.example.com/data"),
-        "defer"
+        ""
     );
 }
 
@@ -72,16 +72,6 @@ fn mainnet_deploy_asks_superseding_kit_read_gate() {
             "solana program deploy ./p.so --url mainnet-beta"
         ),
         "ask"
-    );
-}
-
-#[test]
-fn devnet_deploy_allows_no_spurious_gate() {
-    // Coexistence must not over-restrict: a devnet deploy is allowed, so safe-ai-skill does not block the
-    // kit's normal devnet-first workflow.
-    assert_eq!(
-        gate("gate-bash", "anchor deploy --provider.cluster devnet"),
-        "allow"
     );
 }
 

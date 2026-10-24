@@ -91,4 +91,10 @@ impl GateMeta {
     pub fn unknown() -> Self {
         GateMeta::new(Scope::Other, false)
     }
+
+    /// Metadata for a hook payload the engine could not read (malformed, oversized, or
+    /// missing its command). A hard guard, so no grant relaxes the fail-closed `ask`.
+    pub fn unreadable() -> Self {
+        GateMeta::new(Scope::Other, true)
+    }
 }
