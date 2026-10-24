@@ -4,6 +4,14 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [1.2.0] — Unreleased
+
+### Added
+
+- **opencode adapter (experimental, #26).** `safe-ai-skill adapt opencode <gate>` runs `gate-bash`, `gate-bash-secrets`, `gate-read`, `gate-tamper` and `gate-mcp` on a call from opencode's `tool.execute.before` hook, and [`adapters/opencode/safe-ai-skill.js`](adapters/opencode/safe-ai-skill.js) is the plugin that calls it (one file, no dependencies). opencode's tool ids and camelCase arguments are mapped to the gates' input; MCP tool names (`<server>_<tool>`) are split using the server names in the opencode config, and an unknown or ambiguous name is judged on every word of it. Every `ask` becomes a block (opencode plugins have no ask), nothing is ever allowed outright, and the plugin blocks the call when the engine is missing, fails, times out or answers in any other form. A directory Grep gets the credential-file exclusion as its `include`; a Grep whose `include` could reach a credential file (anything but code-file extensions) is denied, because opencode passes one glob only. Writes to `.opencode/`, `opencode.json(c)`, the global opencode config dir, `$OPENCODE_CONFIG(_DIR)` and the engine binary are denied through the file tools and the shell. Setup and gaps: [docs/adapters.md](docs/adapters.md#opencode-plugin-experimental).
+
+---
+
 ## [1.1.0] — Unreleased
 
 ### Behaviour changes (read before upgrading)

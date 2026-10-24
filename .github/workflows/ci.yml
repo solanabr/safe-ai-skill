@@ -429,6 +429,13 @@ jobs:
           node --check npm/bin/cli.js
           node --check npm/scripts/postinstall.js
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: opencode plugin (fail-closed tests, fake engines)
+        run: node --test adapters/opencode/test/plugin.test.mjs
+
       - name: shellcheck (install.sh + scripts)
         run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh
 
