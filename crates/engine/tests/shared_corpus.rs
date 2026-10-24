@@ -18,8 +18,7 @@
 //! - `runner_plumbing_smoke` (always on): four rows the 1.1.0 gates already satisfy, so a broken
 //!   materialiser shows up in a plain `cargo test`.
 //!
-//! Run the full matrix: `cargo test --features test-hooks --test shared_corpus` (add
-//! `env-read-opt-in` for the opt-in rows' end state).
+//! Run the full matrix: `cargo test --features test-hooks --test shared_corpus`.
 //! `SHARED_CORPUS_FILTER=<id substring>[,..]` narrows it; `SHARED_CORPUS_RESULTS=<path>` writes
 //! one `{"id","plugin"}` line per row for `scripts/conformance-diff.sh` (`?` marks a tier that was
 //! skipped or errored).
@@ -307,7 +306,7 @@ fn parse_ctx(v: &Value, what: &str) -> Result<Ctx, String> {
         let ok = word.as_str().and_then(EnvRead::parse).is_some();
         if !ok {
             return Err(format!(
-                "{what}: ctx.user_policy.secrets.env_read must be deny|ask|tier"
+                "{what}: ctx.user_policy.secrets.env_read must be deny|tier"
             ));
         }
     }
@@ -783,8 +782,8 @@ fn skip_reason(row: &Row, tier: Tier) -> Option<&'static str> {
     {
         return Some("Tier::Off needs test-hooks");
     }
-    if env_read_of(row).is_some_and(|e| e != EnvRead::Deny) {
-        return Some("a loosened env_read needs test-hooks");
+    if env_read_of(row) == Some(EnvRead::Deny) {
+        return Some("env_read: deny needs test-hooks");
     }
     if !row.ctx.grants.is_empty() {
         return Some("grants need a trusted data dir (test-hooks)");
@@ -1168,11 +1167,12 @@ fn work_for(rows: &[Row], filter: &[String]) -> Vec<(usize, usize)> {
     work
 }
 
-/// Cargo features an interim row may name in `until_feature`, and whether this build has them.
-const KNOWN_FEATURES: [&str; 1] = ["env-read-opt-in"];
+/// Cargo features an interim row may name in `until_feature`, and whether this build has them
+/// (none since 1.2.0 retired `env-read-opt-in`).
+const KNOWN_FEATURES: [&str; 0] = [];
 
 fn built_with(feature: &str) -> bool {
-    feature == "env-read-opt-in" && cfg!(feature = "env-read-opt-in")
+    KNOWN_FEATURES.contains(&feature)
 }
 
 /// The plugin verdict this build must give: the interim one while the row says the shipped

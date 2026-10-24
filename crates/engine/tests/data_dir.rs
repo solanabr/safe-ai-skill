@@ -58,30 +58,43 @@ fn cli_honours_claude_config_dir() {
 }
 
 #[test]
-fn cli_without_any_data_dir_errors_with_guidance() {
+fn cli_without_the_plugin_uses_the_standalone_dir() {
     let home = TempDir::new("ddir-none");
     let cwd = TempDir::new("ddir-none-cwd");
-    for args in [
-        &["mode", "strict"][..],
-        &["allow", "--scope", "transfer", "--for", "30m"],
-        &["status"],
-    ] {
-        let run = Invocation::new(args)
-            .home(home.path())
-            .cwd(cwd.path())
-            .run();
-        assert_eq!(run.code, Some(1), "{args:?}: {}", run.stdout);
-        assert!(
-            run.stderr.contains("CLAUDE_PLUGIN_DATA"),
-            "{args:?}: {}",
-            run.stderr
-        );
-        assert!(run.json()["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("CLAUDE_PLUGIN_DATA")));
-    }
+    let standalone = common::standalone_data(home.path());
+    let run = Invocation::new(&["revoke"])
+        .home(home.path())
+        .cwd(cwd.path())
+        .run();
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    assert!(
+        standalone.join("audit.jsonl").is_file(),
+        "revoke audits into the standalone dir"
+    );
+    let status = Invocation::new(&["status"])
+        .home(home.path())
+        .cwd(cwd.path())
+        .run();
+    assert!(
+        status.stdout.contains("safe-ai-skill-data"),
+        "status should report the standalone dir: {}",
+        status.stdout
+    );
     assert!(!home.join(".safe-ai-skill").exists());
     assert!(!cwd.join(".safe-ai-skill").exists());
+    assert!(!home.join(".claude/plugins/data").exists());
+}
+
+#[test]
+fn an_ambiguous_plugin_install_still_errors_with_guidance() {
+    let home = TempDir::new("ddir-ambig");
+    for name in ["safe-ai-skill-a", "safe-ai-skill-b"] {
+        std::fs::create_dir_all(home.join(".claude/plugins/data").join(name)).unwrap();
+    }
+    let run = Invocation::new(&["status"]).home(home.path()).run();
+    assert_eq!(run.code, Some(1), "{}", run.stdout);
+    assert!(run.stderr.contains("CLAUDE_PLUGIN_DATA"), "{}", run.stderr);
+    assert!(!common::standalone_data(home.path()).exists());
 }
 
 #[test]

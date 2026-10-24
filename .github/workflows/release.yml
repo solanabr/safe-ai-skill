@@ -433,9 +433,11 @@ jobs:
           for f in $BINARIES; do
             cp "plugins/safe-ai-skill/bin/$f" dist/
           done
+          # The stamped shim, which install.sh puts in front of the binary (Codex hooks need it).
+          cp plugins/safe-ai-skill/bin/safe-ai-skill dist/safe-ai-skill-shim
           # shellcheck disable=SC2086 # one word per file
-          ( cd dist && sha256sum $BINARIES > SHA256SUMS && cat SHA256SUMS )
-          set --
+          ( cd dist && sha256sum $BINARIES safe-ai-skill-shim > SHA256SUMS && cat SHA256SUMS )
+          set -- dist/safe-ai-skill-shim
           for f in $BINARIES; do set -- "$@" "dist/$f"; done
           gh release create "$TAG" \
             --verify-tag \

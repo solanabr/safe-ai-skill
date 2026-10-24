@@ -159,7 +159,7 @@ const GIT_REWRITES: &[&str] = &[
 ];
 
 /// [`scan`] with the files to protect given (the Codex adapter's self-protection: the
-/// `safe-ai-skill` binary and wrapper, Codex hook config, Claude Code settings). On top of the
+/// `safe-ai-skill` shim and engines, Codex hook config, Claude Code settings). On top of the
 /// wallet gate's deletes, moves, overwrites, globs, ancestors and `cd` tracking it reads
 /// `chmod`/`chown`, `find -delete|-exec` and work-tree-rewriting `git` subcommands.
 pub fn clobber_of(command: &str, cwd: &Path, files: &[PathBuf]) -> Option<String> {
@@ -203,8 +203,7 @@ fn extended_clobber(
     };
     match program.as_str() {
         "find" => {
-            let acts = ["-delete", "-exec", "-execdir", "-ok", "-okdir"];
-            if !words.iter().any(|w| acts.contains(&w.text.as_str())) {
+            if !find_is_destructive(&words) {
                 return None;
             }
             let mut starts: Vec<Word> = words
@@ -219,6 +218,8 @@ fn extended_clobber(
                 dot.splits = false;
                 starts.push(dot);
             }
+            // A start that is, or holds, a protected file is denied whatever the tests say: the
+            // gate does not evaluate `find` expressions.
             starts
                 .iter()
                 .find_map(&hit)
@@ -239,7 +240,14 @@ fn extended_clobber(
                 return None;
             }
             let rest = &words[i + 1..];
-            let paths = operands(rest);
+            let Some(paths) = git_operands(&sub, rest) else {
+                // `--pathspec-from-file`: the paths are not on the command line.
+                return dirs
+                    .known
+                    .iter()
+                    .find_map(|dir| wallets.existing_under(dir))
+                    .map(|t| format!("`git {sub}` may rewrite {t}"));
+            };
             if let Some(t) = paths.iter().find_map(hit) {
                 return Some(format!("`git {sub}` rewrites {t}"));
             }
@@ -249,7 +257,9 @@ fn extended_clobber(
                         matches!(
                             w.text.as_str(),
                             "-u" | "--include-untracked" | "-a" | "--all"
-                        )
+                        ) || (w.text.starts_with('-')
+                            && !w.text.starts_with("--")
+                            && w.text[1..].starts_with(['u', 'a']))
                     }));
             if untracked && paths.is_empty() {
                 // A path-less clean or untracked stash sweeps the whole tree: deny when a
@@ -267,6 +277,138 @@ fn extended_clobber(
             .find_map(hit)
             .map(|t| format!("`{program}` changes {t}")),
     }
+}
+
+/// Commands a `find -exec` may run that only read the file.
+const FIND_READERS: &[&str] = &[
+    "grep",
+    "egrep",
+    "fgrep",
+    "cat",
+    "head",
+    "tail",
+    "ls",
+    "stat",
+    "file",
+    "wc",
+    "sha256sum",
+    "shasum",
+    "md5sum",
+    "md5",
+    "cksum",
+    "echo",
+    "printf",
+    "test",
+    "[",
+    "basename",
+    "dirname",
+    "readlink",
+    "realpath",
+    "du",
+    "diff",
+    "cmp",
+    "jq",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+];
+
+/// Whether a `find` deletes (`-delete`) or runs a command on what it finds that is not a
+/// plain reader given only plain arguments (`-exec rm {} +` is destructive, `-exec grep -l x {}
+/// +` is not; a reader option that names a program, like `--pre`, makes it destructive).
+fn find_is_destructive(words: &[&Word]) -> bool {
+    words
+        .iter()
+        .enumerate()
+        .any(|(i, w)| match w.text.as_str() {
+            "-delete" => true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let Some(c) = words.get(i + 1) else {
+                    return true;
+                };
+                let program = c.text.rsplit('/').next().unwrap_or(&c.text);
+                let args = words[i + 2..]
+                    .iter()
+                    .take_while(|a| a.text != ";" && a.text != "+");
+                let mut args = args.map(|a| a.text.as_str());
+                !FIND_READERS.contains(&program)
+                    || c.dynamic
+                    || args.any(|a| a.starts_with("--pre") || a.contains('$') || a.contains('`'))
+            }
+            _ => false,
+        })
+}
+
+/// The path operands of a work-tree-rewriting `git` subcommand: options and their arguments
+/// (`clean -e PAT`, `stash -m MSG`, `checkout -b NAME`, …) and the `stash` action word are not
+/// paths. `None` for `--pathspec-from-file`, whose paths are not on the command line.
+fn git_operands(sub: &str, rest: &[&Word]) -> Option<Vec<Word>> {
+    // Short options that take an argument, per subcommand; long ones are listed alongside.
+    let (short, long): (&str, &[&str]) = match sub {
+        "clean" => ("e", &["--exclude"]),
+        "stash" => ("m", &["--message"]),
+        "checkout" => ("bB", &["--orphan", "--conflict"]),
+        "switch" => (
+            "cC",
+            &["--create", "--force-create", "--orphan", "--conflict"],
+        ),
+        "restore" => ("s", &["--source"]),
+        _ => ("", &[]),
+    };
+    let mut out = Vec::new();
+    let mut options = true;
+    let mut i = 0;
+    let mut first = true;
+    while let Some(w) = rest.get(i) {
+        let t = w.text.as_str();
+        i += 1;
+        if options && t.starts_with("--pathspec-from-file") {
+            return None;
+        }
+        if options && t == "--" {
+            options = false;
+            continue;
+        }
+        if options && t.starts_with("--") {
+            if long.contains(&t) {
+                i += 1;
+            }
+            continue;
+        }
+        if options && t.starts_with('-') && t.len() > 1 {
+            // In a cluster, a letter that takes an argument consumes the rest of it, or the
+            // next word when it is last.
+            if let Some(at) = t[1..].find(|c| short.contains(c)) {
+                if at + 2 == t.len() {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if sub == "stash" && first && options {
+            first = false;
+            if matches!(
+                t,
+                "push"
+                    | "save"
+                    | "pop"
+                    | "apply"
+                    | "drop"
+                    | "list"
+                    | "show"
+                    | "clear"
+                    | "branch"
+                    | "create"
+                    | "store"
+            ) {
+                continue;
+            }
+        }
+        first = false;
+        out.push((*w).clone());
+    }
+    Some(out)
 }
 
 /// The directories a relative path may resolve against, as the command line goes.

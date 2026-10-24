@@ -26,6 +26,7 @@
 //! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
 pub mod adapt;
+pub mod adapt_opencode;
 pub mod audit;
 pub mod bip39;
 pub mod confirm;

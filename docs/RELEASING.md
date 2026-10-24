@@ -94,7 +94,7 @@ prints the plugin tag name and checks that `plugin.json` and the marketplace ent
 
 | Tag | Used by |
 |---|---|
-| `vX.Y.Z` | the GitHub Release, which `npm/scripts/postinstall.js` and `install.sh` download from |
+| `vX.Y.Z` | the GitHub Release (the binaries, the stamped shim as `safe-ai-skill-shim`, `SHA256SUMS`), which `npm/scripts/postinstall.js` and `install.sh` download from |
 | `safe-ai-skill--vX.Y.Z` | Claude Code plugin dependency version ranges |
 
 Both point at the same commit, and that commit contains the binaries.

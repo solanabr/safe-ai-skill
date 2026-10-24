@@ -1,8 +1,10 @@
-//! Hook adapters for clients other than Claude Code (experimental, issue #23).
+//! Hook adapters for clients other than Claude Code (experimental, issues #23 and #26).
 //!
-//! `safe-ai-skill adapt codex <gate>` runs one PreToolUse gate on a Codex CLI hook payload.
-//! Codex sends Claude-shaped PreToolUse JSON (`tool_name` `Bash` with `tool_input.command`,
-//! MCP tools as `mcp__<server>__<tool>`), so the gates read it unchanged. What differs:
+//! `safe-ai-skill adapt codex <entry>` runs one hook on a Codex CLI hook payload: a PreToolUse
+//! gate, the session start, or the opt-in redaction block ([`codex::route`]). Codex hooks run
+//! it through the plugin shim, which turns any engine failure into Codex's deny. Codex sends
+//! Claude-shaped PreToolUse JSON (`tool_name` `Bash` with `tool_input.command`, MCP tools as
+//! `mcp__<server>__<tool>`), so the gates read it unchanged. What differs:
 //!
 //! - **Output.** Codex PreToolUse honours only `deny`. An `ask` or a bare `allow` is an
 //!   "unsupported" output that Codex logs and then runs the call anyway, so [`render`] turns
@@ -26,6 +28,12 @@ use std::sync::OnceLock;
 
 use crate::io::Decision;
 
+pub mod codex;
+pub mod codex_doctor;
+pub mod shellrc;
+
+pub use codex::interactive_reason;
+
 /// The hook client whose output contract applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Client {
@@ -33,6 +41,8 @@ pub enum Client {
     ClaudeCode,
     /// Codex CLI: only `deny` blocks; `ask` and a bare `allow` fail open.
     Codex,
+    /// opencode, through its plugin ([`crate::adapt_opencode`]): no `ask`, no `allow`.
+    OpenCode,
 }
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -52,16 +62,29 @@ pub fn is_codex() -> bool {
     current() == Client::Codex
 }
 
+/// Whether this process answers opencode.
+pub fn is_opencode() -> bool {
+    current() == Client::OpenCode
+}
+
+/// Whether this process answers a client other than Claude Code (no Claude Code sandbox, no
+/// `CLAUDE_PLUGIN_DATA`, and no `ask`).
+pub fn is_foreign() -> bool {
+    current() != Client::ClaudeCode
+}
+
 /// Parse an `adapt` client name.
 pub fn client_named(name: &str) -> Option<Client> {
     match name {
         "codex" => Some(Client::Codex),
+        "opencode" => Some(Client::OpenCode),
         _ => None,
     }
 }
 
-/// The gates `adapt codex` runs. Codex has no `Read`/`Grep`/`Glob` or `Skill` tool, and its
-/// PostToolUse cannot rewrite output, so `gate-read`, `gate-skill` and `redact` are not offered.
+/// The PreToolUse gates `adapt codex` runs. Codex has no `Read`/`Grep`/`Glob` or `Skill` tool,
+/// so `gate-read` and `gate-skill` are not offered; its PostToolUse cannot rewrite output, so
+/// `redact` is offered only as the opt-in block ([`codex::Route::RedactBlock`]).
 pub const CODEX_GATES: [&str; 4] = ["gate-bash", "gate-bash-secrets", "gate-tamper", "gate-mcp"];
 
 /// Appended to an `ask` reason when Codex gets it as a `deny`.
@@ -87,6 +110,7 @@ pub fn render(decision: &Decision, client: Client) -> Decision {
             }
         }
         (Client::Codex, Decision::Allow) => Decision::Defer,
+        (Client::OpenCode, d) => crate::adapt_opencode::render(d),
         _ => decision.clone(),
     }
 }
@@ -160,8 +184,22 @@ const RELATIVE_STATE_NAMES: &[&str] = &[
     "id.json",
 ];
 
-/// Names of the binaries a Codex hook runs.
-const ENGINE_NAMES: [&str; 2] = ["safe-ai-skill", "safe-ai-skill-codex"];
+/// Names of the files a Codex hook runs: the shim, the per-platform engines beside it, and the
+/// 1.1.0 wrapper.
+const ENGINE_NAMES: [&str; 8] = [
+    "safe-ai-skill",
+    "safe-ai-skill-darwin-arm64",
+    "safe-ai-skill-darwin-x64",
+    "safe-ai-skill-linux-x64",
+    "safe-ai-skill-linux-arm64",
+    "safe-ai-skill-windows-x64.exe",
+    "safe-ai-skill.exe",
+    "safe-ai-skill-codex",
+];
+
+/// Commands that only remove (or empty) their operands: a bare hook-config name given to one
+/// is denied only when a hook config it could be exists ([`codex::hook_config_could_be`]).
+const REMOVERS: &[&str] = &["rm", "unlink", "shred", "truncate"];
 
 /// Locations nothing in Codex protects, which a Codex session must not write.
 #[derive(Debug, Clone, Default)]
@@ -171,9 +209,14 @@ pub struct CodexTargets {
     codex_homes: Vec<PathBuf>,
     /// Claude Code config dirs: `<home>/.claude`, `$CLAUDE_CONFIG_DIR`.
     claude_dirs: Vec<PathBuf>,
-    /// The engine and wrapper: this executable, its siblings by [`ENGINE_NAMES`], and each
-    /// name found on `PATH` (as given and canonical).
+    /// The shim, engines and old wrapper: this executable, its siblings by [`ENGINE_NAMES`],
+    /// and each name found on `PATH` (as given and canonical).
     engines: Vec<PathBuf>,
+    /// Shell startup files ([`shellrc`]): Codex's `$SHELL -lc` hook runs read the login ones.
+    shell: shellrc::ShellStartup,
+    /// State files in the live data dir, so a recursive remove or move of a directory above it
+    /// (`rm -rf ~/.local/share`) is caught.
+    state: Vec<PathBuf>,
 }
 
 impl CodexTargets {
@@ -192,6 +235,15 @@ impl CodexTargets {
         if let Some(h) = &home {
             t.push_codex_home(h.join(".codex"));
             t.push_claude_dir(h.join(".claude"));
+        }
+        t.shell = shellrc::ShellStartup::from_env();
+        if let Some(dir) = crate::datadir::data_dir_with_cwd(None)
+            .ok()
+            .filter(|d| !d.is_unresolved())
+        {
+            for f in ["key", "tier.json", "grants.json", "spend.json"] {
+                push_spellings(&mut t.state, dir.path.join(f));
+            }
         }
         if let Some(c) = var("CODEX_HOME").filter(|c| c.is_absolute()) {
             t.push_codex_home(c);
@@ -225,6 +277,9 @@ impl CodexTargets {
     /// they exist, `.codex/` config and `.claude/` settings in `cwd` and every directory above.
     pub fn files(&self, cwd: &Path) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = self.engines.clone();
+        files.extend(self.shell.existing_login_files());
+        files.extend(self.shell.login_files().iter().cloned());
+        files.extend(self.state.iter().filter(|f| f.exists()).cloned());
         for home in &self.codex_homes {
             files.extend(["hooks.json", "config.toml"].map(|f| home.join(f)));
         }
@@ -271,7 +326,7 @@ fn push_spellings(list: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// `path` resolved against `cwd` (`~/` expanded with `home`), lexically normalised.
-fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+pub(crate) fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     let expanded = match (path.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => home.join(rest),
         _ if path == "~" => home.map(Path::to_path_buf).unwrap_or_default(),
@@ -286,7 +341,7 @@ fn absolute(path: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// Drop `.` and resolve `..` without touching the filesystem.
-fn lexical(path: &Path) -> PathBuf {
+pub(crate) fn lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
@@ -302,7 +357,7 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// `path` with its longest existing ancestor canonicalised (symlinks resolved), the rest
 /// appended; `path` itself when nothing resolves.
-fn canonical_prefix(path: &Path) -> PathBuf {
+pub(crate) fn canonical_prefix(path: &Path) -> PathBuf {
     let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
     let mut cur = path;
     loop {
@@ -340,9 +395,12 @@ fn same_path(a: &Path, b: &Path) -> bool {
 ///
 /// Denied: Codex hook config (`.codex/hooks.json|config.toml`, `$CODEX_HOME/…`, through
 /// symlinks), Claude Code settings (`.claude/settings.json|settings.local.json`, the user's
-/// and `$CLAUDE_CONFIG_DIR`'s), the `safe-ai-skill` binary and wrapper, and, for a relative
+/// and `$CLAUDE_CONFIG_DIR`'s), the `safe-ai-skill` shim and engines, and, for a relative
 /// path, a safe-ai-skill state file or wallet name (the working dir may not be `cwd`).
 pub fn patch_target_reason(target: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    if let Some(reason) = targets.shell.login_reason(target, cwd) {
+        return Some(reason);
+    }
     let lexical = absolute(target, cwd, targets.home.as_deref());
     let canonical = canonical_prefix(&lexical);
     for full in [&lexical, &canonical] {
@@ -424,6 +482,8 @@ const READ_ONLY: &[&str] = &[
     "true",
     "basename",
     "dirname",
+    "source",
+    ".",
 ];
 
 /// Commands that write, move or remove their arguments.
@@ -456,10 +516,10 @@ const MUTATORS: &[&str] = &[
 ];
 
 /// Wrappers skipped when finding the command a segment runs.
-const PREFIXES: &[&str] = &["sudo", "env", "exec", "nohup", "nice", "time", "builtin"];
+pub(crate) const PREFIXES: &[&str] = &["sudo", "env", "exec", "nohup", "nice", "time", "builtin"];
 
 #[derive(Debug, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     Word(String),
     /// A segment break (`;`, `|`, `&`, `(`, `)`, newline); `true` for a pipe (`|`, `|&`).
     Break(bool),
@@ -471,7 +531,7 @@ enum Tok {
 
 /// A rough shell tokenizer: quotes are removed (their content stays in the word), segment
 /// breaks and output redirections are kept.
-fn tokenize(command: &str) -> Vec<Tok> {
+pub(crate) fn tokenize(command: &str) -> Vec<Tok> {
     let mut toks = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
@@ -543,12 +603,23 @@ fn tokenize(command: &str) -> Vec<Tok> {
 pub fn bash_reason(command: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
     if let Some(what) = crate::gates::wallet::clobber_of(command, cwd, &targets.files(cwd)) {
         return Some(format!(
-            "safe-ai-skill: {what}, which the Codex hooks need (the safe-ai-skill binary or \
-             wrapper, Codex hook config, or Claude Code settings); do it yourself, outside the \
+            "safe-ai-skill: {what}, which the Codex hooks need (the safe-ai-skill shim or \
+             engine, Codex hook config, or Claude Code settings); do it yourself, outside the \
              agent."
         ));
     }
+    if let Some(reason) = targets.shell.bash_reason(command, cwd) {
+        return Some(reason);
+    }
     bash_reason_depth(command, cwd, targets, 0)
+}
+
+/// Why a Codex `apply_patch` may not apply: a file it touches is a shell startup file the
+/// patch text may not change ([`shellrc::ShellStartup::content_reason`]).
+pub fn patch_content_reason(patch: &str, cwd: &Path, targets: &CodexTargets) -> Option<String> {
+    patch_paths(patch)
+        .iter()
+        .find_map(|p| targets.shell.content_reason(p, cwd, patch))
 }
 
 /// The path-like pieces of interpreter code: split on quotes, brackets, separators and
@@ -638,7 +709,11 @@ fn bash_reason_depth(
         let mutator = MUTATORS.contains(&cmd);
         let path_like = word.contains('/') || word.starts_with('~');
         let name = word.rsplit('/').next().unwrap_or(word);
-        if mutator && (name == "hooks.json" || name == "config.toml") && !path_like {
+        if mutator
+            && (name == "hooks.json" || name == "config.toml")
+            && !path_like
+            && (!REMOVERS.contains(&cmd) || codex::hook_config_could_be(name, cwd, targets))
+        {
             return Some(format!(
                 "safe-ai-skill: `{word}` may be Codex hook config (a Codex command's working dir \
                  is not known to the hook); change it yourself, outside the agent."
@@ -659,142 +734,6 @@ fn bash_reason_depth(
     None
 }
 
-/// Shells: with no `-c` script, no script file and no redirected or piped input, they read
-/// commands from a terminal the model can type into.
-const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "tcsh", "csh", "busybox",
-];
-
-/// Interpreters with a REPL: no `-c`/`-e` code, no `-m` module and no script means a prompt.
-const REPLS: &[&str] = &[
-    "python", "python2", "python3", "node", "nodejs", "ruby", "perl", "php", "lua", "luajit",
-    "irb", "pry", "ghci", "julia", "tclsh", "R", "deno", "bun",
-];
-
-/// Database shells: interactive unless given a command or file.
-const DB_SHELLS: &[&str] = &[
-    "psql",
-    "mysql",
-    "mariadb",
-    "sqlite3",
-    "mongo",
-    "mongosh",
-    "redis-cli",
-];
-
-/// Why a Codex shell command may not run because it opens an interactive shell or REPL, or
-/// `None`. Codex's `write_stdin` feeds such a session input without running any hook, so every
-/// gate would be skipped for what is typed into it.
-pub fn interactive_reason(command: &str) -> Option<String> {
-    interactive_depth(command, 0)
-}
-
-fn interactive_depth(command: &str, depth: usize) -> Option<String> {
-    let toks = tokenize(command);
-    let mut segment: Vec<&str> = Vec::new();
-    let mut piped = false;
-    let mut input = false;
-    let mut next_piped = false;
-    let mut iter = toks.iter().peekable();
-    loop {
-        let tok = iter.next();
-        match tok {
-            Some(Tok::Word(w)) => {
-                segment.push(w);
-                continue;
-            }
-            Some(Tok::In) => {
-                input = true;
-                continue;
-            }
-            Some(Tok::Out) => {
-                // The redirection target is not an argument.
-                if let Some(Tok::Word(_)) = iter.peek() {
-                    iter.next();
-                }
-                continue;
-            }
-            Some(Tok::Break(pipe)) => next_piped = *pipe,
-            None => {}
-        }
-        if let Some(reason) = interactive_segment(&segment, piped, input, depth) {
-            return Some(reason);
-        }
-        segment.clear();
-        input = false;
-        piped = next_piped;
-        next_piped = false;
-        tok?;
-    }
-}
-
-fn interactive_segment(words: &[&str], piped: bool, input: bool, depth: usize) -> Option<String> {
-    let mut rest = words.iter().copied().skip_while(|w| {
-        let base = w.rsplit('/').next().unwrap_or(w);
-        (w.contains('=') && !w.starts_with('=')) || PREFIXES.contains(&base)
-    });
-    let program_word = rest.next()?;
-    let program = program_word.rsplit('/').next().unwrap_or(program_word);
-    let args: Vec<&str> = rest.collect();
-    let flag = |pred: &dyn Fn(&str) -> bool| args.iter().any(|a| a.starts_with('-') && pred(a));
-    let positional = args.iter().any(|a| !a.starts_with('-'));
-    let forced = flag(&|a| a == "-i" || a == "--interactive");
-    let fed = piped || input;
-    let deny = || {
-        Some(format!(
-            "safe-ai-skill: `{program}` would start an interactive session; Codex feeds it input \
-             through write_stdin without running any hook, so nothing typed into it would be \
-             checked. Run it with the commands as arguments (`-c`, a script file), or yourself."
-        ))
-    };
-    if SHELLS.contains(&program) {
-        let script_at = args
-            .iter()
-            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'));
-        if let Some(at) = script_at {
-            if depth < 2 {
-                if let Some(script) = args.get(at + 1) {
-                    return interactive_depth(script, depth + 1);
-                }
-            }
-            return None;
-        }
-        return ((!positional && !fed) || forced).then(deny).flatten();
-    }
-    if REPLS.contains(&program) {
-        if matches!(program, "deno" | "bun") {
-            let first = args.iter().find(|a| !a.starts_with('-'));
-            return (first.is_none() && !fed || first == Some(&"repl"))
-                .then(deny)
-                .flatten();
-        }
-        let code = flag(&|a| {
-            matches!(
-                a,
-                "-c" | "-e" | "-E" | "--eval" | "-m" | "-r" | "-p" | "--print"
-            )
-        });
-        return ((!code && !positional && !fed) || forced)
-            .then(deny)
-            .flatten();
-    }
-    if DB_SHELLS.contains(&program) {
-        let command = flag(&|a| {
-            matches!(a, "-c" | "-f" | "-e" | "--eval" | "--execute" | "--file")
-                || a.starts_with("--command")
-                || a.starts_with("--file=")
-                || a.starts_with("--execute=")
-        });
-        let sql_arg =
-            program == "sqlite3" && args.iter().filter(|a| !a.starts_with('-')).count() > 1;
-        let redis_cmd = program == "redis-cli" && positional;
-        return (!command && !sql_arg && !redis_cmd && !fed)
-            .then(deny)
-            .flatten();
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,7 +748,52 @@ mod tests {
         t.push_claude_dir(PathBuf::from("/home/u/.claude"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill"));
         t.push_engine(PathBuf::from("/home/u/.local/bin/safe-ai-skill-codex"));
+        t.shell = shellrc::ShellStartup::for_homes(
+            Some(PathBuf::from("/home/u")),
+            &[PathBuf::from("/home/u")],
+            None,
+        );
         t
+    }
+
+    #[test]
+    fn login_shell_startup_files_are_protected() {
+        let cwd = Path::new("/w/proj");
+        let t = targets();
+        for p in [
+            "~/.zshenv",
+            "/home/u/.zprofile",
+            "~/.bash_profile",
+            "~/.profile",
+            "~/.config/fish/config.fish",
+            "~/.config/fish/conf.d/evil.fish",
+        ] {
+            assert!(patch_target_reason(p, cwd, &t).is_some(), "{p}");
+        }
+        for c in [
+            "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.zshenv",
+            "printf 'PATH=/tmp/x:$PATH' > ~/.profile",
+            "cp evil ~/.bash_profile",
+            "sed -i '' 's/a/b/' ~/.zprofile",
+            "echo x > ~/.config/fish/conf.d/x.fish",
+            "echo 'export PATH=/tmp/x:$PATH' >> ~/.zshrc",
+            "echo 'export SAFE_AI_SKILL_DISABLE=1' >> ~/.bashrc",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_some(), "{c}");
+        }
+        for c in [
+            "source ~/.zprofile",
+            ". ~/.profile",
+            "cat ~/.zshenv",
+            "echo hi >> ~/.zshrc",
+            "cat ~/.zshrc; echo $PATH",
+        ] {
+            assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
+        }
+        let patch = "*** Begin Patch\n*** Update File: /home/u/.zshrc\n+export PATH=/tmp/x:$PATH\n*** End Patch";
+        assert!(patch_content_reason(patch, cwd, &t).is_some());
+        let patch = "*** Begin Patch\n*** Update File: /home/u/.zshrc\n+alias ll=ls\n*** End Patch";
+        assert!(patch_content_reason(patch, cwd, &t).is_none());
     }
 
     #[test]
@@ -937,47 +921,6 @@ mod tests {
             "cargo build",
         ] {
             assert!(bash_reason(c, cwd, &t).is_none(), "{c}");
-        }
-    }
-
-    #[test]
-    fn interactive_sessions_are_recognized() {
-        for c in [
-            "bash",
-            "sh -i",
-            "zsh -l",
-            "python3",
-            "python3 -i script.py",
-            "node",
-            "irb",
-            "psql -h db mydb",
-            "sqlite3 my.db",
-            "env FOO=1 bash",
-            "cd x && python",
-            "bash -c 'bash'",
-            "deno",
-            "bun repl",
-        ] {
-            assert!(interactive_reason(c).is_some(), "{c}");
-        }
-        for c in [
-            "bash -c 'ls'",
-            "bash script.sh",
-            "sh -lc 'echo hi'",
-            "python3 script.py",
-            "python3 -c 'print(1)'",
-            "python3 -m pytest",
-            "echo ls | bash",
-            "bash < script.sh",
-            "python3 <<'EOF'\nprint(1)\nEOF",
-            "node -e 'console.log(1)'",
-            "psql -c 'select 1'",
-            "sqlite3 my.db 'select 1'",
-            "deno run x.ts",
-            "cargo test",
-            "ls > bash",
-        ] {
-            assert!(interactive_reason(c).is_none(), "{c}");
         }
     }
 

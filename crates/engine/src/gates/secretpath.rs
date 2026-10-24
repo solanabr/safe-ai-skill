@@ -31,7 +31,7 @@ pub enum Class {
     HardDeny(&'static str),
     /// Name alone does not decide: [`sniff`] it (and deny when it cannot be read).
     Suspect(Suspect),
-    /// Env class: raw reads denied (asked only under the user's `safe-ai-skill tier --env-read ask`), served by `env`.
+    /// Env class: raw reads by the env-read tier rule (`gates::envread`), served by `env`.
     Env,
     /// A varlock `.env.schema`: readable when allow-listed, after the content guard.
     Schema,
@@ -89,6 +89,9 @@ pub fn classify_with_homes(path: &str, homes: &[String]) -> Class {
 fn classify_name(base: &str) -> Class {
     if base.ends_with("-keypair.json") {
         return Class::HardDeny("Solana keypair");
+    }
+    if crate::gates::envread::is_dotenv_keys_name(base) {
+        return Class::HardDeny("dotenvx private keys");
     }
     if base == ".env.schema" {
         return Class::Schema;
@@ -534,7 +537,8 @@ pub fn sniff(path: &Path, limit: usize) -> Sniffed {
     let over = buf.len() > limit;
     buf.truncate(limit);
     let text = String::from_utf8_lossy(&buf);
-    if has_private_key_block(&text) || header_cut_off(&text, over) {
+    if has_private_key_block(&text) || header_cut_off(&text, over) || has_dotenv_private_key(&text)
+    {
         return Sniffed::PrivateKey;
     }
     if over {
@@ -544,6 +548,22 @@ pub fn sniff(path: &Path, limit: usize) -> Sniffed {
         return Sniffed::Keypair;
     }
     Sniffed::Clean
+}
+
+/// Whether `text` assigns a dotenvx private key: `DOTENV_PRIVATE_KEY[_SUFFIX]=` followed
+/// (after optional blanks and a quote) by at least 32 hex digits. A mention without a value
+/// (docs, `.env.example`) is not a key.
+pub fn has_dotenv_private_key(text: &str) -> bool {
+    text.match_indices("DOTENV_PRIVATE_KEY").any(|(i, m)| {
+        let rest = &text[i.saturating_add(m.len())..];
+        let rest = rest
+            .trim_start_matches(|c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        let Some(value) = rest.trim_start_matches([' ', '\t']).strip_prefix('=') else {
+            return false;
+        };
+        let value = value.trim_start_matches([' ', '\t', '"', '\'']);
+        value.bytes().take_while(u8::is_ascii_hexdigit).count() >= 32
+    })
 }
 
 /// Whether `text` holds a PEM / OpenSSH private-key block: a `-----BEGIN … PRIVATE KEY-----`

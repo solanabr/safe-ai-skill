@@ -14,7 +14,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use safe_ai_skill::audit::{self, AuditEntry};
@@ -31,8 +31,8 @@ use safe_ai_skill::spend::{self, SpendLedger};
 use safe_ai_skill::statefile::Loaded;
 use safe_ai_skill::tierstate::{self, Plan};
 use safe_ai_skill::{
-    adapt, grants, headless, migrate, notice, platform, promptguard, redact, registry, relax,
-    sandbox, session, verify,
+    adapt, adapt_opencode, grants, headless, migrate, notice, platform, promptguard, redact,
+    registry, relax, sandbox, session, verify,
 };
 
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
@@ -210,9 +210,9 @@ fn install_panic_ask() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
-        // Codex reads stdout only on exit 0, and a release build aborts after this hook: end
-        // here so the deny counts.
-        if adapt::is_codex() {
+        // Codex (and the opencode plugin) read stdout only on exit 0, and a release build
+        // aborts after this hook: end here so the deny counts.
+        if adapt::is_foreign() {
             std::process::exit(0);
         }
         default(info);
@@ -291,8 +291,15 @@ fn cmd_unknown(sub: &str) -> ExitCode {
 /// payload, never sent by Claude Code) is no opinion except on `gate-bash`. The scanners
 /// (`redact`, `prompt-guard`) have no opinion on any of them.
 fn read_input() -> (Vec<u8>, Result<HookInput, Unreadable>) {
+    if let Some(translated) = TRANSLATED_INPUT.get() {
+        return io::read_payload(translated.as_slice());
+    }
     io::read_payload(std::io::stdin())
 }
+
+/// The Claude-shaped payload an adapter built from another client's stdin; [`read_input`]
+/// reads it in place of stdin.
+static TRANSLATED_INPUT: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Emit the fail-closed `ask` for a PreToolUse payload the engine could not inspect.
 ///
@@ -331,9 +338,9 @@ fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
         cwd,
         dir,
         &|k| std::env::var(k).ok(),
-        // Claude Code's sandbox does not wrap a Codex process, and nothing in Codex stops the
-        // agent from editing the settings that declare it.
-        if adapt::is_codex() {
+        // Claude Code's sandbox does not wrap a Codex or opencode process, and nothing there
+        // stops the agent from editing the settings that declare it.
+        if adapt::is_foreign() {
             sandbox::SandboxState::Off
         } else {
             sandbox::state(&root)
@@ -661,18 +668,22 @@ fn cmd_gate_read() -> ExitCode {
     let verdict = read::decide_tool(tool, input.tool_input.as_ref(), &cwd, &effective);
     let decision = match verdict {
         read::ReadVerdict::Decide(decision) => decision,
-        read::ReadVerdict::Rewrite(updated) => {
-            write_audit(
-                &effective,
-                &dir.path,
-                &input,
-                &raw,
-                "secret_read_rewrite",
-                &Decision::Defer,
-            );
-            let _ = io::emit_updated_input(updated);
-            return ExitCode::SUCCESS;
-        }
+        read::ReadVerdict::Rewrite(updated) => match adapt_opencode::grep_rewrite(updated) {
+            adapt_opencode::Rewrite::Args(updated) => {
+                write_audit(
+                    &effective,
+                    &dir.path,
+                    &input,
+                    &raw,
+                    "secret_read_rewrite",
+                    &Decision::Defer,
+                );
+                let _ = io::emit_updated_input(updated);
+                return ExitCode::SUCCESS;
+            }
+            adapt_opencode::Rewrite::Keep => Decision::Defer,
+            adapt_opencode::Rewrite::Deny(reason) => Decision::Deny { reason },
+        },
     };
     let meta = GateMeta::new(Scope::SecretRead, true);
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
@@ -879,34 +890,87 @@ fn strictest_verdict_of(
     ])
 }
 
-/// `adapt <client> <gate>` (experimental): run one PreToolUse gate on another client's hook
-/// payload and answer in that client's output contract ([`adapt`]). An unknown client or a
-/// gate the client does not offer is a usage error (exit 3, nothing on stdout).
+/// `adapt <client> <entry> [flags]` (experimental): run one hook on another client's payload
+/// and answer in that client's output contract ([`adapt`]). An unknown client or an entry the
+/// client does not offer is a usage error (exit 3, nothing on stdout).
 fn cmd_adapt(rest: &[String]) -> ExitCode {
+    use adapt::codex::Route;
     let client = rest.first().and_then(|c| adapt::client_named(c));
-    let gate = rest.get(1).map(String::as_str).unwrap_or("");
+    let entry = rest.get(1).map(String::as_str).unwrap_or("");
+    let flags = rest.get(2..).unwrap_or_default();
+    let route = match client {
+        Some(adapt::Client::Codex) => adapt::codex::route(entry, flags),
+        Some(adapt::Client::OpenCode) if flags.is_empty() => adapt_opencode::GATES
+            .iter()
+            .find(|g| **g == entry)
+            .map(|g| Route::Gate(g)),
+        _ => None,
+    };
+    let (Some(client), Some(route)) = (client, route) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "{} | adapt opencode <{}>",
+            adapt::codex::usage(),
+            adapt_opencode::GATES.join("|")
+        );
+        return ExitCode::from(EXIT_USAGE);
+    };
+    adapt::set(client);
+    match route {
+        Route::Gate(gate) => {
+            let Some((_, handler)) = SUBCOMMANDS.iter().find(|(name, _)| *name == gate) else {
+                return ExitCode::from(EXIT_USAGE);
+            };
+            install_panic_ask();
+            if client == adapt::Client::OpenCode {
+                return run_with_deadline(
+                    gate_deadline(),
+                    cmd_adapt_opencode,
+                    vec![gate.to_string()],
+                );
+            }
+            run_with_deadline(gate_deadline(), *handler, Vec::new())
+        }
+        Route::SessionStart => cmd_verify_session(),
+        Route::RedactBlock => cmd_redact(),
+    }
+}
+
+/// `adapt opencode <gate>`: translate the opencode plugin's payload ([`adapt_opencode`]), then
+/// run the gate on it. A write to opencode's config or plugin code is denied here, and a
+/// payload that cannot be translated is the unreadable-input ask (a deny under opencode).
+fn cmd_adapt_opencode(rest: &[String]) -> ExitCode {
+    let gate = rest.first().map(String::as_str).unwrap_or("");
+    let (raw, parsed) = read_input();
+    if let Err(why @ (Unreadable::Oversized | Unreadable::Empty)) = parsed {
+        return ask_unreadable(why, &HookInput::default(), &raw);
+    }
     let handler = SUBCOMMANDS
         .iter()
         .find(|(name, _)| *name == gate)
         .map(|(_, handler)| *handler);
-    let (Some(client), Some(handler), 2) = (client, handler, rest.len()) else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: usage: safe-ai-skill adapt codex <{}>",
-            adapt::CODEX_GATES.join("|")
-        );
-        return ExitCode::from(EXIT_USAGE);
-    };
-    if !adapt::CODEX_GATES.contains(&gate) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "safe-ai-skill: `{gate}` is not available through `adapt codex`"
-        );
-        return ExitCode::from(EXIT_USAGE);
+    match (adapt_opencode::prepare(gate, &raw), handler) {
+        (adapt_opencode::Prepared::Gate(translated), Some(handler)) => {
+            let _ = TRANSLATED_INPUT.set(translated);
+            handler(&[])
+        }
+        (adapt_opencode::Prepared::Deny { reason, payload }, _) => {
+            let input: HookInput = serde_json::from_slice(&payload).unwrap_or_default();
+            let cwd = cwd_of(&input);
+            let dir = state_dir(&cwd);
+            let effective = load_effective_policy(&cwd, &dir);
+            let decision = Decision::Deny { reason };
+            record_decision(&decision);
+            write_audit(&effective, &dir.path, &input, &raw, "tamper", &decision);
+            let _ = io::emit_pretooluse(&decision);
+            ExitCode::SUCCESS
+        }
+        (adapt_opencode::Prepared::Malformed(why), _) => {
+            let _ = writeln!(std::io::stderr(), "safe-ai-skill: adapt opencode: {why}");
+            ask_unreadable(Unreadable::Malformed, &HookInput::default(), &raw)
+        }
+        (_, None) => ExitCode::from(EXIT_USAGE),
     }
-    adapt::set(client);
-    install_panic_ask();
-    run_with_deadline(gate_deadline(), handler, Vec::new())
 }
 
 /// `Write|Edit|MultiEdit|NotebookEdit` tripwire: deny writes into safe-ai-skill's own state.
@@ -930,7 +994,13 @@ fn cmd_gate_tamper() -> ExitCode {
         else {
             return ask_unreadable(Unreadable::Malformed, &input, &raw);
         };
-        apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected)
+        let shell_rc = adapt::is_codex()
+            .then(|| adapt::patch_content_reason(patch, &cwd, &adapt::CodexTargets::from_env()))
+            .flatten();
+        match shell_rc {
+            Some(reason) => Decision::Deny { reason },
+            None => apply_patch_decision(&adapt::patch_paths(patch), &cwd, &effective, &protected),
+        }
     } else {
         file_write_decision(tool_input, &cwd, &effective, &protected)
     };
@@ -943,8 +1013,12 @@ fn cmd_gate_tamper() -> ExitCode {
 }
 
 fn cmd_redact() -> ExitCode {
-    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5).
+    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5), except under
+    // the opt-in Codex route, where a result that cannot be scanned is withheld.
     let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
+        if adapt::is_codex() {
+            let _ = io::emit_value(Some(adapt::codex::withheld()));
+        }
         return ExitCode::SUCCESS;
     };
     let Some(response) = input.tool_response.as_ref() else {
@@ -956,9 +1030,14 @@ fn cmd_redact() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let values = safe_ai_skill::env::values::load(&cwd);
-    let _ = io::emit_posttooluse_redact(redact::scrub_tool_response(
-        &input, response, &values, &cwd, &effective,
-    ));
+    let updated = redact::scrub_tool_response(&input, response, &values, &cwd, &effective);
+    // Codex PostToolUse cannot rewrite a result: the opt-in route blocks it instead, with the
+    // redacted text as the reason the model sees.
+    let _ = if adapt::is_codex() {
+        io::emit_value(adapt::codex::redact_block(updated))
+    } else {
+        io::emit_posttooluse_redact(updated)
+    };
     ExitCode::SUCCESS
 }
 
@@ -1276,11 +1355,20 @@ fn cmd_verify_session() -> ExitCode {
     // ledger is started (or repaired), which creates the key on a first run.
     let mut migrated = migrate::run(&dir, now);
     migrated.extend(migrate::mode_to_tier(&dir, now));
+    migrated.extend(migrate::retired_env_read(&dir, now));
+    migrated.extend(migrate::env_tier_notice(&dir, &tier::project_root(&cwd)));
     let spend_state = spend::ledger_state(&plugin_data);
     let _ = SpendLedger::load(&plugin_data);
 
     let (effective, resolution) = load_runtime(&cwd, &dir);
-    let mut res = verify::run_session(&dir, &cwd, &effective);
+    // The sweep reads Claude Code's skill dirs and `.mcp.json`; Codex loads neither, so under
+    // Codex it is not run (pinning or moving Claude Code's packs from a Codex session would
+    // only change another client's state). The report says what is and is not checked.
+    let mut res = if adapt::is_codex() {
+        verify::SessionResult::default()
+    } else {
+        verify::run_session(&dir, &cwd, &effective)
+    };
 
     // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
     // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
@@ -1291,13 +1379,34 @@ fn cmd_verify_session() -> ExitCode {
         root: &root,
         spend: spend_state,
         migrated: &migrated,
-        sandbox: sandbox::declared(&root),
+        // The Claude Code sandbox line is about Claude Code; Codex runs under its own sandbox.
+        sandbox: if adapt::is_codex() {
+            sandbox::Declared::On
+        } else {
+            sandbox::declared(&root)
+        },
         now,
     });
-    let notices: Vec<String> = [effective.ignored_notice(), loosenings]
+    // The platform notices are about Claude Code's install and tools.
+    let platform_notices = if adapt::is_codex() {
+        Vec::new()
+    } else {
+        platform::session_notices()
+    };
+    let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
         .into_iter()
         .flatten()
-        .chain(platform::session_notices())
+        .chain(platform_notices)
+        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+            format!(
+                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+                 {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
+                 use (key included) or delete it.",
+                d.display(),
+                dir.path.display()
+            )
+        }))
         .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
@@ -1331,8 +1440,14 @@ fn cmd_verify_session() -> ExitCode {
         }
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
-    // user's systemMessage only.
-    if let Some(codes) = relax::announce(&dir, now, hook_session(&input).as_deref()) {
+    // user's systemMessage only. Never under Codex: a code is confirmed through Claude Code's
+    // UserPromptSubmit hook, and announcing it here would only spend it.
+    let announced = if adapt::is_codex() {
+        None
+    } else {
+        relax::announce(&dir, now, hook_session(&input).as_deref())
+    };
+    if let Some(codes) = announced {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
         }
@@ -2185,10 +2300,10 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
     cmd_tier(rest)
 }
 
-/// `tier [<name>] [--project] [--env-read deny|ask|tier] | --clear [--project]` — show the
-/// tier (no argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising
-/// the tier or tightening `env_read` applies at once; lowering or loosening is parked for the
-/// user's whole-prompt confirmation (the code reaches the user alone).
+/// `tier [<name>] [--project] [--env-read deny|tier] | --clear [--project]` — show the tier (no
+/// argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising the tier or
+/// tightening `env_read` to `deny` applies at once; lowering, or loosening it back to `tier`, is
+/// parked for the user's whole-prompt confirmation (the code reaches the user alone).
 fn cmd_tier(rest: &[String]) -> ExitCode {
     let cwd = process_cwd();
     let Some(dir) = cli_state_dir("tier", &cwd) else {
@@ -2202,15 +2317,28 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         match arg.as_str() {
             "--project" => project = true,
             "--clear" => clear = true,
-            "--env-read" => match args.next().map(|v| EnvRead::parse(v)) {
-                Some(Some(v)) => env_read = Some(v),
-                _ => return cli_error("tier", "--env-read: expected deny|ask|tier"),
-            },
-            a if a.starts_with('-') || name.is_some() => return cli_error(
-                "tier",
-                "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|ask|tier] \
+            "--env-read" => {
+                match args.next() {
+                    Some(v) if EnvRead::is_retired(v) => return cli_error(
+                        "tier",
+                        "--env-read ask was removed in 1.2.0: project .env reads follow the tier \
+                         (open at off/relaxed/medium, denied at high); --env-read deny denies \
+                         them at every tier",
+                    ),
+                    Some(v) => match EnvRead::parse(v) {
+                        Some(v) => env_read = Some(v),
+                        None => return cli_error("tier", "--env-read: expected deny|tier"),
+                    },
+                    None => return cli_error("tier", "--env-read: expected deny|tier"),
+                }
+            }
+            a if a.starts_with('-') || name.is_some() => {
+                return cli_error(
+                    "tier",
+                    "usage: tier [<off|relaxed|medium|high>] [--project] [--env-read deny|tier] \
                      | tier --clear [--project]",
-            ),
+                )
+            }
             a => name = Some(a),
         }
     }
@@ -2233,9 +2361,6 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
         clear,
     };
     let summary = tierstate::summary(&change);
-    if let Some(note) = env_read.and_then(safe_ai_skill::gates::envread::inactive_note) {
-        let _ = writeln!(std::io::stderr(), "safe-ai-skill tier: {note}");
-    }
     match tierstate::plan(&dir, &change) {
         Plan::NeedsConfirm => park_pending(
             "tier",
@@ -2391,6 +2516,10 @@ fn cmd_status() -> ExitCode {
         "env_read": resolution.env_read.label(),
         "sandbox": effective.runtime.sandbox.label(),
         "data_dir_trusted": dir.trusted,
+        "other_state_dirs": datadir::other_state_dirs(&dir)
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>(),
         "grants_state": grants_state,
         "tier_state": tier_state_label(&dir),
         "grants": grants_view,

@@ -398,12 +398,10 @@ fn grep_content_result_is_redacted_in_place() {
     );
 }
 
-/// The opted-in raw `.env` Read (D8 v2 §2) comes back unchanged through the shim; without the
-/// opt-in the same response is value-scrubbed.
-#[cfg(all(feature = "test-hooks", feature = "env-read-opt-in"))]
+/// A raw `.env` Read the tier permits (Relaxed, the default) comes back unchanged through the
+/// shim; at High, where the read gate denies it, the same response is value-scrubbed.
 #[test]
-fn opted_in_env_read_is_not_rewritten_through_the_shim() {
-    use safe_ai_skill::policy::tier::{EnvRead, Tier};
+fn a_permitted_env_read_is_not_rewritten_through_the_shim() {
     let dotenv = format!("HELIUS_KEY={ENV_VALUE}\nCLUSTER=devnet\n");
     let mut w = World::with_env(&dotenv);
     let file = w.proj().join(".env").to_string_lossy().into_owned();
@@ -415,6 +413,7 @@ fn opted_in_env_read_is_not_rewritten_through_the_shim() {
             "file": { "filePath": file, "content": dotenv, "numLines": 2, "startLine": 1, "totalLines": 2 }
         }),
     );
+    w.assert_redact(&payload, None);
     let scrubbed = updated(json!({
         "type": "text",
         "file": {
@@ -425,31 +424,7 @@ fn opted_in_env_read_is_not_rewritten_through_the_shim() {
             "totalLines": 2
         }
     }));
-    w.assert_redact(&payload, scrubbed.clone());
-    let data = safe_ai_skill::datadir::DataDir {
-        path: w.root.join("data"),
-        trusted: true,
-    };
-    let change = safe_ai_skill::tierstate::Change {
-        project: None,
-        tier: Some(Tier::Relaxed),
-        env_read: Some(EnvRead::Tier),
-        clear: false,
-    };
-    safe_ai_skill::tierstate::apply(&data, &change, 0).unwrap();
-    w.env = vec![
-        (
-            safe_ai_skill::datadir::TEST_TRUST_ENV.to_string(),
-            "1".to_string(),
-        ),
-        (
-            safe_ai_skill::sandbox::TEST_OVERRIDE_ENV.to_string(),
-            "on".to_string(),
-        ),
-    ];
-    w.assert_redact(&payload, None);
-    // Sandbox off: the opt-in is suspended and the response is scrubbed again.
-    w.env[1].1 = "off".to_string();
+    w.env = vec![("SAFE_AI_SKILL_TIER".to_string(), "high".to_string())];
     w.assert_redact(&payload, scrubbed);
 }
 

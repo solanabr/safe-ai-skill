@@ -26,7 +26,7 @@ fn lists_every_file_parses_and_the_manifest_matches() {
     let all = lists::lists().expect("embedded lists parse and match MANIFEST");
     assert_eq!(all.contract, "1.2.0");
     assert_eq!(all.manifest_sha256.len(), 64);
-    assert_eq!(all.credentials.len(), 63);
+    assert_eq!(all.credentials.len(), 66);
     assert_eq!(all.exfil_hosts.len(), 84);
     assert_eq!(all.verbs.len(), 43);
 }
@@ -72,7 +72,7 @@ fn lists_kit_derived_credentials_are_pinned() {
     assert_eq!(in_section("kit:SB_CREDENTIALS"), 13);
     assert_eq!(in_section("kit:SB_HOST_CREDENTIALS"), 10);
     assert_eq!(in_section("kit:SB_BROWSER_STORES"), 22);
-    assert_eq!(in_section("plugin"), 18);
+    assert_eq!(in_section("plugin"), 21);
     let find = |g: &str| {
         creds
             .iter()

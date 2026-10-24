@@ -242,6 +242,10 @@ fn seg_overlap(rec: &str, arg: &str, globbing: bool) -> bool {
     if !has_wild(rec) {
         return (!rec.starts_with('.') || arg.starts_with('.')) && pat_match(arg, rec, true);
     }
+    // As for a literal record: a shell wildcard does not match a leading dot.
+    if rec.starts_with('.') && !arg.starts_with('.') {
+        return false;
+    }
     let ((ap, asu), (rp, rsu)) = (affixes(arg), affixes(rec));
     let compat = |a: &str, b: &str, prefix: bool| {
         if prefix {
@@ -993,8 +997,9 @@ mod tests {
     #[test]
     fn exclusions_cover_every_record_at_home_and_stay_short_in_a_project() {
         let base = grep_exclusions(Path::new("/tmp/some/project"));
-        // The two `**/…` list records (wallet extension stores) join the short list.
-        assert_eq!(base.len(), GREP_EXCLUDED.len() + 2);
+        // The `**/…` list records not already in the short list (the dotenvx key files and the
+        // wallet extension stores) join it.
+        assert_eq!(base.len(), GREP_EXCLUDED.len() + 5);
         let home = grep_exclusions(Path::new("/"));
         assert!(home.len() > base.len());
         for c in lists::credentials()

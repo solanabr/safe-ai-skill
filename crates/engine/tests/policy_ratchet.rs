@@ -104,13 +104,12 @@ fn repo_tier_fields_are_hints_and_profiles_are_removed() {
 #[test]
 fn repo_env_read_is_recorded_only_as_a_tightening_hint() {
     let p = with_repo("secrets:\n  env_read: tier\n");
-    assert_eq!(p.secrets.env_read, "deny");
-    assert!(noted(&p, "secrets.env_read"));
+    assert_eq!(p.secrets.env_read, "tier");
     assert_eq!(p.repo_env_read, Some(EnvRead::Tier));
-    assert_eq!(
-        with_repo("secrets:\n  env_read: deny\n").repo_env_read,
-        Some(EnvRead::Deny)
-    );
+    let deny = with_repo("secrets:\n  env_read: deny\n");
+    assert_eq!(deny.repo_env_read, Some(EnvRead::Deny));
+    assert_eq!(deny.secrets.env_read, "deny");
+    assert_eq!(with_repo("secrets:\n  env_read: ask\n").repo_env_read, None);
     assert_eq!(base().repo_env_read, None);
 }
 
@@ -467,7 +466,10 @@ fn malformed_repo_policy_never_loosens() {
     // Ill-typed values fail closed (caps 0) without loosening anything else.
     let p = with_repo("spend:\n  per_tx_sol_max: lots\n");
     assert!(p.is_fail_closed());
-    assert_eq!(p.secrets, base().secrets);
+    // Fail-closed denies raw project env reads (`env_read: deny`), a tightening.
+    let mut secrets = base().secrets;
+    secrets.env_read = "deny".into();
+    assert_eq!(p.secrets, secrets);
     assert_eq!(p.supply_chain, base().supply_chain);
     assert_eq!(p.ignored_overrides.len(), 1);
 }
@@ -704,15 +706,27 @@ fn an_unauthenticated_tier_or_mode_json_selects_nothing() {
 
 #[test]
 fn repo_cannot_unlist_or_allow_env_reads() {
-    let proj = project("secrets:\n  deny_read_globs: []\n  allow_read_globs: [\"**/.env\"]\n");
+    let proj = project(
+        "secrets:\n  deny_read_globs: []\n  allow_read_globs: [\"**/.env\", \"**/.envrc\"]\n",
+    );
     let data = TempDir::new("ratchet-data");
+    // Another env file stays denied below High, a project `.env` at High.
+    let label = gate(
+        "gate-read",
+        "Read",
+        json!({ "file_path": proj.join(".envrc") }),
+        proj.path(),
+        data.path(),
+        &[],
+    );
+    assert_eq!(label, "deny");
     let label = gate(
         "gate-read",
         "Read",
         json!({ "file_path": proj.join(".env") }),
         proj.path(),
         data.path(),
-        &[],
+        &[("SAFE_AI_SKILL_TIER", "high")],
     );
     assert_eq!(label, "deny");
 }

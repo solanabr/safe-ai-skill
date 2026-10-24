@@ -61,9 +61,6 @@ jobs:
       - name: cargo clippy --features test-hooks
         run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets --features test-hooks -- -D warnings
 
-      - name: cargo clippy --features test-hooks,env-read-opt-in
-        run: cargo clippy --manifest-path ${{ env.MANIFEST }} --all-targets --features test-hooks,env-read-opt-in -- -D warnings
-
   # ── build + test matrix ──────────────────────────────────────────────────
   build-test:
     name: Build + test / ${{ matrix.name }}
@@ -102,20 +99,23 @@ jobs:
       - name: cargo build --verbose
         run: cargo build --manifest-path ${{ env.MANIFEST }} --verbose
 
+      - uses: actions/setup-node@v4
+        if: runner.os != 'Windows'
+        with:
+          node-version: "22"
+
       - name: cargo test --verbose
         run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
+        env:
+          # The opencode plugin's Node tests (real engine) must run, not skip.
+          SAFE_AI_SKILL_REQUIRE_NODE_TESTS: ${{ runner.os != 'Windows' && '1' || '' }}
 
       # The test-only overrides (trusted data dir, sandbox state, crash trigger) exist only in
-      # these builds: the tier matrix, the shared corpus plugin column and the Off / env_read
-      # opt-in / grant rows that drive the binary run here. `test-hooks` alone is the shipped
-      # behaviour (the env-read opt-in inactive); with `env-read-opt-in` the opt-in rows reach
-      # their end state. A separate target dir keeps the release-shaped debug binary for the
-      # steps below.
+      # these builds: the tier matrix, the shared corpus plugin column and the Off /
+      # `env_read: deny` / grant rows that drive the binary run here. A separate target dir
+      # keeps the release-shaped debug binary for the steps below.
       - name: cargo test --features test-hooks
         run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --target-dir crates/engine/target/test-hooks
-
-      - name: cargo test --features test-hooks,env-read-opt-in
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks,env-read-opt-in --target-dir crates/engine/target/test-hooks
 
       # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
       # No network: we use the freshly built binary, not a release download.
@@ -428,6 +428,13 @@ jobs:
         run: |
           node --check npm/bin/cli.js
           node --check npm/scripts/postinstall.js
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: opencode plugin (fail-closed tests, fake engines)
+        run: node --test adapters/opencode/test/plugin.test.mjs
 
       - name: shellcheck (install.sh + scripts)
         run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh

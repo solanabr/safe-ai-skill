@@ -272,6 +272,53 @@ pub fn mode_to_tier(dir: &DataDir, now: u64) -> Vec<String> {
     lines
 }
 
+/// The one-time line for a `tier.json` that held the retired 1.1.0 `env_read: ask`.
+pub const RETIRED_ENV_READ_LINE: &str = "secrets env_read ask was retired in 1.2.0 and is now \
+     `tier`: project .env and .env.* reads follow the tier (open at off, relaxed and medium, \
+     denied at high); run `safe-ai-skill tier --env-read deny` to deny them at every tier";
+
+/// Rewrite a `tier.json` that holds the retired `env_read: ask` as `tier` (1.2.0), once: the
+/// rewritten file no longer names it. Returns the notice line when it did.
+pub fn retired_env_read(dir: &DataDir, now: u64) -> Vec<String> {
+    let _ = now;
+    match tierstate::rewrite_retired_env_read(dir) {
+        Ok(true) => vec![RETIRED_ENV_READ_LINE.to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// The one-time line for an install that existed before 1.2.0 and never chose `env_read`.
+pub const ENV_TIER_LINE: &str = "1.2.0: the agent can now read the project's .env and .env.* \
+     at tier off, relaxed and medium (denied at high), as in solana-ai-kit; run \
+     `safe-ai-skill tier --env-read deny` to keep them denied at every tier";
+
+/// Marker recording that [`ENV_TIER_LINE`] was shown, or that this engine made the state key.
+pub const ENV_TIER_MARKER: &str = statefile::KEY_ERA_MARKER;
+
+/// The 1.2.0 `.env` notice, once per data dir: shown when the state key exists without the
+/// marker (an earlier engine made it) and no `env_read` is stored for `root`; otherwise only
+/// the marker is recorded.
+pub fn env_tier_notice(dir: &DataDir, root: &Path) -> Vec<String> {
+    if dir.is_unresolved() {
+        return Vec::new();
+    }
+    let marker = dir.path.join(ENV_TIER_MARKER);
+    if std::fs::symlink_metadata(&marker).is_ok() {
+        return Vec::new();
+    }
+    let existed = std::fs::symlink_metadata(dir.path.join(KEY_FILE)).is_ok();
+    let stored = tierstate::user_choice(dir, root).env_read.is_some();
+    if statefile::create_dir_private(&dir.path).is_err() || std::fs::write(&marker, b"1\n").is_err()
+    {
+        return Vec::new();
+    }
+    if existed && !stored {
+        vec![ENV_TIER_LINE.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Rename a 1.0 file to `<name>.<suffix>`.
 fn rename_to(path: &Path, suffix: &str) {
     let mut aside = path.as_os_str().to_owned();
@@ -490,6 +537,32 @@ mod tests {
             "{lines:?}"
         );
         for d in [dir, auto, forged] {
+            let _ = std::fs::remove_dir_all(&d.path);
+        }
+    }
+
+    #[test]
+    fn the_env_tier_notice_is_shown_once_to_existing_installs_only() {
+        let root = Path::new("/work/proj");
+        let fresh = tmp_data("env_notice_fresh");
+        assert!(env_tier_notice(&fresh, root).is_empty());
+        assert!(fresh.path.join(ENV_TIER_MARKER).exists());
+        let old = tmp_data("env_notice_old");
+        crate::grants::save(&old, &crate::grants::Grants::default()).unwrap();
+        // An earlier engine made the key: no marker beside it.
+        std::fs::remove_file(old.path.join(ENV_TIER_MARKER)).unwrap();
+        assert_eq!(env_tier_notice(&old, root), vec![ENV_TIER_LINE.to_string()]);
+        assert!(env_tier_notice(&old, root).is_empty(), "shown twice");
+        let chose = tmp_data("env_notice_chose");
+        let change = tierstate::Change {
+            project: None,
+            tier: Some(Tier::Relaxed),
+            env_read: Some(crate::policy::tier::EnvRead::Deny),
+            clear: false,
+        };
+        tierstate::apply(&chose, &change, 1).unwrap();
+        assert!(env_tier_notice(&chose, root).is_empty());
+        for d in [fresh, old, chose] {
             let _ = std::fs::remove_dir_all(&d.path);
         }
     }

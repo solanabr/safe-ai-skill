@@ -1,6 +1,6 @@
 [package]
 name = "safe-ai-skill"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "safe-ai-skill security engine — runtime firewall + supply-chain verifier for Solana AI dev"
 license = "MIT"
@@ -21,10 +21,6 @@ path = "src/lib.rs"
 [features]
 # Test-only hooks (a crash trigger for the panic-ask path). Never enable for a release.
 test-hooks = []
-# The user-scope raw project-env read opt-in (`tier --env-read ask|tier`). Off until the
-# "project env file to network" exfil row exists (D8 v2 spec §2/§5): without it every raw
-# project-env read denies whatever `env_read` says.
-env-read-opt-in = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

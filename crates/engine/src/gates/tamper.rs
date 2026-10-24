@@ -178,8 +178,15 @@ const MUTATING_SUBCOMMANDS: &[&str] = &["grant", "revoke", "confirm"];
 
 /// Hook-only subcommands: run through Bash they could replay a forged hook payload (a fake
 /// UserPromptSubmit to `prompt-guard`, a fake PostToolUse to `pending-notice`). Every `gate-*`
-/// subcommand is hook-only too.
-const HOOK_SUBCOMMANDS: &[&str] = &["pending-notice", "prompt-guard", "redact", "failure-notice"];
+/// subcommand is hook-only too, and so is `adapt` (another client's hooks; its
+/// `session-start` pins packs like `verify session`).
+const HOOK_SUBCOMMANDS: &[&str] = &[
+    "pending-notice",
+    "prompt-guard",
+    "redact",
+    "failure-notice",
+    "adapt",
+];
 
 /// Real subcommands: a cache-path word followed by one of these is the binary being run, not a
 /// path being written. Mutating ones are denied before this list is consulted.
@@ -206,6 +213,7 @@ const SUBCOMMANDS: &[&str] = &[
     "mode",
     "tier",
     "env",
+    "adapt",
     "--version",
 ];
 
@@ -310,12 +318,12 @@ impl Protected {
     /// Read `HOME`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CONFIG_DIR` and
     /// `CLAUDE_PROJECT_DIR` (a project root). No file is read.
     ///
-    /// Under the Codex adapter, where no `CLAUDE_PLUGIN_DATA` is set, the data dir is the one
+    /// Under the Codex and opencode adapters, where no `CLAUDE_PLUGIN_DATA` is set, the data dir is the one
     /// discovery finds (the Claude Code plugin's), so it stays protected there too.
     pub fn from_env() -> Self {
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let data = var("CLAUDE_PLUGIN_DATA").or_else(|| {
-            if !crate::adapt::is_codex() {
+            if !crate::adapt::is_foreign() {
                 return None;
             }
             crate::datadir::data_dir_with_cwd(None)
@@ -1768,7 +1776,8 @@ fn subcommand_reason(sub: &str) -> String {
     if HOOK_SUBCOMMANDS.contains(&sub) || sub.starts_with("gate-") {
         return format!(
             "safe-ai-skill tamper tripwire: `safe-ai-skill {sub}` is a hook subcommand: only \
-             Claude Code runs it, with the real hook payload. Do not retry or work around this \
+             the agent client's own hooks (Claude Code, or Codex for `adapt`) run it, with the \
+             real hook payload. Do not retry or work around this \
              check."
         );
     }
@@ -1901,6 +1910,8 @@ mod tests {
             "safe-ai-skill gate-prompt-expansion",
             "safe-ai-skill verify session",
             "safe-ai-skill confirm 12345678",
+            "safe-ai-skill adapt codex session-start",
+            "echo '{}' | safe-ai-skill adapt codex redact --block-with-redaction",
         ] {
             assert_deny(cmd);
         }

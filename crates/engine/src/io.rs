@@ -250,6 +250,12 @@ pub fn emit_userpromptsubmit(block: Option<&str>) -> std::io::Result<()> {
     write_opinion(render_userpromptsubmit(block))
 }
 
+/// Emit an already-built hook output (the Codex PostToolUse redaction block,
+/// [`crate::adapt::codex::redact_block`]); `None` writes nothing.
+pub fn emit_value(value: Option<Value>) -> std::io::Result<()> {
+    write_opinion(value)
+}
+
 /// Write `value` like [`write_json`]; `None` (no opinion) writes nothing.
 fn write_opinion(value: Option<Value>) -> std::io::Result<()> {
     match value {

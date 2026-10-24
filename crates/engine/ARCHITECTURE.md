@@ -133,10 +133,12 @@ CLI subcommands (not hooks) run the engine with live output and keep its exit st
 ## State files (in the data dir: `datadir::data_dir()`)
 
 `datadir::data_dir()` resolves `CLAUDE_PLUGIN_DATA`, else the preferred `safe-ai-skill-*` dir
-under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`; never a relative path.
-`DataDir::trusted` holds only inside `<passwd home>/.claude/plugins/data`, or inside
-`$CLAUDE_CONFIG_DIR/plugins/data` when that config dir is under the passwd home and neither
-it nor the data dir is inside the project or hook cwd (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
+under `$CLAUDE_CONFIG_DIR/plugins/data` / `~/.claude/plugins/data`, else (no Claude Code plugin)
+the standalone dir: `$SAFE_AI_SKILL_DATA`, else `safe-ai-skill-data` under the platform data
+root; never a relative path. `DataDir::trusted` holds only inside
+`<passwd home>/.claude/plugins/data`, for the standalone default under the passwd home, or for
+an env-placed dir (`$CLAUDE_CONFIG_DIR/plugins/data/*`, `$SAFE_AI_SKILL_DATA`, …) under the
+passwd home and not inside the project or hook cwd (see `datadir` docs). Hooks resolve with `data_dir_with_cwd(Some(cwd))`. Authenticated files go through `statefile` (`{v, mac, body}`, HMAC-SHA256, key in
 `key`). The CLI resolves the same dir from a terminal; state is never written to
 `~/.safe-ai-skill` or the cwd.
 
@@ -168,14 +170,14 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | Module | Role |
 |---|---|
 | `policy/tier.rs` | `Tier {Off, Relaxed, Medium, High}` (`Ord`; aliases `strict`, `paranoid`, `autopilot`), `TierSource`, and `resolve(root, &DataDir, env) -> (Tier, EnvRead, Vec<Note>)`: `base` (`relaxed`), then the user value from `tier.json` (`projects[root]`, else `global`), then `max()` with the raise-only hints (kit `.claude/security.json` `tier`/`declared.tier`/`enforced.tier`, repo `policy.yaml` `tier`, env `SAFE_AI_SKILL_TIER`). A lower hint is ignored with a note. The table in the README is checked against the table in this file. |
-| `tierstate.rs` | The authenticated `tier.json` v1 under the statefile MAC and generation index; the writer behind `safe-ai-skill tier`. A raise applies at once; a lowering or an `env_read` loosening (`deny` < `ask` < `tier`) becomes a `confirm::PendingKind::Tier` request. `mode.rs` stays as a deprecated alias. |
+| `tierstate.rs` | The authenticated `tier.json` v1 under the statefile MAC and generation index; the writer behind `safe-ai-skill tier`. A raise applies at once; a lowering or an `env_read` loosening (`deny` < `tier`; a stored 1.1.0 `ask` loads as `tier` and is rewritten at SessionStart) becomes a `confirm::PendingKind::Tier` request. `mode.rs` stays as a deprecated alias. |
 | `sandbox.rs` | `state(root) -> {On, Off, Unknown}` from the first `sandbox.enabled` in managed, project-local, project, then user settings (passwd home, never env `HOME`; `$CLAUDE_CONFIG_DIR`). `On` also needs macOS or Linux with `bwrap` on a fixed path, never native Windows. Declared configuration, not a runtime proof. A test override exists only under `test-hooks`. |
 | `headless.rs` | `is_headless(env)`: any of `SAFE_AI_SKILL_HEADLESS`/`KIT_FIREWALL_HEADLESS` (`1`/`true`) or a CI variable not `0`/`false`. The shared rule's `/dev/tty` signal is not wired (hook processes never have a terminal, so it would deny every interactive ask). Any signal turns it on, nothing turns it off. `main.rs` post-processes every PreToolUse verdict: `ask` becomes `deny`; a grant confirmed earlier still allows below High. |
 | `lists.rs` | Parses the embedded `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!`, `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
 | `gates/credpaths.rs`, `gates/creddump.rs` | Credential path classification and directory-Grep exclusion globs from `credentials.list`; the command-form readers (`gh auth token`, `git credential fill`, `security … -w`, `op read`, …) and any Bash word or `NAME=` prefix value naming a store (metadata-only programs excepted; an `ssh`/`scp`/`sftp` identity and `ssh-keygen -y -f` exempt). Deny at every tier. |
-| `gates/envread.rs`, `gates/envwrite.rs` | The raw project-env read verdict from `(tier, env_read, sandbox)`; the Write/Edit/MultiEdit and agent `env set\|unset` verdict (deny from Medium). The opt-in applies only with the sandbox `On`, and only in a build with the `env-read-opt-in` cargo feature (off in releases: `OPT_IN_AVAILABLE`). |
+| `gates/envread.rs`, `gates/envwrite.rs` | Project env files (`.env`/`.env.*` inside the project root, by name and resolved path) by tier, as solana-ai-kit: raw reads `(tier, env_read, project)` open at Off/Relaxed/Medium and denied at High (`env_read: deny` denies at every tier; other env files always deny); writes (Write/Edit/MultiEdit, agent `env set\|unset`, the Bash writes `creddump` recognises) denied at Medium (other env files Medium and High). A command line that reads an env file and runs a network program or network code denies at every tier. |
 | `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). A line joining two or more gated actions, or any hard-guard ask, is never grantable; a command over 256 KiB or with more than 2048 expansions asks unparsed. |
-| `gates/exfil.rs` | The call line for the naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`. Deferred (#19): it has no opinion in 1.1.0. Secret uploads by path are denied by `gates/secrets.rs` as reads. |
+| `gates/exfil.rs` | The call line for the naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`. Deferred (#19): it has no opinion in 1.1.0. Secret uploads by path are denied by `gates/secrets.rs`; an env read beside a network command by `gates/creddump.rs` (`envread::to_network`). |
 | `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
 | `verify/gitobj.rs`, `verify/history.rs` | Read-only git object reader (loose objects, `.idx` v1/v2 + `.pack` v2/v3, OFS/REF deltas; no git process, `gitdir:`/`commondir` confined to the pack or its submodule dir, FIFO-safe opens) under a time/byte/object `Budget` that every tree walk charges, and the history scan `verify::check::check_dir` (`verify add|check`, `install`, once per directory via `check_dir_with`; never the sweep) runs over it: every blob through `rules::scan_blob` under each distinct name, docs-described commits that touch code (`docs_commit_code` report-only, combo `docs_commit_sink` on added lines), and `history_unscanned` for anything left unread. |
 
@@ -252,7 +254,7 @@ pub struct SpendPolicy { pub per_tx_sol_max: f64, pub hard_tx_sol_max: f64, pub 
 pub struct McpPolicy { pub sensitive_name_pattern: String }   // verbs expanded (see below)
 pub struct SwapPolicy { pub rugcheck: bool, pub rugcheck_max_score: u32, pub rugcheck_timeout_ms: u64, pub trusted_mints: Vec<String> }
 pub struct SecretsPolicy {
-    pub env_read: String,                   // a policy file can only tighten; the user's choice is tier.json
+    pub env_read: String,                   // `tier` (default) or `deny`; a project can only tighten; the user's choice is tier.json
     pub deny_read_globs: Vec<String>, pub allow_read_globs: Vec<String>,
     pub key_material_extra_globs: Vec<String>, // union with credentials.list
     pub exfil_hosts_extra: Vec<String>,     // union with exfil-hosts.list (for the planned tripwire)
@@ -565,7 +567,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`tier [<name>] [--project] [--env-read deny|ask|tier] | --clear` (`mode` is a deprecated alias) · `revoke` · `status` · `--version`. `allow`, a tier lowering and
+`tier [<name>] [--project] [--env-read deny|tier] | --clear` (`mode` is a deprecated alias) · `revoke` · `status` · `--version`. `allow`, a tier lowering and
 `verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
 an argument error exits 1.
 
