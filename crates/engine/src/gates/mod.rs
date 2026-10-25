@@ -10,6 +10,7 @@ pub mod credpaths;
 pub mod envread;
 pub mod envwrite;
 pub mod exfil;
+pub mod fetchexec;
 pub mod mcp;
 pub mod mcpexec;
 pub mod read;
