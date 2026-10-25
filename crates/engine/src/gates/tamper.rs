@@ -1938,7 +1938,7 @@ enum Guarded {
     McpJson,
     /// A `package.json` outside `node_modules`.
     PackageJson,
-    /// A subagent definition, `.claude/agents/*.md`.
+    /// A subagent definition, `.claude/agents/**/*.md`.
     AgentDef,
 }
 
@@ -1974,11 +1974,10 @@ fn classify(norm: &str, homes: &ConfigHomes) -> Option<Guarded> {
     {
         return Some(Guarded::KitHooks);
     }
-    if dirs.len() >= 2
-        && dirs[dirs.len() - 2] == ".claude"
-        && parent == "agents"
-        && name.ends_with(".md")
-    {
+    let in_agents = dirs
+        .windows(2)
+        .any(|w| w[0] == ".claude" && w[1] == "agents");
+    if in_agents && name.ends_with(".md") {
         return Some(Guarded::AgentDef);
     }
     if *name == ".mcp.json" {
@@ -2122,9 +2121,21 @@ pub fn decide_file_content_in(
     homes: &ConfigHomes,
 ) -> Option<Verdict> {
     let input = tool_input?;
+    if input.get("file_path").is_none() {
+        // NotebookEdit cannot write a config file sensibly: one aimed at a guarded path asks.
+        let raw = input.get("notebook_path").and_then(Value::as_str)?;
+        let path = absolute_in(raw, cwd, homes)?;
+        let kind = classify_path(&path, homes).or_else(|| hardlinked_kind(&path, cwd, homes))?;
+        let shown: String = raw.chars().take(160).collect();
+        return match kind {
+            Guarded::GitHooks => Some(Verdict::Ask(git_hook_reason(&shown))),
+            Guarded::KitHooks => Some(Verdict::Ask(kit_hook_reason(&shown))),
+            _ => Some(Verdict::Ask(unreadable_reason(&shown))),
+        };
+    }
     let raw = input.get("file_path").and_then(Value::as_str)?;
     let path = absolute_in(raw, cwd, homes)?;
-    let kind = classify_path(&path, homes)?;
+    let kind = classify_path(&path, homes).or_else(|| hardlinked_kind(&path, cwd, homes))?;
     let shown: String = raw.chars().take(160).collect();
     match kind {
         Guarded::GitHooks => return Some(Verdict::Ask(git_hook_reason(&shown))),
@@ -2137,17 +2148,46 @@ pub fn decide_file_content_in(
         Old::Unreadable => return Some(Verdict::Ask(unreadable_reason(&shown))),
     };
     match after_write(input, old.as_deref())? {
-        After::Exact(new) => judge_content(kind, &shown, old.as_deref().unwrap_or(""), &new),
-        After::Fragment { old, new } => judge_content(kind, &shown, &old, &new),
+        After::Exact(new) => judge_content(kind, &shown, old.as_deref().unwrap_or(""), &new, true),
+        After::Fragment { old, new } => judge_content(kind, &shown, &old, &new, false),
     }
 }
 
-/// The verdict on `kind` going from `before` to `after` text.
-fn judge_content(kind: Guarded, shown: &str, before: &str, after: &str) -> Option<Verdict> {
+/// The guarded kind of the file `path` is a hard link to (another name for the same inode),
+/// checked only when the file has more than one link.
+#[cfg(unix)]
+fn hardlinked_kind(path: &Path, cwd: &Path, homes: &ConfigHomes) -> Option<Guarded> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.nlink() < 2 {
+        return None;
+    }
+    guarded_paths(cwd, homes).into_iter().find_map(|g| {
+        let other = std::fs::metadata(&g).ok()?;
+        (other.dev() == meta.dev() && other.ino() == meta.ino())
+            .then(|| classify(&normalize_path(&g.to_string_lossy()), homes))
+            .flatten()
+    })
+}
+
+#[cfg(not(unix))]
+fn hardlinked_kind(_path: &Path, _cwd: &Path, _homes: &ConfigHomes) -> Option<Guarded> {
+    None
+}
+
+/// The verdict on `kind` going from `before` to `after` text; `exact` when `after` is the
+/// whole new file (not an edit's own text).
+fn judge_content(
+    kind: Guarded,
+    shown: &str,
+    before: &str,
+    after: &str,
+    exact: bool,
+) -> Option<Verdict> {
     match kind {
-        Guarded::Settings => {
-            settings_change(before, after).map(|what| Verdict::Deny(disable_reason(shown, &what)))
-        }
+        Guarded::Settings => settings_change(before, after)
+            .or_else(|| exact.then(|| breaks_settings(before, after)).flatten())
+            .map(|what| Verdict::Deny(disable_reason(shown, &what))),
         Guarded::AgentDef => {
             (bypass_frontmatter(after) && !bypass_frontmatter(before)).then(|| {
                 Verdict::Deny(disable_reason(
@@ -2283,7 +2323,7 @@ fn settings_facts(text: &str) -> SettingsFacts {
         return facts;
     }
     let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) else {
-        textual_settings_facts(&compact(text), &mut facts);
+        textual_settings_facts(&compact(&decode_json_escapes(text)), &mut facts);
         return facts;
     };
     if let Some(Value::Object(plugins)) = obj.get("enabledPlugins") {
@@ -2443,12 +2483,57 @@ fn settings_change(before: &str, after: &str) -> Option<String> {
     None
 }
 
-/// Whether agent-definition text sets `permissionMode: bypassPermissions`.
+/// Why a whole new settings text drops protection by not being JSON: the client ignores a
+/// settings file it cannot parse, so the protection `before` held goes with it.
+fn breaks_settings(before: &str, after: &str) -> Option<String> {
+    if after.trim().is_empty() || serde_json::from_str::<Value>(after).is_ok() {
+        return None;
+    }
+    let had = settings_facts(before);
+    (had.hooks.is_some() && !had.protecting.is_empty())
+        .then(|| "is not valid JSON, so the client drops its plugin and hook entries".to_string())
+}
+
+/// Whether agent-definition text sets `permissionMode: bypassPermissions`: in its front matter
+/// or the text of an edit, block or flow style, quoted or not, with a trailing comment or a
+/// block scalar.
 fn bypass_frontmatter(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line: String = compact(line).replace(['"', '\''], "");
-        line == "permissionmode:bypasspermissions"
+    let mut flat = String::new();
+    for line in text.lines() {
+        let line = match line.find(" #") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        flat.push_str(line);
+        flat.push('\n');
+    }
+    let flat: String = compact(&flat).replace(['"', '\''], "");
+    flat.match_indices("permissionmode:").any(|(i, m)| {
+        let value = flat[i + m.len()..].trim_start_matches(['>', '|', '-', '+']);
+        value.starts_with("bypasspermissions")
     })
+}
+
+/// `text` with JSON `\uXXXX` escapes decoded (an edit's text spelled to dodge a match).
+fn decode_json_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("\\u") {
+        out.push_str(&rest[..i]);
+        let hex = rest.get(i + 2..i + 6).unwrap_or("");
+        match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+            Some(c) if hex.len() == 4 => {
+                out.push(c);
+                rest = &rest[i + 6..];
+            }
+            _ => {
+                out.push_str("\\u");
+                rest = &rest[i + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The string values of `"key": "…"` pairs in `text` (any nesting), for text that may not be
@@ -2533,6 +2618,13 @@ fn git_risky(text: &str) -> BTreeSet<String> {
 
 /// Whether git setting `key` (lowercase, dotted) set to `value` makes git run a program.
 fn risky_git_key(key: &str, value: &str) -> bool {
+    let tool_key = matches!(
+        key,
+        "editor" | "pager" | "core.editor" | "core.pager" | "sequence.editor"
+    ) || key.starts_with("pager.");
+    if tool_key && is_known_editor_or_pager(value) {
+        return false;
+    }
     let builtin_fsmonitor = matches!(value.to_ascii_lowercase().as_str(), "true" | "false" | "");
     if !key.contains('.') {
         // An edit fragment without its section header.
@@ -2570,6 +2662,25 @@ fn risky_git_key(key: &str, value: &str) -> bool {
         ("credential", "helper") => value.starts_with('!') || value.contains('/'),
         _ => false,
     }
+}
+
+/// Whether `value` is a bare, well-known editor or pager (`vim`, `code --wait`, `delta`).
+fn is_known_editor_or_pager(value: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "vim",
+        "vi",
+        "nvim",
+        "nano",
+        "emacs",
+        "code --wait",
+        "subl -w",
+        "less",
+        "more",
+        "cat",
+        "delta",
+    ];
+    let words: Vec<&str> = value.split_whitespace().collect();
+    KNOWN.contains(&words.join(" ").to_ascii_lowercase().as_str())
 }
 
 /// The MCP servers in `.mcp.json` text (name → its JSON); `None` when the text is not JSON.
@@ -2663,14 +2774,22 @@ enum Content {
 enum Op {
     Write(Content),
     Delete,
+    /// `find <start> … -delete` (or `-exec rm`): deletes what below `start` matches one of the
+    /// `-name` globs (lowercase), everything when there is none.
+    Find(Vec<String>),
     /// `chmod`/`chown`: may enable or disable a hook script.
     Mode,
+    /// `ln` without `-s`: a hard link, another name the file can be rewritten through.
+    Link,
 }
 
 /// The directories relative paths may resolve against: the cwd and each literal `cd` target.
 struct Places {
     known: Vec<PathBuf>,
     unknown: bool,
+    /// Variables a target may name: `HOME`, `PWD`, `CLAUDE_PROJECT_DIR`, `CLAUDE_CONFIG_DIR`
+    /// and the line's own assignments ([`shell::same_line_assignments`]), later ones winning.
+    vars: Vec<(String, String)>,
 }
 
 impl Places {
@@ -2678,6 +2797,10 @@ impl Places {
     /// change the gate cannot follow, a relative path is also placed under a stand-in dir so
     /// its own components still classify.
     fn resolve(&self, raw: &str, homes: &ConfigHomes) -> Vec<PathBuf> {
+        let Some(expanded) = expand_vars(raw, &self.vars) else {
+            return Vec::new();
+        };
+        let raw = expanded.as_str();
         let mut out: Vec<PathBuf> = self
             .known
             .iter()
@@ -2693,12 +2816,15 @@ impl Places {
     fn cd(&mut self, cmd: &SimpleCommand, homes: &ConfigHomes) {
         let target = cmd.words.iter().skip(1).find(|w| !w.text.starts_with('-'));
         match target {
-            Some(w) if !w.dynamic && !w.splits => {
-                let next: Vec<PathBuf> = self
-                    .known
-                    .iter()
-                    .filter_map(|d| absolute_in(&w.text, d, homes))
-                    .collect();
+            Some(w) if !w.splits => {
+                let next: Vec<PathBuf> = match expand_vars(&w.text, &self.vars) {
+                    Some(text) => self
+                        .known
+                        .iter()
+                        .filter_map(|d| absolute_in(&text, d, homes))
+                        .collect(),
+                    None => Vec::new(),
+                };
                 if next.is_empty() {
                     self.unknown = true;
                 }
@@ -2725,6 +2851,163 @@ struct Touch {
     paths: Vec<PathBuf>,
 }
 
+/// `raw` with `$NAME` / `${NAME}` replaced from `vars` (the last entry for a name wins); `None`
+/// when it holds a substitution or a variable `vars` does not know.
+fn expand_vars(raw: &str, vars: &[(String, String)]) -> Option<String> {
+    if !raw.contains('$') {
+        return (!raw.contains('`')).then(|| raw.to_string());
+    }
+    let lookup = |name: &str| vars.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v);
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let (name, after) = if let Some(braced) = tail.strip_prefix('{') {
+            let end = braced.find('}')?;
+            (&braced[..end], &braced[end + 1..])
+        } else {
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            (&tail[..end], &tail[end..])
+        };
+        out.push_str(lookup(name)?);
+        rest = after;
+    }
+    out.push_str(rest);
+    (!out.contains('`')).then_some(out)
+}
+
+/// The variables a Bash target may name, for [`expand_vars`].
+fn target_vars(command: &str, cwd: &Path, homes: &ConfigHomes) -> Vec<(String, String)> {
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let mut vars = vec![("PWD".to_string(), path(cwd))];
+    let fixed = [
+        ("HOME", homes.home.as_deref()),
+        ("CLAUDE_PROJECT_DIR", homes.project_dir.as_deref()),
+        ("CLAUDE_CONFIG_DIR", homes.config_dir.as_deref()),
+    ];
+    for (name, value) in fixed {
+        if let Some(value) = value {
+            vars.push((name.to_string(), path(value)));
+        }
+    }
+    vars.extend(shell::same_line_assignments(command));
+    vars
+}
+
+/// The body of the first heredoc in `command` (`<<EOF`, `<<-'EOF'`, `<< "EOF"`), if any.
+fn heredoc_body(command: &str) -> Option<String> {
+    let at = command
+        .match_indices("<<")
+        .map(|(i, _)| i)
+        .find(|&i| !command[i + 2..].starts_with('<'))?;
+    let rest = command[at + 2..]
+        .strip_prefix('-')
+        .unwrap_or(&command[at + 2..]);
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let delim: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | '|' | '&' | '>' | '<' | ')'))
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    if delim.is_empty() {
+        return None;
+    }
+    let (_, body) = rest.split_once('\n')?;
+    let mut out = String::new();
+    for line in body.split('\n') {
+        if line.trim() == delim {
+            return Some(out);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// `text` with shell escapes decoded as `printf` and `echo -e` do: `\n`, `\t`, `\\`, `\"`,
+/// `\'`, `\xHH`, octal `\NNN` / `\0NNN`, `\uHHHH`.
+fn decode_shell_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let digits = |from: usize, max: usize, radix: u32| -> (u32, usize) {
+        let mut value = 0u32;
+        let mut n = 0;
+        while n < max {
+            match chars.get(from + n).and_then(|c| c.to_digit(radix)) {
+                Some(d) => {
+                    value = value.saturating_mul(radix).saturating_add(d);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        (value, n)
+    };
+    while let Some(&c) = chars.get(i) {
+        if c != '\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let Some(&next) = chars.get(i + 1) else {
+            out.push(c);
+            break;
+        };
+        let simple = match next {
+            'n' => Some('\n'),
+            't' => Some('\t'),
+            'r' => Some('\r'),
+            '\\' => Some('\\'),
+            '"' => Some('"'),
+            '\'' => Some('\''),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            out.push(ch);
+            i += 2;
+            continue;
+        }
+        let (value, used, skip) = match next {
+            'x' => {
+                let (v, n) = digits(i + 2, 2, 16);
+                (v, n, 2)
+            }
+            'u' => {
+                let (v, n) = digits(i + 2, 4, 16);
+                (v, n, 2)
+            }
+            '0' => {
+                let (v, n) = digits(i + 2, 3, 8);
+                (v, n, 2)
+            }
+            '1'..='7' => {
+                let (v, n) = digits(i + 1, 3, 8);
+                (v, n, 1)
+            }
+            _ => (0, 0, 0),
+        };
+        match (skip, char::from_u32(value)) {
+            (0, _) | (_, None) => {
+                out.push(c);
+                i += 1;
+            }
+            (_, Some(ch)) if used > 0 || next == '0' => {
+                out.push(ch);
+                i += skip + used;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Decide a Bash command by what it does to the files [`decide_file_content`] guards: a
 /// redirect, `tee`, `sed -i`/`perl -i`, `mv`/`cp`/`install`/`ln`/`dd`/`truncate` onto them,
 /// `rm` of them (or of a directory holding them), `chmod` of a hook, or interpreter code
@@ -2745,8 +3028,10 @@ pub fn decide_bash_writes(
 
 /// [`decide_bash_writes`] with the settings locations given.
 pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> Option<Verdict> {
-    let gitconfig = contains_ci(command, "git") && contains_ci(command, "config");
-    if !gitconfig && !BASH_NEEDLES.iter().any(|n| contains_ci(command, n)) {
+    let git_cmd = contains_ci(command, "git")
+        && (contains_ci(command, "config") || contains_ci(command, "core."));
+    let env_cmd = contains_ci(command, "launchctl") || contains_ci(command, "set-environment");
+    if !git_cmd && !env_cmd && !BASH_NEEDLES.iter().any(|n| contains_ci(command, n)) {
         return None;
     }
     let mut strictest: Option<Verdict> = exported_switch(command).map(Verdict::Ask);
@@ -2754,16 +3039,35 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
     let mut places = Places {
         known: vec![lexical_path(cwd)],
         unknown: false,
+        vars: target_vars(command, cwd, homes),
     };
     let mut touches: Vec<Touch> = Vec::new();
     // The text a redirect writes is known when the line's one command (besides `cd`s) is an
-    // `echo`/`printf` of literal words.
-    let mut writers = parsed
+    // `echo`/`printf` of literal words, or a `cat`/`tee` fed a heredoc.
+    let writers: Vec<&SimpleCommand> = parsed
         .commands
         .iter()
-        .filter(|c| !matches!(c.program().as_str(), "cd" | "pushd"));
-    let single_echo = match (writers.next(), writers.next()) {
-        (Some(only), None) => emitted(only),
+        .filter(|c| !matches!(c.program().as_str(), "cd" | "pushd"))
+        .collect();
+    let heredoc = || {
+        command
+            .contains("<<")
+            .then(|| heredoc_body(command))
+            .flatten()
+    };
+    let single_echo = match writers.as_slice() {
+        [only] if matches!(only.program().as_str(), "cat" | "tee") => heredoc(),
+        [only] => emitted(only),
+        _ => None,
+    };
+    // `echo '…' | tee -a f`: the text the second command reads.
+    let piped = match writers.as_slice() {
+        [first, second] if matches!(second.program().as_str(), "tee" | "sponge") => {
+            emitted(first).map(|text| (std::ptr::from_ref(*second), text))
+        }
+        [only] if only.program() == "tee" => single_echo
+            .clone()
+            .map(|text| (std::ptr::from_ref(*only), text)),
         _ => None,
     };
     for cmd in &parsed.commands {
@@ -2779,7 +3083,11 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
         if let Some(reason) = git_config_set(cmd).or_else(|| npm_lifecycle_set(cmd)) {
             strictest = stricter(strictest, Verdict::Ask(reason));
         }
-        for (word, op) in command_touches(cmd) {
+        let stdin = piped
+            .as_ref()
+            .filter(|(at, _)| std::ptr::eq(*at, cmd))
+            .map(|(_, text)| text.as_str());
+        for (word, op) in command_touches(cmd, stdin) {
             touches.push(Touch {
                 paths: places.resolve(&word.text, homes),
                 glob: word.splits && word.text.contains(['*', '?', '[']),
@@ -2803,8 +3111,31 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
         });
     }
     for code in interpreter_code(&parsed) {
-        if !crate::gates::envwrite::code_writes(&code) {
+        let lower = code.to_ascii_lowercase();
+        let writes = crate::gates::envwrite::code_writes(&code)
+            || lower.contains("writefilesync")
+            || lower.contains(".write(")
+            || lower.contains("'w'")
+            || lower.contains("\"w\"");
+        if !writes {
             continue;
+        }
+        // A path the code assembles (`os.path.join('.claude', 'settings.json')`, `'.claude/' +
+        // …`, `homedir()`) is not a quoted string of its own.
+        let assembles = contains_ci(&code, ".claude")
+            && ["settings", "hooks", "agents", "security"]
+                .iter()
+                .any(|n| contains_ci(&code, n));
+        if assembles {
+            strictest = stricter(
+                strictest,
+                Verdict::Ask(
+                    "safe-ai-skill tamper tripwire: this code writes a file and builds a path \
+                     under `.claude`, where safe-ai-skill's settings and hooks live; make the \
+                     change with the Edit tool, or ask the user to make it."
+                        .to_string(),
+                ),
+            );
         }
         for raw in quoted_paths(&code) {
             touches.push(Touch {
@@ -2815,13 +3146,53 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
             });
         }
     }
+    // A target the line computes (`> $(…)`, an unknown `$X`) on a line naming `.claude`.
+    let computed = touches.iter().any(|t| {
+        t.paths.is_empty()
+            && matches!(t.op, Op::Write(_) | Op::Delete | Op::Find(_))
+            && t.raw.contains(['$', '`'])
+    });
+    if computed && contains_ci(command, ".claude") {
+        strictest = stricter(
+            strictest,
+            Verdict::Ask(
+                "safe-ai-skill tamper tripwire: this command writes to a path it computes on a \
+                 line that names `.claude`, so safe-ai-skill cannot tell which file changes; \
+                 spell the path out, or ask the user to make the change."
+                    .to_string(),
+            ),
+        );
+    }
     if touches.is_empty() {
         return strictest;
+    }
+    // Texts the line writes to a path, for a later `cp`/`mv` of that file: taken per segment so
+    // one command's `echo '…' > tmp` is known even when the line has several commands.
+    let mut written: Vec<(String, String)> = Vec::new();
+    for segment in command.split(['&', ';', '\n', '|']) {
+        let seg = shell::parse(segment);
+        let writers: Vec<&SimpleCommand> = seg
+            .commands
+            .iter()
+            .filter(|c| !matches!(c.program().as_str(), "cd" | "pushd"))
+            .collect();
+        let text = match writers.as_slice() {
+            [only] if matches!(only.program().as_str(), "cat" | "tee") => heredoc_body(segment),
+            [only] => emitted(only),
+            _ => None,
+        };
+        if let Some(text) = text {
+            for file in &seg.output_files {
+                for path in places.resolve(file, homes) {
+                    written.push((normalize_path(&path.to_string_lossy()), text.clone()));
+                }
+            }
+        }
     }
     let guarded = guarded_paths(cwd, homes);
     for touch in &touches {
         for (path, kind) in touch_targets(touch, &guarded, homes) {
-            if let Some(v) = judge_bash(kind, &path, touch, command, &places) {
+            if let Some(v) = judge_bash(kind, &path, touch, command, &places, &written) {
                 if matches!(v, Verdict::Deny(_)) {
                     return Some(v);
                 }
@@ -2857,10 +3228,14 @@ fn exported_switch(command: &str) -> Option<String> {
             let start = before
                 .rfind([';', '|', '&', '\n', '(', '`', '\'', '"'])
                 .map_or(0, |j| j + 1);
-            let first = before[start..].split_whitespace().next().unwrap_or("");
+            let mut seg = before[start..].split_whitespace();
+            let first = seg.next().unwrap_or("");
             let exports = matches!(first, "export" | "declare" | "typeset")
                 && (next == Some('=') || first == "export");
-            let setenv = first == "setenv" && next.is_some_and(char::is_whitespace);
+            let spaced = next.is_some_and(char::is_whitespace);
+            let setenv = (first == "setenv" && spaced)
+                || (first == "launchctl" && seg.next() == Some("setenv") && spaced)
+                || (first == "systemctl" && before[start..].contains("set-environment"));
             if exports || setenv {
                 return Some(format!(
                     "safe-ai-skill tamper tripwire: this exports `{}`, a safe-ai-skill or kit \
@@ -2873,7 +3248,8 @@ fn exported_switch(command: &str) -> Option<String> {
     None
 }
 
-/// The text an `echo`/`printf` of literal words prints, if that is what `cmd` is.
+/// The text an `echo`/`printf` of literal words prints, if that is what `cmd` is: `echo -e`
+/// and `printf` escapes decoded, `printf` formats with only `%s` filled in.
 fn emitted(cmd: &SimpleCommand) -> Option<String> {
     let program = cmd.program();
     let args = cmd.words.get(1..)?;
@@ -2883,12 +3259,18 @@ fn emitted(cmd: &SimpleCommand) -> Option<String> {
     match program.as_str() {
         "echo" => {
             let mut newline = true;
+            let mut escapes = false;
             let mut rest = args;
             while let Some((flag, tail)) = rest.split_first() {
-                if !matches!(flag.text.as_str(), "-n" | "-e" | "-E" | "-ne" | "-en") {
+                let t = flag.text.as_str();
+                let is_flag = t.len() > 1
+                    && t.starts_with('-')
+                    && t[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E'));
+                if !is_flag {
                     break;
                 }
-                newline &= !flag.text.contains('n');
+                newline &= !t.contains('n');
+                escapes |= t.contains('e');
                 rest = tail;
             }
             let mut text = rest
@@ -2896,20 +3278,37 @@ fn emitted(cmd: &SimpleCommand) -> Option<String> {
                 .map(|w| w.text.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
+            if escapes {
+                text = decode_shell_escapes(&text);
+            }
             if newline {
                 text.push('\n');
             }
             Some(text)
         }
         "printf" => {
-            let format = &args.first()?.text;
-            (!format.contains('%') && args.len() == 1).then(|| {
-                format
-                    .replace("\\n", "\n")
-                    .replace("\\t", "\t")
-                    .replace("\\\"", "\"")
-                    .replace("\\\\", "\\")
-            })
+            let args = match args.first() {
+                Some(w) if w.text == "--" => &args[1..],
+                _ => args,
+            };
+            let (format, values) = args.split_first()?;
+            let format = format.text.as_str();
+            let specs = format.matches('%').count();
+            let only_s = format.matches("%s").count() == specs;
+            if !only_s {
+                return None;
+            }
+            let mut text = String::new();
+            let mut values = values.iter().map(|w| w.text.as_str());
+            let mut parts = format.split("%s");
+            if let Some(first) = parts.next() {
+                text.push_str(&decode_shell_escapes(first));
+            }
+            for part in parts {
+                text.push_str(values.next().unwrap_or(""));
+                text.push_str(&decode_shell_escapes(part));
+            }
+            Some(text)
         }
         _ => None,
     }
@@ -2934,11 +3333,26 @@ fn operands(words: &[Word]) -> Vec<&Word> {
 
 /// The paths one simple command writes, deletes or re-modes (redirects and interpreter code
 /// are read elsewhere).
-fn command_touches(cmd: &SimpleCommand) -> Vec<(Word, Op)> {
+/// `stdin` is the text piped into it, when the line shows it.
+fn command_touches(cmd: &SimpleCommand, stdin: Option<&str>) -> Vec<(Word, Op)> {
     let program = cmd.program();
     let args = cmd.words.get(1..).unwrap_or_default();
     let mut out: Vec<(Word, Op)> = Vec::new();
     let mut push = |w: &Word, op: Op| out.push((w.clone(), op));
+    if program == "ln" {
+        let symbolic = args.iter().any(|w| {
+            w.text == "--symbolic"
+                || (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('s'))
+        });
+        if !symbolic {
+            let ops = operands(args);
+            if let Some((_, sources)) = ops.split_last() {
+                for source in sources {
+                    push(source, Op::Link);
+                }
+            }
+        }
+    }
     match program.as_str() {
         "rm" | "unlink" | "shred" | "srm" | "rmdir" => {
             for w in operands(args) {
@@ -2980,9 +3394,49 @@ fn command_touches(cmd: &SimpleCommand) -> Vec<(Word, Op)> {
                 }
             }
         }
-        "tee" => {
+        "tee" | "sponge" => {
+            let append = args.iter().any(|w| w.text == "-a" || w.text == "--append");
+            let content = match stdin {
+                Some(text) if append => Content::Appended(text.to_string()),
+                Some(text) => Content::Known(text.to_string()),
+                None => Content::Unknown,
+            };
             for w in operands(args) {
-                push(w, Op::Write(Content::Unknown));
+                push(w, Op::Write(content.clone()));
+            }
+        }
+        "find" => {
+            let starts: Vec<&Word> = args
+                .iter()
+                .take_while(|w| !w.text.starts_with(['-', '(', '!']))
+                .collect();
+            let texts: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+            let deletes = texts.contains(&"-delete")
+                || texts.windows(2).any(|w| {
+                    matches!(w[0], "-exec" | "-execdir" | "-ok" | "-okdir")
+                        && matches!(
+                            shell::base_name(w[1]).as_str(),
+                            "rm" | "unlink" | "shred" | "srm"
+                        )
+                });
+            if !deletes {
+                return out;
+            }
+            let names: Vec<String> = texts
+                .windows(2)
+                .filter(|w| matches!(w[0], "-name" | "-iname"))
+                .map(|w| w[1].to_lowercase())
+                .collect();
+            if starts.is_empty() {
+                let mut dot = cmd.words[0].clone();
+                dot.text = ".".to_string();
+                dot.dynamic = false;
+                dot.splits = false;
+                push(&dot, Op::Find(names));
+            } else {
+                for w in starts {
+                    push(w, Op::Find(names.clone()));
+                }
             }
         }
         "truncate" => {
@@ -3151,7 +3605,17 @@ fn touch_targets(
     homes: &ConfigHomes,
 ) -> Vec<(PathBuf, Guarded)> {
     let mut out = Vec::new();
-    let delete = matches!(touch.op, Op::Delete);
+    let delete = matches!(touch.op, Op::Delete | Op::Find(_));
+    // `find -name GLOB`: only what the globs name is deleted.
+    let named = |gk: &str| match &touch.op {
+        Op::Find(names) if !names.is_empty() => {
+            let base = gk.rsplit('/').next().unwrap_or(gk);
+            names
+                .iter()
+                .any(|n| crate::gates::bash::glob_match(n, base))
+        }
+        _ => true,
+    };
     for path in &touch.paths {
         let key = normalize_path(&path.to_string_lossy());
         if touch.glob {
@@ -3170,14 +3634,14 @@ fn touch_targets(
             }
             continue;
         }
-        if let Some(kind) = classify_path(path, homes) {
+        if let Some(kind) = classify_path(path, homes).filter(|_| named(&key)) {
             out.push((path.clone(), kind));
         }
         if delete {
             let prefix = format!("{key}/");
             for g in guarded {
                 let gk = normalize_path(&g.to_string_lossy());
-                if gk.starts_with(&prefix) && crate::localfs::exists(g) {
+                if gk.starts_with(&prefix) && named(&gk) && crate::localfs::exists(g) {
                     if let Some(kind) = classify(&gk, homes) {
                         out.push((g.clone(), kind));
                     }
@@ -3208,12 +3672,14 @@ fn emulate_sed(script: &str, text: &str) -> Option<String> {
                 '\\', '[', ']', '*', '+', '?', '^', '$', '(', ')', '{', '}', '|',
             ],
         )
-        || special(replacement, &['\\', '&'])
+        || special(&replacement.replace("\\n", ""), &['\\', '&'])
         || !flags.chars().all(|c| c == 'g')
     {
         return None;
     }
     let all = flags.contains('g');
+    let replacement = replacement.replace("\\n", "\n");
+    let replacement = replacement.as_str();
     let mut out: Vec<String> = Vec::new();
     for line in text.split('\n') {
         out.push(if all {
@@ -3245,6 +3711,7 @@ fn judge_bash(
     touch: &Touch,
     command: &str,
     places: &Places,
+    written: &[(String, String)],
 ) -> Option<Verdict> {
     let shown: String = touch.raw.chars().take(160).collect();
     let unknown_write = || {
@@ -3254,7 +3721,18 @@ fn judge_bash(
              make it."
         ))
     };
-    match (&touch.op, kind) {
+    let op = match &touch.op {
+        Op::Find(_) => &Op::Delete,
+        op => op,
+    };
+    if matches!(op, Op::Link) {
+        return Some(Verdict::Ask(format!(
+            "safe-ai-skill tamper tripwire: this hard-links `{shown}`, a file safe-ai-skill \
+             guards, so it could be rewritten under another name; ask the user to make the link \
+             themselves if it is wanted."
+        )));
+    }
+    match (op, kind) {
         (Op::Mode, Guarded::GitHooks) => return Some(Verdict::Ask(git_hook_reason(&shown))),
         (Op::Mode, Guarded::KitHooks) => return Some(Verdict::Ask(kit_hook_reason(&shown))),
         (Op::Mode, _) => return None,
@@ -3283,28 +3761,39 @@ fn judge_bash(
         Old::Text(text) => text.as_str(),
         Old::Missing => "",
         Old::Unreadable => {
-            return match touch.op {
+            return match op {
                 Op::Delete => None,
                 _ if kind == Guarded::PackageJson && !mentions_lifecycle(command) => None,
-                _ if kind == Guarded::AgentDef => None,
                 _ => Some(unknown_write()),
             };
         }
     };
-    let content = match &touch.op {
+    let content = match op {
         Op::Delete => Some(String::new()),
         Op::Write(Content::Known(text)) => Some(text.clone()),
         Op::Write(Content::Appended(text)) => Some(format!("{before}{text}")),
-        Op::Write(Content::From(source)) => places
-            .known
-            .first()
-            .map(|cwd| cwd.join(source))
-            .and_then(|p| crate::policy::tier::read_bounded(&p, MAX_CONFIG_READ)),
+        Op::Write(Content::From(source)) => {
+            let sources = places.resolve(&source.to_string_lossy(), &ConfigHomes::default());
+            // A file the same line wrote first (`printf … > /tmp/a && cp /tmp/a …`).
+            let earlier = sources.iter().find_map(|p| {
+                let key = normalize_path(&p.to_string_lossy());
+                written
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, t)| t.clone())
+            });
+            earlier.or_else(|| {
+                sources
+                    .first()
+                    .and_then(|p| crate::policy::tier::read_bounded(p, MAX_CONFIG_READ))
+            })
+        }
         Op::Write(Content::Sed(script)) => emulate_sed(script, before),
-        Op::Write(Content::Unknown) | Op::Mode => None,
+        Op::Write(Content::Unknown) | Op::Mode | Op::Find(_) | Op::Link => None,
     };
     let exact = matches!(
-        touch.op,
+        op,
         Op::Delete | Op::Write(Content::Known(_) | Content::Appended(_) | Content::From(_))
     );
     if !exact && kind == Guarded::PackageJson && !mentions_lifecycle(command) {
@@ -3312,7 +3801,7 @@ fn judge_bash(
     }
     match content {
         Some(after) => {
-            let verdict = judge_content(kind, &shown, before, &after);
+            let verdict = judge_content(kind, &shown, before, &after, exact);
             match verdict {
                 Some(Verdict::Deny(_)) => verdict,
                 _ if exact => verdict,
@@ -3320,7 +3809,6 @@ fn judge_bash(
                 _ => Some(unknown_write()),
             }
         }
-        None if kind == Guarded::AgentDef => None,
         None => Some(unknown_write()),
     }
 }
@@ -3333,6 +3821,15 @@ fn git_config_set(cmd: &SimpleCommand) -> Option<String> {
     let words = cmd.words.get(1..)?;
     let mut i = 0;
     while let Some(w) = words.get(i) {
+        if w.text == "-c" {
+            // A one-shot `git -c key=value <command>` runs with that setting.
+            if let Some((key, value)) = words.get(i + 1).and_then(|v| v.text.split_once('=')) {
+                let key = key.to_ascii_lowercase();
+                if risky_git_key(&key, value) {
+                    return Some(git_config_reason(&format!("{key}={value}")));
+                }
+            }
+        }
         match w.text.as_str() {
             "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => i += 2,
             t if t.starts_with('-') => i += 1,
