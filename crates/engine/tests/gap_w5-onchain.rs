@@ -59,6 +59,13 @@ fn run_case(case: &Value) -> String {
     let proj = TempDir::new("w5-proj");
     let data = TempDir::new("w5-data");
     let bin = TempDir::new("w5-path");
+    if let Some(files) = case["cwd_files"].as_object() {
+        for (rel, body) in files {
+            if let Some(rel) = rel.strip_prefix("proj/") {
+                std::fs::write(proj.join(rel), body.as_str().unwrap_or_default()).unwrap();
+            }
+        }
+    }
     let path = match cli_url(case) {
         Some(url) => {
             let stub = bin.join("solana");
@@ -387,4 +394,146 @@ fn bench_decide_over_difftest_payloads() {
         "bench: {} payloads x {ROUNDS} rounds, {per} ns/call",
         cmds.len()
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round: red-team R1, R2, R7, R8 and read-only lookups
+// ---------------------------------------------------------------------------------------
+
+/// The natural decision for `command` with the CLI default `network`, run in a project dir
+/// holding `files` (relative path, content).
+fn decide_in(command: &str, network: Network, files: &[(&str, &str)]) -> Decision {
+    let proj = TempDir::new("w5-fix");
+    for (rel, body) in files {
+        std::fs::write(proj.join(rel), body).unwrap();
+    }
+    let ctx = Context {
+        network,
+        anchor_network: network,
+        plugin_data: proj.path().to_path_buf(),
+        project_dir: proj.path().to_path_buf(),
+    };
+    bash::decide(command, &ctx, &Policy::default()).0
+}
+
+#[test]
+fn r1_a_backslash_ends_the_url_authority() {
+    for url in [
+        r"'https://evil.example\@api.devnet.solana.com'",
+        r"'https://evil.example\api.devnet.solana.com'",
+        "'https://api.devnet.solana.com%2e.evil.example'",
+        "'https://api.devnet.solana.com\t.evil.example'",
+        "'https://api.devnet.solana.com,evil.example'",
+    ] {
+        for cmd in [
+            format!("solana transfer {PK} 0.5 --url {url}"),
+            format!("spl-token transfer {MINT} 1000 {PK} --url {url}"),
+        ] {
+            let d = decide_in(&cmd, Network::Devnet, &[]);
+            assert!(matches!(d, Decision::Ask { .. }), "{cmd}: {d:?}");
+        }
+    }
+    // The plain host, with userinfo, keeps its cluster.
+    let d = decide_in(
+        &format!("solana transfer {PK} 0.5 --url https://u:p@api.devnet.solana.com"),
+        Network::Unknown,
+        &[],
+    );
+    assert_eq!(d, Decision::Allow);
+}
+
+const DECOY: &str = "address_labels:\n  k: |\n    json_rpc_url: https://api.devnet.solana.com\n\
+json_rpc_url: https://rpc.mycorp.io\n";
+
+#[test]
+fn r2_only_a_single_top_level_json_rpc_url_counts() {
+    let configs = [
+        DECOY,
+        "address_labels:\n  json_rpc_url: https://api.devnet.solana.com\njson_rpc_url: https://rpc.mycorp.io\n",
+        "json_rpc_url: https://api.devnet.solana.com\njson_rpc_url: https://rpc.mycorp.io\n",
+        "{json_rpc_url: https://api.devnet.solana.com}\n",
+        "x: &u https://rpc.mycorp.io\njson_rpc_url: *u\n",
+        "json_rpc_url: https://api.devnet.solana.com\n---\njson_rpc_url: https://rpc.mycorp.io\n",
+        "json_rpc_url: [https://api.devnet.solana.com\n",
+        "  json_rpc_url: https://api.devnet.solana.com\n",
+    ];
+    for body in configs {
+        for cmd in [
+            format!("solana -C c.yml transfer {PK} 0.5"),
+            format!("spl-token -C c.yml transfer {MINT} 1000000 {PK}"),
+        ] {
+            let d = decide_in(&cmd, Network::Devnet, &[("c.yml", body)]);
+            assert!(matches!(d, Decision::Ask { .. }), "{body:?} {cmd}: {d:?}");
+        }
+    }
+    // A config as the CLI writes it keeps its cluster.
+    let real = "---\njson_rpc_url: \"https://api.devnet.solana.com\"\nwebsocket_url: ''\n\
+keypair_path: /k.json\naddress_labels:\n  \"11111111111111111111111111111111\": System Program\n\
+commitment: confirmed\n";
+    let d = decide_in(
+        &format!("solana -C c.yml transfer {PK} 0.5"),
+        Network::Unknown,
+        &[("c.yml", real)],
+    );
+    assert_eq!(d, Decision::Allow);
+}
+
+#[test]
+fn r7_only_feature_status_is_read_only() {
+    for cmd in [
+        "solana feature activate F.json -um",
+        "solana feature revoke F.json -ud",
+    ] {
+        let d = decide_in(cmd, Network::Devnet, &[]);
+        assert!(matches!(d, Decision::Ask { .. }), "{cmd}: {d:?}");
+    }
+    assert_eq!(
+        decide_in("solana feature status -um", Network::Devnet, &[]),
+        Decision::Defer
+    );
+}
+
+#[test]
+fn r8_more_authority_verbs_name_an_authority_change() {
+    for cmd in [
+        format!("solana stake-set-lockup S --new-custodian {PK} -ud"),
+        "solana stake-set-lockup-checked S --new-custodian ~/c.json -ud".to_string(),
+        "solana vote-update-validator V ~/id.json ~/w.json -ud".to_string(),
+        format!("solana create-stake-account ~/s.json 1 --stake-authority {PK} -ud"),
+        "solana create-stake-account-checked ~/s.json 1 --withdraw-authority ~/w.json -ud"
+            .to_string(),
+        format!("solana create-stake-account ~/s.json 1 --custodian {PK} -ud"),
+        format!("solana create-nonce-account ~/n.json 1 --nonce-authority {PK} -ud"),
+    ] {
+        let d = decide_in(&cmd, Network::Devnet, &[]);
+        assert!(
+            matches!(&d, Decision::Ask { reason } if reason.contains("uthority change")),
+            "{cmd}: {d:?}"
+        );
+    }
+    // Without an authority flag a create stays the generic ask.
+    let d = decide_in(
+        "solana create-stake-account ~/s.json 1 -ud",
+        Network::Devnet,
+        &[],
+    );
+    assert!(
+        matches!(&d, Decision::Ask { reason } if !reason.contains("uthority change")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn account_lookups_are_read_only() {
+    for cmd in [
+        "solana stake-account S -ud",
+        "solana vote-account V",
+        "solana nonce-account N -um",
+    ] {
+        assert_eq!(
+            decide_in(cmd, Network::Devnet, &[]),
+            Decision::Defer,
+            "{cmd}"
+        );
+    }
 }
