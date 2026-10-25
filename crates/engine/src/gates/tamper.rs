@@ -10,6 +10,18 @@
 //!   by `$(which safe-ai-skill)`, or that references protected state.
 //! - **Write|Edit|MultiEdit|NotebookEdit** (the `gate-tamper` hook): a write whose target is
 //!   protected state, checked as given and with symlinks resolved.
+//! - **Content-aware** ([`decide_file_content`] for file tools, [`decide_bash_writes`] for
+//!   Bash): what a write makes a file say, compared with the file as it is (an Edit is applied
+//!   in memory; one that cannot be placed is judged on its own text). A Claude Code settings
+//!   file (`.claude/settings*.json`, `~/.claude`, `$CLAUDE_CONFIG_DIR`) that turns a
+//!   `safe-ai-skill@…` plugin off or drops it, sets `disableAllHooks`,
+//!   `allowManagedHooksOnly`, `env.SAFE_AI_SKILL_DISABLE` or `permissions.defaultMode:
+//!   bypassPermissions`, or removes or narrows a guard hook, and an agent definition with
+//!   `permissionMode: bypassPermissions`, is denied at every tier and never relaxed (D1). A git
+//!   hook, a git config key that runs a program, a new or changed `.mcp.json` server or npm
+//!   lifecycle script, a kit hook script, a lower kit tier in `.claude/security.json`, and an
+//!   `export` of a `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` switch ask. A Bash write whose text the
+//!   command line does not show (`sed -i`, `cp` from an unreadable file, `python -c`) asks.
 //!
 //! Protected state:
 //! - the plugin data dir. Anywhere: `$CLAUDE_PLUGIN_DATA` (its path, or the variable itself).
@@ -70,13 +82,18 @@
 //!   separators: a relative name with a trailing dot or space (`safe-ai-skill-stbr.`), 8.3 short
 //!   names, `%USERPROFILE%`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::context::shell::{self, SimpleCommand, Word};
+use crate::gate::Verdict;
 use crate::io::Decision;
+use crate::policy::tier::Tier;
+use crate::policy::Policy;
 
 /// Work units one Bash command may cost the tripwire and the secrets scan together. A unit is
 /// roughly the cost of looking at one token; checking a word against the path rules costs
@@ -1804,6 +1821,1596 @@ fn path_reason(target: &str, kind: Kind) -> String {
          the user to make it themselves in their own terminal.",
         kind.describe()
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Content-aware tamper checks: what a write makes a settings or hook-bearing file say.
+// ---------------------------------------------------------------------------------------------
+
+/// Largest existing file (or `cp` source) read to evaluate a write.
+const MAX_CONFIG_READ: u64 = 1024 * 1024;
+
+/// Git hook names (`githooks(5)`): a file of one of these names under `.git/hooks` runs.
+const GIT_HOOK_NAMES: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-receive",
+    "update",
+    "proc-receive",
+    "post-receive",
+    "post-update",
+    "reference-transaction",
+    "push-to-checkout",
+    "pre-auto-gc",
+    "post-rewrite",
+    "sendemail-validate",
+    "fsmonitor-watchman",
+    "post-index-change",
+];
+
+/// npm lifecycle scripts that run on `npm install`, `npm publish` or `npm pack`.
+const LIFECYCLE_SCRIPTS: &[&str] = &[
+    "preinstall",
+    "install",
+    "postinstall",
+    "preuninstall",
+    "uninstall",
+    "postuninstall",
+    "prepare",
+    "preprepare",
+    "postprepare",
+    "prepublish",
+    "prepublishOnly",
+    "prepack",
+    "postpack",
+    "dependencies",
+];
+
+/// Byte needles one of which a Bash command must hold (ASCII case-insensitively) before
+/// [`decide_bash_writes`] parses it.
+const BASH_NEEDLES: &[&str] = &[
+    ".claude",
+    "settings",
+    "security.json",
+    ".git",
+    "hooks",
+    ".mcp",
+    "package.json",
+    "kit_firewall",
+    "safe_ai_skill",
+    "pkg",
+    "set-script",
+];
+
+/// Where the user-level Claude Code settings live, taken from the hook environment.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigHomes {
+    /// `$HOME` (`%USERPROFILE%` when unset): `~/.claude/settings*.json`, and what `~` expands to.
+    pub home: Option<PathBuf>,
+    /// `$CLAUDE_CONFIG_DIR`: its `settings*.json` are user settings too.
+    pub config_dir: Option<PathBuf>,
+    /// `$CLAUDE_PROJECT_DIR`, a project root besides the session's working directory.
+    pub project_dir: Option<PathBuf>,
+}
+
+impl ConfigHomes {
+    /// Read `HOME` (or `USERPROFILE`), `CLAUDE_CONFIG_DIR` and `CLAUDE_PROJECT_DIR`. No file is
+    /// read; relative values are ignored.
+    pub fn from_env() -> Self {
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.has_root())
+        };
+        ConfigHomes {
+            home: var("HOME").or_else(|| var("USERPROFILE")),
+            config_dir: var("CLAUDE_CONFIG_DIR"),
+            project_dir: var("CLAUDE_PROJECT_DIR"),
+        }
+    }
+}
+
+/// A file whose content decides whether protection holds or code runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Guarded {
+    /// A Claude Code `settings.json` / `settings.local.json` (project, user or config dir).
+    Settings,
+    /// The kit's `.claude/security.json`.
+    KitSecurity,
+    /// The kit's `.claude/hooks` dir or a script in it.
+    KitHooks,
+    /// A file under a `.git/…/hooks` dir.
+    GitHooks,
+    /// A git `config` / `config.worktree`.
+    GitConfig,
+    /// A `.mcp.json`.
+    McpJson,
+    /// A `package.json` outside `node_modules`.
+    PackageJson,
+    /// A subagent definition, `.claude/agents/*.md`.
+    AgentDef,
+}
+
+/// What a guarded file is, from its normalised (lowercase, `/`-separated, absolute) path.
+fn classify(norm: &str, homes: &ConfigHomes) -> Option<Guarded> {
+    let comps: Vec<&str> = norm.split('/').filter(|c| !c.is_empty()).collect();
+    let (name, dirs) = comps.split_last()?;
+    let parent = dirs.last().copied().unwrap_or("");
+    if matches!(*name, "settings.json" | "settings.local.json") {
+        let parent_path = norm.rsplit_once('/').map_or("", |(p, _)| p);
+        let config_dir = homes
+            .config_dir
+            .as_ref()
+            .is_some_and(|c| normalize_path(&c.to_string_lossy()) == parent_path);
+        if parent == ".claude" || config_dir {
+            return Some(Guarded::Settings);
+        }
+    }
+    if parent == ".claude" && *name == "security.json" {
+        return Some(Guarded::KitSecurity);
+    }
+    if let Some(i) = dirs.iter().position(|c| *c == ".git") {
+        if dirs[i + 1..].contains(&"hooks") {
+            return Some(Guarded::GitHooks);
+        }
+        if matches!(*name, "config" | "config.worktree") {
+            return Some(Guarded::GitConfig);
+        }
+    }
+    if comps
+        .windows(2)
+        .any(|w| w[0] == ".claude" && w[1] == "hooks")
+    {
+        return Some(Guarded::KitHooks);
+    }
+    if dirs.len() >= 2
+        && dirs[dirs.len() - 2] == ".claude"
+        && parent == "agents"
+        && name.ends_with(".md")
+    {
+        return Some(Guarded::AgentDef);
+    }
+    if *name == ".mcp.json" {
+        return Some(Guarded::McpJson);
+    }
+    if *name == "package.json" && !dirs.contains(&"node_modules") {
+        return Some(Guarded::PackageJson);
+    }
+    None
+}
+
+/// `raw` with a leading `~`, `$HOME` or `${HOME}` expanded, made absolute against `dir` and
+/// lexically normalised. `None` when it still holds an expansion.
+fn absolute_in(raw: &str, dir: &Path, homes: &ConfigHomes) -> Option<PathBuf> {
+    let home = homes.home.as_deref();
+    let expanded = if raw == "~" || raw == "$HOME" || raw == "${HOME}" {
+        home?.to_path_buf()
+    } else if let Some(rest) = ["~/", "$HOME/", "${HOME}/"]
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))
+    {
+        home?.join(rest)
+    } else {
+        PathBuf::from(raw)
+    };
+    if expanded.to_string_lossy().contains('$') {
+        return None;
+    }
+    Some(lexical_path(&dir.join(expanded)))
+}
+
+/// The guarded kind of `path`, as given or with symlinks resolved.
+fn classify_path(path: &Path, homes: &ConfigHomes) -> Option<Guarded> {
+    classify(&normalize_path(&path.to_string_lossy()), homes).or_else(|| {
+        let real = resolve_existing(path)?;
+        classify(&normalize_path(&real.to_string_lossy()), homes)
+    })
+}
+
+/// A file's current text: absent, readable, or present but unreadable (too large, not text).
+enum Old {
+    Missing,
+    Text(String),
+    Unreadable,
+}
+
+fn read_old(path: Option<&Path>) -> Old {
+    let Some(path) = path else {
+        return Old::Unreadable;
+    };
+    if !crate::localfs::exists(path) {
+        return Old::Missing;
+    }
+    match crate::policy::tier::read_bounded(path, MAX_CONFIG_READ) {
+        Some(text) => Old::Text(text),
+        None => Old::Unreadable,
+    }
+}
+
+/// The text a Write / Edit / MultiEdit leaves, or (when the edit cannot be placed on the file
+/// as it is) the edit's own old and new text.
+enum After {
+    Exact(String),
+    Fragment { old: String, new: String },
+}
+
+/// `base` with `old` replaced by `new` (all occurrences with `all`); `None` when the edit
+/// would fail.
+fn apply_edit(base: &str, old: &str, new: &str, all: bool) -> Option<String> {
+    if old.is_empty() {
+        return base.is_empty().then(|| new.to_string());
+    }
+    if !base.contains(old) {
+        return None;
+    }
+    Some(if all {
+        base.replace(old, new)
+    } else {
+        base.replacen(old, new, 1)
+    })
+}
+
+/// What a file tool's input makes the file say, given its current text.
+fn after_write(input: &Value, current: Option<&str>) -> Option<After> {
+    if let Some(content) = input.get("content").and_then(Value::as_str) {
+        return Some(After::Exact(content.to_string()));
+    }
+    let edit = |e: &Value| -> Option<(String, String, bool)> {
+        Some((
+            e.get("old_string")?.as_str()?.to_string(),
+            e.get("new_string")?.as_str()?.to_string(),
+            e.get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ))
+    };
+    let edits: Vec<(String, String, bool)> = match input.get("edits").and_then(Value::as_array) {
+        Some(list) => list.iter().filter_map(edit).collect(),
+        None => vec![edit(input)?],
+    };
+    if edits.is_empty() {
+        return None;
+    }
+    let mut text = current.unwrap_or("").to_string();
+    for (old, new, all) in &edits {
+        match apply_edit(&text, old, new, *all) {
+            Some(next) => text = next,
+            None => {
+                let join = |pick: fn(&(String, String, bool)) -> &str| {
+                    edits.iter().map(pick).collect::<Vec<_>>().join("\n")
+                };
+                return Some(After::Fragment {
+                    old: join(|e| &e.0),
+                    new: join(|e| &e.1),
+                });
+            }
+        }
+    }
+    Some(After::Exact(text))
+}
+
+/// Decide a `Write|Edit|MultiEdit` call by what it makes the file say: deny (at every tier,
+/// never relaxable) when a Claude Code settings file or agent definition stops protecting
+/// the session, ask when a git hook or config, `.mcp.json`, `package.json` lifecycle script,
+/// kit hook or kit tier changes. `None` is no opinion. Reads the current file when the target
+/// is one of those.
+pub fn decide_file_content(
+    tool_input: Option<&Value>,
+    cwd: &Path,
+    policy: &Policy,
+    tier: Tier,
+) -> Option<Verdict> {
+    let _ = (policy, tier);
+    decide_file_content_in(tool_input, cwd, &ConfigHomes::from_env())
+}
+
+/// [`decide_file_content`] with the settings locations given.
+pub fn decide_file_content_in(
+    tool_input: Option<&Value>,
+    cwd: &Path,
+    homes: &ConfigHomes,
+) -> Option<Verdict> {
+    let input = tool_input?;
+    let raw = input.get("file_path").and_then(Value::as_str)?;
+    let path = absolute_in(raw, cwd, homes)?;
+    let kind = classify_path(&path, homes)?;
+    let shown: String = raw.chars().take(160).collect();
+    match kind {
+        Guarded::GitHooks => return Some(Verdict::Ask(git_hook_reason(&shown))),
+        Guarded::KitHooks => return Some(Verdict::Ask(kit_hook_reason(&shown))),
+        _ => {}
+    }
+    let old = match read_old(Some(&path)) {
+        Old::Missing => None,
+        Old::Text(text) => Some(text),
+        Old::Unreadable => return Some(Verdict::Ask(unreadable_reason(&shown))),
+    };
+    match after_write(input, old.as_deref())? {
+        After::Exact(new) => judge_content(kind, &shown, old.as_deref().unwrap_or(""), &new),
+        After::Fragment { old, new } => judge_content(kind, &shown, &old, &new),
+    }
+}
+
+/// The verdict on `kind` going from `before` to `after` text.
+fn judge_content(kind: Guarded, shown: &str, before: &str, after: &str) -> Option<Verdict> {
+    match kind {
+        Guarded::Settings => {
+            settings_change(before, after).map(|what| Verdict::Deny(disable_reason(shown, &what)))
+        }
+        Guarded::AgentDef => {
+            (bypass_frontmatter(after) && !bypass_frontmatter(before)).then(|| {
+                Verdict::Deny(disable_reason(
+                    shown,
+                    "gives a subagent `permissionMode: bypassPermissions`",
+                ))
+            })
+        }
+        Guarded::KitSecurity => {
+            let (from, to) = (kit_tier(before), kit_tier(after));
+            (to < from).then(|| {
+                Verdict::Ask(format!(
+                    "safe-ai-skill tamper tripwire: this lowers the kit tier in `{shown}` from \
+                     {} to {}; lowering a firewall tier is the user's call, so ask them to make \
+                     the change.",
+                    tier_name(from),
+                    tier_name(to)
+                ))
+            })
+        }
+        Guarded::GitConfig => {
+            let had = git_risky(before);
+            git_risky(after)
+                .into_iter()
+                .find(|k| !had.contains(k))
+                .map(|k| Verdict::Ask(git_config_reason(&k)))
+        }
+        Guarded::McpJson => mcp_change(before, after).map(|server| {
+            Verdict::Ask(format!(
+                "safe-ai-skill tamper tripwire: this adds or changes the MCP server `{server}` \
+                 in `{shown}`, which the client starts as a program; ask the user to review and \
+                 add it themselves."
+            ))
+        }),
+        Guarded::PackageJson => lifecycle_change(before, after).map(|script| {
+            Verdict::Ask(format!(
+                "safe-ai-skill tamper tripwire: this adds or changes the `{script}` script in \
+                 `{shown}`, which npm runs on install; ask the user to review it before it is \
+                 added."
+            ))
+        }),
+        Guarded::GitHooks => Some(Verdict::Ask(git_hook_reason(shown))),
+        Guarded::KitHooks => Some(Verdict::Ask(kit_hook_reason(shown))),
+    }
+}
+
+fn disable_reason(shown: &str, what: &str) -> String {
+    format!(
+        "safe-ai-skill tamper tripwire: this change to `{shown}` {what}, which turns off \
+         protection, so an agent may never make it; only the user can turn safe-ai-skill down, \
+         with the `safe-ai-skill` CLI and its confirmation code."
+    )
+}
+
+fn git_hook_reason(shown: &str) -> String {
+    format!(
+        "safe-ai-skill tamper tripwire: `{shown}` is a git hook, which git runs as code on \
+         commit, checkout or push; ask the user to install it themselves if it is wanted."
+    )
+}
+
+fn kit_hook_reason(shown: &str) -> String {
+    format!(
+        "safe-ai-skill tamper tripwire: `{shown}` holds the kit's guard hooks; ask the user to \
+         change or remove them themselves if that is wanted."
+    )
+}
+
+fn git_config_reason(setting: &str) -> String {
+    let shown: String = setting.chars().take(160).collect();
+    format!(
+        "safe-ai-skill tamper tripwire: setting `{shown}` makes git run a program of the \
+         agent's choosing; ask the user to set it themselves if it is wanted."
+    )
+}
+
+fn unreadable_reason(shown: &str) -> String {
+    format!(
+        "safe-ai-skill tamper tripwire: `{shown}` is too large or unreadable to check what this \
+         write changes; ask the user to review the change."
+    )
+}
+
+fn tier_name(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Off => "off",
+        Tier::Relaxed => "relaxed",
+        Tier::Medium => "medium",
+        Tier::High => "high",
+    }
+}
+
+/// What a settings file says about protection.
+#[derive(Default)]
+struct SettingsFacts {
+    /// Switches that turn protection off (display form).
+    disabling: BTreeSet<String>,
+    /// What keeps it on: `plugin:<key>` and `hook:<command>` (lowercase, no whitespace).
+    protecting: BTreeSet<String>,
+    /// Guard hooks as `<event>|<matcher>|<command>`, when the text parsed as JSON.
+    hooks: Option<BTreeSet<String>>,
+}
+
+/// Whether a hook command looks like a firewall guard rather than a formatter or notifier.
+fn is_guard_command(command: &str) -> bool {
+    let c = command.to_ascii_lowercase();
+    c.contains("safe-ai-skill")
+        || c.contains(".claude/hooks/")
+        || c.contains("-guard")
+        || c.contains("firewall")
+}
+
+fn compact(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn is_truthy_switch(value: &Value) -> bool {
+    match value {
+        Value::String(s) => !matches!(s.trim(), "" | "0" | "false"),
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        _ => false,
+    }
+}
+
+fn settings_facts(text: &str) -> SettingsFacts {
+    let mut facts = SettingsFacts::default();
+    if text.trim().is_empty() {
+        facts.hooks = Some(BTreeSet::new());
+        return facts;
+    }
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) else {
+        textual_settings_facts(&compact(text), &mut facts);
+        return facts;
+    };
+    if let Some(Value::Object(plugins)) = obj.get("enabledPlugins") {
+        for (key, on) in plugins {
+            let key = key.to_lowercase();
+            if !key.starts_with("safe-ai-skill@") {
+                continue;
+            }
+            match on {
+                Value::Bool(false) => {
+                    facts
+                        .disabling
+                        .insert(format!("turns off the `{key}` plugin"));
+                }
+                Value::Bool(true) => {
+                    facts.protecting.insert(format!("plugin:{key}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (field, shown) in [
+        ("disableAllHooks", "sets `disableAllHooks`"),
+        ("allowManagedHooksOnly", "sets `allowManagedHooksOnly`"),
+    ] {
+        if obj.get(field) == Some(&Value::Bool(true)) {
+            facts.disabling.insert(shown.to_string());
+        }
+    }
+    if let Some(Value::Object(env)) = obj.get("env") {
+        if env
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("SAFE_AI_SKILL_DISABLE") && is_truthy_switch(v))
+        {
+            facts
+                .disabling
+                .insert("sets `SAFE_AI_SKILL_DISABLE`".to_string());
+        }
+    }
+    let mode = obj
+        .get("permissions")
+        .and_then(|p| p.get("defaultMode"))
+        .and_then(Value::as_str);
+    if mode.is_some_and(|m| m.eq_ignore_ascii_case("bypassPermissions")) {
+        facts
+            .disabling
+            .insert("sets `permissions.defaultMode` to `bypassPermissions`".to_string());
+    }
+    let mut hooks = BTreeSet::new();
+    if let Some(Value::Object(events)) = obj.get("hooks") {
+        for (event, groups) in events {
+            for group in groups.as_array().into_iter().flatten() {
+                let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("");
+                let entries = group.get("hooks").and_then(Value::as_array);
+                for entry in entries.into_iter().flatten() {
+                    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !is_guard_command(command) {
+                        continue;
+                    }
+                    let command = compact(command);
+                    hooks.insert(format!("{}|{}|{command}", event.to_lowercase(), matcher));
+                    facts.protecting.insert(format!("hook:{command}"));
+                }
+            }
+        }
+    }
+    facts.hooks = Some(hooks);
+    facts
+}
+
+/// [`settings_facts`] for text that is not a JSON object (an edit fragment, broken JSON),
+/// read from its whitespace-free lowercase form.
+fn textual_settings_facts(text: &str, facts: &mut SettingsFacts) {
+    for (needle, shown) in [
+        ("\"disableallhooks\":true", "sets `disableAllHooks`"),
+        (
+            "\"allowmanagedhooksonly\":true",
+            "sets `allowManagedHooksOnly`",
+        ),
+        (
+            "\"defaultmode\":\"bypasspermissions\"",
+            "sets `permissions.defaultMode` to `bypassPermissions`",
+        ),
+    ] {
+        if text.contains(needle) {
+            facts.disabling.insert(shown.to_string());
+        }
+    }
+    for (i, _) in text.match_indices("\"safe_ai_skill_disable\":") {
+        let value = &text[i + "\"safe_ai_skill_disable\":".len()..];
+        let value = value.trim_start_matches('"');
+        let end = value.find(['"', ',', '}']).unwrap_or(value.len());
+        if !matches!(&value[..end], "" | "0" | "false") {
+            facts
+                .disabling
+                .insert("sets `SAFE_AI_SKILL_DISABLE`".to_string());
+        }
+    }
+    for (i, _) in text.match_indices("\"safe-ai-skill@") {
+        let rest = &text[i + 1..];
+        let Some(end) = rest.find('"') else { continue };
+        let key = &rest[..end];
+        let after = &rest[end + 1..];
+        if after.starts_with(":false") {
+            facts
+                .disabling
+                .insert(format!("turns off the `{key}` plugin"));
+        } else if after.starts_with(":true") {
+            facts.protecting.insert(format!("plugin:{key}"));
+        }
+    }
+    for (i, _) in text.match_indices("\"command\":\"") {
+        let rest = &text[i + "\"command\":\"".len()..];
+        let mut end = rest.len();
+        let mut escaped = false;
+        for (j, c) in rest.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => {
+                    end = j;
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
+        let command = &rest[..end];
+        if is_guard_command(command) {
+            facts.protecting.insert(format!("hook:{command}"));
+        }
+    }
+}
+
+/// How a settings change turns protection off, if it does: a switch it sets, or a guard it
+/// removes (a `safe-ai-skill@…` plugin entry, a guard hook, or a guard hook's matcher).
+fn settings_change(before: &str, after: &str) -> Option<String> {
+    let (b, a) = (settings_facts(before), settings_facts(after));
+    if let Some(what) = a.disabling.difference(&b.disabling).next() {
+        return Some(what.clone());
+    }
+    if let Some(gone) = b.protecting.difference(&a.protecting).next() {
+        return Some(match gone.split_once(':') {
+            Some(("plugin", key)) => format!("removes the `{key}` plugin entry"),
+            _ => {
+                let command: String = gone.trim_start_matches("hook:").chars().take(80).collect();
+                format!("removes or changes the guard hook `{command}`")
+            }
+        });
+    }
+    if let (Some(had), Some(has)) = (&b.hooks, &a.hooks) {
+        if let Some(gone) = had.difference(has).next() {
+            let shown: String = gone.chars().take(80).collect();
+            return Some(format!("narrows the guard hook `{shown}`"));
+        }
+    }
+    None
+}
+
+/// Whether agent-definition text sets `permissionMode: bypassPermissions`.
+fn bypass_frontmatter(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line: String = compact(line).replace(['"', '\''], "");
+        line == "permissionmode:bypasspermissions"
+    })
+}
+
+/// The string values of `"key": "…"` pairs in `text` (any nesting), for text that may not be
+/// JSON. Escapes are kept as written.
+fn string_values<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+    let quoted = format!("\"{key}\"");
+    let mut out = Vec::new();
+    for (i, _) in text.match_indices(&quoted) {
+        let rest = text[i + quoted.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let mut end = rest.len();
+        let mut escaped = false;
+        for (j, c) in rest.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => {
+                    end = j;
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
+        out.push(&rest[..end]);
+    }
+    out
+}
+
+/// The kit tier a `security.json` text asks for: the highest of its tier fields, Relaxed (the
+/// kit default) when it names none.
+fn kit_tier(text: &str) -> Tier {
+    let tiers: Vec<Tier> = match crate::policy::tier::kit_hints_from(text) {
+        Some(hints) => hints.into_iter().filter_map(|h| h.tier).collect(),
+        None => string_values(text, "tier")
+            .into_iter()
+            .filter_map(Tier::parse)
+            .collect(),
+    };
+    tiers.into_iter().max().unwrap_or(Tier::Relaxed)
+}
+
+/// The settings in git-config text that make git run a program, as `key=value`.
+fn git_risky(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        let mut line = line.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            let (inner, after) = rest.split_once(']').unwrap_or((rest, ""));
+            section = match inner.trim().split_once(char::is_whitespace) {
+                Some((name, sub)) => format!(
+                    "{}.{}",
+                    name.to_lowercase(),
+                    sub.trim().trim_matches('"').to_lowercase()
+                ),
+                None => inner.trim().to_lowercase(),
+            };
+            line = after.trim();
+        }
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let (key, value) = match line.split_once('=') {
+            Some((k, v)) => (k.trim().to_lowercase(), v.trim().trim_matches('"')),
+            None => (line.to_lowercase(), "true"),
+        };
+        let full = if section.is_empty() {
+            key
+        } else {
+            format!("{section}.{key}")
+        };
+        if risky_git_key(&full, value) {
+            out.insert(format!("{full}={value}"));
+        }
+    }
+    out
+}
+
+/// Whether git setting `key` (lowercase, dotted) set to `value` makes git run a program.
+fn risky_git_key(key: &str, value: &str) -> bool {
+    let builtin_fsmonitor = matches!(value.to_ascii_lowercase().as_str(), "true" | "false" | "");
+    if !key.contains('.') {
+        // An edit fragment without its section header.
+        return matches!(key, "hookspath" | "pager" | "sshcommand" | "editor")
+            || (key == "fsmonitor" && !builtin_fsmonitor);
+    }
+    let (first, last) = (
+        key.split('.').next().unwrap_or(""),
+        key.rsplit('.').next().unwrap_or(""),
+    );
+    match key {
+        "core.hookspath"
+        | "core.pager"
+        | "core.sshcommand"
+        | "core.editor"
+        | "core.gitproxy"
+        | "core.askpass"
+        | "sequence.editor"
+        | "diff.external"
+        | "gpg.program"
+        | "gpg.ssh.program"
+        | "gpg.x509.program"
+        | "uploadpack.packobjectshook"
+        | "include.path" => return true,
+        "core.fsmonitor" => return !builtin_fsmonitor,
+        _ => {}
+    }
+    match (first, last) {
+        ("alias", _) => value.starts_with('!'),
+        ("filter", "clean" | "smudge" | "process") => true,
+        ("diff", "textconv" | "command") => true,
+        ("merge", "driver") => true,
+        ("includeif", "path") => true,
+        ("pager", _) => true,
+        ("credential", "helper") => value.starts_with('!') || value.contains('/'),
+        _ => false,
+    }
+}
+
+/// The MCP servers in `.mcp.json` text (name → its JSON); `None` when the text is not JSON.
+fn mcp_servers(text: &str) -> Option<BTreeMap<String, String>> {
+    if text.trim().is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let value: Value = serde_json::from_str(text).ok()?;
+    let servers = value
+        .get("mcpServers")
+        .or_else(|| value.get("servers"))
+        .and_then(Value::as_object);
+    Some(
+        servers
+            .into_iter()
+            .flatten()
+            .map(|(name, v)| (name.clone(), v.to_string()))
+            .collect(),
+    )
+}
+
+/// The MCP server a `.mcp.json` change adds or changes, if any (`?` when the text cannot be
+/// read as JSON and changes).
+fn mcp_change(before: &str, after: &str) -> Option<String> {
+    match (mcp_servers(before), mcp_servers(after)) {
+        (Some(had), Some(has)) => has
+            .iter()
+            .find(|(name, v)| had.get(*name) != Some(v))
+            .map(|(name, _)| name.chars().take(80).collect()),
+        (None, Some(has)) => has.keys().next().map(|n| n.chars().take(80).collect()),
+        (_, None) => (before != after).then(|| "?".to_string()),
+    }
+}
+
+/// The lifecycle scripts in `package.json` text (name → command), read as JSON or, failing
+/// that, from its `"name": "…"` pairs.
+fn lifecycle_scripts(text: &str) -> BTreeMap<String, String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text) {
+        let scripts = value.get("scripts").and_then(Value::as_object);
+        return scripts
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| LIFECYCLE_SCRIPTS.contains(&name.as_str()))
+            .map(|(name, v)| (name.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect();
+    }
+    LIFECYCLE_SCRIPTS
+        .iter()
+        .flat_map(|name| {
+            string_values(text, name)
+                .into_iter()
+                .map(move |v| (name.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// The lifecycle script a `package.json` change adds or changes, if any.
+fn lifecycle_change(before: &str, after: &str) -> Option<String> {
+    let had = lifecycle_scripts(before);
+    lifecycle_scripts(after)
+        .into_iter()
+        .find(|(name, v)| had.get(name) != Some(v))
+        .map(|(name, _)| name)
+}
+
+// ----- Bash -----
+
+/// ASCII case-insensitive substring test, without allocating.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// The new text of a Bash write, as far as the command line shows it.
+#[derive(Debug, Clone)]
+enum Content {
+    /// Spelled out (`echo '…' >`, `printf '…' >`).
+    Known(String),
+    /// Appended text (`echo '…' >>`).
+    Appended(String),
+    /// Copied from this file (`cp src dst`, `mv src dst`).
+    From(PathBuf),
+    /// A `sed` script applied in place.
+    Sed(String),
+    /// Unknown.
+    Unknown,
+}
+
+/// What a Bash command does to a path.
+#[derive(Debug, Clone)]
+enum Op {
+    Write(Content),
+    Delete,
+    /// `chmod`/`chown`: may enable or disable a hook script.
+    Mode,
+}
+
+/// The directories relative paths may resolve against: the cwd and each literal `cd` target.
+struct Places {
+    known: Vec<PathBuf>,
+    unknown: bool,
+}
+
+impl Places {
+    /// Every absolute spelling of `raw` (none when it holds an expansion); after a directory
+    /// change the gate cannot follow, a relative path is also placed under a stand-in dir so
+    /// its own components still classify.
+    fn resolve(&self, raw: &str, homes: &ConfigHomes) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .known
+            .iter()
+            .filter_map(|d| absolute_in(raw, d, homes))
+            .collect();
+        out.dedup();
+        if self.unknown && !raw.starts_with(['/', '~', '$']) {
+            out.push(PathBuf::from("/?").join(raw));
+        }
+        out
+    }
+
+    fn cd(&mut self, cmd: &SimpleCommand, homes: &ConfigHomes) {
+        let target = cmd.words.iter().skip(1).find(|w| !w.text.starts_with('-'));
+        match target {
+            Some(w) if !w.dynamic && !w.splits => {
+                let next: Vec<PathBuf> = self
+                    .known
+                    .iter()
+                    .filter_map(|d| absolute_in(&w.text, d, homes))
+                    .collect();
+                if next.is_empty() {
+                    self.unknown = true;
+                }
+                for dir in next {
+                    if !self.known.contains(&dir) {
+                        self.known.push(dir);
+                    }
+                }
+            }
+            None if cmd.program() == "cd" => match homes.home.clone() {
+                Some(home) => self.known.push(home),
+                None => self.unknown = true,
+            },
+            _ => self.unknown = true,
+        }
+    }
+}
+
+/// One path a Bash command touches.
+struct Touch {
+    raw: String,
+    op: Op,
+    glob: bool,
+    paths: Vec<PathBuf>,
+}
+
+/// Decide a Bash command by what it does to the files [`decide_file_content`] guards: a
+/// redirect, `tee`, `sed -i`/`perl -i`, `mv`/`cp`/`install`/`ln`/`dd`/`truncate` onto them,
+/// `rm` of them (or of a directory holding them), `chmod` of a hook, or interpreter code
+/// (`python -c`, `node -e`, a heredoc) that opens one for writing; plus `git config` setting a
+/// key that runs a program, `npm pkg set scripts.<lifecycle>`, and `export` of a
+/// `KIT_FIREWALL_*` / `SAFE_AI_SKILL_*` switch. A change shown to turn protection off is a deny
+/// at every tier; one whose content the command line does not show asks. `None` is no
+/// opinion. No process is started; files are read only for a guarded target.
+pub fn decide_bash_writes(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+    tier: Tier,
+) -> Option<Verdict> {
+    let _ = (policy, tier);
+    decide_bash_writes_in(command, cwd, &ConfigHomes::from_env())
+}
+
+/// [`decide_bash_writes`] with the settings locations given.
+pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> Option<Verdict> {
+    let gitconfig = contains_ci(command, "git") && contains_ci(command, "config");
+    if !gitconfig && !BASH_NEEDLES.iter().any(|n| contains_ci(command, n)) {
+        return None;
+    }
+    let mut strictest: Option<Verdict> = exported_switch(command).map(Verdict::Ask);
+    let parsed = shell::parse(command);
+    let mut places = Places {
+        known: vec![lexical_path(cwd)],
+        unknown: false,
+    };
+    let mut touches: Vec<Touch> = Vec::new();
+    // The text a redirect writes is known when the line's one command (besides `cd`s) is an
+    // `echo`/`printf` of literal words.
+    let mut writers = parsed
+        .commands
+        .iter()
+        .filter(|c| !matches!(c.program().as_str(), "cd" | "pushd"));
+    let single_echo = match (writers.next(), writers.next()) {
+        (Some(only), None) => emitted(only),
+        _ => None,
+    };
+    for cmd in &parsed.commands {
+        let program = cmd.program();
+        if matches!(program.as_str(), "cd" | "pushd") {
+            places.cd(cmd, homes);
+            continue;
+        }
+        if matches!(program.as_str(), "popd") {
+            places.unknown = true;
+            continue;
+        }
+        if let Some(reason) = git_config_set(cmd).or_else(|| npm_lifecycle_set(cmd)) {
+            strictest = stricter(strictest, Verdict::Ask(reason));
+        }
+        for (word, op) in command_touches(cmd) {
+            touches.push(Touch {
+                paths: places.resolve(&word.text, homes),
+                glob: word.splits && word.text.contains(['*', '?', '[']),
+                raw: word.text.clone(),
+                op,
+            });
+        }
+    }
+    let append = command.contains(">>");
+    for file in &parsed.output_files {
+        let content = match (&single_echo, append) {
+            (Some(text), false) => Content::Known(text.clone()),
+            (Some(text), true) => Content::Appended(text.clone()),
+            (None, _) => Content::Unknown,
+        };
+        touches.push(Touch {
+            paths: places.resolve(file, homes),
+            glob: file.contains(['*', '?', '[']),
+            raw: file.clone(),
+            op: Op::Write(content),
+        });
+    }
+    for code in interpreter_code(&parsed) {
+        if !crate::gates::envwrite::code_writes(&code) {
+            continue;
+        }
+        for raw in quoted_paths(&code) {
+            touches.push(Touch {
+                paths: places.resolve(raw, homes),
+                glob: false,
+                raw: raw.to_string(),
+                op: Op::Write(Content::Unknown),
+            });
+        }
+    }
+    if touches.is_empty() {
+        return strictest;
+    }
+    let guarded = guarded_paths(cwd, homes);
+    for touch in &touches {
+        for (path, kind) in touch_targets(touch, &guarded, homes) {
+            if let Some(v) = judge_bash(kind, &path, touch, command, &places) {
+                if matches!(v, Verdict::Deny(_)) {
+                    return Some(v);
+                }
+                strictest = stricter(strictest, v);
+            }
+        }
+    }
+    strictest
+}
+
+fn stricter(current: Option<Verdict>, next: Verdict) -> Option<Verdict> {
+    match (&current, &next) {
+        (Some(Verdict::Deny(_)), _) => current,
+        (Some(Verdict::Ask(_)), Verdict::Ask(_) | Verdict::NoOpinion | Verdict::Allow(_)) => {
+            current
+        }
+        _ => Some(next),
+    }
+}
+
+/// The `KIT_FIREWALL_*` / `SAFE_AI_SKILL_*` variable an `export`, `declare -x`, `typeset -x`
+/// or `setenv` in `command` sets (also as text written to a shell rc file), as the ask reason.
+fn exported_switch(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    for needle in ["kit_firewall_", "safe_ai_skill_"] {
+        for (i, _) in lower.match_indices(needle) {
+            let name: String = lower[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let next = lower[i + name.len()..].chars().next();
+            let before = &lower[..i];
+            let start = before
+                .rfind([';', '|', '&', '\n', '(', '`', '\'', '"'])
+                .map_or(0, |j| j + 1);
+            let first = before[start..].split_whitespace().next().unwrap_or("");
+            let exports = matches!(first, "export" | "declare" | "typeset")
+                && (next == Some('=') || first == "export");
+            let setenv = first == "setenv" && next.is_some_and(char::is_whitespace);
+            if exports || setenv {
+                return Some(format!(
+                    "safe-ai-skill tamper tripwire: this exports `{}`, a safe-ai-skill or kit \
+                     firewall switch; ask the user to set it themselves if it is wanted.",
+                    name.to_ascii_uppercase()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The text an `echo`/`printf` of literal words prints, if that is what `cmd` is.
+fn emitted(cmd: &SimpleCommand) -> Option<String> {
+    let program = cmd.program();
+    let args = cmd.words.get(1..)?;
+    if args.iter().any(|w| w.dynamic) {
+        return None;
+    }
+    match program.as_str() {
+        "echo" => {
+            let mut newline = true;
+            let mut rest = args;
+            while let Some((flag, tail)) = rest.split_first() {
+                if !matches!(flag.text.as_str(), "-n" | "-e" | "-E" | "-ne" | "-en") {
+                    break;
+                }
+                newline &= !flag.text.contains('n');
+                rest = tail;
+            }
+            let mut text = rest
+                .iter()
+                .map(|w| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if newline {
+                text.push('\n');
+            }
+            Some(text)
+        }
+        "printf" => {
+            let format = &args.first()?.text;
+            (!format.contains('%') && args.len() == 1).then(|| {
+                format
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Non-option operands of `words` (after `--`, everything).
+fn operands(words: &[Word]) -> Vec<&Word> {
+    let mut out = Vec::new();
+    let mut options = true;
+    for w in words {
+        if options && w.text == "--" {
+            options = false;
+            continue;
+        }
+        if options && w.text.starts_with('-') && w.text.len() > 1 {
+            continue;
+        }
+        out.push(w);
+    }
+    out
+}
+
+/// The paths one simple command writes, deletes or re-modes (redirects and interpreter code
+/// are read elsewhere).
+fn command_touches(cmd: &SimpleCommand) -> Vec<(Word, Op)> {
+    let program = cmd.program();
+    let args = cmd.words.get(1..).unwrap_or_default();
+    let mut out: Vec<(Word, Op)> = Vec::new();
+    let mut push = |w: &Word, op: Op| out.push((w.clone(), op));
+    match program.as_str() {
+        "rm" | "unlink" | "shred" | "srm" | "rmdir" => {
+            for w in operands(args) {
+                push(w, Op::Delete);
+            }
+        }
+        "mv" | "cp" | "install" | "ln" | "rsync" | "ditto" | "scp" => {
+            let texts: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+            let target_dir = texts
+                .iter()
+                .position(|a| *a == "-t" || *a == "--target-directory")
+                .and_then(|i| args.get(i + 1));
+            let ops = operands(args);
+            let (dest, sources): (&Word, Vec<&Word>) = match target_dir {
+                Some(dir) => (
+                    dir,
+                    ops.into_iter().filter(|w| w.text != dir.text).collect(),
+                ),
+                None => match ops.split_last() {
+                    Some((last, rest)) => (*last, rest.to_vec()),
+                    None => return out,
+                },
+            };
+            let content = match sources.as_slice() {
+                [only] if !only.dynamic && !only.splits && program != "ln" => {
+                    Content::From(PathBuf::from(&only.text))
+                }
+                _ => Content::Unknown,
+            };
+            push(dest, Op::Write(content.clone()));
+            for source in &sources {
+                if let Some(name) = Path::new(&source.text).file_name() {
+                    let mut inside = dest.clone();
+                    inside.text = format!("{}/{}", dest.text, name.to_string_lossy());
+                    push(&inside, Op::Write(content.clone()));
+                }
+                if program == "mv" {
+                    push(source, Op::Delete);
+                }
+            }
+        }
+        "tee" => {
+            for w in operands(args) {
+                push(w, Op::Write(Content::Unknown));
+            }
+        }
+        "truncate" => {
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if matches!(w.text.as_str(), "-s" | "-r" | "--reference") {
+                    skip = true;
+                } else if !w.text.starts_with('-') {
+                    push(w, Op::Write(Content::Unknown));
+                }
+            }
+        }
+        "dd" => {
+            for w in args {
+                if let Some(file) = w.text.strip_prefix("of=") {
+                    let mut target = w.clone();
+                    target.text = file.to_string();
+                    push(&target, Op::Write(Content::Unknown));
+                }
+            }
+        }
+        "sed" | "gsed" => {
+            let in_place = args
+                .iter()
+                .any(|w| w.text.starts_with("-i") || w.text.starts_with("--in-place"));
+            if !in_place {
+                return out;
+            }
+            let mut script: Option<String> = None;
+            let mut files: Vec<&Word> = Vec::new();
+            let mut i = 0;
+            let mut options = true;
+            while let Some(w) = args.get(i) {
+                let t = w.text.as_str();
+                if options && t == "--" {
+                    options = false;
+                } else if options && matches!(t, "-e" | "--expression" | "-f" | "--file") {
+                    script = args.get(i + 1).map(|s| s.text.clone());
+                    i += 1;
+                } else if options && t == "-i" && args.get(i + 1).is_some_and(|n| n.text.is_empty())
+                {
+                    // BSD `sed -i '' …`: the empty backup suffix.
+                    i += 1;
+                } else if options && t.starts_with('-') && t.len() > 1 {
+                } else if script.is_none() {
+                    script = Some(t.to_string());
+                } else {
+                    files.push(w);
+                }
+                i += 1;
+            }
+            let content = script.map_or(Content::Unknown, Content::Sed);
+            for w in files {
+                push(w, Op::Write(content.clone()));
+            }
+        }
+        "perl" | "ruby" => {
+            let in_place = args.iter().any(|w| {
+                (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('i'))
+                    || w.text.starts_with("--in-place")
+            });
+            if !in_place {
+                return out;
+            }
+            let mut skip = false;
+            for w in args {
+                if skip {
+                    skip = false;
+                } else if w.text == "-e" || w.text == "-E" {
+                    skip = true;
+                } else if !w.text.starts_with('-') {
+                    push(w, Op::Write(Content::Unknown));
+                }
+            }
+        }
+        "chmod" | "chown" | "chgrp" | "chflags" => {
+            for w in operands(args).into_iter().skip(1) {
+                push(w, Op::Mode);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Interpreter code on the command line: `python -c CODE`, `node -e CODE`, `ruby -e CODE`,
+/// `perl -e CODE`, and code fed on standard input.
+fn interpreter_code(parsed: &shell::Parsed) -> Vec<String> {
+    let mut out = parsed.stdin_code.clone();
+    for cmd in &parsed.commands {
+        let Some(at) = shell::interpreter_at(&cmd.words) else {
+            continue;
+        };
+        let words = &cmd.words[at..];
+        for (i, w) in words.iter().enumerate().skip(1) {
+            if matches!(
+                w.text.as_str(),
+                "-c" | "-e" | "-E" | "--eval" | "-p" | "--print"
+            ) {
+                if let Some(code) = words.get(i + 1) {
+                    out.push(code.text.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The quoted strings in interpreter `code` that look like paths.
+fn quoted_paths(code: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = code;
+    while let Some(start) = rest.find(['\'', '"']) {
+        let quote = &rest[start..start + 1];
+        let body = &rest[start + 1..];
+        let Some(end) = body.find(quote) else { break };
+        let found = &body[..end];
+        if found.contains(['/', '.']) && !found.contains(char::is_whitespace) {
+            out.push(found);
+        }
+        rest = &body[end + 1..];
+    }
+    out
+}
+
+/// The guarded paths a session may reach: the project's (cwd and `$CLAUDE_PROJECT_DIR`) and
+/// the user's settings, for globs and for deletes of a directory holding one.
+fn guarded_paths(cwd: &Path, homes: &ConfigHomes) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let roots = std::iter::once(cwd).chain(homes.project_dir.as_deref());
+    for root in roots {
+        for rel in [
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".claude/security.json",
+            ".claude/hooks",
+            ".mcp.json",
+            "package.json",
+            ".git/config",
+        ] {
+            out.push(root.join(rel));
+        }
+        for hook in GIT_HOOK_NAMES {
+            out.push(root.join(".git/hooks").join(hook));
+        }
+    }
+    let user_dirs = homes
+        .home
+        .iter()
+        .map(|h| h.join(".claude"))
+        .chain(homes.config_dir.clone());
+    for dir in user_dirs {
+        out.push(dir.join("settings.json"));
+        out.push(dir.join("settings.local.json"));
+    }
+    out
+}
+
+/// The guarded files `touch` reaches: its own paths when they classify, glob matches against
+/// [`guarded_paths`], and for a delete the existing guarded files below it.
+fn touch_targets(
+    touch: &Touch,
+    guarded: &[PathBuf],
+    homes: &ConfigHomes,
+) -> Vec<(PathBuf, Guarded)> {
+    let mut out = Vec::new();
+    let delete = matches!(touch.op, Op::Delete);
+    for path in &touch.paths {
+        let key = normalize_path(&path.to_string_lossy());
+        if touch.glob {
+            for g in guarded {
+                let gk = normalize_path(&g.to_string_lossy());
+                let hit = crate::gates::bash::glob_match(&key, &gk)
+                    || (delete
+                        && gk
+                            .match_indices('/')
+                            .any(|(i, _)| crate::gates::bash::glob_match(&key, &gk[..i])));
+                if hit {
+                    if let Some(kind) = classify(&gk, homes) {
+                        out.push((g.clone(), kind));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(kind) = classify_path(path, homes) {
+            out.push((path.clone(), kind));
+        }
+        if delete {
+            let prefix = format!("{key}/");
+            for g in guarded {
+                let gk = normalize_path(&g.to_string_lossy());
+                if gk.starts_with(&prefix) && crate::localfs::exists(g) {
+                    if let Some(kind) = classify(&gk, homes) {
+                        out.push((g.clone(), kind));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `text` with a simple `s/pattern/replacement/[g]` sed script applied (literal pattern and
+/// replacement only); `None` for anything else.
+fn emulate_sed(script: &str, text: &str) -> Option<String> {
+    let rest = script.strip_prefix('s')?;
+    let delim = rest.chars().next()?;
+    if delim.is_alphanumeric() || delim == '\\' {
+        return None;
+    }
+    let parts: Vec<&str> = rest[delim.len_utf8()..].split(delim).collect();
+    let [pattern, replacement, flags] = parts.as_slice() else {
+        return None;
+    };
+    let special = |s: &str, set: &[char]| s.contains(set);
+    if pattern.is_empty()
+        || special(
+            pattern,
+            &[
+                '\\', '[', ']', '*', '+', '?', '^', '$', '(', ')', '{', '}', '|',
+            ],
+        )
+        || special(replacement, &['\\', '&'])
+        || !flags.chars().all(|c| c == 'g')
+    {
+        return None;
+    }
+    let all = flags.contains('g');
+    let mut out: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        out.push(if all {
+            line.replace(pattern, replacement)
+        } else {
+            line.replacen(pattern, replacement, 1)
+        });
+    }
+    Some(out.join("\n"))
+}
+
+/// Whether `command` spells an npm lifecycle script name as a key (`"postinstall"`,
+/// `scripts.prepare`, `'install'`).
+fn mentions_lifecycle(command: &str) -> bool {
+    LIFECYCLE_SCRIPTS.iter().any(|name| {
+        command.match_indices(name).any(|(i, _)| {
+            let before = command[..i].chars().next_back();
+            let after = command[i + name.len()..].chars().next();
+            matches!(before, Some('"' | '\'' | '.'))
+                && matches!(after, Some('"' | '\'' | '=' | ':' | '\\'))
+        })
+    })
+}
+
+/// The verdict on a Bash command's `touch` of guarded `path`.
+fn judge_bash(
+    kind: Guarded,
+    path: &Path,
+    touch: &Touch,
+    command: &str,
+    places: &Places,
+) -> Option<Verdict> {
+    let shown: String = touch.raw.chars().take(160).collect();
+    let unknown_write = || {
+        Verdict::Ask(format!(
+            "safe-ai-skill tamper tripwire: this command rewrites `{shown}` in a way \
+             safe-ai-skill cannot read; make the change with the Edit tool, or ask the user to \
+             make it."
+        ))
+    };
+    match (&touch.op, kind) {
+        (Op::Mode, Guarded::GitHooks) => return Some(Verdict::Ask(git_hook_reason(&shown))),
+        (Op::Mode, Guarded::KitHooks) => return Some(Verdict::Ask(kit_hook_reason(&shown))),
+        (Op::Mode, _) => return None,
+        (_, Guarded::KitHooks) => return Some(Verdict::Ask(kit_hook_reason(&shown))),
+        (Op::Write(_), Guarded::GitHooks) => return Some(Verdict::Ask(git_hook_reason(&shown))),
+        (Op::Delete, Guarded::Settings) => {}
+        (Op::Delete, Guarded::KitSecurity) => {
+            return matches!(read_old(Some(path)), Old::Text(_)).then(|| {
+                Verdict::Ask(format!(
+                    "safe-ai-skill tamper tripwire: this removes `{shown}`, the kit's tier \
+                     file; ask the user to remove it themselves if that is wanted."
+                ))
+            });
+        }
+        (Op::Delete, _) => return None,
+        _ => {}
+    }
+    // An unplaced path (after an untracked `cd`) has no file to read.
+    let placed = path.has_root() && !path.starts_with("/?");
+    let old = if placed {
+        read_old(Some(path))
+    } else {
+        Old::Unreadable
+    };
+    let before = match &old {
+        Old::Text(text) => text.as_str(),
+        Old::Missing => "",
+        Old::Unreadable => {
+            return match touch.op {
+                Op::Delete => None,
+                _ if kind == Guarded::PackageJson && !mentions_lifecycle(command) => None,
+                _ if kind == Guarded::AgentDef => None,
+                _ => Some(unknown_write()),
+            };
+        }
+    };
+    let content = match &touch.op {
+        Op::Delete => Some(String::new()),
+        Op::Write(Content::Known(text)) => Some(text.clone()),
+        Op::Write(Content::Appended(text)) => Some(format!("{before}{text}")),
+        Op::Write(Content::From(source)) => places
+            .known
+            .first()
+            .map(|cwd| cwd.join(source))
+            .and_then(|p| crate::policy::tier::read_bounded(&p, MAX_CONFIG_READ)),
+        Op::Write(Content::Sed(script)) => emulate_sed(script, before),
+        Op::Write(Content::Unknown) | Op::Mode => None,
+    };
+    let exact = matches!(
+        touch.op,
+        Op::Delete | Op::Write(Content::Known(_) | Content::Appended(_) | Content::From(_))
+    );
+    if !exact && kind == Guarded::PackageJson && !mentions_lifecycle(command) {
+        return None;
+    }
+    match content {
+        Some(after) => {
+            let verdict = judge_content(kind, &shown, before, &after);
+            match verdict {
+                Some(Verdict::Deny(_)) => verdict,
+                _ if exact => verdict,
+                // An emulated `sed`: only a deny is certain; anything else is still unread.
+                _ => Some(unknown_write()),
+            }
+        }
+        None if kind == Guarded::AgentDef => None,
+        None => Some(unknown_write()),
+    }
+}
+
+/// The ask reason for a `git config` that sets a key making git run a program.
+fn git_config_set(cmd: &SimpleCommand) -> Option<String> {
+    if cmd.program() != "git" {
+        return None;
+    }
+    let words = cmd.words.get(1..)?;
+    let mut i = 0;
+    while let Some(w) = words.get(i) {
+        match w.text.as_str() {
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => i += 2,
+            t if t.starts_with('-') => i += 1,
+            _ => break,
+        }
+    }
+    if words.get(i)?.text != "config" {
+        return None;
+    }
+    const READS: &[&str] = &[
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--get-color",
+        "--get-colorbool",
+        "--unset",
+        "--unset-all",
+        "-l",
+        "--list",
+        "--remove-section",
+        "--rename-section",
+        "-e",
+        "--edit",
+    ];
+    const VALUED: &[&str] = &["-f", "--file", "--blob", "--type", "--default", "--comment"];
+    let mut positional: Vec<&str> = Vec::new();
+    let mut j = i + 1;
+    while let Some(w) = words.get(j) {
+        let t = w.text.as_str();
+        if READS.contains(&t) {
+            return None;
+        }
+        if VALUED.contains(&t) {
+            j += 2;
+            continue;
+        }
+        if !t.starts_with('-') {
+            positional.push(t);
+        }
+        j += 1;
+    }
+    let args = match positional.first() {
+        Some(&"set") => &positional[1..],
+        Some(&("get" | "list" | "unset" | "remove-section" | "rename-section" | "edit")) => {
+            return None
+        }
+        _ => &positional[..],
+    };
+    let [key, value, ..] = args else {
+        return None;
+    };
+    let key = key.to_ascii_lowercase();
+    risky_git_key(&key, value).then(|| git_config_reason(&format!("{key}={value}")))
+}
+
+/// The ask reason for `npm pkg set scripts.<lifecycle>=…` or `npm set-script <lifecycle>`.
+fn npm_lifecycle_set(cmd: &SimpleCommand) -> Option<String> {
+    if !matches!(cmd.program().as_str(), "npm" | "pnpm" | "yarn" | "bun") {
+        return None;
+    }
+    let texts: Vec<&str> = cmd.words.iter().map(|w| w.text.as_str()).collect();
+    let script = if let Some(i) = texts.iter().position(|t| *t == "set-script") {
+        texts.get(i + 1).copied()
+    } else if texts.windows(2).any(|w| w == ["pkg", "set"]) {
+        texts.iter().find_map(|t| {
+            let key = t.split('=').next()?.strip_prefix("scripts.")?;
+            Some(key)
+        })
+    } else {
+        None
+    }?;
+    LIFECYCLE_SCRIPTS.contains(&script).then(|| {
+        format!(
+            "safe-ai-skill tamper tripwire: this sets the `{script}` script in package.json, \
+             which npm runs on install; ask the user to review it before it is added."
+        )
+    })
 }
 
 #[cfg(test)]
