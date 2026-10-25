@@ -19,7 +19,7 @@
 //!   within-cap SOL transfer on a positively identified devnet/testnet/localnet, and only when
 //!   every command is a direct solana-family command; deploys there get no opinion. An
 //!   `spl-token transfer` amount is in tokens (D3): never budgeted or granted as SOL, no
-//!   opinion on identified devnet/localnet, a hard-guard ask anywhere else.
+//!   opinion on identified devnet/testnet/localnet, a hard-guard ask anywhere else.
 //! - A command naming a solana-family program that cannot be parsed, runs code the command
 //!   line does not spell out, or runs an expansion as its program asks as a hard guard, and
 //!   is denied at High.
@@ -1384,14 +1384,17 @@ fn transfer_decision(
 
 /// Build an `spl-token transfer` decision (spec D3). Its amount is in TOKEN units: it never
 /// reaches the SOL caps or the ledger, and no SOL grant covers it (a hard guard with no
-/// `amount_sol`). A positively identified devnet or localnet gets no opinion; mainnet, testnet
+/// `amount_sol`). A positively identified devnet, testnet or localnet gets no opinion; mainnet
 /// and an unidentified cluster ask, which is a deny headless and at High.
 fn token_transfer_decision(argv: &Argv, ctx: &Context) -> (Decision, GateMeta) {
     let (amount, destination) = parse_transfer(argv, "spl-token");
     let mut meta = GateMeta::new(Scope::Transfer, true);
     meta.program = Some("spl-token".to_string());
     meta.destination = destination;
-    if matches!(ctx.network, Network::Devnet | Network::Localnet) {
+    if matches!(
+        ctx.network,
+        Network::Devnet | Network::Testnet | Network::Localnet
+    ) {
         return (Decision::Defer, meta);
     }
     let mint = argv
