@@ -47,7 +47,7 @@ fn run_row(row: &Value) -> (String, Decision) {
     let homes = ConfigHomes {
         home: Some(home.clone()),
         config_dir: Some(home.join(".claude")),
-        project_dir: None,
+        project_dir: Some(proj.clone()),
     };
     let input = substitute(&row["tool_input"], &proj, &home);
     let verdict = if row["tool"] == "Bash" {

@@ -2140,6 +2140,161 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
+/// Variables a command line assigns as statements of their own (`f=x;`, `export D=x &&`,
+/// `local p="$f/y"`), in source order, with quotes removed and references to variables assigned
+/// earlier on the line (`$f`, `${f}`) expanded. A later entry for a name overrides an earlier
+/// one. A value whose text cannot be known (a `$(…)` or backtick substitution, or a variable not
+/// assigned earlier on the line) drops the name: a lookup then finds no value. A prefix
+/// assignment to a command (`f=x cmd`) lasts only for that command and is not listed.
+pub fn same_line_assignments(command: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut known: Vec<(String, String)> = Vec::new();
+    // Statements are read one at a time so a value can use the ones before it.
+    let mut rest = command;
+    while !rest.is_empty() {
+        let (words, next) = statement_words(rest, &known);
+        rest = next;
+        let mut iter = words.iter().peekable();
+        let leads = matches!(
+            iter.peek().map(|w| w.0.as_str()),
+            Some("export" | "declare" | "typeset" | "local" | "readonly")
+        );
+        if leads {
+            iter.next();
+            while iter.peek().is_some_and(|w| w.0.starts_with('-')) {
+                iter.next();
+            }
+        }
+        let words: Vec<&(String, bool)> = iter.collect();
+        let pairs: Vec<Option<(&str, &str)>> = words
+            .iter()
+            .map(|(text, _)| {
+                let (name, value) = text.split_once('=')?;
+                let mut chars = name.chars();
+                let first = chars.next()?;
+                ((first.is_ascii_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then_some((name, value))
+            })
+            .collect();
+        // Only a statement made of assignments (after `export` and the like) lasts.
+        if pairs.is_empty() || (!leads && pairs.iter().any(Option::is_none)) {
+            continue;
+        }
+        for (pair, (_, dynamic)) in pairs.iter().zip(&words) {
+            let Some((name, value)) = pair else { continue };
+            known.retain(|(n, _)| n != name);
+            out.retain(|(n, _)| n != name);
+            if !dynamic {
+                known.push((name.to_string(), value.to_string()));
+                out.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The words of the first statement of `text` (up to an unquoted `;`, `&`, `|`, newline or
+/// parenthesis), each with quotes removed, known variables expanded, and whether its value is
+/// unknown; and the text after the statement.
+fn statement_words<'a>(
+    text: &'a str,
+    known: &[(String, String)],
+) -> (Vec<(String, bool)>, &'a str) {
+    let mut words: Vec<(String, bool)> = Vec::new();
+    let mut word = String::new();
+    let mut dynamic = false;
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    let lookup = |name: &str| {
+        known
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    };
+    while let Some((i, c)) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => word.push(c),
+            (Some('"'), '"') => quote = None,
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (_, '\\') => {
+                if let Some((_, escaped)) = chars.next() {
+                    word.push(escaped);
+                }
+                in_word = true;
+            }
+            (_, '`') => {
+                dynamic = true;
+                in_word = true;
+            }
+            (_, '$') => {
+                in_word = true;
+                match chars.peek().map(|&(_, n)| n) {
+                    Some('(') => dynamic = true,
+                    Some('{') => {
+                        chars.next();
+                        let mut name = String::new();
+                        for (_, n) in chars.by_ref() {
+                            if n == '}' {
+                                break;
+                            }
+                            name.push(n);
+                        }
+                        match lookup(&name) {
+                            Some(v) => word.push_str(&v),
+                            None => dynamic = true,
+                        }
+                    }
+                    Some(n) if n.is_ascii_alphabetic() || n == '_' => {
+                        let mut name = String::new();
+                        while let Some(&(_, n)) = chars.peek() {
+                            if !(n.is_ascii_alphanumeric() || n == '_') {
+                                break;
+                            }
+                            name.push(n);
+                            chars.next();
+                        }
+                        match lookup(&name) {
+                            Some(v) => word.push_str(&v),
+                            None => dynamic = true,
+                        }
+                    }
+                    Some(_) => dynamic = true,
+                    None => word.push('$'),
+                }
+            }
+            (Some(_), _) => word.push(c),
+            (None, ';' | '&' | '|' | '\n' | '(' | ')') => {
+                if in_word {
+                    words.push((std::mem::take(&mut word), dynamic));
+                }
+                return (words, &text[i + c.len_utf8()..]);
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push((std::mem::take(&mut word), dynamic));
+                    dynamic = false;
+                    in_word = false;
+                }
+            }
+            (None, _) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push((word, dynamic));
+    }
+    (words, "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2678,5 +2833,32 @@ mod tests {
             ["open(1)\n"]
         );
         assert!(parse("cat <<< 'open(1)'").stdin_code.is_empty());
+    }
+
+    #[test]
+    fn same_line_assignments_follow_statements_and_expand_earlier_ones() {
+        let got = same_line_assignments("f=.claude/settings.local.json; echo x > $f");
+        assert_eq!(
+            got,
+            [("f".to_string(), ".claude/settings.local.json".to_string())]
+        );
+        let got = same_line_assignments("d=.cla; p=\"${d}ude\"/s.json && export Q='a b' R=$p");
+        let get = |n: &str| {
+            got.iter()
+                .rev()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("p"), Some(".claude/s.json"));
+        assert_eq!(get("Q"), Some("a b"));
+        assert_eq!(get("R"), Some(".claude/s.json"));
+        // Unknown values drop the name; prefix assignments to a command do not last.
+        let got = same_line_assignments("f=a; f=$(pwd); g=$UNSET; h=x cmd; k=1 && k=`id`");
+        assert!(got.is_empty(), "{got:?}");
+        // Single quotes keep `$` literal.
+        assert_eq!(
+            same_line_assignments("v='$HOME/x'"),
+            [("v".to_string(), "$HOME/x".to_string())]
+        );
     }
 }
