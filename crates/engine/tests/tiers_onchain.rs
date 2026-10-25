@@ -365,8 +365,10 @@ fn class_c_on_mainnet_or_unknown_asks_below_high_and_denies_at_high() {
             let cmd = cmd.trim_end();
             assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{cmd}");
             // `$URL` may split into more words: a transfer's amount is then unclear, which no
-            // grant can budget.
-            let granted = if cluster.contains('$') && cmd.contains("transfer") {
+            // grant can budget. A token amount is never covered by a SOL grant (D3).
+            let granted = if (cluster.contains('$') && cmd.contains("transfer"))
+                || cmd.starts_with("spl-token transfer")
+            {
                 ["ask", "ask", "ask", "deny"]
             } else {
                 ["allow", "allow", "allow", "deny"]

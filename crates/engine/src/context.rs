@@ -398,6 +398,51 @@ pub struct Argv<'a> {
     ambiguous_value: bool,
 }
 
+/// Whether the shell may turn one word into a different number of words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Splits {
+    /// It stays one word.
+    No,
+    /// Only through an unquoted glob or brace character (`*`, `?`, `[`, `{`): no expansion.
+    Glob,
+    /// Through an expansion (`$X`, `$(…)`, `"$@"`): its text is unknown.
+    Yes,
+}
+
+impl Splits {
+    /// Whether this word, the value of flag `name`, is a URL whose glob leaves its cluster as
+    /// spelled ([`inert_url_glob`]).
+    fn inert_as_url(self, name: &str, value: &str) -> bool {
+        self == Splits::Glob && URL_FLAGS.contains(&name) && inert_url_glob(value)
+    }
+}
+
+/// Whether an RPC URL spelled with an unquoted glob (`https://api.mainnet-beta.solana.com/?x`)
+/// names the same cluster whatever the shell does with the glob. True only when the scheme and
+/// host (`http(s)://` or `ws(s)://`, up to the first `/`) hold no glob, brace or expansion
+/// character and there is no brace or expansion anywhere: then every glob character sits in a
+/// later path component, so the shell leaves the word as written (no match), fails the
+/// command (zsh `nomatch`, bash `failglob`), or yields words that all start with that same
+/// `scheme://host/`. The CLI reads the first as its URL and rejects the rest as extra
+/// positionals: none can be an amount, a subcommand or a pubkey.
+fn inert_url_glob(value: &str) -> bool {
+    const SPECIAL: [char; 6] = ['*', '?', '[', '{', '$', '`'];
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "ws" | "wss"
+    ) {
+        return false;
+    }
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let (authority, _) = rest.split_at(slash);
+    !authority.contains(SPECIAL) && !value.contains(['{', '$', '`'])
+}
+
 /// How one word relates to the words around it.
 enum Kind<'a> {
     /// A positional word.
@@ -415,27 +460,35 @@ enum Kind<'a> {
 impl<'a> Argv<'a> {
     /// Split a tokenized command (`tokens[0]` is the program word).
     pub fn parse(tokens: &'a [String]) -> Argv<'a> {
-        let words: Vec<(&'a str, bool)> = tokens
+        let words: Vec<(&'a str, Splits)> = tokens
             .iter()
             .skip(1)
-            .map(|t| (t.as_str(), false))
+            .map(|t| (t.as_str(), Splits::No))
             .filter(|(word, _)| !is_fd_duplication(word))
             .collect();
         Argv::parse_words(&words)
     }
 
     /// Split a parsed shell command (`words[0]` is the program word). A word the shell may
-    /// split or glob ([`shell::Word::splits`]) makes every position from it on uncertain.
+    /// split or glob ([`shell::Word::splits`]) makes every position from it on uncertain,
+    /// except a URL flag's value whose glob cannot change its cluster ([`inert_url_glob`]).
     pub fn from_shell(words: &'a [shell::Word]) -> Argv<'a> {
-        let words: Vec<(&'a str, bool)> = words
+        let words: Vec<(&'a str, Splits)> = words
             .iter()
             .skip(1)
-            .map(|w| (w.text.as_str(), w.splits))
+            .map(|w| {
+                let splits = match (w.splits, w.dynamic) {
+                    (false, _) => Splits::No,
+                    (true, false) => Splits::Glob,
+                    (true, true) => Splits::Yes,
+                };
+                (w.text.as_str(), splits)
+            })
             .collect();
         Argv::parse_words(&words)
     }
 
-    fn parse_words(words: &[(&'a str, bool)]) -> Argv<'a> {
+    fn parse_words(words: &[(&'a str, Splits)]) -> Argv<'a> {
         let mut argv = Argv {
             positionals: Vec::new(),
             uncertain_from: None,
@@ -445,7 +498,11 @@ impl<'a> Argv<'a> {
         let mut i = 0;
         while let Some(&(word, splits)) = words.get(i) {
             i += 1;
-            if splits {
+            let inert = match kind(word) {
+                Kind::Attached(name, value) => splits.inert_as_url(name, value),
+                _ => false,
+            };
+            if splits != Splits::No && !inert {
                 // Its words, flags included, are unknowable: so is everything after it.
                 argv.ambiguous_value = true;
                 argv.mark_uncertain();
@@ -469,7 +526,8 @@ impl<'a> Argv<'a> {
                     Some(value) if !is_flag_like(value) => {
                         argv.flags.push((name, Some(value)));
                         i += 1;
-                        if words.get(i - 1).is_some_and(|&(_, s)| s) {
+                        let value_splits = words.get(i - 1).map_or(Splits::No, |&(_, s)| s);
+                        if value_splits != Splits::No && !value_splits.inert_as_url(name, value) {
                             argv.ambiguous_value = true;
                             argv.mark_uncertain();
                         }

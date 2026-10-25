@@ -486,8 +486,9 @@ fn spl_token_positionals_and_flags() {
         ),
         Network::Devnet,
     );
-    assert_eq!(d, Decision::Allow);
-    assert_eq!(meta.amount_sol, Some(0.5));
+    // A token transfer on devnet: no opinion, and never a SOL amount (D3).
+    assert_eq!(d, Decision::Defer);
+    assert_eq!(meta.amount_sol, None);
     assert_eq!(
         meta.destination.as_deref(),
         Some(DEST),
@@ -499,7 +500,8 @@ fn spl_token_positionals_and_flags() {
 fn transfer_all_asks_as_hard_guard() {
     for cmd in [
         format!("solana transfer {DEST} ALL -ud"),
-        format!("spl-token transfer {MINT} ALL {DEST} -ud"),
+        // A token transfer is judged on its cluster alone (D3): ALL asks off devnet/localnet.
+        format!("spl-token transfer {MINT} ALL {DEST} -um"),
     ] {
         let (d, meta) = decide(&cmd, Network::Devnet);
         assert!(is_ask(&d), "{cmd}: {d:?}");

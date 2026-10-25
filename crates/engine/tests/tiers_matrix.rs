@@ -838,10 +838,16 @@ fn f3_class_c_on_mainnet_or_unknown() {
         ] {
             let cmd = cmd.trim_end();
             check(cmd, w.x4("Bash", &bash(cmd)), ASK_HIGH_DENY);
+            // A token amount is never covered by a SOL grant (D3).
+            let granted_want = if cmd.starts_with("spl-token transfer") {
+                ASK_HIGH_DENY
+            } else {
+                ["allow", "allow", "allow", "deny"]
+            };
             check(
                 &format!("granted {cmd}"),
                 granted.x4("Bash", &bash(cmd)),
-                ["allow", "allow", "allow", "deny"],
+                granted_want,
             );
             if cluster == "-um" {
                 check(
