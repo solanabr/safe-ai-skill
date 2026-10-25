@@ -629,6 +629,10 @@ fn encoded_bash_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option
         let ctx = Context::build(&decoded, cwd);
         all.push(as_verdict(bash::decide(&decoded, &ctx, effective).0));
         all.push(as_verdict(secrets::decide(&decoded, cwd, effective)));
+        all.push(exfil::decide_bash(&decoded, cwd, effective, tier));
+        all.push(fetchexec::decide(&decoded, cwd, effective, tier));
+        all.push(tamper::decide_bash_writes(&decoded, cwd, effective, tier));
+        all.push(envread::decide_bash(&decoded));
     }
     strictest(all)
 }
