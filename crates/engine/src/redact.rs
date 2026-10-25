@@ -331,17 +331,85 @@ const NON_SECRET_ENV_PARTS: &[&str] = &[
     "MONKEY",
 ];
 
-/// Whether an environment variable name is secret-named (decision D2): it contains a
-/// [`SECRET_ENV_WORDS`] word outside every [`NON_SECRET_ENV_PARTS`] occurrence. The env-dump
-/// redaction ([`scrub_env_lines`]) and the echo/printenv deny
-/// ([`crate::gates::envread::decide_bash`]) share it.
+/// Words that make a name secret whatever its suffix: `SOLANA_PRIVATE_KEY_PATH` is still
+/// treated as holding key material.
+const STRONG_SECRET_ENV_WORDS: &[&str] = &[
+    "PRIVATE",
+    "SECRET",
+    "MNEMONIC",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "SEED_PHRASE",
+];
+
+/// Name suffixes that hold a locator or a public value rather than a secret: a keypair
+/// *path*, a token *mint*, an *address*, an *id*, a *url*. Overridden by
+/// [`STRONG_SECRET_ENV_WORDS`] and by [`SECRET_URL_NAMES`].
+const NON_SECRET_ENV_SUFFIXES: &[&str] = &[
+    "_PATH", "_FILE", "_DIR", "_MINT", "_ADDRESS", "_ID", "_URL", "_URI",
+];
+
+/// URL-valued names whose value carries a credential: database DSNs (`user:pass@`) and RPC
+/// URLs with an `api-key` query.
+const SECRET_URL_NAMES: &[&str] = &["DATABASE_URL", "DB_URL", "REDIS_URL", "RPC_URL", "MONGO"];
+
+/// Secret words that must be a whole `_`-separated segment, so `PATH`, `SKIP`, `PASSTHROUGH`
+/// and the shell's own `PWD`/`OLDPWD` stay public.
+const SECRET_ENV_SEGMENTS: &[&str] = &[
+    "PAT", "SK", "PASS", "JWT", "COOKIE", "SESSION", "DSN", "PWD",
+];
+
+/// Whether an environment variable name is secret-named (decision D2). A
+/// [`STRONG_SECRET_ENV_WORDS`] word always is; otherwise a [`NON_SECRET_ENV_SUFFIXES`] suffix
+/// is not (unless the name is a [`SECRET_URL_NAMES`] URL); otherwise the name holds a
+/// [`SECRET_ENV_WORDS`] word outside every [`NON_SECRET_ENV_PARTS`] occurrence, or a
+/// [`SECRET_ENV_SEGMENTS`] segment. The env-dump redaction ([`scrub_env_lines`]) and the
+/// echo/printenv deny ([`crate::gates::envread::decide_bash`]) share it.
 pub fn is_secret_env_name(name: &str) -> bool {
     let upper = name.trim().to_ascii_uppercase();
-    let upper = upper.as_bytes();
+    if is_strong_secret_env_name(&upper) {
+        return true;
+    }
+    if SECRET_URL_NAMES.iter().any(|n| upper.contains(n)) {
+        return true;
+    }
+    if NON_SECRET_ENV_SUFFIXES.iter().any(|s| upper.ends_with(s)) {
+        return false;
+    }
+    if upper == "PWD" || upper == "OLDPWD" {
+        return false;
+    }
+    let bytes = upper.as_bytes();
     SECRET_ENV_WORDS.iter().any(|word| {
-        positions(upper, word.as_bytes())
-            .any(|at| !inside_non_secret_part(upper, at, at + word.len()))
-    })
+        positions(bytes, word.as_bytes())
+            .any(|at| !inside_non_secret_part(bytes, at, at + word.len()))
+    }) || upper
+        .split('_')
+        .any(|seg| SECRET_ENV_SEGMENTS.contains(&seg))
+}
+
+/// Whether an upper-cased name holds a [`STRONG_SECRET_ENV_WORDS`] word.
+fn is_strong_secret_env_name(upper: &str) -> bool {
+    STRONG_SECRET_ENV_WORDS.iter().any(|w| upper.contains(w))
+}
+
+/// Whether a value is a plain filesystem path, public whatever its name (a keypair *file*
+/// location, not the key). Only a [`STRONG_SECRET_ENV_WORDS`] name blanks it. Base58 values are
+/// not exempt: an API key can look like an address.
+fn is_public_env_value(value: &str) -> bool {
+    let v = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    (v.starts_with('/') || v.starts_with("./") || v.starts_with("~/"))
+        && !v.contains(char::is_whitespace)
+}
+
+/// Whether the value of `name` at `text[vs..ve]` is blanked by the env-dump redaction.
+fn blanks_env_value(text: &str, name: &str, vs: usize, ve: usize) -> bool {
+    if !is_secret_env_name(name) || value_already_blank(text, vs, ve) {
+        return false;
+    }
+    is_strong_secret_env_name(&name.trim().to_ascii_uppercase())
+        || !is_public_env_value(&text[vs..ve])
 }
 
 /// The start of every occurrence of `needle` in `hay` (short names: a window scan).
@@ -431,7 +499,7 @@ fn collect_env_assignment_lines(text: &str, spans: &mut Vec<(usize, usize)>) {
         if let Some((name_end, value_start)) = env_assignment_at(text, line_start) {
             let name = &text[skip_decl_prefix(text, line_start)..name_end];
             let (vs, ve, resume) = env_value_span(bytes, value_start);
-            if is_secret_env_name(name) && !value_already_blank(text, vs, ve) {
+            if blanks_env_value(text, name, vs, ve) {
                 spans.push((vs, ve));
             }
             next = resume;
@@ -592,7 +660,7 @@ fn collect_env_pairs(text: &str, spans: &mut Vec<(usize, usize)>) {
         } else {
             k
         };
-        if is_secret_env_name(name) && !value_already_blank(text, vs, ve) {
+        if blanks_env_value(text, name, vs, ve) {
             spans.push((vs, ve));
         }
         i = ve;

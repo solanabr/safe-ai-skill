@@ -509,6 +509,11 @@ const CODE_ENV_READS: &[&str] = &[
 /// copied to an innocently named variable first (`k=$HELIUS_API_KEY; echo $k`), `eval`
 /// with built names, and a script file that prints it.
 pub fn decide_bash(command: &str) -> Option<Verdict> {
+    if (command.contains('|') || command.contains('>')) && dump_leaves_redaction(command) {
+        return Some(Verdict::Ask(
+            "safe-ai-skill: this env dump is transformed or written to a file before it is shown, which hides its secret values from redaction; run the bare `printenv` / `env` (secret values are blanked) or filter it with `grep` — approve to proceed".to_string(),
+        ));
+    }
     if !ENV_DUMP_PREFILTER.iter().any(|p| command.contains(p)) {
         return None;
     }
@@ -536,6 +541,103 @@ pub fn decide_bash(command: &str) -> Option<Verdict> {
     code.iter()
         .find_map(|c| code_prints_secret(c))
         .map(|name| Verdict::Deny(print_reason(&name)))
+}
+
+/// Commands an env dump may be piped into and keep its output redactable: filters that pass
+/// `NAME=value` lines through unchanged.
+const DUMP_SAFE_FILTERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "rg", "sort", "uniq", "head", "tail", "less", "more", "wc", "cat",
+];
+
+/// Whether a bare env dump (`env`, `printenv`, `export -p`, `set`, `declare -p`/`-x`,
+/// `typeset -p`/`-x`) is piped into anything but a [`DUMP_SAFE_FILTERS`] filter (or a
+/// keys-only `cut -d= -f1`), or written to a file: the PostToolUse redaction then cannot see
+/// its `NAME=value` lines (decision D2 allows the bare dump because of that redaction).
+fn dump_leaves_redaction(command: &str) -> bool {
+    split_unquoted(command, &[";", "&&", "||", "\n"])
+        .iter()
+        .any(|pipeline| {
+            let stages = split_unquoted(pipeline, &["|"]);
+            let Some(first) = stages.first() else {
+                return false;
+            };
+            let (dump, rest) = split_redirect(first);
+            if !is_env_dump(&dump) {
+                return false;
+            }
+            rest.contains('>') || stages.iter().skip(1).any(|stage| !is_safe_filter(stage))
+        })
+}
+
+/// The words of a stage before its first unquoted `>`, and the remainder.
+fn split_redirect(stage: &str) -> (Vec<String>, String) {
+    let at = stage.find('>').unwrap_or(stage.len());
+    let words = stage[..at].split_whitespace().map(str::to_string).collect();
+    (words, stage[at..].to_string())
+}
+
+fn is_env_dump(words: &[String]) -> bool {
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["env"]
+        | ["env", "-0"]
+        | ["printenv"]
+        | ["printenv", "-0"]
+        | ["set"]
+        | ["export"]
+        | ["export", "-p"] => true,
+        ["declare" | "typeset", flags] => {
+            flags.starts_with('-') && (flags.contains('p') || flags.contains('x'))
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_filter(stage: &str) -> bool {
+    let words: Vec<&str> = stage.split_whitespace().collect();
+    match words.split_first() {
+        // Keys only (`cut -d= -f1`), or a column range that keeps each line's `NAME=` prefix.
+        Some((&"cut", args)) => {
+            args.iter().any(|a| a.starts_with("-c1"))
+                || (args.contains(&"-f1")
+                    && !args.iter().any(|a| a.starts_with("-f") && *a != "-f1"))
+        }
+        Some((cmd, _)) => DUMP_SAFE_FILTERS.contains(cmd) && !stage.contains('>'),
+        None => false,
+    }
+}
+
+/// `text` split on any of `seps` outside single and double quotes.
+fn split_unquoted(text: &str, seps: &[&str]) -> Vec<String> {
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    let (mut single, mut double) = (false, false);
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' && !double {
+            single = !single;
+        } else if c == '"' && !single {
+            double = !double;
+        } else if !single && !double {
+            let rest = &text[i..];
+            // A lone `|` must not be half of `||`.
+            let sep = seps
+                .iter()
+                .find(|s| rest.starts_with(**s) && !(**s == "|" && rest.starts_with("||")));
+            if let Some(sep) = sep {
+                out.push(std::mem::take(&mut cur));
+                for _ in 1..sep.chars().count() {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        cur.push(c);
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn proc_environ_reason() -> String {
