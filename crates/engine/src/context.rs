@@ -204,8 +204,17 @@ fn classify_url(raw: &str) -> Network {
         Some(("http" | "https" | "ws" | "wss", rest)) => rest,
         _ => return Network::Unknown,
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // WHATWG (the `url` crate the CLIs connect through) ends the authority at `\` too for these
+    // schemes: `https://evil.example\@api.devnet.solana.com` is the host `evil.example`.
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (authority, after) = rest.split_at(end);
+    // Anything a URL parser could strip, decode or read differently identifies nothing.
+    if !authority
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '@' | '[' | ']'))
+    {
+        return Network::Unknown;
+    }
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     let host = if host_port.starts_with('[') {
         host_port.find(']').map_or(host_port, |i| &host_port[..=i])
@@ -360,9 +369,44 @@ fn config_file_network(file: &str, base: Option<&Path>) -> Network {
     let Some(text) = read_small_file(&path) else {
         return Network::Unknown;
     };
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("json_rpc_url:"))
-        .map_or(Network::Unknown, classify_url)
+    config_text_network(&text)
+}
+
+/// The cluster a CLI config file's text names: its one top-level `json_rpc_url`.
+///
+/// The CLI reads the file as YAML, so a line scan alone can be fooled (a `json_rpc_url:` line
+/// inside a block scalar or a nested map). The file must parse as one YAML mapping whose
+/// `json_rpc_url` is a string, and exactly one unindented line may spell that key, with the
+/// same plain or quoted value. Anything else (duplicate, flow, anchor or alias syntax, a
+/// second document, a parse error) is [`Network::Unknown`].
+fn config_text_network(text: &str) -> Network {
+    let mut top_level = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("json_rpc_url:"));
+    let (Some(spelled), None) = (top_level.next(), top_level.next()) else {
+        return Network::Unknown;
+    };
+    let spelled = spelled.trim();
+    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(text)
+    else {
+        return Network::Unknown;
+    };
+    let Some(serde_yaml::Value::String(parsed)) = map.get("json_rpc_url") else {
+        return Network::Unknown;
+    };
+    let unquoted = spelled
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| {
+            spelled
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+        })
+        .unwrap_or(spelled);
+    if unquoted != parsed {
+        return Network::Unknown;
+    }
+    classify_url(parsed)
 }
 
 /// Read a regular file of at most [`MAX_CONFIG_BYTES`]; `None` otherwise (a FIFO or device

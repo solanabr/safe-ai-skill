@@ -1218,6 +1218,17 @@ fn classify_solana(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, Ga
             withdraw_decision(&sub, ctx)
         }
         s if SOLANA_AUTHORITY_VERBS.contains(&s) => authority_decision("solana", s, ctx, argv),
+        s if SOLANA_CREATE_VERBS.contains(&s)
+            && CREATE_AUTHORITY_FLAGS.iter().any(|f| argv.has_flag(f)) =>
+        {
+            authority_decision("solana", s, ctx, argv)
+        }
+        // `feature activate|revoke` send a transaction; only `feature status` reads.
+        "feature" => match word_or_ask(argv, 1, "solana") {
+            Ok(action) if action == "status" => readonly("solana"),
+            Ok(action) => ask_not_readonly("solana", &format!("feature {action}")),
+            Err(verdict) => verdict,
+        },
         "close-vote-account" => irreversible_decision(
             "solana",
             ctx,
@@ -1472,6 +1483,26 @@ const SOLANA_AUTHORITY_VERBS: &[&str] = &[
     "vote-authorize-withdrawer",
     "vote-authorize-withdrawer-checked",
     "authorize-nonce-account",
+    // Lockup custodian and vote identity changes.
+    "stake-set-lockup",
+    "stake-set-lockup-checked",
+    "vote-update-validator",
+];
+
+/// `solana` subcommands that create a stake or nonce account; with a
+/// [`CREATE_AUTHORITY_FLAGS`] flag they hand its authority to another key.
+const SOLANA_CREATE_VERBS: &[&str] = &[
+    "create-stake-account",
+    "create-stake-account-checked",
+    "create-nonce-account",
+];
+
+/// Flags naming the authority of the account a [`SOLANA_CREATE_VERBS`] command creates.
+const CREATE_AUTHORITY_FLAGS: &[&str] = &[
+    "--stake-authority",
+    "--withdraw-authority",
+    "--custodian",
+    "--nonce-authority",
 ];
 
 /// Build an authority-change decision for `<program> <verb>`. Always a hard guard (no grant
@@ -1680,7 +1711,9 @@ pub(crate) fn is_solana_readonly(sub: &str) -> bool {
             | "stakes"
             | "supply"
             | "validators"
-            | "feature"
+            | "stake-account"
+            | "vote-account"
+            | "nonce-account"
     )
 }
 
