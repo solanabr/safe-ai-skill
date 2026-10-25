@@ -1,0 +1,66 @@
+{"id": "EV02", "tool": "Bash", "tool_input": {"command": "printenv"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "EV03", "tool": "Bash", "tool_input": {"command": "export -p"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "EV04", "tool": "Bash", "tool_input": {"command": "printenv HELIUS_API_KEY"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "EV05", "tool": "Bash", "tool_input": {"command": "set | grep -i key"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "EV06", "tool": "Bash", "tool_input": {"command": "cat /proc/self/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "EV07", "tool": "Bash", "tool_input": {"command": "source .env && echo $HELIUS_API_KEY"}, "cwd_files": {".env": "HELIUS_API_KEY=sk_live_abc123\nPRIVATE_KEY=[1,2,3]\n"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "EV08", "tool": "Bash", "tool_input": {"command": "echo $ANTHROPIC_API_KEY"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "NX25", "tool": "Bash", "tool_input": {"command": "printenv | grep -i -E 'key|secret|token'"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "SB29", "tool": "EnvRead", "tool_input": {"file": ".env.production"}, "cwd_files": {".env.production": "K=1"}, "tier": "off", "headless": false, "want": "allow"}
+{"id": "SB29", "tool": "EnvRead", "tool_input": {"file": ".env.production"}, "cwd_files": {".env.production": "K=1"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "SB29", "tool": "EnvRead", "tool_input": {"file": ".env.production"}, "cwd_files": {".env.production": "K=1"}, "tier": "medium", "headless": false, "want": "deny"}
+{"id": "SB29", "tool": "EnvRead", "tool_input": {"file": ".env.production"}, "cwd_files": {".env.production": "K=1"}, "tier": "high", "headless": false, "want": "deny"}
+{"id": "W3D01", "tool": "Bash", "tool_input": {"command": "xargs -0 -n1 < /proc/self/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D02", "tool": "Bash", "tool_input": {"command": "xargs -0 -a /proc/1/environ echo"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D03", "tool": "Bash", "tool_input": {"command": "strings /proc/$$/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D04", "tool": "Bash", "tool_input": {"command": "tr '\\0' '\\n' < /proc/self/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D05", "tool": "Bash", "tool_input": {"command": "python3 -c \"print(open('/proc/self/environ').read())\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D06", "tool": "Bash", "tool_input": {"command": "cat /proc/self/task/1/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D07", "tool": "Bash", "tool_input": {"command": "cat \"/proc/self/\"'environ'"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D08", "tool": "Bash", "tool_input": {"command": "cat /proc/self/env*"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D09", "tool": "Bash", "tool_input": {"command": "cd /proc/self && cat environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D10", "tool": "Bash", "tool_input": {"command": "p=/proc/self; cat $p/environ"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D11", "tool": "Bash", "tool_input": {"command": "ps eww"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D12", "tool": "Bash", "tool_input": {"command": "ps auxe"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D13", "tool": "Bash", "tool_input": {"command": "echo \"key=${HELIUS_API_KEY}\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D14", "tool": "Bash", "tool_input": {"command": "echo ${HELIUS_API_KEY:0:6}"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D15", "tool": "Bash", "tool_input": {"command": "printf '%s\\n' \"$GITHUB_TOKEN\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D16", "tool": "Bash", "tool_input": {"command": "x=HELIUS_API_KEY; echo ${!x}"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D17", "tool": "Bash", "tool_input": {"command": "bash -c 'echo $DB_PASSWORD'"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D18", "tool": "Bash", "tool_input": {"command": "echo $(printenv OPENAI_API_KEY)"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D19", "tool": "Bash", "tool_input": {"command": "print -r -- $WALLET_MNEMONIC"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D20", "tool": "Bash", "tool_input": {"command": "declare -p AWS_SECRET_ACCESS_KEY"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D21", "tool": "Bash", "tool_input": {"command": "cat <<< \"$STRIPE_SECRET\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D22", "tool": "Bash", "tool_input": {"command": "python3 -c \"import os;print(os.environ['HELIUS_API_KEY'])\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D23", "tool": "Bash", "tool_input": {"command": "node -e 'console.log(process.env.HELIUS_API_KEY)'"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D24", "tool": "Bash", "tool_input": {"command": "ruby -e 'puts ENV[\"API_TOKEN\"]'"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D25", "tool": "Bash", "tool_input": {"command": "echo $authorization"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3D26", "tool": "Bash", "tool_input": {"command": "set -a; . ./.env; set +a; echo \"$PRIVATE_KEY\""}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "W3A01", "tool": "Bash", "tool_input": {"command": "env"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A02", "tool": "Bash", "tool_input": {"command": "declare -p"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A03", "tool": "Bash", "tool_input": {"command": "set"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A04", "tool": "Bash", "tool_input": {"command": "env | sort"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A05", "tool": "Bash", "tool_input": {"command": "printenv PATH"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A06", "tool": "Bash", "tool_input": {"command": "printenv HOME USER"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A07", "tool": "Bash", "tool_input": {"command": "echo $HOME"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A08", "tool": "Bash", "tool_input": {"command": "echo \"$PATH\""}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A09", "tool": "Bash", "tool_input": {"command": "echo '$HELIUS_API_KEY'"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A10", "tool": "Bash", "tool_input": {"command": "echo ${#HELIUS_API_KEY}"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A11", "tool": "Bash", "tool_input": {"command": "echo ${HELIUS_API_KEY:+set}"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A12", "tool": "Bash", "tool_input": {"command": "[ -n \"$HELIUS_API_KEY\" ] && echo set"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A13", "tool": "Bash", "tool_input": {"command": "echo $SOLANA_PUBKEY"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A14", "tool": "Bash", "tool_input": {"command": "echo $UPGRADE_AUTHORITY"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A15", "tool": "Bash", "tool_input": {"command": "echo $GIT_AUTHOR_NAME"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A16", "tool": "Bash", "tool_input": {"command": "echo $SSH_AUTH_SOCK"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A17", "tool": "Bash", "tool_input": {"command": "echo $TOKENIZERS_PARALLELISM"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A18", "tool": "Bash", "tool_input": {"command": "ps aux"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A19", "tool": "Bash", "tool_input": {"command": "ps -ef"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A20", "tool": "Bash", "tool_input": {"command": "ls /proc/self"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A21", "tool": "Bash", "tool_input": {"command": "cat /proc/cpuinfo"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A22", "tool": "Bash", "tool_input": {"command": "printf -v masked '%s' \"$HELIUS_API_KEY\""}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A23", "tool": "Bash", "tool_input": {"command": "curl -H \"Authorization: Bearer $HELIUS_API_KEY\" http://localhost:8899"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A24", "tool": "Bash", "tool_input": {"command": "python3 -c \"import os,requests;r=requests.get('http://localhost:3000',headers={'k':os.environ['HELIUS_API_KEY']});print(r.status_code)\""}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A25", "tool": "Bash", "tool_input": {"command": "anchor build && anchor test"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A26", "tool": "Bash", "tool_input": {"command": "cat .env.local"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A27", "tool": "Bash", "tool_input": {"command": "echo ${!SOLANA_*}"}, "tier": "relaxed", "headless": false, "want": "allow"}
+{"id": "W3A28", "tool": "Bash", "tool_input": {"command": "export HELIUS_API_KEY=$(cat key.txt)"}, "tier": "relaxed", "headless": false, "want": "allow"}
