@@ -37,7 +37,7 @@ pub const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
 /// Scrub one `tool_response` value: every string leaf goes through [`scrub_values`] and then
 /// [`scrub`]; keys, numbers, booleans and structure are kept. `None` when nothing changed.
 pub fn scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value> {
-    scrub_value(response, values)
+    scrub_value(response, values, false)
 }
 
 /// Whether `text` carries a redaction marker this module writes (`***REDACTED:` or
@@ -57,7 +57,9 @@ pub fn contains_marker(text: &str) -> bool {
 /// read gate, re-run on the request with this `policy` (its runtime tier and `env_read`), lets
 /// it through (no opinion, or an ask the user approved). When the read gate crashed or was
 /// bypassed on a read it would deny, the response is scrubbed. Bash output (`cat .env`) is
-/// always value-scrubbed: only the Read tool's response feeds an Edit.
+/// always value-scrubbed: only the Read tool's response feeds an Edit. Bash output also gets
+/// [`scrub_env_lines`], so an allowed env dump (`printenv`, `env`, `set`, `export -p`,
+/// `declare -p`) reaches the model with its secret-named values blanked (decision D2).
 pub fn scrub_tool_response(
     input: &HookInput,
     response: &Value,
@@ -68,7 +70,8 @@ pub fn scrub_tool_response(
     if is_permitted_env_read(input, response, cwd, policy) {
         return scrub_response(response, &[]);
     }
-    scrub_response(response, values)
+    let bash = input.tool_name.as_deref() == Some("Bash");
+    scrub_value(response, values, bash)
 }
 
 fn is_permitted_env_read(input: &HookInput, response: &Value, cwd: &Path, policy: &Policy) -> bool {
@@ -105,7 +108,8 @@ fn is_env_file(file: &str, cwd: &Path) -> bool {
         || std::fs::canonicalize(cwd.join(file)).is_ok_and(|r| is_env(&r.to_string_lossy()))
 }
 
-fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
+/// [`scrub_response`]; `env_lines` adds the [`scrub_env_lines`] pass (Bash output).
+fn scrub_value(response: &Value, values: &[KnownValue], env_lines: bool) -> Option<Value> {
     if is_binary_payload(response) {
         return None;
     }
@@ -114,14 +118,18 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
         Value::String(text) => {
             let after_values = scrub_values(text, values);
             let base = after_values.as_deref().unwrap_or(text);
-            match scrub(base) {
-                Some(out) => Some(Value::String(out)),
-                None => after_values.map(Value::String),
+            let after_patterns = scrub(base).or(after_values);
+            if !env_lines {
+                return after_patterns.map(Value::String);
             }
+            let base = after_patterns.as_deref().unwrap_or(text);
+            scrub_env_lines(base).or(after_patterns).map(Value::String)
         }
         Value::Array(items) => {
-            let scrubbed: Vec<Option<Value>> =
-                items.iter().map(|v| scrub_value(v, values)).collect();
+            let scrubbed: Vec<Option<Value>> = items
+                .iter()
+                .map(|v| scrub_value(v, values, env_lines))
+                .collect();
             if scrubbed.iter().all(Option::is_none) {
                 return None;
             }
@@ -142,7 +150,7 @@ fn scrub_value(response: &Value, values: &[KnownValue]) -> Option<Value> {
                 if image_stdout && key == "stdout" {
                     continue;
                 }
-                if let Some(new) = scrub_value(value, values) {
+                if let Some(new) = scrub_value(value, values, env_lines) {
                     out.insert(key.clone(), new);
                     changed = true;
                 }
@@ -287,6 +295,308 @@ pub(crate) fn names_secret_value(key: &str) -> bool {
             && ["SECRET", "PRIVATE", "AUTH", "ACCESS"]
                 .iter()
                 .any(|w| key.contains(w)))
+}
+
+/// Words that mark an environment variable name as secret when they appear anywhere in it,
+/// case-insensitively (decision D2): `HELIUS_API_KEY`, `GITHUB_TOKEN`, `DB_PASSWD`, `OAUTH_X`.
+const SECRET_ENV_WORDS: &[&str] = &[
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "MNEMONIC",
+    "SEED",
+    "PRIVATE",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+/// Public or non-secret name parts that contain a [`SECRET_ENV_WORDS`] word, removed before
+/// the test: Solana public keys and authorities (`*_PUBKEY`, `*_PUBLIC_KEY`, `*_AUTHORITY`),
+/// `GIT_AUTHOR_*`, `SSH_AUTH_SOCK` (a socket path), `TOKENIZERS_PARALLELISM`,
+/// `PYTHONHASHSEED`, `KEYBOARD`, `MONKEY`. A name keeps its secret status when another secret
+/// word remains (`UPGRADE_AUTHORITY_KEYPAIR`, `PUBKEY_SECRET`).
+const NON_SECRET_ENV_PARTS: &[&str] = &[
+    "PUBKEY",
+    "PUBLIC_KEY",
+    "PUBLICKEY",
+    "AUTHORITY",
+    "AUTHORITIES",
+    "GIT_AUTHOR",
+    "SSH_AUTH_SOCK",
+    "TOKENIZERS",
+    "HASHSEED",
+    "KEYBOARD",
+    "MONKEY",
+];
+
+/// Whether an environment variable name is secret-named (decision D2): it contains a
+/// [`SECRET_ENV_WORDS`] word outside every [`NON_SECRET_ENV_PARTS`] occurrence. The env-dump
+/// redaction ([`scrub_env_lines`]) and the echo/printenv deny
+/// ([`crate::gates::envread::decide_bash`]) share it.
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    let upper = upper.as_bytes();
+    SECRET_ENV_WORDS.iter().any(|word| {
+        positions(upper, word.as_bytes())
+            .any(|at| !inside_non_secret_part(upper, at, at + word.len()))
+    })
+}
+
+/// The start of every occurrence of `needle` in `hay` (short names: a window scan).
+fn positions<'a>(hay: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    hay.windows(needle.len())
+        .enumerate()
+        .filter(move |(_, w)| *w == needle)
+        .map(|(at, _)| at)
+}
+
+/// Whether `name[start..end]` lies inside a [`NON_SECRET_ENV_PARTS`] occurrence, or inside an
+/// `AUTHOR` not followed by `I` (`AUTHOR` is a name, `AUTHORIZATION` a credential).
+fn inside_non_secret_part(name: &[u8], start: usize, end: usize) -> bool {
+    let covers = |part: &str, after_ok: &dyn Fn(usize) -> bool| {
+        positions(name, part.as_bytes())
+            .any(|at| at <= start && end <= at + part.len() && after_ok(at + part.len()))
+    };
+    NON_SECRET_ENV_PARTS.iter().any(|p| covers(p, &|_| true))
+        || covers("AUTHOR", &|after| name.get(after) != Some(&b'I'))
+}
+
+/// Longest quoted env value [`scrub_env_lines`] follows across lines (64 KiB); an unclosed
+/// quote blanks to the end of its line.
+const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
+
+/// The marker that replaces a blanked env value.
+const ENV_MARKER: &str = "***REDACTED:env***";
+
+/// Blank the values of secret-named variables ([`is_secret_env_name`]) in env-dump-shaped
+/// text, for Bash output (decision D2: bare `printenv`, `env`, `set`, `export -p`,
+/// `declare -p` are allowed and their secrets blanked here). Two shapes:
+///
+/// - a line (`\n`- or NUL-separated, so `env -0` counts) `NAME=value`, optionally after
+///   `export `, `declare -x `, `typeset -x ` or other `declare`/`typeset`/`local`/`readonly`
+///   flags; a quoted value (`'…'`, `"…"`, `$'…'`) is followed to its closing quote across
+///   lines (bash `set` output);
+/// - a key/value pair whose key is an upper-case env name, bare or quoted, then `:` or `=>`
+///   and a quoted value: `'HELIUS_API_KEY': 'abc'` (Python `print(os.environ)`),
+///   `HELIUS_API_KEY: 'abc'` (Node `console.log(process.env)`), `"K": "v"` (JSON).
+///
+/// The value is replaced by `***REDACTED:env***`, quotes kept; an empty value or one already
+/// redacted is left alone. `None` when nothing changed.
+pub fn scrub_env_lines(text: &str) -> Option<String> {
+    if !text.contains('=') && !text.contains(':') {
+        return None;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    collect_env_assignment_lines(text, &mut spans);
+    collect_env_pairs(text, &mut spans);
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(ENV_MARKER);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    Some(out)
+}
+
+fn is_env_name_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_env_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether the value at `start` is empty or already carries a redaction marker.
+fn value_already_blank(text: &str, start: usize, end: usize) -> bool {
+    end <= start || contains_marker(&text[start..end])
+}
+
+/// `NAME=value` lines ([`scrub_env_lines`]).
+fn collect_env_assignment_lines(text: &str, spans: &mut Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let mut line_start = 0usize;
+    while line_start < bytes.len() {
+        let mut next = line_start;
+        if let Some((name_end, value_start)) = env_assignment_at(text, line_start) {
+            let name = &text[skip_decl_prefix(text, line_start)..name_end];
+            let (vs, ve, resume) = env_value_span(bytes, value_start);
+            if is_secret_env_name(name) && !value_already_blank(text, vs, ve) {
+                spans.push((vs, ve));
+            }
+            next = resume;
+        }
+        // Advance to the next line (newline or NUL separated).
+        match bytes[next..].iter().position(|&b| b == b'\n' || b == 0) {
+            Some(rel) => line_start = next + rel + 1,
+            None => break,
+        }
+    }
+}
+
+/// The start of the variable name on the line at `at`, after leading blanks and an
+/// `export`/`declare`/`typeset`/`local`/`readonly` keyword with its `-x`-style flags.
+fn skip_decl_prefix(text: &str, at: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = at;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    for kw in ["export ", "declare ", "typeset ", "local ", "readonly "] {
+        if text[i..].starts_with(kw) {
+            i += kw.len();
+            loop {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'-' {
+                    while i < bytes.len() && bytes[i] != b' ' && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    i
+}
+
+/// `(name_end, value_start)` when the line at `at` is `[prefix ]NAME=…`.
+fn env_assignment_at(text: &str, at: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let start = skip_decl_prefix(text, at);
+    if start >= bytes.len() || !is_env_name_start(bytes[start]) {
+        return None;
+    }
+    let mut end = start;
+    while end < bytes.len() && is_env_name_char(bytes[end]) {
+        end += 1;
+    }
+    (end < bytes.len() && bytes[end] == b'=').then_some((end, end + 1))
+}
+
+/// The value span starting at `vs` and where scanning resumes: a quoted value
+/// (`'…'` with bash's `'\''` joins, `"…"` and `$'…'` with backslash escapes) runs to its
+/// closing quote, up to [`MAX_ENV_VALUE_BYTES`]; an unquoted one to the end of the line.
+fn env_value_span(bytes: &[u8], vs: usize) -> (usize, usize, usize) {
+    let line_end = |from: usize| {
+        bytes[from..]
+            .iter()
+            .position(|&b| b == b'\n' || b == 0)
+            .map_or(bytes.len(), |p| from + p)
+    };
+    let (open, body) = match bytes.get(vs) {
+        Some(b'$') if bytes.get(vs + 1) == Some(&b'\'') => (b'\'', vs + 2),
+        Some(&q @ (b'\'' | b'"')) => (q, vs + 1),
+        _ => {
+            let end = line_end(vs);
+            return (vs, end, end);
+        }
+    };
+    let escapes = open == b'"' || body == vs + 2;
+    let limit = bytes.len().min(body.saturating_add(MAX_ENV_VALUE_BYTES));
+    let mut i = body;
+    while i < limit {
+        let b = bytes[i];
+        if escapes && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == open {
+            // bash `set` joins single-quoted runs with `'\''`.
+            if open == b'\'' && !escapes && bytes[i..].starts_with(b"'\\''") {
+                i += 4;
+                continue;
+            }
+            return (body, i, i);
+        }
+        i += 1;
+    }
+    let end = line_end(body);
+    (body, end, end)
+}
+
+/// Quoted or bare upper-case env-name keys followed by `:`/`=>` and a quoted value
+/// ([`scrub_env_lines`]).
+fn collect_env_pairs(text: &str, spans: &mut Vec<(usize, usize)>) {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !is_env_name_start(b) || (i > 0 && is_env_name_char(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() && is_env_name_char(bytes[end]) {
+            end += 1;
+        }
+        i = end;
+        let name = &text[start..end];
+        let env_shaped = name.bytes().any(|c| c.is_ascii_uppercase())
+            && !name.bytes().any(|c| c.is_ascii_lowercase());
+        if !env_shaped {
+            continue;
+        }
+        let mut j = end;
+        if start > 0 && matches!(bytes[start - 1], b'\'' | b'"') {
+            if bytes.get(j) != Some(&bytes[start - 1]) {
+                continue;
+            }
+            j += 1;
+        }
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        if bytes.get(j) == Some(&b':') {
+            j += 1;
+        } else if bytes[j..].starts_with(b"=>") {
+            j += 2;
+        } else {
+            continue;
+        }
+        while j < bytes.len() && bytes[j] == b' ' {
+            j += 1;
+        }
+        let Some(&quote @ (b'\'' | b'"')) = bytes.get(j) else {
+            continue;
+        };
+        let vs = j + 1;
+        let mut k = vs;
+        let limit = bytes.len().min(vs.saturating_add(MAX_ENV_VALUE_BYTES));
+        while k < limit && bytes[k] != quote && bytes[k] != b'\n' {
+            if bytes[k] == b'\\' {
+                k += 1;
+            }
+            k += 1;
+        }
+        // Unclosed within the bound: blank to the end of the line (an ASCII boundary).
+        let ve = if k >= limit {
+            bytes[vs..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(bytes.len(), |p| vs + p)
+        } else {
+            k
+        };
+        if is_secret_env_name(name) && !value_already_blank(text, vs, ve) {
+            spans.push((vs, ve));
+        }
+        i = ve;
+    }
 }
 
 /// A single redaction span: `[start, end)` byte range and the marker kind.
