@@ -16,8 +16,10 @@
 //! - **Class C** (transfers, deploys, authority changes, withdraws): on mainnet
 //!   or Unknown an ask below High (a grantable one unless it is an authority change, an
 //!   account close or an unbudgetable amount) and a deny at High. `Allow` comes only from a
-//!   within-cap transfer on a positively identified devnet/testnet/localnet, and only when
-//!   every command is a direct solana-family command; deploys there get no opinion.
+//!   within-cap SOL transfer on a positively identified devnet/testnet/localnet, and only when
+//!   every command is a direct solana-family command; deploys there get no opinion. An
+//!   `spl-token transfer` amount is in tokens (D3): never budgeted or granted as SOL, no
+//!   opinion on identified devnet/localnet, a hard-guard ask anywhere else.
 //! - A command naming a solana-family program that cannot be parsed, runs code the command
 //!   line does not spell out, or runs an expansion as its program asks as a hard guard, and
 //!   is denied at High.
@@ -1215,6 +1217,7 @@ fn classify_solana(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, Ga
         "withdraw-stake" | "withdraw-from-vote-account" | "withdraw-from-nonce-account" => {
             withdraw_decision(&sub, ctx)
         }
+        s if SOLANA_AUTHORITY_VERBS.contains(&s) => authority_decision("solana", s, ctx, argv),
         "close-vote-account" => irreversible_decision(
             "solana",
             ctx,
@@ -1242,7 +1245,7 @@ fn classify_program(argv: &Argv, program: &str, ctx: &Context) -> (Decision, Gat
             Scope::Authority,
             "upgrade-authority change",
         ),
-        "set-buffer-authority" => authority_decision(program, ctx, argv),
+        "set-buffer-authority" => authority_decision(program, "set-buffer-authority", ctx, argv),
         // `program close` in any form is Class U, decided before this (shared list); a hard
         // guard here too in case the list is bypassed.
         "close" => irreversible_decision(program, ctx, argv, Scope::Destructive, "program close"),
@@ -1253,13 +1256,13 @@ fn classify_program(argv: &Argv, program: &str, ctx: &Context) -> (Decision, Gat
 }
 
 /// Classify an `spl-token ...` command.
-fn classify_spl_token(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
+fn classify_spl_token(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision, GateMeta) {
     let sub = match word_or_ask(argv, 0, "spl-token") {
         Ok(sub) => sub,
         Err(verdict) => return verdict,
     };
     match sub.as_str() {
-        "transfer" => transfer_decision(argv, "spl-token", ctx, policy),
+        "transfer" => token_transfer_decision(argv, ctx),
         "authorize" if argv.has_flag("--disable") => irreversible_decision(
             "spl-token",
             ctx,
@@ -1267,7 +1270,7 @@ fn classify_spl_token(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision,
             Scope::Authority,
             "authority removal (--disable)",
         ),
-        "authorize" => authority_decision("spl-token", ctx, argv),
+        "authorize" | "approve" => authority_decision("spl-token", &sub, ctx, argv),
         "burn" => destructive_decision("spl-token", ctx, false),
         "close" => irreversible_decision(
             "spl-token",
@@ -1319,7 +1322,9 @@ fn classify_anchor_idl(argv: &Argv, sub: &str, ctx: &Context) -> (Decision, Gate
             Scope::Authority,
             "IDL authority change",
         ),
-        "set-buffer-authority" => authority_decision("anchor", ctx, argv),
+        "set-buffer-authority" => {
+            authority_decision("anchor", "idl set-buffer-authority", ctx, argv)
+        }
         "close" => {
             irreversible_decision("anchor", ctx, argv, Scope::Destructive, "IDL account close")
         }
@@ -1327,7 +1332,8 @@ fn classify_anchor_idl(argv: &Argv, sub: &str, ctx: &Context) -> (Decision, Gate
     }
 }
 
-/// Build a transfer decision via the spend ledger (predict-only; no debit here).
+/// Build a `solana transfer` (SOL) decision via the spend ledger (predict-only; no debit
+/// here). Token transfers go through [`token_transfer_decision`] instead.
 ///
 /// Only a definite amount on a positively identified devnet/testnet/localnet can be allowed;
 /// mainnet or an unidentified network escalates to ask (a deny stays a deny). `ALL`, or an
@@ -1363,6 +1369,36 @@ fn transfer_decision(
     };
 
     (decision, meta)
+}
+
+/// Build an `spl-token transfer` decision (spec D3). Its amount is in TOKEN units: it never
+/// reaches the SOL caps or the ledger, and no SOL grant covers it (a hard guard with no
+/// `amount_sol`). A positively identified devnet or localnet gets no opinion; mainnet, testnet
+/// and an unidentified cluster ask, which is a deny headless and at High.
+fn token_transfer_decision(argv: &Argv, ctx: &Context) -> (Decision, GateMeta) {
+    let (amount, destination) = parse_transfer(argv, "spl-token");
+    let mut meta = GateMeta::new(Scope::Transfer, true);
+    meta.program = Some("spl-token".to_string());
+    meta.destination = destination;
+    if matches!(ctx.network, Network::Devnet | Network::Localnet) {
+        return (Decision::Defer, meta);
+    }
+    let mint = argv
+        .positionals
+        .get(1)
+        .filter(|m| argv.uncertain_from.is_none() && looks_like_pubkey(m))
+        .map_or_else(|| "an unidentified mint".to_string(), |m| m.to_string());
+    let what = match (&amount, argv.positionals.get(2)) {
+        (Amount::Value(_), Some(raw)) => format!("{raw} tokens of {mint}"),
+        (Amount::All, _) => format!("ALL tokens of {mint}"),
+        _ => format!("an unreadable amount of tokens of {mint}"),
+    };
+    let reason = format!(
+        "spl-token transfer of {what} on {}: SOL caps and grants never cover token amounts — \
+         approve to proceed",
+        cluster_label(ctx.network)
+    );
+    (Decision::Ask { reason }, meta)
 }
 
 /// Build a deploy decision (`program deploy|write-buffer|upgrade|extend`, `program-v4 deploy`,
@@ -1425,22 +1461,42 @@ fn irreversible_decision(
     (decision, meta)
 }
 
-/// Build an authority-change decision. Always a hard guard; mainnet phrasing differs.
-fn authority_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, GateMeta) {
+/// `solana` subcommands that hand a stake, vote or nonce account's authority to another key
+/// (`solana --help`, solana-cli 3.1). Like `spl-token authorize`, they are authority changes:
+/// a hard-guard ask on every cluster, denied at High on mainnet or an unidentified cluster.
+const SOLANA_AUTHORITY_VERBS: &[&str] = &[
+    "stake-authorize",
+    "stake-authorize-checked",
+    "vote-authorize-voter",
+    "vote-authorize-voter-checked",
+    "vote-authorize-withdrawer",
+    "vote-authorize-withdrawer-checked",
+    "authorize-nonce-account",
+];
+
+/// Build an authority-change decision for `<program> <verb>`. Always a hard guard (no grant
+/// covers it); mainnet phrasing differs. `spl-token approve` lands here too: a delegate may
+/// then move the account's tokens, so it hands over authority over them.
+fn authority_decision(
+    program: &str,
+    verb: &str,
+    ctx: &Context,
+    argv: &Argv,
+) -> (Decision, GateMeta) {
     let mut meta = GateMeta::new(Scope::Authority, true);
     meta.program = Some(program.to_string());
     if let Some(target) = first_pubkey_arg(argv) {
         meta.destination = Some(target);
     }
 
-    let reason = if matches!(ctx.network, Network::Mainnet) {
-        "Mainnet authority change — approve to proceed"
+    let net = if matches!(ctx.network, Network::Mainnet) {
+        "Mainnet authority"
     } else {
-        "Authority change — approve to proceed"
+        "Authority"
     };
     (
         Decision::Ask {
-            reason: reason.to_string(),
+            reason: format!("{net} change (`{program} {verb}`) — approve to proceed"),
         },
         meta,
     )
@@ -1804,17 +1860,21 @@ mod tests {
     }
 
     #[test]
-    fn spl_token_transfer_parses_amount() {
-        let ctx = ctx_with(Network::Devnet, "spl_xfer");
+    fn spl_token_transfer_amount_is_tokens_not_sol() {
         let mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-        let (d, meta) = decide(
-            &format!("spl-token transfer {mint} 0.25 {DEST}"),
-            &ctx,
-            &policy(),
-        );
-        assert_eq!(d, Decision::Allow);
-        assert_eq!(meta.amount_sol, Some(0.25));
+        let cmd = format!("spl-token transfer {mint} 0.25 {DEST}");
+        let (d, meta) = decide(&cmd, &ctx_with(Network::Devnet, "spl_xfer"), &policy());
+        assert_eq!(d, Decision::Defer);
+        assert_eq!(meta.amount_sol, None);
         assert_eq!(meta.program.as_deref(), Some("spl-token"));
+        assert_eq!(meta.destination.as_deref(), Some(DEST));
+        let (d, meta) = decide(&cmd, &ctx_with(Network::Mainnet, "spl_xfer_m"), &policy());
+        assert!(
+            d.reason().contains(&format!("0.25 tokens of {mint}")),
+            "{d:?}"
+        );
+        assert!(meta.hard_guard);
+        assert_eq!(meta.amount_sol, None);
     }
 
     #[test]
