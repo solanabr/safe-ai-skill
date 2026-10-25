@@ -301,6 +301,10 @@ struct Request {
     secrets_gate_asks: bool,
     /// A browser script reading cookies or storage and calling a network sink.
     reads_page_secrets: bool,
+    /// A `git push` to a URL or to a remote the same line added: an unknown host asks.
+    push: bool,
+    /// The program word is an unresolved expansion: only a listed host (or a secret) decides.
+    listed_only: bool,
 }
 
 /// The verdict for a Bash `command` run in `cwd`; `None` is no opinion.
@@ -421,6 +425,9 @@ fn judge(request: &Request, policy: &Policy, tier: Tier, budget: &mut usize) -> 
             dest.host
         )));
     }
+    if request.listed_only {
+        return None;
+    }
     let outside: Vec<&Dest> = request
         .dests
         .iter()
@@ -451,6 +458,12 @@ fn judge(request: &Request, policy: &Policy, tier: Tier, budget: &mut usize) -> 
             )))
         }
         _ => {}
+    }
+    if request.push {
+        return Some(Verdict::Ask(format!(
+            "This `git push` sends the repository to `{host}`, a remote added in the same \
+             command; approve only if the user asked to publish there."
+        )));
     }
     if request.reads_page_secrets {
         return Some(Verdict::Ask(format!(
@@ -489,7 +502,7 @@ fn may_reach_network(command: &str) -> bool {
     }
     const WORDS: &[&str] = &[
         "curl", "curlie", "wget", "wget2", "http", "https", "xh", "xhs", "nc", "ncat", "netcat",
-        "telnet", "socat", "ssh", "scp", "sftp", "rsync", "aria2c",
+        "telnet", "socat", "ssh", "scp", "sftp", "rsync", "aria2c", "git",
     ];
     let bytes = command.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
@@ -511,13 +524,34 @@ fn may_reach_network(command: &str) -> bool {
 
 fn bash_requests(command: &str) -> Vec<Request> {
     let parsed = shell::parse(command);
+    let assignments = same_line_assignments(command);
+    let mut remotes: Vec<(String, String)> = Vec::new();
     let mut out = Vec::new();
     for cmd in &parsed.commands {
-        let program = cmd.program();
+        let words: Vec<&str> = cmd.words.iter().skip(1).map(|w| w.text.as_str()).collect();
+        let mut program = cmd.program();
+        if let Some(name) = cmd.words.first().and_then(|w| expansion_name(&w.text)) {
+            match assignments.iter().rev().find(|(n, _)| n == name) {
+                Some((_, value)) => program = shell::base_name(value),
+                None => {
+                    let mut request = fetcher_request(&words);
+                    request.listed_only = true;
+                    if !request.dests.is_empty() {
+                        out.push(request);
+                    }
+                    continue;
+                }
+            }
+        }
+        if program == "git" {
+            if let Some(request) = git_request(&words, &mut remotes) {
+                out.push(request);
+            }
+            continue;
+        }
         let Some(style) = style_of(&program) else {
             continue;
         };
-        let words: Vec<&str> = cmd.words.iter().skip(1).map(|w| w.text.as_str()).collect();
         let request = match style {
             Style::Curl => curl_request(&words),
             Style::Wget => wget_request(&words),
@@ -560,6 +594,96 @@ fn bash_requests(command: &str) -> Vec<Request> {
         }
     }
     out
+}
+
+/// `$name` or `${name}` spelled as a whole word: the variable name.
+fn expansion_name(word: &str) -> Option<&str> {
+    let name = word.strip_prefix('$')?;
+    let name = match name.strip_prefix('{') {
+        Some(inner) => inner.strip_suffix('}')?,
+        None => name,
+    };
+    let ok = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then_some(name)
+}
+
+/// `name=value` words anywhere on the line (prefix assignments, `export`, `local`,
+/// `declare`), in order, quotes removed.
+fn same_line_assignments(command: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for word in
+        command.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')'))
+    {
+        let Some((name, value)) = word.split_once('=') else {
+            continue;
+        };
+        let valid = !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let value = value.trim_matches(|c| c == '"' || c == '\'');
+        if valid && !value.is_empty() {
+            out.push((name.to_string(), value.to_string()));
+        }
+    }
+    out
+}
+
+/// A git URL (`scheme://…` or scp-like `user@host:path`) → its destination.
+fn git_url(word: &str) -> Option<Dest> {
+    if let Some(dest) = parse_url(word) {
+        return Some(dest);
+    }
+    let (authority, path) = word.split_once(':')?;
+    if authority.contains('/') || path.starts_with("//") || !authority.contains('@') {
+        return None;
+    }
+    let host = normalize_host(authority.rsplit('@').next()?)?;
+    Some(Dest {
+        host,
+        rest: String::new(),
+    })
+}
+
+/// `git remote add|set-url NAME URL` records a remote; `git push URL|NAME` to a URL or to a
+/// recorded remote is a push request.
+fn git_request(words: &[&str], remotes: &mut Vec<(String, String)>) -> Option<Request> {
+    let positional = positionals(
+        words,
+        &[
+            "-C",
+            "-c",
+            "--git-dir",
+            "--work-tree",
+            "--namespace",
+            "-o",
+            "--push-option",
+            "--repo",
+        ],
+        |_, _| {},
+    );
+    match positional.as_slice() {
+        ["remote", "add", name, url, ..] | ["remote", "set-url", name, url, ..] => {
+            remotes.push((name.to_string(), url.to_string()));
+            None
+        }
+        ["push", target, ..] => {
+            let url = remotes
+                .iter()
+                .rev()
+                .find(|(n, _)| n == target)
+                .map_or(*target, |(_, u)| u.as_str());
+            let dest = git_url(url)?;
+            Some(Request {
+                dests: vec![dest],
+                sends: true,
+                push: true,
+                ..Request::default()
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Positional words, skipping flags and the values of `value_flags` (`--flag=value` is one word).
