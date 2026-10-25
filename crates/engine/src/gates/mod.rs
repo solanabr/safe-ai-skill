@@ -7,6 +7,7 @@
 pub mod bash;
 pub mod creddump;
 pub mod credpaths;
+pub mod encoded;
 pub mod envread;
 pub mod envwrite;
 pub mod exfil;

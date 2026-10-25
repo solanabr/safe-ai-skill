@@ -43,7 +43,21 @@ pub fn decide(
         return (decision, GateMeta::new(Scope::Other, false));
     }
 
-    let name_sensitive = name_matches_sensitive(tool_name, &policy.mcp.sensitive_name_pattern);
+    // Routed tools (Helius `heliusWrite`, …) carry the verb in `tool_input.action`, not the
+    // tool name, possibly nested under `params`/`args` (depth ≤ 3). Classify from the tool
+    // name AND the action together, using token-boundary matching so `display`/`design`/
+    // `minted` do not match `pay`/`sign`/`mint`.
+    let action = payload.and_then(extract_action);
+    let action_tokens: Vec<String> = action.as_deref().map(name_tokens).unwrap_or_default();
+    // A read action (`getStakeAccounts`, `listDelegates`, …) must not inherit a value-moving
+    // verb from a substring of its name; its tokens are dropped from classification.
+    let read_action = action_tokens.first().is_some_and(|t| is_read_verb(t));
+    let mut class_tokens = name_tokens(tool_name);
+    if !read_action {
+        class_tokens.extend(action_tokens);
+    }
+
+    let name_sensitive = tokens_match_sensitive(&class_tokens, &policy.mcp.sensitive_name_pattern);
     let signal = payload.and_then(payload_signal);
 
     // Fast path: not a sensitive name and no value-moving payload signal.
@@ -51,23 +65,41 @@ pub fn decide(
         return (Decision::Defer, GateMeta::unknown());
     }
 
-    // Classify scope from the tool name (preferred) then from the payload signal.
-    let scope = classify_scope(tool_name);
+    let staking = is_staking(&class_tokens);
+    // A token transfer moves value in TOKEN units, never SOL: no SOL grant or cap covers it
+    // (D3), so it is never relaxed and carries no SOL amount.
+    let token_units = is_token_transfer(&class_tokens);
+    // Staking / delegation has no destination but still moves value out of liquid control; its
+    // scope stays `Other`, with a stake-specific reason.
+    let scope = if staking {
+        Scope::Other
+    } else {
+        classify_scope(&class_tokens)
+    };
 
     let mut meta = GateMeta::new(scope, false);
     let dest = signal.as_ref().and_then(|s| s.destination.clone());
-    let amount = signal.as_ref().and_then(|s| s.amount_sol);
     let mint = signal.as_ref().and_then(|s| s.mint.clone());
+    // A SOL transfer's amount is grantable; a token transfer's is not (token units), so it is
+    // dropped so no SOL grant can be matched against it.
+    let amount = if token_units {
+        None
+    } else {
+        signal.as_ref().and_then(|s| s.amount_sol)
+    };
 
     meta.amount_sol = amount;
     meta.destination = dest.clone();
-    // A value-moving call whose amount cannot be read (an unknown field, `transfer_all`, a
-    // non-numeric value) cannot be checked against a grant's caps: no grant covers it.
-    if amount.is_none() && matches!(scope, Scope::Transfer | Scope::Swap) {
+    // Never relaxable: staking/delegation and token transfers (D3), and any value-moving call
+    // whose SOL amount cannot be read (an unknown field, `transfer_all`, a non-numeric value).
+    if staking
+        || token_units
+        || (amount.is_none() && matches!(scope, Scope::Transfer | Scope::Swap))
+    {
         meta.hard_guard = true;
     }
 
-    let short_tool = short_name(tool_name);
+    let short_tool = action.as_deref().unwrap_or_else(|| short_name(tool_name));
 
     let reason = match scope {
         Scope::Swap => {
@@ -84,14 +116,24 @@ pub fn decide(
                 }
             )
         }
-        // Staking / delegation moves value out of liquid control even without a
-        // destination address. `Scope` has no `Stake` variant, so it stays `Scope::Other`
-        // (already set by `classify_scope`) but carries a stake-specific reason.
-        _ if is_staking(tool_name) => {
-            let amt_str = amount
+        // Staking / delegation moves value out of liquid control even without a destination
+        // address. `Scope` has no `Stake` variant, so it stays `Scope::Other` but carries a
+        // stake-specific reason. Its SOL amount (if readable) is shown but never grants it.
+        _ if staking => {
+            let amt_str = stake_amount(payload)
                 .map(|a| format!("{a} SOL"))
                 .unwrap_or_else(|| "unspecified amount".to_string());
-            format!("MCP staking/delegation: {short_tool} ({amt_str})")
+            format!("MCP staking/delegation: {short_tool} ({amt_str}) — approve to proceed")
+        }
+        _ if token_units => {
+            let dest_str = dest
+                .as_deref()
+                .map(truncate)
+                .unwrap_or_else(|| "unknown destination".to_string());
+            format!(
+                "MCP token transfer: {short_tool} → {dest_str} (token units, so no SOL grant \
+                 covers it) — approve to proceed"
+            )
         }
         _ => {
             let dest_str = dest
@@ -115,28 +157,27 @@ struct PayloadSignal {
     mint: Option<String>,
 }
 
-/// Inspect a payload for value-moving keys. Returns `Some` only when BOTH an amount-like
-/// key (`amount`/`lamports`/`sol`/`tokenAmount`/`amountSol`) AND a destination-like key
+/// Inspect a payload for value-moving keys, looking into nested `params`/`args` objects
+/// (depth ≤ 3). Returns `Some` only when BOTH an amount-like key
+/// (`amount`/`lamports`/`sol`/`tokenAmount`/`amountSol`) AND a destination-like key
 /// (`destination`/`to`/`recipient`/`mint`) are present — the signature of a transfer-style
 /// call. A mint alone (a token reference without a destination) does not trip the signal
 /// on its own; name-based classification handles swaps.
 fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
-    let obj = payload.as_object()?;
-
     let mut amount_sol: Option<f64> = None;
     let mut has_amount = false;
     // Prefer an explicit SOL field, else lamports (÷1e9), else a raw amount.
-    if let Some(v) = obj.get("sol").or_else(|| obj.get("amountSol")) {
+    if let Some(v) = find_key(payload, &["sol", "amountSol"], 0) {
         amount_sol = number(v);
         has_amount = true;
     }
-    if let Some(v) = obj.get("lamports") {
+    if let Some(v) = find_key(payload, &["lamports"], 0) {
         has_amount = true;
         if amount_sol.is_none() {
             amount_sol = number(v).map(|n| n / 1_000_000_000.0);
         }
     }
-    if let Some(v) = obj.get("amount").or_else(|| obj.get("tokenAmount")) {
+    if let Some(v) = find_key(payload, &["amount", "tokenAmount"], 0) {
         has_amount = true;
         if amount_sol.is_none() {
             // A bare `amount` could be SOL or token base units; record only if it parses,
@@ -145,11 +186,16 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
         }
     }
 
-    let destination = ["destination", "to", "recipient"]
-        .iter()
-        .find_map(|k| obj.get(*k).and_then(Value::as_str))
+    let destination = find_key(
+        payload,
+        &["destination", "to", "recipient", "recipientAddress"],
+        0,
+    )
+    .and_then(Value::as_str)
+    .map(str::to_string);
+    let mint = find_key(payload, &["mint", "mintAddress"], 0)
+        .and_then(Value::as_str)
         .map(str::to_string);
-    let mint = obj.get("mint").and_then(Value::as_str).map(str::to_string);
 
     let has_dest = destination.is_some() || mint.is_some();
 
@@ -164,45 +210,146 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
     }
 }
 
+/// The SOL amount of a staking call, read where present (for the reason text only).
+fn stake_amount(payload: Option<&Value>) -> Option<f64> {
+    let p = payload?;
+    find_key(p, &["sol", "amountSol"], 0)
+        .and_then(number)
+        .or_else(|| {
+            find_key(p, &["lamports"], 0)
+                .and_then(number)
+                .map(|n| n / 1_000_000_000.0)
+        })
+        .or_else(|| find_key(p, &["amount"], 0).and_then(number))
+}
+
+/// Find the first of `keys` in `payload` or in a nested `params`/`args`/`input`/`arguments`
+/// object, searching to depth 3. Routed MCP tools nest their real parameters this way.
+fn find_key<'v>(payload: &'v Value, keys: &[&str], depth: usize) -> Option<&'v Value> {
+    if depth > 3 {
+        return None;
+    }
+    let obj = payload.as_object()?;
+    for k in keys {
+        if let Some(v) = obj.get(*k) {
+            return Some(v);
+        }
+    }
+    for nest in ["params", "args", "input", "arguments"] {
+        if let Some(inner) = obj.get(nest) {
+            if let Some(found) = find_key(inner, keys, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The routed `action` verb of an MCP payload (`tool_input.action`, or nested under
+/// `params`/`args`, depth ≤ 3).
+fn extract_action(payload: &Value) -> Option<String> {
+    find_key(payload, &["action"], 0)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// Parse a JSON value as an `f64`, accepting numbers and numeric strings.
 fn number(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Case-insensitive substring match of any `|`-separated alternative in `pattern`
-/// against the tool name. (The frozen pattern is a regex-ish alternation; a substring
-/// scan is sufficient and avoids a regex dependency.)
-fn name_matches_sensitive(tool_name: &str, pattern: &str) -> bool {
-    let name = tool_name.to_ascii_lowercase();
+/// Split an MCP tool name or action verb into lowercase tokens on the `__`/`.`/`_`/`-`/space
+/// delimiters and camelCase boundaries (`heliusWrite` → `["helius", "write"]`,
+/// `transferSol` → `["transfer", "sol"]`). Token-boundary matching keeps `display`/`design`/
+/// `minted` from matching `pay`/`sign`/`mint`.
+fn name_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower_or_digit = false;
+    for c in s.chars() {
+        if matches!(c, '_' | '.' | '-') || c.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower_or_digit = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower_or_digit && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(c.to_ascii_lowercase());
+        prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether any single-word alternative of the sensitive-name `pattern` is a whole token of
+/// the tool name / action.
+fn tokens_match_sensitive(tokens: &[String], pattern: &str) -> bool {
     pattern
         .split('|')
         .map(str::trim)
         .filter(|alt| !alt.is_empty())
-        .any(|alt| name.contains(&alt.to_ascii_lowercase()))
+        .any(|alt| {
+            let a = alt.to_ascii_lowercase();
+            tokens.contains(&a)
+        })
 }
 
-/// Classify the action scope from the tool name.
-fn classify_scope(tool_name: &str) -> Scope {
-    let n = tool_name.to_ascii_lowercase();
-    if n.contains("swap") {
+/// Classify the action scope from the tool-name / action tokens.
+fn classify_scope(tokens: &[String]) -> Scope {
+    let has = |v: &str| tokens.iter().any(|t| t == v);
+    if has("swap") {
         Scope::Swap
-    } else if n.contains("transfer")
-        || n.contains("send")
-        || n.contains("withdraw")
-        || n.contains("pay")
-    {
+    } else if has("transfer") || has("send") || has("withdraw") || has("pay") {
         Scope::Transfer
     } else {
         Scope::Other
     }
 }
 
-/// Whether the tool name indicates a staking / delegation action (no destination, but
-/// still value-moving). Used only to phrase the reason; the scope stays `Scope::Other`.
-fn is_staking(tool_name: &str) -> bool {
-    let n = tool_name.to_ascii_lowercase();
-    n.contains("stake") || n.contains("delegate")
+/// Whether the tokens indicate a staking / delegation action (no destination, but still
+/// value-moving): `stake`, `unstake`, `delegate`, `deactivate`.
+fn is_staking(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "stake" | "unstake" | "delegate" | "deactivate"))
+}
+
+/// Whether the tokens indicate a TOKEN (SPL) transfer: a `token` token alongside a
+/// transfer/send verb (`transferToken`, `sendToken`). Token amounts are not SOL (D3).
+fn is_token_transfer(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| t == "token")
+        && tokens
+            .iter()
+            .any(|t| matches!(t.as_str(), "transfer" | "send"))
+}
+
+/// Whether an action's leading token is a read verb, so a value-moving substring in its name
+/// (`getStakeAccounts`, `listTransfers`) must not classify it as a mutation.
+fn is_read_verb(token: &str) -> bool {
+    matches!(
+        token,
+        "get"
+            | "list"
+            | "fetch"
+            | "parse"
+            | "read"
+            | "query"
+            | "show"
+            | "find"
+            | "resolve"
+            | "search"
+            | "describe"
+            | "lookup"
+            | "status"
+            | "simulate"
+            | "estimate"
+    )
 }
 
 /// Classify an MCP tool against `policy.catalog.high_risk_classes`.
@@ -468,12 +615,75 @@ mod tests {
     }
 
     #[test]
-    fn dot_suffixed_send_substring_matches() {
-        // Confirms the dot-suffixed short name still substring-matches the `send` verb.
-        assert!(name_matches_sensitive(
-            "mcp__helius__heliusWrite.sendSol",
+    fn dot_suffixed_send_token_matches() {
+        // The dot-suffixed short name tokenizes to include the `send` verb as a whole token.
+        assert!(tokens_match_sensitive(
+            &name_tokens("mcp__helius__heliusWrite.sendSol"),
             &Policy::default().mcp.sensitive_name_pattern
         ));
+    }
+
+    #[test]
+    fn token_boundary_rejects_substring_false_positives() {
+        // `display`/`design`/`minted` must NOT match `pay`/`sign`/`mint`.
+        let pat = &Policy::default().mcp.sensitive_name_pattern;
+        for name in [
+            "mcp__gallery__displayArt",
+            "mcp__studio__designReview",
+            "mcp__assets__listMinted",
+        ] {
+            assert!(
+                !tokens_match_sensitive(&name_tokens(name), pat),
+                "{name} should not match"
+            );
+        }
+    }
+
+    #[test]
+    fn helius_write_stake_from_action_asks() {
+        // The verb lives in the payload `action`, not the tool name.
+        for payload in [
+            json!({ "action": "stake", "amount": 10 }),
+            json!({ "action": "stake" }),
+            json!({ "action": "stake", "params": { "amount": 10, "validator": "x" } }),
+            json!({ "params": { "action": "sendSol", "to": "x", "amount": 50 } }),
+        ] {
+            let (d, _m) = decide(
+                "mcp__helius__heliusWrite",
+                Some(&payload),
+                &ctx(),
+                &Policy::default(),
+            );
+            assert!(matches!(d, Decision::Ask { .. }), "{payload}: {d:?}");
+        }
+    }
+
+    #[test]
+    fn token_transfer_is_hard_guarded_and_sol_amount_dropped() {
+        let payload = json!({ "action": "sendToken", "mint": "m", "to": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin", "amount": 5 });
+        let (d, m) = decide(
+            "mcp__helius__heliusWrite",
+            Some(&payload),
+            &ctx(),
+            &Policy::default(),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Transfer);
+        assert!(m.hard_guard, "token transfer is never grant-covered (D3)");
+        assert_eq!(m.amount_sol, None, "token units are not SOL");
+    }
+
+    #[test]
+    fn read_action_not_misclassified() {
+        // `getStakeAccounts` contains `stake` but is a read — it must not ask.
+        let payload = json!({ "action": "getStakeAccounts", "address": "x" });
+        let (d, _m) = decide(
+            "mcp__helius__heliusWallet",
+            Some(&payload),
+            &ctx(),
+            &Policy::default(),
+        );
+        assert_eq!(d, Decision::Defer, "{d:?}");
     }
 
     #[test]
