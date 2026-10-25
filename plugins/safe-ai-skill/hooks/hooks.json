@@ -11,6 +11,9 @@
       { "matcher": "Read|Grep|Glob", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-read", "timeout": 10, "onFailure": "continue" }
       ]},
+      { "matcher": "WebFetch", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-webfetch", "timeout": 10, "onFailure": "continue" }
+      ]},
       { "matcher": "mcp__.*", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-mcp", "timeout": 15, "onFailure": "continue" }
       ]},

@@ -122,15 +122,19 @@ fn read_schema_has_no_opinion() {
 #[test]
 fn read_other_project_env_files_follow_the_tier() {
     let proj = project();
-    for name in [
-        ".env",
-        ".env.local",
-        ".env.production",
-        ".env.schema.bak",
-        ".env.schema.local",
-    ] {
+    for name in [".env", ".env.local", ".env.schema.bak", ".env.schema.local"] {
         write(&proj, name, "X=1\n");
         assert_eq!(read(proj.path(), proj.join(name)).0, "", "{name}");
+        assert_eq!(read_high(proj.path(), proj.join(name)).0, "deny", "{name}");
+    }
+}
+
+#[test]
+fn read_production_env_files_deny_from_relaxed() {
+    let proj = project();
+    for name in [".env.production", ".env.prod", ".env.production.local"] {
+        write(&proj, name, "X=1\n");
+        assert_eq!(read(proj.path(), proj.join(name)).0, "deny", "{name}");
         assert_eq!(read_high(proj.path(), proj.join(name)).0, "deny", "{name}");
     }
 }

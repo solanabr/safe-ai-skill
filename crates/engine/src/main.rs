@@ -23,7 +23,9 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::{creddump, envwrite, exfil, mcpexec, read, tamper, wallet};
+use safe_ai_skill::gates::{
+    creddump, encoded, envread, envwrite, exfil, fetchexec, mcpexec, read, tamper, wallet,
+};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
 use safe_ai_skill::policy::{self, Policy};
@@ -73,6 +75,7 @@ const DEADLINE_GATES: &[&str] = &[
     "gate-bash-secrets",
     "gate-read",
     "gate-mcp",
+    "gate-webfetch",
     "gate-tamper",
     "gate-skill",
 ];
@@ -84,6 +87,7 @@ const PANIC_ASK_GATES: &[&str] = &[
     "gate-bash-secrets",
     "gate-read",
     "gate-mcp",
+    "gate-webfetch",
     "gate-tamper",
     "gate-skill",
 ];
@@ -98,6 +102,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-bash-secrets", |_| cmd_gate_bash_secrets()),
     ("gate-read", |_| cmd_gate_read()),
     ("gate-mcp", |_| cmd_gate_mcp()),
+    ("gate-webfetch", |_| cmd_gate_webfetch()),
     ("gate-tamper", |_| cmd_gate_tamper()),
     ("gate-skill", |_| cmd_gate_skill()),
     ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
@@ -387,6 +392,10 @@ fn join_tier(
     meta: GateMeta,
 ) -> (Decision, GateMeta) {
     match tier_verdict {
+        // On a deny tie the gate's own reason stays: it carries the more specific remedy.
+        Some(Verdict::Deny(_)) if matches!(decision, Decision::Deny { .. }) => {
+            (decision, GateMeta::new(Scope::SecretRead, true))
+        }
         Some(v @ (Verdict::Ask(_) | Verdict::Deny(_)))
             if verdict_rank(&v) >= decision_rank(&decision) =>
         {
@@ -591,8 +600,37 @@ fn cmd_gate_bash() -> ExitCode {
     // entry as well as from `gate-bash-secrets`.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
     let nested_verdict = nested_claude_verdict(nested, effective.tier());
-    let (decision, meta) = join_tier(strictest([wallet_verdict, nested_verdict]), decision, meta);
+    let encoded_verdict = encoded_bash_verdict(command, &cwd, &effective);
+    let (decision, meta) = join_tier(
+        strictest([wallet_verdict, nested_verdict, encoded_verdict]),
+        decision,
+        meta,
+    );
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// An encoded payload piped or eval'd into a shell, decoded and judged by the bash and
+/// secrets gates (strictest wins); an undecodable payload asks, a deny at High.
+fn encoded_bash_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
+    use safe_ai_skill::gates::{bash, secrets};
+    let as_verdict = |d: Decision| match d {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    };
+    let tier = effective.tier();
+    let mut all = vec![encoded::decide(command).map(|v| match v {
+        Verdict::Ask(reason) if tier == Tier::High => {
+            Verdict::Deny(format!("{reason} Denied at tier high."))
+        }
+        v => v,
+    })];
+    for decoded in encoded::expand(command) {
+        let ctx = Context::build(&decoded, cwd);
+        all.push(as_verdict(bash::decide(&decoded, &ctx, effective).0));
+        all.push(as_verdict(secrets::decide(&decoded, cwd, effective)));
+    }
+    strictest(all)
 }
 
 /// [`tamper::decide_nested_claude`] as a tier verdict: its `ask` is a deny at High.
@@ -634,6 +672,10 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         creddump::decide(command, &cwd, &effective, tier),
         envwrite::decide_cli(command, &cwd, &effective, tier),
         exfil::decide_bash(command, &cwd, &effective, tier),
+        fetchexec::decide(command, &cwd, &effective, tier),
+        tamper::decide_bash_writes(command, &cwd, &effective, tier),
+        envread::decide_bash(command),
+        encoded_bash_verdict(command, &cwd, &effective),
     ]);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
@@ -746,6 +788,30 @@ fn finish_blocked_pack(
 }
 
 /// PreToolUse `Skill`: deny a skill whose pack is blocked (re-hashed on the spot).
+fn cmd_gate_webfetch() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let input = match parsed {
+        Ok(input) => input,
+        Err(Unreadable::Empty) => return ExitCode::SUCCESS,
+        Err(why) => return ask_unreadable(why, &HookInput::default(), &raw),
+    };
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let field = |k: &str| {
+        input
+            .tool_input
+            .as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+    let verdict =
+        exfil::decide_webfetch(field("url"), field("prompt"), &effective, effective.tier());
+    let (decision, meta) = join_tier(verdict, Decision::Defer, GateMeta::new(Scope::Other, true));
+    finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
 fn cmd_gate_skill() -> ExitCode {
     let (raw, parsed) = read_input();
     let input = match parsed {
@@ -828,6 +894,7 @@ fn file_write_decision(
     let tier_verdict = strictest([
         wallet::decide_file(tool_input, cwd, effective, tier),
         envwrite::decide_file(tool_input, cwd, effective, tier),
+        tamper::decide_file_content(tool_input, cwd, effective, tier),
     ]);
     join_tier(tier_verdict, decision, GateMeta::new(Scope::Other, true)).0
 }

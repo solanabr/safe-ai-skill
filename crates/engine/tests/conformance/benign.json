@@ -534,6 +534,26 @@
         "exit": 0,
         "stdout": ""
       }
+    },
+    {
+      "name": "gate-webfetch: docs page",
+      "args": [
+        "gate-webfetch"
+      ],
+      "stdin": {
+        "hook_event_name": "PreToolUse",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "tool_name": "WebFetch",
+        "tool_input": {
+          "url": "https://docs.rs/serde/latest/serde/",
+          "prompt": "summarise the derive docs"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
     }
   ]
 }
