@@ -73,8 +73,8 @@ fn gate_bash(command: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// D8 v2 §3.1 Class U: a hard-guard ask on identified localnet/devnet, a deny on mainnet,
-// testnet and unknown clusters (program and buffer closes included). Authority changes to a
+// D8 v2 §3.1 Class U: a hard-guard ask on identified localnet/devnet/testnet, a deny on
+// mainnet and unknown clusters (program and buffer closes included). Authority changes to a
 // new key are Class C.
 // ---------------------------------------------------------------------------------------
 
@@ -121,7 +121,7 @@ fn anchor_deploy_final_passthrough_on_mainnet_denies() {
 }
 
 #[test]
-fn every_irreversible_command_asks_on_devnet_as_hard_guard() {
+fn every_irreversible_command_asks_on_devnet_and_testnet_as_hard_guard() {
     let class_u = [
         "solana program deploy --final ./p.so".to_string(),
         "solana program upgrade BUF PROG --final".to_string(),
@@ -138,15 +138,11 @@ fn every_irreversible_command_asks_on_devnet_as_hard_guard() {
         "anchor program deploy --final".to_string(),
     ];
     for cmd in &class_u {
-        for network in [Network::Devnet, Network::Localnet] {
+        for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
             let (d, meta) = decide(cmd, network);
             assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
             assert!(meta.hard_guard, "{cmd} on {network:?} must be a hard guard");
         }
-        // Testnet is not a positively identified localnet/devnet.
-        let (d, meta) = decide(cmd, Network::Testnet);
-        assert!(is_deny(&d), "{cmd} on testnet: {d:?}");
-        assert!(meta.hard_guard);
     }
     // Class C hard guards: an authority change to a new key asks on every cluster.
     for cmd in [
@@ -160,24 +156,18 @@ fn every_irreversible_command_asks_on_devnet_as_hard_guard() {
         }
     }
     // A program or buffer close in any form is Class U: never grantable, a hard-guard ask
-    // on an identified devnet/localnet and a deny on testnet.
+    // on an identified devnet/testnet/localnet.
     for cmd in [
         "solana program close BUF",
         "solana program close --buffers",
         "anchor program close BUF",
     ] {
-        for network in [Network::Devnet, Network::Localnet] {
+        for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
             let (d, meta) = decide(cmd, network);
             assert!(is_ask(&d), "{cmd} on {network:?}: {d:?}");
             assert!(meta.hard_guard, "{cmd} on {network:?} is never grantable");
             assert_eq!(meta.scope, Scope::Destructive);
         }
-        let (d, meta) = decide(cmd, Network::Testnet);
-        assert!(
-            matches!(d, Decision::Deny { .. }),
-            "{cmd} on testnet: {d:?}"
-        );
-        assert!(meta.hard_guard);
     }
 }
 

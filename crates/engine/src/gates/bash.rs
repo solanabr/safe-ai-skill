@@ -11,8 +11,8 @@
 //! D8 v2 (spec §2, §3) splits on-chain actions by recoverability:
 //!
 //! - **Class U** (the shared list's `irreversible net` rows, [`lists::irreversible`]): denied
-//!   with the command echoed on mainnet, testnet and any cluster not positively identified
-//!   (Unknown), a hard-guard ask on identified localnet/devnet; at every tier, never granted.
+//!   with the command echoed on mainnet and any cluster not positively identified (Unknown), a
+//!   hard-guard ask on identified localnet/devnet/testnet; at every tier, never granted.
 //! - **Class C** (transfers, deploys, authority changes, withdraws): on mainnet
 //!   or Unknown an ask below High (a grantable one unless it is an authority change, an
 //!   account close or an unbudgetable amount) and a deny at High. `Allow` comes only from a
@@ -942,8 +942,7 @@ fn ask_component(
     let cluster_risk: u8 = match network {
         Network::Mainnet => 3,
         Network::Unknown => 2,
-        Network::Testnet => 1,
-        Network::Devnet | Network::Localnet => 0,
+        Network::Devnet | Network::Testnet | Network::Localnet => 0,
     };
     let counterparty = matches!(
         meta.scope,
@@ -1098,18 +1097,18 @@ fn class_u(row: &str, cluster: &Cluster, command: &str, ctx: &Context) -> (Decis
     let net = cluster_label(cluster.network);
     let source = cluster.source.describe(ctx);
     let decision = match cluster.network {
-        Network::Localnet | Network::Devnet => Decision::Ask {
+        Network::Localnet | Network::Devnet | Network::Testnet => Decision::Ask {
             reason: format!(
                 "Irreversible on-chain action `{row}` on {net} (cluster from {source}): it \
                  destroys the capability even for its owner — approve to proceed (no grant \
                  covers it)"
             ),
         },
-        Network::Mainnet | Network::Testnet | Network::Unknown => Decision::Deny {
+        Network::Mainnet | Network::Unknown => Decision::Deny {
             reason: format!(
                 "Irreversible on-chain action `{row}` on {net} (cluster from {source}): it \
                  destroys the capability even for its owner and runs through the agent only \
-                 on a positively identified localnet or devnet. Run it yourself outside the \
+                 on a positively identified localnet, devnet or testnet. Run it yourself outside the \
                  agent if you intend it: `{}`",
                 echo(command)
             ),

@@ -757,11 +757,6 @@ fn f3_class_u_denies_on_mainnet() {
 }
 
 #[test]
-fn f3_class_u_denies_on_testnet() {
-    class_u_denies("f3-u-t", "-ut");
-}
-
-#[test]
 fn f3_class_u_denies_on_a_missing_config_file() {
     class_u_denies("f3-u-c", "-C missing.yml");
 }
@@ -778,10 +773,11 @@ fn f3_class_u_denies_with_no_identified_cluster() {
 }
 
 #[test]
-fn f3_class_u_on_devnet_asks_no_grant_relaxes_it_and_headless_denies() {
+fn f3_class_u_on_devnet_or_testnet_asks_no_grant_relaxes_it_and_headless_denies() {
     let w = World::new("f3-u-dev");
     w.grant_everything();
     let mut cmds = class_u("-ud");
+    cmds.extend(class_u("-ut"));
     cmds.extend(class_u_templates().iter().map(|t| t.replace("{c}", "-ul")));
     for cmd in cmds {
         // The data dir holds a confirmed grant of every scope: still an ask.

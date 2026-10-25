@@ -17,6 +17,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 ### Changed
 
 - **Token amounts are token units:** SOL spend caps and grants never cover `spl-token` or MCP token transfers. Mainnet or an unknown cluster asks (deny headless); devnet, testnet and localnet have no opinion.
+- **Testnet is treated like devnet:** an irreversible action on a positively identified testnet is a hard-guard ask, as on devnet and localnet, instead of a deny.
 - **More authority changes are hard guards:** stake, vote and nonce authority commands and `spl-token approve`.
 - **Cluster detection is stricter:** an ambiguous RPC URL or `-C` config file resolves to an unknown cluster.
 - **MCP:** routed actions are read from nested parameters; staking actions are hard-guarded; the sensitive-name pattern is wider (`default.policy.yaml`).

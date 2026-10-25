@@ -510,11 +510,11 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["on", "on", "on", "on"],
     ),
     (
-        "Class U, mainnet, Unknown, or any cluster not positively identified as localnet/devnet",
+        "Class U, mainnet, Unknown, or any cluster not positively identified as localnet/devnet/testnet",
         ["deny", "deny", "deny", "deny"],
     ),
     (
-        "Class U, positively identified localnet/devnet",
+        "Class U, positively identified localnet/devnet/testnet",
         ["ask", "ask", "ask", "ask"],
     ),
     (

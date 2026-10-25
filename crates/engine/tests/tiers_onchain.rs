@@ -200,15 +200,8 @@ fn class_u(cluster: &str) -> Vec<String> {
 }
 
 #[test]
-fn class_u_denies_on_mainnet_testnet_and_unknown_at_every_tier() {
-    for cluster in [
-        "-um",
-        "-ut",
-        "--url mainnet-beta",
-        "-C missing.yml",
-        "-u $URL",
-        "",
-    ] {
+fn class_u_denies_on_mainnet_and_unknown_at_every_tier() {
+    for cluster in ["-um", "--url mainnet-beta", "-C missing.yml", "-u $URL", ""] {
         for cmd in class_u(cluster) {
             let setups: [fn(Tier) -> Setup; 3] = [
                 Setup::at,
@@ -223,8 +216,8 @@ fn class_u_denies_on_mainnet_testnet_and_unknown_at_every_tier() {
 }
 
 #[test]
-fn class_u_on_a_mainnet_or_testnet_cli_default_denies() {
-    for default in [Network::Mainnet, Network::Testnet, Network::Unknown] {
+fn class_u_on_a_mainnet_or_unknown_cli_default_denies() {
+    for default in [Network::Mainnet, Network::Unknown] {
         for cmd in class_u("") {
             let got = x4(&cmd, |t| Setup::at(t).default_net(default));
             assert_eq!(got, ["deny"; 4], "{cmd} on {default:?}");
@@ -233,15 +226,22 @@ fn class_u_on_a_mainnet_or_testnet_cli_default_denies() {
 }
 
 #[test]
-fn class_u_asks_on_identified_localnet_and_devnet_and_no_grant_relaxes_it() {
-    for cluster in ["-ul", "-ud", "--url devnet", "--url http://127.0.0.1:8899"] {
+fn class_u_asks_on_identified_localnet_devnet_and_testnet_and_no_grant_relaxes_it() {
+    for cluster in [
+        "-ul",
+        "-ud",
+        "-ut",
+        "--url devnet",
+        "--url testnet",
+        "--url http://127.0.0.1:8899",
+    ] {
         for cmd in class_u(cluster) {
             assert_eq!(x4(&cmd, Setup::at), ["ask"; 4], "{cmd}");
             assert_eq!(x4(&cmd, |t| Setup::at(t).grant()), ["ask"; 4], "{cmd}");
             assert_eq!(x4(&cmd, |t| Setup::at(t).headless()), ["deny"; 4], "{cmd}");
         }
     }
-    for default in [Network::Devnet, Network::Localnet] {
+    for default in [Network::Devnet, Network::Testnet, Network::Localnet] {
         for cmd in class_u("") {
             let got = x4(&cmd, |t| Setup::at(t).default_net(default).grant());
             assert_eq!(got, ["ask"; 4], "{cmd} on {default:?}");
@@ -297,7 +297,7 @@ fn class_u_deny_reasons_echo_the_command_and_the_cluster_source() {
     let d = run_lib("spl-token close A", Setup::at(Tier::Relaxed));
     assert!(d.reason().contains("CLI config"), "{d:?}");
     assert!(d.reason().contains("unidentified"), "{d:?}");
-    // Testnet is named as such.
+    // Testnet is named as such in its ask.
     let d = run_lib("spl-token close A -ut", Setup::at(Tier::Relaxed));
     assert!(d.reason().contains("testnet"), "{d:?}");
 }
@@ -308,15 +308,15 @@ fn class_u_through_an_expansion_program_is_still_class_u() {
     for cmd in [
         "$S program deploy --final x.so -um",
         "S=solana; $S program close P --bypass-warning",
-        "$T close-mint M -ut",
+        "$T close-mint M -um",
     ] {
         assert_eq!(x4(cmd, Setup::at), ["deny"; 4], "{cmd}");
     }
-    // On devnet it asks like any Class U command, and an expansion program denies at High.
-    assert_eq!(
-        x4("$S program-v4 finalize P -ud", Setup::at),
-        ["ask", "ask", "ask", "deny"]
-    );
+    // On devnet or testnet it asks like any Class U command, and an expansion program
+    // denies at High.
+    for cmd in ["$S program-v4 finalize P -ud", "$T close-mint M -ut"] {
+        assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{cmd}");
+    }
 }
 
 #[test]
@@ -615,9 +615,9 @@ fn binary_tiers() -> Vec<Tier> {
 }
 
 #[test]
-fn e2e_class_u_wrapped_forms_deny_on_mainnet_testnet_and_unknown() {
+fn e2e_class_u_wrapped_forms_deny_on_mainnet_and_unknown() {
     let w = World::new("onchain-u");
-    for cluster in ["-um", "-ut", "-C missing.yml", ""] {
+    for cluster in ["-um", "-C missing.yml", ""] {
         for cmd in class_u(cluster) {
             assert_eq!(w.bash(&cmd, Tier::Relaxed), "deny", "{cmd}");
         }
@@ -632,9 +632,9 @@ fn e2e_class_u_wrapped_forms_deny_on_mainnet_testnet_and_unknown() {
 }
 
 #[test]
-fn e2e_class_u_asks_on_devnet_and_denies_headless() {
+fn e2e_class_u_asks_on_devnet_or_testnet_and_denies_headless() {
     let w = World::new("onchain-u-dev");
-    for cmd in class_u("-ud") {
+    for cmd in class_u("-ud").into_iter().chain(class_u("-ut")) {
         assert_eq!(w.bash(&cmd, Tier::Relaxed), "ask", "{cmd}");
     }
     for tier in binary_tiers() {
@@ -659,12 +659,12 @@ fn e2e_class_u_cluster_sources() {
     let w = World::new("onchain-u-src");
     // No `solana` on PATH: the CLI default is unknown.
     assert_eq!(w.bash("spl-token close-mint M", Tier::Relaxed), "deny");
-    // CLI config devnet / localnet: ask; testnet / mainnet: deny. (The `solana` stub is a
+    // CLI config devnet / testnet / localnet: ask; mainnet / unidentified: deny. (The `solana` stub is a
     // #!/bin/sh script, which Windows cannot exec.)
     let cli_urls = [
         ("https://api.devnet.solana.com", "ask"),
         ("http://localhost:8899", "ask"),
-        ("https://api.testnet.solana.com", "deny"),
+        ("https://api.testnet.solana.com", "ask"),
         ("https://api.mainnet-beta.solana.com", "deny"),
         ("https://rpc.example.com", "deny"),
     ];
@@ -1229,7 +1229,7 @@ fn dynamic_eval_and_shell_c_scripts_are_judged_like_the_unwrapped_form() {
         r#"eval "$(printf so)lana program close P --bypass-warning -um""#,
         "eval $(echo c29sYW5h | base64 -d) program close P --bypass-warning -um",
         r#"bash -c "$(printf 'so%sna' la) program close P --bypass-warning -um""#,
-        r#"sh -lc "$T burn A 1 -ut""#,
+        r#"sh -lc "$T burn A 1 -um""#,
         r#"eval "$S program close P --bypass-warning""#,
     ] {
         assert!(bash::may_concern(cmd), "{cmd}");
@@ -1240,14 +1240,18 @@ fn dynamic_eval_and_shell_c_scripts_are_judged_like_the_unwrapped_form() {
             "{cmd}"
         );
     }
-    // On devnet: the expansion's ask, denied at High.
-    assert_eq!(
-        x4(
-            r#"eval "$S program close P --bypass-warning -ud""#,
-            Setup::at
-        ),
-        ["ask", "ask", "ask", "deny"]
-    );
+    // On devnet or testnet: the expansion's ask, denied at High; headless still denies.
+    for cmd in [
+        r#"eval "$S program close P --bypass-warning -ud""#,
+        r#"sh -lc "$T burn A 1 -ut""#,
+    ] {
+        assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{cmd}");
+        assert_eq!(
+            x4(cmd, |t| Setup::at(t).grant().headless()),
+            ["deny"; 4],
+            "{cmd}"
+        );
+    }
     // A dynamic script with nothing solana-shaped keeps no opinion.
     assert_eq!(x4(r#"eval "$CMD --help""#, Setup::at), ["", "", "", ""]);
 }

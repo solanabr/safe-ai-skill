@@ -164,8 +164,8 @@ The plugin takes a tier as an input: `off < relaxed < medium < high`, default `r
 | `env keys` | n/o | n/o | n/o | n/o |
 | Pattern redaction (keys, seeds, PEM, vendor tokens) in successful tool results | on | on | on | on |
 | Value scrub of project env values in successful tool results, except the Read response of a raw read the tier permits | on | on | on | on |
-| Irreversible on-chain action (`--final`, `program close` (program or buffer), `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet, an unknown cluster or testnet | deny | deny | deny | deny |
-| … on a positively identified localnet or devnet (never relaxed by a grant) | ask | ask | ask | ask |
+| Irreversible on-chain action (`--final`, `program close` (program or buffer), `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet or an unknown cluster | deny | deny | deny | deny |
+| … on a positively identified localnet, devnet or testnet (never relaxed by a grant) | ask | ask | ask | ask |
 | Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
 | Value-moving or authority-changing action on mainnet or an unknown cluster | ask | ask | ask | deny |
 | … with a live confirmed grant covering it (grantable scopes only) | allow | allow | allow | deny |

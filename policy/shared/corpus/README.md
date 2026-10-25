@@ -78,8 +78,8 @@ checks them again on its actual verdicts for rows without `interim`.
 ## Where the verdicts come from
 
 - `plugin`: the F0 to F4 task briefs (the tables in `.superpowers/sdd/.../F1..F5-brief.md`) and the
-  contract's section 2.4 seed. Class U denies on mainnet, testnet and Unknown, asks on identified
-  localnet/devnet, and is never grantable.
+  contract's section 2.4 seed. Class U denies on mainnet and Unknown, asks on identified
+  localnet/devnet/testnet, and is never grantable.
 - `kit`: read from solanabr/solana-ai-kit `42755ab` (`onchain-guard.sh`, `secrets-guard.awk`,
   `egress-guard.sh`, `firewall.sh` deny lists), nothing executed. The pin is `42755ab`; the permanent
   wrapper denies below were re-checked at kit HEAD `edf0cb5` (same entries, different line numbers).
