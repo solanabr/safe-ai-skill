@@ -75,11 +75,22 @@ pub fn decide(command: &str) -> Option<Verdict> {
 /// below confirms a decoder actually feeds a shell.
 fn prefilter(command: &str) -> bool {
     let l = command.to_ascii_lowercase();
-    l.contains("base64")
-        || l.contains("xxd")
-        || l.contains("\\x")
-        || l.contains("rev")
-        || l.contains("eval")
+    const MARKERS: &[&str] = &[
+        "base64",
+        "base32",
+        "base16",
+        "basenc",
+        "xxd",
+        "openssl",
+        "b64decode",
+        "b32decode",
+        "buffer.from",
+        "atob",
+        "\\x",
+        "rev",
+        "eval",
+    ];
+    MARKERS.iter().any(|m| l.contains(m))
 }
 
 /// Decode every candidate in `command`, push it, and recurse into it (bounded by depth).
@@ -98,17 +109,22 @@ fn expand_rec(command: &str, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-/// Every decoded command text in `command`: from `eval "$(…)"` substitutions and from
-/// pipelines that decode a literal and feed a shell.
+/// Every decoded command text in `command`: from `eval "$(…)"` and `sh -c "$(…)"`
+/// substitutions, interpreter one-liners that decode-and-exec, pipelines that decode a literal
+/// into a shell, and a decode written to a file that a later command runs.
 fn decode_candidates(command: &str) -> Vec<String> {
     let mut res = Vec::new();
     for cmd in split_commands(command) {
-        // `eval "$(…)"` / `eval $(…)` / `` eval `…` ``: the inner command's output is run.
-        for inner in eval_inners(&cmd) {
+        // `eval "$(…)"`, and `sh -c "$(…)"` / `python3 -c "$(…)"`: a substitution the shell or
+        // interpreter runs; its output is code.
+        for inner in eval_inners(&cmd).into_iter().chain(dash_c_inners(&cmd)) {
             if let Some(v) = pipeline_value(&inner).value {
                 res.push(v);
             }
         }
+        // An interpreter one-liner that decodes a literal and executes it
+        // (`python3 -c "…os.system(base64.b64decode('…'))"`, `node -e "…Buffer.from(…)…"`).
+        res.extend(interpreter_decode_exec(&cmd));
         // A plain pipeline that decodes a literal and ends in a shell/interpreter.
         let info = pipeline_value(&cmd);
         if info.decoded_any && info.reached_sink {
@@ -117,13 +133,20 @@ fn decode_candidates(command: &str) -> Vec<String> {
             }
         }
     }
+    // A decode written to a file that a later command runs (`echo X | base64 -d > f && sh f`).
+    res.extend(decode_to_file_then_run(command));
     res
 }
 
-/// Whether some command decodes an *opaque* payload into a shell.
+/// Whether some command decodes an *opaque* payload (a variable, a substitution, a fetched
+/// body) into a shell or interpreter — the case [`decode_candidates`] cannot read.
 fn dynamic_decode_into_shell(command: &str) -> bool {
+    // A decode chain nested deeper than the expansion cap: fail closed rather than go silent.
+    if nesting_exceeds_cap(command) {
+        return true;
+    }
     for cmd in split_commands(command) {
-        for inner in eval_inners(&cmd) {
+        for inner in eval_inners(&cmd).into_iter().chain(dash_c_inners(&cmd)) {
             let info = pipeline_value(&inner);
             if info.has_decoder && info.value.is_none() {
                 return true;
@@ -133,8 +156,33 @@ fn dynamic_decode_into_shell(command: &str) -> bool {
         if info.has_decoder && info.reached_sink && info.value.is_none() {
             return true;
         }
+        if interpreter_dynamic_decode_exec(&cmd) {
+            return true;
+        }
     }
     false
+}
+
+/// Whether the decode chain in `command` nests deeper than [`MAX_DEPTH`]: after unwrapping
+/// `MAX_DEPTH` layers, a layer still decodes further. Such a payload is not fully expandable,
+/// so the caller asks.
+fn nesting_exceeds_cap(command: &str) -> bool {
+    let mut frontier = vec![command.to_string()];
+    for _ in 0..MAX_DEPTH {
+        let mut next = Vec::new();
+        for c in &frontier {
+            for d in decode_candidates(c) {
+                if !d.is_empty() && d.len() <= MAX_BYTES && prefilter(&d) {
+                    next.push(d);
+                }
+            }
+        }
+        if next.is_empty() {
+            return false;
+        }
+        frontier = next;
+    }
+    frontier.iter().any(|c| !decode_candidates(c).is_empty())
 }
 
 /// What a single pipeline resolves to.
@@ -165,9 +213,17 @@ fn pipeline_value(pipeline: &str) -> PipelineInfo {
             continue;
         }
 
-        // A stage with a here-string carries its own literal: `base64 -d <<< LIT`.
+        // A stage with a here-string carries its own literal: `base64 -d <<< LIT`, or a
+        // substitution: `bash <<< "$(echo X | base64 -d)"`.
         if let Some((cmd_part, here)) = split_herestring(s) {
-            value = literal_of_herestring(&here);
+            if let Some(inner) = first_substitution(&here) {
+                let iv = pipeline_value(&inner);
+                value = iv.value;
+                has_decoder |= iv.has_decoder;
+                decoded_any |= iv.decoded_any;
+            } else {
+                value = literal_of_herestring(&here);
+            }
             started = true;
             apply_stage(
                 cmd_part,
@@ -236,6 +292,7 @@ fn apply_stage(
 #[derive(Clone, Copy)]
 enum Decoder {
     Base64,
+    Base32,
     Hex,
     Rev,
 }
@@ -244,12 +301,29 @@ enum Decoder {
 fn decoder_of(stage: &str) -> Option<Decoder> {
     let words = words_of(stage);
     let prog = words.first().map(|w| base_name(w)).unwrap_or_default();
+    let has = |f: &str| words[1..].iter().any(|a| a == f);
+    let any = |fs: &[&str]| fs.iter().any(|f| has(f));
+    let decode_flag = any(&["-d", "--decode", "-D", "-a"]) || has("-base64");
     match prog.as_str() {
-        "base64" => words[1..]
-            .iter()
-            .any(|a| a == "-d" || a == "--decode" || a == "-D")
-            .then_some(Decoder::Base64),
+        "base64" => (any(&["-d", "--decode", "-D"]) || words.len() == 1).then_some(Decoder::Base64),
+        "base32" => (any(&["-d", "--decode"]) || words.len() == 1).then_some(Decoder::Base32),
+        "base16" => (any(&["-d", "--decode"]) || words.len() == 1).then_some(Decoder::Hex),
         "base64decode" | "b64decode" => Some(Decoder::Base64),
+        // `basenc --base32 -d` etc. The alphabet flag names the codec.
+        "basenc" => {
+            if !(any(&["-d", "--decode"])) {
+                None
+            } else if any(&["--base32", "--base32hex"]) {
+                Some(Decoder::Base32)
+            } else if has("--base16") {
+                Some(Decoder::Hex)
+            } else {
+                Some(Decoder::Base64)
+            }
+        }
+        // `openssl base64 -d`, `openssl enc -d -base64`/`-a`.
+        "openssl" => (decode_flag && (has("base64") || has("enc") || has("-base64")))
+            .then_some(Decoder::Base64),
         "xxd" => {
             let flags: String = words[1..]
                 .iter()
@@ -288,6 +362,7 @@ fn is_shell_sink(stage: &str) -> bool {
 fn apply_decoder(dec: Decoder, input: &str) -> Option<String> {
     let bytes = match dec {
         Decoder::Base64 => base64_decode(input)?,
+        Decoder::Base32 => base32_decode(input)?,
         Decoder::Hex => hex_decode(input)?,
         Decoder::Rev => return Some(rev_text(input)),
     };
@@ -329,6 +404,13 @@ fn initial_literal(stage: &str) -> (Option<String>, bool) {
                 return (None, false);
             }
             let raw = unquote_value(fmt);
+            // `printf %s X` / `printf %b X`: the format just passes its argument through.
+            if matches!(raw.as_str(), "%s" | "%b") {
+                return match words.get(2) {
+                    Some(arg) if !is_dynamic(arg) => (Some(unquote_value(arg)), true),
+                    _ => (None, false),
+                };
+            }
             let had_escape = raw.contains('\\');
             (Some(decode_c_escapes(&raw)), had_escape)
         }
@@ -474,6 +556,223 @@ fn eval_inners(command: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Interpreters/shells whose `-c`/`-e` argument is executed as code.
+const CODE_RUNNERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "busybox", "python", "python2",
+    "python3", "pypy", "pypy3", "node", "nodejs", "perl", "ruby", "deno", "bun", "php",
+];
+
+/// The code argument of a `<runner> -c CODE` / `<runner> -e CODE` command, if any.
+fn code_arg(command: &str) -> Option<String> {
+    let words = words_of_raw(command);
+    let prog = base_name(&strip_quotes(words.first()?));
+    if !CODE_RUNNERS
+        .iter()
+        .any(|r| prog == *r || prog.starts_with(&format!("{r}.")))
+    {
+        return None;
+    }
+    let idx = words.iter().position(|w| {
+        let s = strip_quotes(w);
+        s == "-c" || s == "-e" || s == "-ec" || s == "-ce"
+    })?;
+    words.get(idx + 1).map(|w| unquote_value(w))
+}
+
+/// Substitution bodies inside a `sh -c "$(…)"` / `python3 -c "$(…)"` code argument.
+fn dash_c_inners(command: &str) -> Vec<String> {
+    code_arg(command)
+        .as_deref()
+        .and_then(first_substitution)
+        .into_iter()
+        .collect()
+}
+
+/// Exec sinks: functions/modules that run a string as a program, in shell one-liners for
+/// Python and Node. Their presence marks decoded text as code that will run.
+const EXEC_SINKS: &[&str] = &[
+    "os.system",
+    "subprocess",
+    "popen",
+    "check_output",
+    "check_call",
+    "exec(",
+    "eval(",
+    "child_process",
+    "execsync",
+    "spawn",
+    "system(",
+];
+
+/// Decoded payloads from an interpreter one-liner that decodes a literal and executes it:
+/// `python3 -c "…os.system(base64.b64decode('<b64>'))"`, `node -e "…Buffer.from('<b64>',
+/// 'base64')…child_process…"`.
+fn interpreter_decode_exec(command: &str) -> Vec<String> {
+    let Some(code) = code_arg(command) else {
+        return Vec::new();
+    };
+    let lc = code.to_ascii_lowercase();
+    if !EXEC_SINKS.iter().any(|s| lc.contains(s)) {
+        return Vec::new();
+    }
+    inline_decode_literals(&code)
+        .into_iter()
+        .filter_map(|(dec, lit)| apply_decoder(dec, &lit))
+        .collect()
+}
+
+/// Whether an interpreter one-liner decodes-and-execs but the literal cannot be read (a
+/// variable or other expansion), so the caller must ask.
+fn interpreter_dynamic_decode_exec(command: &str) -> bool {
+    let Some(code) = code_arg(command) else {
+        return false;
+    };
+    let lc = code.to_ascii_lowercase();
+    if !EXEC_SINKS.iter().any(|s| lc.contains(s)) {
+        return false;
+    }
+    // A decode call is present but no literal argument was recovered → opaque.
+    let has_decode_call = ["b64decode", "b32decode", "buffer.from", "atob", "unhexlify"]
+        .iter()
+        .any(|m| lc.contains(m));
+    has_decode_call && inline_decode_literals(&code).is_empty()
+}
+
+/// Find `(decoder, literal)` pairs in interpreter code: `b64decode('…')`, `b32decode("…")`,
+/// `Buffer.from('…', 'base64')`, `atob('…')`.
+fn inline_decode_literals(code: &str) -> Vec<(Decoder, String)> {
+    let mut out = Vec::new();
+    let lc = code.to_ascii_lowercase();
+    for (marker, dec) in [
+        ("b64decode", Decoder::Base64),
+        ("b32decode", Decoder::Base32),
+        ("atob(", Decoder::Base64),
+        ("buffer.from(", Decoder::Base64),
+    ] {
+        let mut from = 0;
+        while let Some(rel) = lc[from..].find(marker) {
+            let after = from + rel + marker.len();
+            from = after;
+            if let Some(lit) = first_quoted(&code[after..]) {
+                out.push((dec, lit));
+            }
+        }
+    }
+    out
+}
+
+/// The first single- or double-quoted string in `text` (no interleaving expansion handling;
+/// the caller only needs a static literal).
+fn first_quoted(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if matches!(chars[i], '\'' | '"') {
+            let q = chars[i];
+            let mut lit = String::new();
+            i += 1;
+            while i < chars.len() && chars[i] != q {
+                lit.push(chars[i]);
+                i += 1;
+            }
+            // A bare word before the quote (e.g. an expansion) would already have stopped us.
+            return Some(lit);
+        }
+        // Stop at anything that is not a separator before a quote (an identifier/variable).
+        if !chars[i].is_whitespace() && chars[i] != '(' && chars[i] != ',' {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decoded payloads written to a file by one command and run by a later one in the same line:
+/// `echo <b64> | base64 -d > x.sh && sh x.sh`.
+fn decode_to_file_then_run(command: &str) -> Vec<String> {
+    let cmds = split_commands(command);
+    let mut written: Vec<(String, String)> = Vec::new();
+    for cmd in &cmds {
+        let info = pipeline_value(cmd);
+        if info.decoded_any {
+            if let (Some(value), Some(file)) = (info.value, redirect_target(cmd)) {
+                written.push((file, value));
+            }
+        }
+    }
+    if written.is_empty() {
+        return Vec::new();
+    }
+    let mut res = Vec::new();
+    for cmd in &cmds {
+        for (file, value) in &written {
+            if runs_file(cmd, file) {
+                res.push(value.clone());
+            }
+        }
+    }
+    res
+}
+
+/// The target of an output redirect (`> F`, `>> F`, `>F`) in a command, if any.
+fn redirect_target(command: &str) -> Option<String> {
+    let bytes: Vec<char> = command.chars().collect();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '>' => {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] == '>' {
+                    j += 1;
+                }
+                while j < bytes.len() && bytes[j].is_whitespace() {
+                    j += 1;
+                }
+                let mut file = String::new();
+                while j < bytes.len() && !bytes[j].is_whitespace() && bytes[j] != ';' {
+                    file.push(bytes[j]);
+                    j += 1;
+                }
+                if !file.is_empty() && file != "/dev/null" {
+                    return Some(strip_quotes(&file));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `command` runs `file` as a script (`sh file`, `bash file`, `source file`,
+/// `. file`, `./file`).
+fn runs_file(command: &str, file: &str) -> bool {
+    let words = words_of(command);
+    let Some(prog) = words.first() else {
+        return false;
+    };
+    let p = base_name(prog);
+    let base = base_name(file);
+    let names_file = |w: &str| w == file || base_name(w) == base;
+    if (CODE_RUNNERS.contains(&p.as_str()) || p == "source" || prog == ".")
+        && words[1..].iter().any(|w| names_file(w))
+    {
+        return true;
+    }
+    // `./x.sh` or a bare path to the file as the program word.
+    names_file(prog) && (prog.contains('/') || prog == file)
 }
 
 /// Extract the first `$( … )` or backtick substitution body from `text` (skips surrounding
@@ -746,6 +1045,43 @@ fn b64_value(b: u8) -> Option<u8> {
     }
 }
 
+/// Decode an RFC4648 base32 string (`A–Z2–7`), ignoring whitespace and padding.
+fn base32_decode(input: &str) -> Option<Vec<u8>> {
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .take_while(|&b| b != b'=')
+        .collect();
+    if clean.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(clean.len() * 5 / 8);
+    let mut acc = 0u64;
+    let mut bits = 0u32;
+    for &b in &clean {
+        let v = b32_value(b)?;
+        acc = (acc << 5) | u64::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+        if out.len() > MAX_BYTES {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// The 5-bit value of a base32 digit (`A–Z`, `2–7`), case-insensitive.
+fn b32_value(b: u8) -> Option<u8> {
+    match b.to_ascii_uppercase() {
+        c @ b'A'..=b'Z' => Some(c - b'A'),
+        c @ b'2'..=b'7' => Some(c - b'2' + 26),
+        _ => None,
+    }
+}
+
 /// Decode a whitespace-tolerant hex string (`xxd -r -p`).
 fn hex_decode(input: &str) -> Option<Vec<u8>> {
     let digits: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
@@ -860,6 +1196,131 @@ mod tests {
         // Decoding to a variable / file, not a shell, yields nothing from expand.
         let b64 = "c29sYW5hIGJhbGFuY2U=";
         assert!(expand(&format!("echo {b64} | base64 -d > out.txt")).is_empty());
+    }
+
+    const SOLANA: &str = "solana -um transfer 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin 5";
+
+    fn b64(s: &str) -> String {
+        b64_encode(s.as_bytes())
+    }
+
+    #[test]
+    fn herestring_substitution_into_shell() {
+        // E03: bash <<< "$(echo B64 | base64 -d)"
+        let cmd = format!("bash <<< \"$(echo {} | base64 -d)\"", b64(SOLANA));
+        assert_eq!(expand(&cmd), vec![SOLANA.to_string()]);
+    }
+
+    #[test]
+    fn shell_dash_c_substitution() {
+        // E13: sh -c "$(echo B64 | base64 -d)"
+        let cmd = format!("sh -c \"$(echo {} | base64 -d)\"", b64(SOLANA));
+        assert_eq!(expand(&cmd), vec![SOLANA.to_string()]);
+    }
+
+    #[test]
+    fn base32_and_openssl_and_basenc() {
+        // E08 / E14 and basenc.
+        let b32 = base32_encode(SOLANA.as_bytes());
+        assert_eq!(
+            expand(&format!("echo {b32} | base32 -d | sh")),
+            vec![SOLANA.to_string()]
+        );
+        assert_eq!(
+            expand(&format!("echo {} | openssl base64 -d | sh", b64(SOLANA))),
+            vec![SOLANA.to_string()]
+        );
+        assert_eq!(
+            expand(&format!(
+                "echo {} | openssl enc -d -base64 | sh",
+                b64(SOLANA)
+            )),
+            vec![SOLANA.to_string()]
+        );
+        assert_eq!(
+            expand(&format!("echo {b32} | basenc --base32 -d | sh")),
+            vec![SOLANA.to_string()]
+        );
+    }
+
+    #[test]
+    fn python_and_node_decode_exec() {
+        // E11.
+        let py = format!(
+            "python3 -c \"import base64,os;os.system(base64.b64decode('{}'))\"",
+            b64(SOLANA)
+        );
+        assert_eq!(expand(&py), vec![SOLANA.to_string()]);
+        let node = format!(
+            "node -e \"require('child_process').execSync(Buffer.from('{}','base64').toString())\"",
+            b64(SOLANA)
+        );
+        assert_eq!(expand(&node), vec![SOLANA.to_string()]);
+    }
+
+    #[test]
+    fn python_decode_exec_with_dynamic_literal_asks() {
+        assert!(
+            decide("python3 -c \"import base64,os;os.system(base64.b64decode(key))\"").is_some()
+        );
+    }
+
+    #[test]
+    fn decode_to_file_then_run() {
+        // E12.
+        let cmd = format!(
+            "echo {} | base64 -d > /tmp/x.sh && sh /tmp/x.sh",
+            b64(SOLANA)
+        );
+        assert!(
+            expand(&cmd).contains(&SOLANA.to_string()),
+            "{:?}",
+            expand(&cmd)
+        );
+    }
+
+    #[test]
+    fn nesting_beyond_cap_asks_not_silent() {
+        // E07: four nested `echo … | base64 -d | sh`.
+        let mut cur = SOLANA.to_string();
+        for _ in 0..4 {
+            cur = format!("echo {} | base64 -d | sh", b64(&cur));
+        }
+        // Expand cannot reach the innermost command within the depth cap …
+        assert!(!expand(&cur).contains(&SOLANA.to_string()));
+        // … so decide() fails closed with an ask.
+        assert!(decide(&cur).is_some());
+    }
+
+    #[test]
+    fn cert_pem_decode_unaffected() {
+        // E18: decoding a cert to a file is not an exec; encoded has no opinion.
+        let cmd = "cat cert.pem | base64 -d > cert.der";
+        assert!(expand(cmd).is_empty());
+        assert!(decide(cmd).is_none());
+    }
+
+    /// Test-only base32 encoder (RFC4648, padded).
+    fn base32_encode(data: &[u8]) -> String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut out = String::new();
+        let mut acc = 0u64;
+        let mut bits = 0u32;
+        for &b in data {
+            acc = (acc << 8) | u64::from(b);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(A[((acc >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(A[((acc << (5 - bits)) & 31) as usize] as char);
+        }
+        while !out.len().is_multiple_of(8) {
+            out.push('=');
+        }
+        out
     }
 
     /// Test-only base64 encoder (standard alphabet, padded).
