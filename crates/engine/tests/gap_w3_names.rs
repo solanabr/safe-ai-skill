@@ -92,3 +92,49 @@ fn filtered_dumps_and_unrelated_pipes_have_no_opinion() {
         assert_eq!(kind(cmd), "", "{cmd}");
     }
 }
+
+fn blanked(text: &str, secret: &str) -> bool {
+    scrub_env_lines(text).is_some_and(|out| !out.contains(secret))
+}
+
+#[test]
+fn more_output_shapes_are_redacted() {
+    for (text, secret) in [
+        ("API_TOKEN = s3cr3tVal\n", "s3cr3tVal"),
+        ("API_TOKEN\t=\ts3cr3tVal\n", "s3cr3tVal"),
+        ("+ API_TOKEN=s3cr3tVal\n", "s3cr3tVal"),
+        (".env.local:API_TOKEN=s3cr3tVal\n", "s3cr3tVal"),
+        ("src/a.env:12:API_TOKEN=s3cr3tVal\n", "s3cr3tVal"),
+        ("{\"api_key\": \"s3cr3tVal\"}", "s3cr3tVal"),
+        ("{'api_key': 's3cr3tVal'}", "s3cr3tVal"),
+        ("API_TOKEN: s3cr3tVal\n", "s3cr3tVal"),
+        ("{\"API_TOKEN\": 98765432}", "98765432"),
+        (
+            "HTTPS_PROXY=http://user:s3cr3tVal@localhost:8080\n",
+            "s3cr3tVal",
+        ),
+        (
+            "url: https://mainnet.helius-rpc.com/?api-key=s3cr3tVal\n",
+            "s3cr3tVal",
+        ),
+    ] {
+        assert!(
+            blanked(text, secret),
+            "{text:?} -> {:?}",
+            scrub_env_lines(text)
+        );
+    }
+}
+
+#[test]
+fn ordinary_output_is_left_alone() {
+    for text in [
+        "a == b\n",
+        "HOME=/Users/x\n",
+        "{\"name\": \"anchor\", \"version\": 3}",
+        "see https://docs.solana.com/cli\n",
+        "TOKEN_MINT: So11111111111111111111111111111111111111112\n",
+    ] {
+        assert_eq!(scrub_env_lines(text), None, "{text:?}");
+    }
+}

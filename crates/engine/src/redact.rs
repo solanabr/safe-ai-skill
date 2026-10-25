@@ -459,6 +459,7 @@ pub fn scrub_env_lines(text: &str) -> Option<String> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     collect_env_assignment_lines(text, &mut spans);
     collect_env_pairs(text, &mut spans);
+    collect_url_secrets(text, &mut spans);
     if spans.is_empty() {
         return None;
     }
@@ -520,6 +521,31 @@ fn skip_decl_prefix(text: &str, at: usize) -> usize {
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
         i += 1;
     }
+    // `set -x` trace lines: `+ NAME=…`, `++ NAME=…`.
+    let plus = bytes[i..].iter().take_while(|&&b| b == b'+').count();
+    if plus > 0 && bytes.get(i + plus) == Some(&b' ') {
+        i += plus + 1;
+    }
+    // `grep` output: `path:NAME=…` or `path:12:NAME=…`.
+    let line_end = bytes[i..]
+        .iter()
+        .position(|&b| b == b'\n' || b == 0)
+        .map_or(bytes.len(), |p| i + p);
+    let mut j = i;
+    while let Some(colon) = bytes[j..line_end]
+        .iter()
+        .position(|&b| b == b':')
+        .map(|p| j + p)
+    {
+        let segment = &bytes[j..colon];
+        if segment.is_empty() || segment.iter().any(|&b| b == b' ' || b == b'=') {
+            break;
+        }
+        j = colon + 1;
+        if bytes.get(j).is_some_and(|&b| is_env_name_start(b)) {
+            i = j;
+        }
+    }
     for kw in ["export ", "declare ", "typeset ", "local ", "readonly "] {
         if text[i..].starts_with(kw) {
             i += kw.len();
@@ -552,7 +578,20 @@ fn env_assignment_at(text: &str, at: usize) -> Option<(usize, usize)> {
     while end < bytes.len() && is_env_name_char(bytes[end]) {
         end += 1;
     }
-    (end < bytes.len() && bytes[end] == b'=').then_some((end, end + 1))
+    let mut eq = end;
+    while eq < bytes.len() && (bytes[eq] == b' ' || bytes[eq] == b'\t') {
+        eq += 1;
+    }
+    if eq >= bytes.len() || bytes[eq] != b'=' || bytes.get(eq + 1) == Some(&b'=') {
+        return None;
+    }
+    let mut vs = eq + 1;
+    if eq > end {
+        while vs < bytes.len() && (bytes[vs] == b' ' || bytes[vs] == b'\t') {
+            vs += 1;
+        }
+    }
+    Some((end, vs))
 }
 
 /// The value span starting at `vs` and where scanning resumes: a quoted value
@@ -598,6 +637,49 @@ fn env_value_span(bytes: &[u8], vs: usize) -> (usize, usize, usize) {
 
 /// Quoted or bare upper-case env-name keys followed by `:`/`=>` and a quoted value
 /// ([`scrub_env_lines`]).
+/// Query parameters whose value is an API credential (`?api-key=…`, Helius RPC URLs).
+const SECRET_QUERY_KEYS: &[&str] = &["api-key=", "api_key=", "apikey=", "access_token=", "token="];
+
+/// The password of a `scheme://user:password@host` URL and the value of a
+/// [`SECRET_QUERY_KEYS`] parameter, whatever the surrounding variable is called.
+fn collect_url_secrets(text: &str, spans: &mut Vec<(usize, usize)>) {
+    let url_end = |from: usize| {
+        text[from..]
+            .find(|c: char| c.is_whitespace() || "'\"<>`".contains(c))
+            .map_or(text.len(), |p| from + p)
+    };
+    for (at, _) in text.match_indices("://") {
+        let auth_start = at + 3;
+        let end = url_end(auth_start);
+        let authority_end = text[auth_start..end]
+            .find('/')
+            .map_or(end, |p| auth_start + p);
+        let authority = &text[auth_start..authority_end];
+        if let (Some(colon), Some(at_sign)) = (authority.find(':'), authority.rfind('@')) {
+            if colon < at_sign {
+                let (vs, ve) = (auth_start + colon + 1, auth_start + at_sign);
+                if ve > vs && !value_already_blank(text, vs, ve) {
+                    spans.push((vs, ve));
+                }
+            }
+        }
+        let lower = text[authority_end..end].to_ascii_lowercase();
+        for key in SECRET_QUERY_KEYS {
+            for (k, _) in lower.match_indices(key) {
+                let boundary = k == 0 || matches!(lower.as_bytes()[k - 1], b'?' | b'&' | b';');
+                if !boundary {
+                    continue;
+                }
+                let vs = authority_end + k + key.len();
+                let ve = text[vs..end].find('&').map_or(end, |p| vs + p);
+                if ve > vs && !value_already_blank(text, vs, ve) {
+                    spans.push((vs, ve));
+                }
+            }
+        }
+    }
+}
+
 fn collect_env_pairs(text: &str, spans: &mut Vec<(usize, usize)>) {
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -614,9 +696,13 @@ fn collect_env_pairs(text: &str, spans: &mut Vec<(usize, usize)>) {
         }
         i = end;
         let name = &text[start..end];
+        let quoted_key = start > 0 && matches!(bytes[start - 1], b'\'' | b'"');
         let env_shaped = name.bytes().any(|c| c.is_ascii_uppercase())
             && !name.bytes().any(|c| c.is_ascii_lowercase());
-        if !env_shaped {
+        // A quoted all-lowercase snake_case key (`"api_key"`) counts too; camelCase JSON
+        // fields (`"tokenProgram"`) do not.
+        let snake = quoted_key && !name.bytes().any(|c| c.is_ascii_uppercase());
+        if !env_shaped && !snake {
             continue;
         }
         let mut j = end;
@@ -640,6 +726,22 @@ fn collect_env_pairs(text: &str, spans: &mut Vec<(usize, usize)>) {
             j += 1;
         }
         let Some(&quote @ (b'\'' | b'"')) = bytes.get(j) else {
+            // An unquoted value (a YAML scalar, a JSON number) runs to the line end or the
+            // next `,`/`}`.
+            if bytes
+                .get(j)
+                .is_some_and(|&b| b != b'\n' && b != b'{' && b != b'[')
+                && is_secret_env_name(name)
+            {
+                let ve = bytes[j..]
+                    .iter()
+                    .position(|&b| matches!(b, b'\n' | b',' | b'}' | 0))
+                    .map_or(bytes.len(), |p| j + p);
+                let ve = j + text[j..ve].trim_end().len();
+                if ve > j && !value_already_blank(text, j, ve) {
+                    spans.push((j, ve));
+                }
+            }
             continue;
         };
         let vs = j + 1;
