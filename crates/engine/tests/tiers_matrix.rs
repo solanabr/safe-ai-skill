@@ -1819,7 +1819,8 @@ fn i22_interpreter_code_naming_an_env_file_is_a_read() {
         "uv run python -c \"print(open('.env').read())\"",
         "uv run --with requests python -c \"print(open('.env').read())\"",
         "poetry run python -c \"print(open('.env').read())\"",
-        "npx tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        // `npx tsx` (an undeclared runner) also asks under D4; `gap_w4-fetchexec` covers it.
+        "tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "ts-node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "pypy3 -c \"print(open('.env').read())\"",
         "Rscript -e \"readLines('.env')\"",
@@ -1984,7 +1985,8 @@ fn i22_templates_and_metadata_have_no_opinion() {
         "file .env",
         "echo .env | xargs ls -la",
         "node -e \"console.log(process.env)\"",
-        "python3 -c \"import os; print(os.environ.get('KEY'))\"",
+        // Printing a secret-named variable is a deny under D2 (`gap_w3-envdump` covers it).
+        "python3 -c \"import os; print(os.environ.get('HOME'))\"",
         "node -e \"console.log('process.env')\"",
         "awk '$0 ~ \".env\"' .gitignore",
         "perl -ne \"print if /'\\.env'/\" src/config.py",
