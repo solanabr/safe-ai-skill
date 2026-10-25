@@ -25,8 +25,8 @@ trap 'rm -rf "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 
 # The shim and the fakes read these; the caller's own values must not leak into the cases.
-unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE CLAUDE_PROJECT_DIR FAKE_UNAME_S \
-  FAKE_UNAME_M FAKE_MARKS FAKE_REAL_SHA
+unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE SAFE_AI_SKILL_SHIM_CACHE CLAUDE_PROJECT_DIR \
+  FAKE_UNAME_S FAKE_UNAME_M FAKE_MARKS FAKE_REAL_SHA
 
 # The real platform, for the cases that run a native executable as the engine.
 host_s=$(uname -s)
@@ -92,7 +92,13 @@ mkdir "$shasum_dir" "$broken_sha_dir"
 printf '#!/bin/sh\n: >"$FAKE_MARKS/shasum"\n[ "$*" = "-a 256" ] || exit 1\nexec $FAKE_REAL_SHA\n' \
   >"$shasum_dir/shasum"
 printf '#!/bin/sh\nexit 1\n' >"$broken_sha_dir/sha256sum"
-chmod +x "$shasum_dir/shasum" "$broken_sha_dir/sha256sum"
+# A sha256sum that records it ran, for the verified-hash cache cases (PATH keeps the host's
+# stat and date).
+rec_sha_dir=$work/rec-sha
+mkdir "$rec_sha_dir"
+# shellcheck disable=SC2016 # expands when the fake runs
+printf '#!/bin/sh\n: >"$FAKE_MARKS/sha"\nexec $FAKE_REAL_SHA\n' >"$rec_sha_dir/sha256sum"
+chmod +x "$shasum_dir/shasum" "$broken_sha_dir/sha256sum" "$rec_sha_dir/sha256sum"
 
 # mk <path> <body>: write an executable fake engine that records it ran, then runs <body>.
 # The fakes' $-expressions are meant to expand when they run, not here.
@@ -173,6 +179,8 @@ fresh() {
   no_stamp=
   e_path=
   e_tmpdir=
+  e_cache=
+  e_data=$data_dir
   stale=1
 }
 
@@ -181,7 +189,7 @@ fresh() {
 launch() {
   PATH=$fakebin:${e_path:-$PATH}
   FAKE_MARKS=$marks
-  CLAUDE_PLUGIN_DATA=$data_dir
+  CLAUDE_PLUGIN_DATA=$e_data
   CLAUDE_PROJECT_DIR=$project_dir
   FAKE_UNAME_M=$u_m
   export PATH FAKE_MARKS CLAUDE_PLUGIN_DATA CLAUDE_PROJECT_DIR FAKE_UNAME_M
@@ -189,6 +197,8 @@ launch() {
   if [ -n "$e_strict" ]; then SAFE_AI_SKILL_STRICT=$e_strict && export SAFE_AI_SKILL_STRICT; fi
   if [ -n "$e_disable" ]; then SAFE_AI_SKILL_DISABLE=$e_disable && export SAFE_AI_SKILL_DISABLE; fi
   if [ -n "$e_tmpdir" ]; then TMPDIR=$e_tmpdir && export TMPDIR; fi
+  if [ -n "$e_cache" ]; then SAFE_AI_SKILL_SHIM_CACHE=$e_cache && export SAFE_AI_SKILL_SHIM_CACHE; fi
+  if [ -z "$e_data" ]; then unset CLAUDE_PLUGIN_DATA; fi
   if [ "$sh_cmd" = direct ]; then exec "$bin_dir/safe-ai-skill" "$@"; fi
   # shellcheck disable=SC2086 # sh_cmd is one shell or two words, e.g. "bash --posix"
   if [ -n "$bare" ]; then cd "$bin_dir" && exec $sh_cmd safe-ai-skill "$@"; fi
@@ -465,9 +475,147 @@ opencode_matrix() {
   expect_out "$DENY"
 }
 
+# The verified-hash cache: a binary whose sha256 matched once is not rehashed while its
+# fingerprint (dev, inode, size, mtime, ctime) and the stamped hash stay the same. Only a
+# binary whose ctime predates the check is cached, so these cases age their engines first.
+cache_matrix() {
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  engine "$bin_dir/safe-ai-skill-windows-x64.exe" ok
+  stamp
+  : >"$bin_dir/.sha-tools-from-path"
+  e_path=$rec_sha_dir:$PATH
+  cache=$data_dir/shim-verified-linux-x64
+  sleep 2
+
+  t "cache: a first run hashes the prebuilt and records it, mode 0600"
+  run gate-read
+  expect_rc 0
+  expect_ran sha
+  expect_ran safe-ai-skill-linux-x64
+  check
+  [ -f "$cache" ] && [ ! -L "$cache" ] || fail "no cache file at $cache"
+  check
+  case $(ls -l "$cache" 2>/dev/null) in
+    -rw-------*) ;;
+    *) fail "cache mode is $(ls -l "$cache" 2>/dev/null | cut -c1-10), want -rw-------" ;;
+  esac
+  check
+  [ -z "$(find "$data_dir" -name '.shim-verified-*')" ] || fail "a temp file was left behind"
+
+  rm -f "$marks"/*
+  t "cache: a second run skips the hash"
+  run gate-read
+  expect_rc 0
+  expect_out "ran=safe-ai-skill-linux-x64 args=gate-read stdin=$payload_text"
+  expect_not_ran sha
+  expect_ran safe-ai-skill-linux-x64
+
+  for off in 0 envset; do
+    rm -f "$marks"/*
+    if [ "$off" = 0 ]; then e_cache=0; else e_data=; fi
+    t "cache: off ($off) hashes on every call"
+    run gate-read
+    expect_rc 0
+    expect_ran sha
+    expect_ran safe-ai-skill-linux-x64
+    e_cache=
+    e_data=$data_dir
+  done
+
+  good=$(cat "$cache")
+  for bad in hash perm symlink garbage empty; do
+    case $bad in
+      hash) printf '%s\n' "$good" | sed 's/ [0-9a-f]\{64\} / 0000000000000000000000000000000000000000000000000000000000000000 /' >"$cache" ;;
+      perm) chmod 644 "$cache" ;;
+      symlink) rm -f "$cache" && printf '%s\n' "$good" >"$cache.real" &&
+        chmod 600 "$cache.real" && ln -s "$cache.real" "$cache" ;;
+      garbage) printf 'v1 junk\n' >"$cache" ;;
+      empty) : >"$cache" ;;
+    esac
+    rm -f "$marks"/*
+    t "cache: a $bad cache is not trusted"
+    run gate-read
+    expect_rc 0
+    expect_ran sha
+    expect_ran safe-ai-skill-linux-x64
+    check
+    if [ "$bad" = symlink ]; then
+      [ -L "$cache" ] || fail "the symlinked cache was replaced"
+      rm -f "$cache" "$cache.real"
+      run gate-read
+    else
+      [ "$(cat "$cache")" = "$good" ] || fail "the cache was not rewritten after the rehash"
+    fi
+    check
+    case $(ls -l "$cache" 2>/dev/null) in
+      -rw-------*) ;;
+      *) fail "cache mode after rewrite is not -rw-------" ;;
+    esac
+  done
+
+  t "cache: a rewritten prebuilt is rehashed and caught despite the cache"
+  no_stamp=1
+  cp -p "$bin_dir/safe-ai-skill-linux-x64" "$case_dir/ref"
+  engine "$bin_dir/safe-ai-skill-linux-x64" planted
+  touch -r "$case_dir/ref" "$bin_dir/safe-ai-skill-linux-x64"
+  rm -f "$marks"/*
+  run gate-bash
+  expect_rc 2
+  expect_ran sha
+  expect_not_ran safe-ai-skill-linux-x64
+  check
+  [ "$(cat "$cache")" = "$good" ] || fail "a failed check changed the cache"
+
+  t "cache: a prebuilt swapped in by rename is rehashed and caught"
+  cp -p "$case_dir/ref" "$bin_dir/safe-ai-skill-linux-x64"
+  run gate-read
+  expect_rc 0
+  cp -p "$bin_dir/safe-ai-skill-linux-x64" "$case_dir/swap"
+  engine "$case_dir/swap" planted
+  touch -r "$case_dir/ref" "$case_dir/swap"
+  mv -f "$case_dir/swap" "$bin_dir/safe-ai-skill-linux-x64"
+  rm -f "$marks"/*
+  run gate-bash
+  expect_rc 2
+  expect_ran sha
+  expect_not_ran safe-ai-skill-linux-x64
+
+  # Deterministic only when the rewrite and the run share one wall-clock second.
+  t "cache: a prebuilt changed within the check's second is not cached"
+  same=
+  for _ in 1 2 3 4 5; do
+    s0=$(date +%s)
+    engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    rm -f "$cache"
+    run gate-read
+    if [ "$s0" = "$(date +%s)" ]; then
+      same=1
+      break
+    fi
+  done
+  if [ -n "$same" ]; then
+    expect_rc 0
+    check
+    [ ! -e "$cache" ] || fail "a just-changed prebuilt was cached"
+  else
+    echo "skip: could not run the shim within one second of rewriting the prebuilt"
+  fi
+
+  t "cache: Windows never caches (a user process can set ctime there)"
+  u_s=MINGW64_NT-10.0-22631
+  rm -f "$marks"/*
+  run gate-read
+  expect_rc 0
+  expect_ran safe-ai-skill-windows-x64.exe
+  check
+  [ -z "$(find "$data_dir" -name 'shim-verified-windows*')" ] || fail "a Windows cache was written"
+}
+
 matrix() {
   codex_matrix
   opencode_matrix
+  cache_matrix
 
   # Dispatch: each platform runs its own prebuilt, with args and stdin intact.
   for spec in Darwin/arm64/darwin-arm64 Darwin/x86_64/darwin-x64 Linux/x86_64/linux-x64 \
