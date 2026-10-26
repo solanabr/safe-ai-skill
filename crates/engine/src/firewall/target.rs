@@ -4,8 +4,10 @@
 //! worktree at the main checkout's root; outside a git repository, when the repository root is
 //! the home directory, or on Windows it stays next to `.claude/settings.json` in the starting
 //! directory (docs: settings.md, "Where Claude Code keeps the local file in a git repository").
-//! Relative sandbox paths in that file anchor at the session's primary working directory, so
-//! the generated `"."` entries mean the project wherever the file lives.
+//! Relative sandbox paths in that file anchor at the session's primary working directory, not
+//! at the directory holding the file (settings.md, same section), so `"."` means wherever the
+//! session starts; the repository root (`dir`) and its `.git` ([`Target::git_dir`]) are written
+//! as absolute paths beside it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,10 @@ pub struct Target {
     pub in_git: bool,
     /// The git common dir's real path when it lies outside the session's project root.
     pub git_common_outside: Option<PathBuf>,
+    /// The repository's `.git` directory (absolute), when `dir` is the git work tree root and
+    /// `.git` there is a directory (a linked worktree's `.git` file is covered by
+    /// `git_common_outside` instead).
+    pub git_dir: Option<PathBuf>,
 }
 
 impl Target {
@@ -45,8 +51,13 @@ pub fn locate(cwd: &Path, home: Option<&Path>) -> Target {
         .map(Path::to_path_buf);
     let home = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
     let mut git_common_outside = None;
+    let mut git_dir = None;
     let dir = match &toplevel {
         Some(top) if !cfg!(windows) && home.as_deref() != Some(top.as_path()) => {
+            let dotgit = top.join(".git");
+            if std::fs::symlink_metadata(&dotgit).is_ok_and(|m| m.is_dir()) {
+                git_dir = Some(dotgit);
+            }
             let common = common_dir(top);
             if let Some(c) = &common {
                 if !c.starts_with(top) {
@@ -71,6 +82,7 @@ pub fn locate(cwd: &Path, home: Option<&Path>) -> Target {
         dir,
         in_git,
         git_common_outside,
+        git_dir,
     }
 }
 
@@ -198,10 +210,14 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "sas-fw-target-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
+            "sas-fw-target-{tag}-{}-{nanos}-{seq}",
+            std::process::id()
         ));
         std::fs::create_dir_all(&p).unwrap();
         std::fs::canonicalize(&p).unwrap()
@@ -225,6 +241,7 @@ mod tests {
         assert_eq!(t.dir, d);
         assert!(t.in_git);
         assert!(t.git_common_outside.is_none());
+        assert_eq!(t.git_dir, Some(d.join(".git")));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -244,6 +261,7 @@ mod tests {
         let t = locate(&wt, None);
         assert_eq!(t.dir, main);
         assert_eq!(t.git_common_outside, Some(main.join(".git")));
+        assert_eq!(t.git_dir, None);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -254,6 +272,7 @@ mod tests {
         std::fs::create_dir_all(d.join("p")).unwrap();
         let t = locate(&d.join("p"), Some(&d));
         assert_eq!(t.dir, d.join("p"));
+        assert_eq!(t.git_dir, None);
         let _ = std::fs::remove_dir_all(&d);
     }
 

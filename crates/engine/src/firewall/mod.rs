@@ -260,6 +260,23 @@ pub fn inferred_tier(doc: &Json) -> Option<Tier> {
     }
 }
 
+/// The keys on a path this writer manages (or a parent of one) that `doc` repeats. Claude Code
+/// reads the last occurrence of a repeated key, so a file with one is never edited.
+pub fn duplicate_keys(doc: &Json) -> Vec<String> {
+    let paths: Vec<&str> = rules::LISTS.iter().chain(rules::SCALARS).copied().collect();
+    doc.duplicate_keys(&paths)
+}
+
+fn duplicate_message(t: &Target, keys: &[String]) -> String {
+    format!(
+        "{} repeats the key(s) {}; Claude Code reads only the last occurrence of each, so the \
+         firewall will not edit this file; merge each repeated key into one and run the \
+         command again",
+        t.settings.display(),
+        keys.join(", ")
+    )
+}
+
 fn live_doc(t: &Target) -> Option<Json> {
     target::read_settings(&t.settings)
         .ok()
@@ -419,6 +436,8 @@ fn machine(t: &Target) -> MachineInputs {
             .git_common_outside
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
+        git_dir: t.git_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        project_root: Some(t.dir.to_string_lossy().into_owned()),
     }
 }
 
@@ -438,6 +457,10 @@ fn compute(t: &Target, tier: Tier, prior: &Prior) -> Result<Preview, String> {
             "{} does not hold a JSON object; fix it and run the command again",
             t.settings.display()
         ));
+    }
+    let dups = duplicate_keys(&doc);
+    if !dups.is_empty() {
+        return Err(duplicate_message(t, &dups));
     }
     let m = machine(t);
     let block = rules::plan(tier, &domains(tier)?, &m);
@@ -567,7 +590,7 @@ fn write(dir: &DataDir, t: &Target, tier: Tier, prior: &Prior, now: u64) -> Resu
 /// One drift finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Drift {
-    /// A stable id: `not-applied`, `tier`, `absent`, `rule-set`, `record`.
+    /// A stable id: `not-applied`, `tier`, `absent`, `rule-set`, `record`, `duplicate-key`.
     pub kind: &'static str,
     /// One sentence ending with the remedy.
     pub message: String,
@@ -622,6 +645,14 @@ pub fn check(ctx: &Ctx<'_>) -> Report {
                 .to_string(),
         });
     }
+    let live = live_doc(&t);
+    let dups = live.as_ref().map(duplicate_keys).unwrap_or_default();
+    if !dups.is_empty() {
+        drift.push(Drift {
+            kind: "duplicate-key",
+            message: duplicate_message(&t, &dups),
+        });
+    }
     let enforced = p.record().cloned();
     match &enforced {
         None => {
@@ -659,7 +690,6 @@ pub fn check(ctx: &Ctx<'_>) -> Report {
                     ),
                 });
             }
-            let live = live_doc(&t);
             for (path, entries) in &r.rule_ids {
                 let have: Vec<&str> = live
                     .as_ref()

@@ -24,6 +24,9 @@
 #   - opencode hooks (`adapt opencode <gate>`, run by the opencode plugin): the same deny JSON
 #     on every failure, and the engine's answer passes only when it is nothing, one deny line
 #     or (gate-read) one `updatedInput` line.
+#   - gate-config (ConfigChange) blocks the settings change on tamper or crash with a top-level
+#     `decision: "block"` (exit 0), the answer that event honours; when the engine can't run
+#     it continues like the other non-PreToolUse hooks.
 #   - gate-permission (PermissionRequest) ignores exit 2, so where gate-bash exits 2 (tamper,
 #     crash, strict) it prints a PermissionRequest deny with exit 0. When the engine can't run
 #     it prints nothing: Claude Code then shows its own prompt (denies when nobody can see it).
@@ -95,6 +98,8 @@ case $sub in
   gate-skill) kind=skill ;;
   # PermissionRequest fails closed like gate-bash, but exit 2 means nothing on that event.
   gate-permission) kind=permission ;;
+  # ConfigChange: no `ask` there; a block keeps an unchecked settings change out.
+  gate-config) kind=config ;;
   # Hooks on events other than PreToolUse, where `ask` means nothing.
   gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice | session-end)
     kind=other
@@ -158,6 +163,12 @@ codex_fail() {
 # be JSON-safe.
 permission_deny() {
   printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"%s"}}}\n' "$1"
+  exit 0
+}
+
+# ConfigChange block (exit 0): the change is not applied. The argument must be JSON-safe.
+config_block() {
+  printf '{"decision":"block","reason":"%s"}\n' "$1"
   exit 0
 }
 
@@ -284,6 +295,7 @@ tampered() {
   case $kind in
     solana | mcp | skill | cli) exit 2 ;;
     permission) permission_deny "safe-ai-skill engine binary on $label fails its sha256 check (tampered?) and was not run. Reinstall the plugin" ;;
+    config) config_block "safe-ai-skill engine binary on $label fails its sha256 check (tampered?) and was not run; the settings change was not applied. Reinstall the plugin" ;;
   esac
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
@@ -338,6 +350,10 @@ crashed() {
     permission)
       printf 'safe-ai-skill: engine crashed (%s); %s denied this request\n' "$how" "$sub" >&2
       permission_deny "safe-ai-skill engine crashed ($how); the request is denied, run this call yourself"
+      ;;
+    config)
+      printf 'safe-ai-skill: engine crashed (%s); %s blocked this settings change\n' "$how" "$sub" >&2
+      config_block "safe-ai-skill engine crashed ($how); the settings change was not applied"
       ;;
   esac
   printf 'safe-ai-skill: engine crashed (%s); %s skipped\n' "$how" "$sub" >&2

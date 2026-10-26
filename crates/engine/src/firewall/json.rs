@@ -28,18 +28,19 @@ pub enum Json {
 }
 
 impl Json {
-    /// The value under `key` of an object.
+    /// The value under `key` of an object. A duplicated key reads as its last occurrence, as
+    /// Claude Code (and serde_json) read it.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
-            Json::Obj(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            Json::Obj(entries) => entries.iter().rfind(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    /// The value under `key` of an object, mutable.
+    /// The value under `key` of an object, mutable (the last occurrence, as [`Json::get`]).
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Json> {
         match self {
-            Json::Obj(entries) => entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
+            Json::Obj(entries) => entries.iter_mut().rfind(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
@@ -49,10 +50,11 @@ impl Json {
         path.split('.').try_fold(self, |node, key| node.get(key))
     }
 
-    /// Set `key` of an object: replaced in place, else appended. No-op on a non-object.
+    /// Set `key` of an object: its last occurrence replaced in place, else appended. No-op on a
+    /// non-object.
     pub fn set(&mut self, key: &str, value: Json) {
         if let Json::Obj(entries) = self {
-            match entries.iter_mut().find(|(k, _)| k == key) {
+            match entries.iter_mut().rfind(|(k, _)| k == key) {
                 Some((_, v)) => *v = value,
                 None => entries.push((key.to_string(), value)),
             }
@@ -64,6 +66,30 @@ impl Json {
         if let Json::Obj(entries) = self {
             entries.retain(|(k, _)| k != key);
         }
+    }
+
+    /// Every prefix of `paths` (dotted) whose last key appears more than once in its object,
+    /// in `paths` order without repeats. Each step descends into the last occurrence.
+    pub fn duplicate_keys(&self, paths: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for path in paths {
+            let mut node = Some(self);
+            let mut prefix = String::new();
+            for key in path.split('.') {
+                let Some(Json::Obj(entries)) = node else {
+                    break;
+                };
+                if !prefix.is_empty() {
+                    prefix.push('.');
+                }
+                prefix.push_str(key);
+                if entries.iter().filter(|(k, _)| k == key).count() > 1 && !out.contains(&prefix) {
+                    out.push(prefix.clone());
+                }
+                node = node.and_then(|n| n.get(key));
+            }
+        }
+        out
     }
 
     /// The string elements of an array (others skipped).
@@ -433,6 +459,21 @@ mod tests {
             to_text_with(&v, "    "),
             "{\n    \"a\": [\n        1\n    ]\n}\n"
         );
+    }
+
+    #[test]
+    fn duplicate_keys_read_last_and_are_reported() {
+        let v = parse(
+            r#"{"sandbox":{"enabled":true},"model":"a","sandbox":{"enabled":false,"x":1,"x":2},"model":"b"}"#,
+        )
+        .unwrap();
+        assert_eq!(v.at("sandbox.enabled"), Some(&Json::Bool(false)));
+        assert_eq!(
+            v.duplicate_keys(&["sandbox.enabled", "sandbox.x", "permissions.deny"]),
+            ["sandbox", "sandbox.x"]
+        );
+        let clean = parse(r#"{"sandbox":{"enabled":true},"a":1,"a":2}"#).unwrap();
+        assert!(clean.duplicate_keys(&["sandbox.enabled"]).is_empty());
     }
 
     #[test]

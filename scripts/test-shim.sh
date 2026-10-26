@@ -307,6 +307,12 @@ expect_permission_deny() {
     and d["hookSpecificOutput"]["decision"]["behavior"] == "deny"
     and "'"$1"'" in d["hookSpecificOutput"]["decision"]["message"]'
 }
+# expect_config_block <needle>: a ConfigChange block whose reason contains <needle>.
+expect_config_block() {
+  expect_json 'list(d) == ["decision", "reason"]
+    and d["decision"] == "block"
+    and "'"$1"'" in d["reason"]'
+}
 # expect_notice <needle>: a SessionStart notice whose two texts both contain <needle>.
 expect_notice() {
   expect_json "'$1' in d['systemMessage']
@@ -763,6 +769,11 @@ matrix() {
     expect_rc 0
     expect_no_out
     expect_err_lines 1
+    t "$sc: gate-config lets the settings change through with one stderr line"
+    run gate-config
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
     t "$sc: SessionStart reports the firewall INACTIVE"
     run verify session
     expect_rc 0
@@ -781,7 +792,7 @@ matrix() {
     expect_err_has 'firewall inactive'
     t "$sc: SAFE_AI_SKILL_STRICT=1 fails closed"
     e_strict=1
-    for args in gate-read gate-bash gate-mcp 'verify session'; do
+    for args in gate-read gate-bash gate-mcp gate-config 'verify session'; do
       # shellcheck disable=SC2086 # 'verify session' is two arguments
       run $args
       expect_rc 2
@@ -827,6 +838,11 @@ matrix() {
     expect_rc 0
     expect_permission_deny crashed
     expect_err_has 'denied this request'
+    t "crash $sc: gate-config blocks the settings change with exit 0"
+    run gate-config
+    expect_rc 0
+    expect_config_block crashed
+    expect_err_has 'blocked this settings change'
     t "crash $sc: session-end continues"
     run session-end
     expect_rc 0
@@ -1047,6 +1063,10 @@ matrix() {
   run gate-permission
   expect_rc 0
   expect_permission_deny sha256
+  t "tamper: gate-config blocks the settings change with exit 0"
+  run gate-config
+  expect_rc 0
+  expect_config_block sha256
   t "tamper: the other PreToolUse gates ask"
   for args in gate-read gate-bash-secrets; do
     run "$args"
@@ -1339,6 +1359,9 @@ for event, groups in cfg["hooks"].items():
                 problems.append(f"{event}: must run gate-permission, runs {cmd!r}")
             if sub == "gate-permission" and not permission:
                 problems.append(f"{event}: gate-permission belongs on PermissionRequest only")
+            # The shim answers gate-config with ConfigChange's own block (decision: block).
+            if (sub == "gate-config") != (event == "ConfigChange"):
+                problems.append(f"{event}: gate-config belongs on ConfigChange, and only it there")
             want = "block" if solana_entry or skill or permission else "continue"
             blocking += solana_entry
             if solana_entry and (group.get("matcher") != "Bash" or "if" in hook):
