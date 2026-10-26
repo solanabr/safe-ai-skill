@@ -437,6 +437,7 @@ fn machine(t: &Target) -> MachineInputs {
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         git_dir: t.git_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        project_root: Some(t.dir.to_string_lossy().into_owned()),
     }
 }
 

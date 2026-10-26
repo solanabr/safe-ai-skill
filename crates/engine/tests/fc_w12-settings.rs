@@ -215,7 +215,12 @@ fn lowering_is_parked_and_writes_nothing() {
     assert!(done.contains("relaxed"), "{done}");
     let fresh = Env::new("lower-fresh");
     ok(fresh.apply(None, Tier::Relaxed));
-    assert_eq!(e.text(), fresh.text());
+    // The block names each project's root, so compare with the roots masked.
+    let masked = |env: &Env| {
+        env.text()
+            .replace(env.project.to_string_lossy().as_ref(), "<root>")
+    };
+    assert_eq!(masked(&e), masked(&fresh));
     let choice = safe_ai_skill::tierstate::user_choice(&e.data, &e.project);
     assert_eq!(choice.tier.map(|(t, _)| t), Some(Tier::Relaxed));
 }
@@ -391,6 +396,61 @@ fn duplicated_keys_are_refused_and_reported() {
     }
     let note = firewall::session_note(&d.ctx(Tier::Relaxed)).unwrap();
     assert!(note.contains("repeats"), "{note}");
+}
+
+#[test]
+fn project_root_is_written_absolute_from_a_subdirectory_at_high() {
+    let e = Env::new("rootsub");
+    std::fs::create_dir_all(e.project.join(".git")).unwrap();
+    let sub = e.project.join("a/b");
+    std::fs::create_dir_all(&sub).unwrap();
+    let ctx = Ctx {
+        dir: &e.data,
+        cwd: &sub,
+        effective: Tier::High,
+        home: None,
+        now: 1_000,
+    };
+    let apply = Command::Apply {
+        tier: None,
+        project: false,
+        dry_run: false,
+    };
+    ok(firewall::run(&apply, &ctx));
+    let root = e.project.to_string_lossy().into_owned();
+    let d = e.doc();
+    for list in [
+        "sandbox.filesystem.allowWrite",
+        "sandbox.filesystem.allowRead",
+    ] {
+        let got = strings(&d, list);
+        assert!(got.contains(&root), "{list}: {got:?}");
+        assert!(got.contains(&".".to_string()), "{list}: {got:?}");
+    }
+    // A rule-set-1 block (relative entries only) is brought up to date by the resync.
+    let text = e.text().replace(&format!("        \"{root}\",\n"), "");
+    assert!(!text.contains(&format!("\"{root}\"")), "{text}");
+    std::fs::write(e.settings(), &text).unwrap();
+    let mut file: firewall::RecordFile = match statefile::load(&e.data, RECORD_FILE) {
+        statefile::Loaded::Valid(f) => f,
+        _ => panic!(),
+    };
+    for rec in file.targets.values_mut() {
+        rec.rule_set_version = 1;
+        for v in rec.rule_ids.values_mut() {
+            v.retain(|x| *x != root);
+        }
+    }
+    statefile::store(&e.data, RECORD_FILE, &file).unwrap();
+    assert!(firewall::session_resync(&ctx).is_some());
+    let d = e.doc();
+    for list in [
+        "sandbox.filesystem.allowWrite",
+        "sandbox.filesystem.allowRead",
+    ] {
+        assert!(strings(&d, list).contains(&root), "{list}");
+    }
+    assert!(firewall::check(&ctx).drift.is_empty());
 }
 
 #[test]

@@ -6,7 +6,8 @@
 //! directory (docs: settings.md, "Where Claude Code keeps the local file in a git repository").
 //! Relative sandbox paths in that file anchor at the session's primary working directory, not
 //! at the directory holding the file (settings.md, same section), so `"."` means wherever the
-//! session starts and the repository's `.git` is written as an absolute path ([`Target::git_dir`]).
+//! session starts; the repository root (`dir`) and its `.git` ([`Target::git_dir`]) are written
+//! as absolute paths beside it.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
