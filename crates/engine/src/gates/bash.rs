@@ -1311,7 +1311,17 @@ fn classify_anchor(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision, G
         "idl" | "legacy-idl" => classify_anchor_idl(argv, &sub, ctx),
         // Local/dev operations.
         "build" | "keys" | "verify" | "localnet" | "expand" | "new" | "init" => readonly("anchor"),
-        // `test` deploys to the configured cluster; `run` executes repo-defined scripts.
+        // `test` deploys to the resolved cluster (usually its own local validator): no opinion
+        // on a positively identified localnet/devnet/testnet, an ask anywhere else.
+        "test"
+            if matches!(
+                ctx.network,
+                Network::Localnet | Network::Devnet | Network::Testnet
+            ) =>
+        {
+            readonly("anchor")
+        }
+        // `run` executes repo-defined scripts.
         "test" | "run" => ask_not_readonly("anchor", &sub),
         _ => ask_unknown("anchor"),
     }

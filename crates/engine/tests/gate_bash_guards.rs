@@ -599,7 +599,8 @@ fn read_only_fast_path_has_no_opinion() {
 fn trimmed_commands_are_off_the_fast_path() {
     for cmd in [
         "spl-token gc",
-        "anchor test",
+        // `anchor test` on an identified devnet has no opinion; off it, it still asks.
+        "anchor test --provider.cluster mainnet",
         "anchor run deploy-script",
         "anchor idl fetch PROG",
         "anchor idl init --filepath target/idl/p.json PROG",
