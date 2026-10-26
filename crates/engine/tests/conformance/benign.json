@@ -570,6 +570,42 @@
         "exit": 0,
         "stdout": ""
       }
+    },
+    {
+      "name": "gate-permission: ordinary read",
+      "args": [
+        "gate-permission"
+      ],
+      "stdin": {
+        "hook_event_name": "PermissionRequest",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "permission_mode": "default",
+        "tool_name": "Read",
+        "tool_input": {
+          "file_path": "README.md"
+        }
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
+    },
+    {
+      "name": "session-end: quiet session",
+      "args": [
+        "session-end"
+      ],
+      "stdin": {
+        "hook_event_name": "SessionEnd",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "reason": "other"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
     }
   ]
 }

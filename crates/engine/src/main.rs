@@ -104,6 +104,8 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-mcp", |_| cmd_gate_mcp()),
     ("gate-webfetch", |_| cmd_gate_webfetch()),
     ("gate-config", |_| cmd_gate_config()),
+    ("gate-permission", |_| cmd_gate_permission()),
+    ("session-end", |_| cmd_session_end()),
     ("gate-tamper", |_| cmd_gate_tamper()),
     ("gate-skill", |_| cmd_gate_skill()),
     ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
@@ -649,6 +651,7 @@ fn inner_text_verdict(text: &str, cwd: &Path, effective: &Policy) -> Option<Verd
         tamper::decide_bash_writes(text, cwd, effective, tier),
         envread::decide_bash(text),
         gitguard::decide(text, cwd, effective, tier),
+        safe_ai_skill::gates::containers::decide(text, cwd, effective, tier),
     ])
 }
 
@@ -707,6 +710,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         envread::decide_bash(command),
         encoded_bash_verdict(command, &cwd, &effective),
         git_verdict(command, &cwd, &effective),
+        safe_ai_skill::gates::containers::decide(command, &cwd, &effective, tier),
     ]);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
@@ -860,6 +864,56 @@ fn cmd_gate_config() -> ExitCode {
             serde_json::json!({ "decision": "block", "reason": reason }),
         ));
     }
+    ExitCode::SUCCESS
+}
+
+/// `PermissionRequest`: deny a hard-guarded call nobody would approve ([`permreq`]); never
+/// allows.
+fn cmd_gate_permission() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let Ok(input) = parsed else {
+        return ExitCode::SUCCESS;
+    };
+    let Some(tool) = input.tool_name.as_deref() else {
+        return ExitCode::SUCCESS;
+    };
+    let cwd = cwd_of(&input);
+    let dir = state_dir(&cwd);
+    let effective = load_effective_policy(&cwd, &dir);
+    let out = safe_ai_skill::gates::permreq::decide(
+        tool,
+        input.tool_input.as_ref(),
+        input.permission_mode.as_deref(),
+        &cwd,
+        &effective,
+        &dir,
+    );
+    if let Some(msg) = out
+        .as_ref()
+        .and_then(|v| v["hookSpecificOutput"]["decision"]["message"].as_str())
+    {
+        write_audit(
+            &effective,
+            &dir.path,
+            &input,
+            &raw,
+            "permission_request",
+            &Decision::Deny {
+                reason: msg.to_string(),
+            },
+        );
+    }
+    let _ = io::emit_value(out);
+    ExitCode::SUCCESS
+}
+
+/// `session-end`: the SessionEnd hook writes this session's report (informational). Claude
+/// Code discards SessionEnd output, so nothing is printed and it always exits 0.
+fn cmd_session_end() -> ExitCode {
+    let (raw, parsed) = read_input();
+    let cwd = cwd_of(&parsed.unwrap_or_default());
+    let dir = state_dir(&cwd);
+    let _ = safe_ai_skill::report::session_end(&dir, &raw, now_secs());
     ExitCode::SUCCESS
 }
 
@@ -1603,6 +1657,19 @@ fn cmd_verify_session() -> ExitCode {
             res.system_message.push('\n');
         }
         res.system_message.push_str(&tip);
+    }
+
+    // The previous session's report in this project, when it had a deny or ask: one line, once.
+    if let Some(recap) = safe_ai_skill::report::session_start(
+        &dir,
+        hook_session(&input).as_deref().unwrap_or(""),
+        &cwd,
+        now,
+    ) {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&recap);
     }
 
     if let Some(out) = res.hook_output() {

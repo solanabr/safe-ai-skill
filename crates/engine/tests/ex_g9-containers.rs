@@ -28,7 +28,10 @@ const OTHERS: &[&str] = &[
 ];
 
 fn case_dir(id: &str, files: Option<&Value>) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ex-g9-{}-{id}", std::process::id()));
+    // Tests in this binary run in parallel and share case ids: a counter keeps dirs apart.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ex-g9-{}-{n}-{id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     if let Some(files) = files.and_then(Value::as_object) {
