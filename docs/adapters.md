@@ -58,6 +58,8 @@ shim and accepts its answers.
 | Session start (`startup`, `resume`, `clear`, `compact`, `fork`) | `session-start` | The tier and state report, as `systemMessage` (shown to you) and `additionalContext` (given to the model). The supply-chain sweep is not run: it reads Claude Code's skill dirs and `.mcp.json`, which Codex does not load. Codex skills (`.agents/skills`, `$CODEX_HOME/skills`) and the MCP servers in Codex's `config.toml` are not scanned, and the report says so. |
 | Tool results (opt-in) | `redact --block-with-redaction` | See [Redaction](#redaction-opt-in). |
 
+**Which firewall checks reach Codex.** `gate-bash-secrets` carries the exfil tripwire, the tamper-content write checks, the download-and-run gate, the env-dump checks (`/proc/*/environ`, printing a secret-named variable, a dump piped elsewhere) and the encoded-command gate for Bash, and `gate-bash` the on-chain gates, so these run under Codex like under Claude Code (every `ask` is a `deny`). `gate-mcp` carries the MCP exfil, staking and token-transfer checks. There is **no `gate-webfetch` entry** (`CODEX_GATES` is `gate-bash`, `gate-bash-secrets`, `gate-tamper`, `gate-mcp`): Codex runs no hooks for its hosted tools (web search), so the `WebFetch` exfil check has nothing to attach to. A bare `printenv`/`env` dump passes with its secret values visible to the model unless the opt-in `redact` hook is on, because the value blanking is a redaction (PostToolUse) step.
+
 ### Self-protection
 
 Under Codex, these targets are also denied, through `apply_patch` and through shell writes.
@@ -378,6 +380,8 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
 | MCP tools `<server>_<tool>`, plugin and custom tools | `gate-mcp` | See [MCP names](#mcp-names). |
 | `read_mcp_resource` `{server, uri}` | `gate-mcp` | As `mcp__<server>__read_mcp_resource`; a path-like `uri` gets the read check. |
 | `task`, `todowrite`, `question`, `webfetch`, `websearch`, `skill`, `lsp`, `plan_exit`, `execute`, `list_mcp_resources`, `list_mcp_resource_templates`, `invalid` | none | |
+
+**Which firewall checks reach opencode.** The `bash` gates are `gate-bash` and `gate-bash-secrets`, so the exfil tripwire, tamper-content write checks, download-and-run, env-dump and encoded-command checks run on `bash` commands, and `gate-mcp` runs the MCP checks, as under Codex (`GATES` in `adapt_opencode.rs`). opencode's `webfetch` tool is **ungated** and there is no `gate-webfetch` entry, so a `WebFetch` URL to an exfil host is not seen (a `curl` through `bash` is). opencode has no output redaction, so a bare `printenv`/`env` dump reaches the model with its values.
 
 **`ask` becomes a block.** opencode's `tool.execute.before` either throws or returns; there is
 no ask. So every `ask` reaches opencode as a deny, and the reason says how to go ahead: run it

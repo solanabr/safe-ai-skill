@@ -60,7 +60,7 @@ One JSON object per line, eight topic files. The plugin's engine runner
     state; `combined` is recomputed. End-state invariants are not checked on a row that has
     `interim`'s kit value, only on the end state.
     - Additive: `reason` (required with `interim.plugin`): why the shipped engine differs, for
-      example `exfil tripwire deferred (#19)`. The engine runner asserts `interim.plugin` on such a
+      example `a file-body upload keeps the POST ask at every tier`. The engine runner asserts `interim.plugin` on such a
       row.
     - Additive: `until_feature`: a cargo feature that already gives the end state; a build with
       it is held to `plugin`, a build without it to `interim.plugin`. No feature is known since
@@ -99,15 +99,19 @@ checks them again on its actual verdicts for rows without `interim`.
   50 SOL exceeds `hard_tx_sol_max` and denies (kept as DEV-3B); MN-3 and MN-4 get interim kit values.
 - P2 is open: no row freezes the precedence between `ANCHOR_PROVIDER_URL` and `Anchor.toml` for
   `anchor *`; CL-3, CL-3B and CL-8 cover only the `solana`-side and flag cases.
-- Not covered here: supply chain (F5, needs pack fixtures) and PostToolUse redaction, which are not
-  PreToolUse verdicts.
+- Not covered here: supply chain (F5, needs pack fixtures), PostToolUse redaction, and the tripwire
+  gates' own cases (tamper content, download-and-run, encoded commands, env dumps, `gate-webfetch`),
+  which are held by `crates/engine/tests/gap_w*.rs`.
 
 ## Known limits
 
 - **Hook wiring.** The runner calls `gate-bash` for every Bash row, matching `hooks.json`'s single
   unconditional `gate-bash` entry.
-- **Interim rows.** The exfil tripwire is deferred (#19): its host-list and quiet JSON-RPC rows hold
-  the shipped verdicts in `interim.plugin`.
+- **Interim rows.** The exfil tripwire shipped (#19). The one exfil row that still carries
+  `interim.plugin` is the file-body upload to a Solana RPC host, which keeps the POST ask at every
+  tier.
+- **Class U on testnet.** The `-t` rows (`IR-6`, `U01-t`, ...) expect `AAAA`: testnet is treated like
+  devnet, a hard-guard ask, not a deny.
 - **Sandbox.** `sandbox: unset` and `off` both map to the engine's "off" override under `test-hooks`,
   so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by F2's tests.
 - **Not in the corpus:** supply chain (needs pack fixtures) and PostToolUse redaction.

@@ -11,17 +11,22 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **Exfil tripwire** ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)): requests to the shared exfil host list are denied from Bash, MCP browser tools and a new `gate-webfetch` hook for `WebFetch`. See [docs/tiers.md](docs/tiers.md#exfiltration-tripwire).
 - **Content-aware tamper checks:** an edit that would turn the firewall off is denied at every tier and is never relaxable; risky git, MCP, package-script and kit-tier edits ask.
 - **Download-and-run gate:** running freshly downloaded code, or a one-shot package runner for a package the project does not declare, asks (deny at High and headless).
-- **Encoded-command gate:** encoded payloads run through a shell are decoded and judged by every Bash gate; an undecodable one asks (deny at High).
+- **Encoded-command gate:** encoded payloads run through a shell are decoded and judged by every Bash gate (Solana, secrets, credential dump, wallet destruction, env write, exfil, download-and-run, tamper-write and env-dump), as if typed; an undecodable one asks (deny at High).
 - **Shim verified-hash cache:** the shim skips rehashing an unchanged engine binary. `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off; every hook call is then slower (a few ms with a native `sha256sum`, about 20 ms with Perl `shasum`).
+
+### Documentation
+
+- `docs/adapters.md` states which of these gates reach Codex and opencode: neither has a `gate-webfetch` entry, and opencode has no output redaction.
+- Known limits kept open and documented: `/proc` environment reads by a non-literal path, secrets printed by tools other than `echo`/`printf`, `.env.production` reached through a glob, symlink or Grep, a tamper write through an existing hard link, and base64-decoded write targets that never name `.claude`.
 
 ### Changed
 
 - **Token amounts are token units:** SOL spend caps and grants never cover `spl-token` or MCP token transfers. Mainnet or an unknown cluster asks (deny headless); devnet, testnet and localnet have no opinion.
-- **Testnet is treated like devnet:** an irreversible action on a positively identified testnet is a hard-guard ask, as on devnet and localnet, instead of a deny.
+- **Testnet is treated like devnet:** an irreversible action on a positively identified testnet is a hard-guard ask, as on devnet and localnet, instead of a deny, and an `spl-token` transfer there has no opinion. Mainnet and unidentified clusters still deny. This supersedes the testnet wording in the 1.1.0 and 1.2.0 entries below.
 - **More authority changes are hard guards:** stake, vote and nonce authority commands and `spl-token approve`.
 - **Cluster detection is stricter:** an ambiguous RPC URL or `-C` config file resolves to an unknown cluster.
 - **MCP:** routed actions are read from nested parameters; staking actions are hard-guarded; the sensitive-name pattern is wider (`default.policy.yaml`).
-- **Env output:** printing a secret-named variable is denied; bare env dumps pass with values blanked; a transformed dump asks. The secret-name rule no longer flags paths, mints or addresses. Redaction covers more output shapes and credentials inside URLs. `.env.production` is denied from Relaxed up.
+- **Env output:** printing a secret-named variable is denied; bare env dumps pass with values blanked; a transformed dump asks. The secret-name rule no longer flags paths, mints or addresses. Redaction blanks `NAME = value` with spaces, `set -x` trace lines, `grep path:` prefixes, quoted snake_case keys, unquoted YAML/JSON values, and the password or `api-key`/`token` query value inside URLs. `.env.production` is denied from Relaxed up.
 
 ## [1.2.0] — Unreleased
 
