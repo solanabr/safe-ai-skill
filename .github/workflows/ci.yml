@@ -388,7 +388,8 @@ jobs:
 
       - name: Gate smoke quarantine notice
         if: steps.gate_smoke.outcome == 'failure'
-        run: echo "::warning::Windows gate smoke failed (quarantined, see #33)"
+        # Quoted: unquoted, YAML reads ` #33)"` as a comment and bash gets an open quote.
+        run: 'echo "::warning::Windows gate smoke failed (quarantined, see #33)"'
 
       - name: Engine suite (fails on any failure not in the known-failures list)
         run: python -I scripts/windows-test-gate.py

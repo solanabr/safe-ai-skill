@@ -6,9 +6,12 @@
 //! strictest of those, the original command's gates, and `encoded::decide` wins. The MCP
 //! cases emulate `cmd_gate_mcp`'s tier-High conversion plus `headless::apply`.
 
+mod common;
+
 use std::path::Path;
 
-use safe_ai_skill::context::Context;
+use common::TempDir;
+use safe_ai_skill::context::{Context, Network};
 use safe_ai_skill::gate::GateMeta;
 use safe_ai_skill::gates::{bash, encoded, mcp, secrets};
 use safe_ai_skill::headless;
@@ -60,10 +63,23 @@ fn policy_at(tier: Tier, headless_flag: bool) -> Policy {
     p
 }
 
+/// A context with a fresh data dir and no CLI default cluster. `Context::build` would take the
+/// data dir from the process env (the runner's or developer's real one, where `bash::decide`
+/// starts the spend ledger) and run the machine's `solana config get`.
+fn ctx_in(data: &TempDir) -> Context {
+    Context {
+        network: Network::Unknown,
+        anchor_network: Network::Unknown,
+        plugin_data: data.join("data"),
+        project_dir: Path::new(".").to_path_buf(),
+    }
+}
+
 /// The MCP pipeline as `cmd_gate_mcp` applies it (minus the other writers' gates, which are
 /// `Defer` for these inputs): `mcp::decide` → tier-High ask-to-deny → `headless::apply`.
 fn mcp_decision(tool: &str, payload: &Value, policy: &Policy) -> Decision {
-    let ctx = Context::build("", Path::new("."));
+    let data = TempDir::new("w6-mcp");
+    let ctx = ctx_in(&data);
     let (decision, _meta) = mcp::decide(tool, Some(payload), &ctx, policy);
     let decision = match decision {
         Decision::Ask { reason } if policy.tier() == Tier::High => Decision::Deny { reason },
@@ -77,13 +93,13 @@ fn mcp_decision(tool: &str, payload: &Value, policy: &Policy) -> Decision {
 /// then `headless::apply`.
 fn bash_decision(command: &str, policy: &Policy) -> Decision {
     let cwd = Path::new(".");
-    let ctx = Context::build(command, cwd);
+    let data = TempDir::new("w6-bash");
+    let ctx = ctx_in(&data);
     let (mut decision, _meta): (Decision, GateMeta) = bash::decide(command, &ctx, policy);
     decision = strictest(decision, secrets::decide(command, cwd, policy));
 
     for decoded in encoded::expand(command) {
-        let dctx = Context::build(&decoded, cwd);
-        let (bd, _m) = bash::decide(&decoded, &dctx, policy);
+        let (bd, _m) = bash::decide(&decoded, &ctx, policy);
         decision = strictest(decision, bd);
         decision = strictest(decision, secrets::decide(&decoded, cwd, policy));
     }
