@@ -24,7 +24,10 @@
 #   - opencode hooks (`adapt opencode <gate>`, run by the opencode plugin): the same deny JSON
 #     on every failure, and the engine's answer passes only when it is nothing, one deny line
 #     or (gate-read) one `updatedInput` line.
-#   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2.
+#   - gate-permission (PermissionRequest) ignores exit 2, so where gate-bash exits 2 (tamper,
+#     crash, strict) it prints a PermissionRequest deny with exit 0. When the engine can't run
+#     it prints nothing: Claude Code then shows its own prompt (denies when nobody can see it).
+#   - SAFE_AI_SKILL_STRICT=1 makes every unusable case exit 2 (gate-permission: deny).
 #   - SAFE_AI_SKILL_DISABLE=1 (exact) turns the hooks off, unless strict or the committed
 #     project settings mention it (a repo can't disable the firewall); SessionStart
 #     reports either way.
@@ -90,8 +93,12 @@ case $sub in
   gate-mcp) kind=mcp ;;
   # A fail-open Skill gate would let a blocked pack's `!cmd` run (spec D6.2 as amended).
   gate-skill) kind=skill ;;
+  # PermissionRequest fails closed like gate-bash, but exit 2 means nothing on that event.
+  gate-permission) kind=permission ;;
   # Hooks on events other than PreToolUse, where `ask` means nothing.
-  gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice) kind=other ;;
+  gate-prompt-expansion | redact | failure-notice | prompt-guard | pending-notice | session-end)
+    kind=other
+    ;;
   gate-*) kind=broad ;;
   verify) if [ "${2:-}" = session ]; then kind=session sub='verify session'; else kind=cli; fi ;;
   # Hooks of other clients, by client and entry.
@@ -145,6 +152,13 @@ codex_fail() {
     opencode) codex_deny "safe-ai-skill: $1. The call is blocked; review it and run it yourself." ;;
     codex_post) codex_block "safe-ai-skill: $1. This result was not scanned for secrets, so it is withheld." ;;
   esac
+}
+
+# PermissionRequest deny (exit 0; exit 2 is not honoured on that event). The argument must
+# be JSON-safe.
+permission_deny() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"%s"}}}\n' "$1"
+  exit 0
 }
 
 # SessionStart notice for the user (systemMessage) and the model (additionalContext).
@@ -236,7 +250,12 @@ env_failure() {
     fi
   fi
   codex_fail "engine inactive on $label: $1"
-  if [ -n "$strict" ]; then exit 2; fi
+  if [ -n "$strict" ]; then
+    if [ "$kind" = permission ]; then
+      permission_deny "safe-ai-skill inactive on $label: $1 (SAFE_AI_SKILL_STRICT=1); run this call yourself"
+    fi
+    exit 2
+  fi
   case $kind in
     solana)
       # gate-bash runs for every Bash call: keep the ask to the Solana surface. A payload
@@ -264,6 +283,7 @@ tampered() {
   codex_fail "the engine binary on $label fails its sha256 check (tampered?) and was not run"
   case $kind in
     solana | mcp | skill | cli) exit 2 ;;
+    permission) permission_deny "safe-ai-skill engine binary on $label fails its sha256 check (tampered?) and was not run. Reinstall the plugin" ;;
   esac
   if [ -n "$strict" ]; then exit 2; fi
   case $kind in
@@ -314,6 +334,10 @@ crashed() {
     solana | mcp | skill)
       printf 'safe-ai-skill: engine crashed (%s); %s blocked this call\n' "$how" "$sub" >&2
       exit 2
+      ;;
+    permission)
+      printf 'safe-ai-skill: engine crashed (%s); %s denied this request\n' "$how" "$sub" >&2
+      permission_deny "safe-ai-skill engine crashed ($how); the request is denied, run this call yourself"
       ;;
   esac
   printf 'safe-ai-skill: engine crashed (%s); %s skipped\n' "$how" "$sub" >&2

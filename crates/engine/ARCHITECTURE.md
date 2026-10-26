@@ -97,8 +97,10 @@ contract:
 - `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
   turns the hooks off, but is ignored in strict mode or when the committed project
   `.claude/settings.json` mentions it; SessionStart reports either way.
-- The single unconditional `Bash` `gate-bash` entry and the `Skill` matcher set
-  `onFailure: block`, the others `continue`; so a crashing engine blocks every Bash call.
+- The single unconditional `Bash` `gate-bash` entry, the `Skill` matcher and `gate-permission`
+  set `onFailure: block`, the others `continue`; so a crashing engine blocks every Bash call.
+  `PermissionRequest` ignores exit 2, so the shim answers a crash, tamper or strict case there
+  with a deny JSON (exit 0); `session-end` is informational and always continues.
   `gate-bash` has a fast path (`bash::may_concern`) that answers no opinion before loading
   policy, lists or state for a command that cannot concern it. `onFailure`
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
