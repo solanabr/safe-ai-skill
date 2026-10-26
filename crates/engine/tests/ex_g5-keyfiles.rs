@@ -211,18 +211,29 @@ fn chmod(dir: &Path, rel: &str, mode: u32) {
 fn sweep_reports_readable_tracked_and_unignored_key_files() {
     let dir = temp("sweep");
     git(&dir, &["init", "-q"]);
-    write(&dir, ".gitignore", ".env\n");
+    write(&dir, ".gitignore", ".env\n*.key\n");
     write(&dir, ".env", "API_KEY=sk_live_sweep_value\n");
     chmod(&dir, ".env", 0o644);
+    write(
+        &dir,
+        "deploy/server.key",
+        &format!(
+            "{0}BEGIN PRIVATE KEY{0}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n{0}END PRIVATE KEY{0}\n",
+            "-----"
+        ),
+    );
+    chmod(&dir, "deploy/server.key", 0o644);
     write(&dir, "config/.env.production", "DB_PASSWORD=sweep_pw\n");
-    chmod(&dir, "config/.env.production", 0o600);
+    chmod(&dir, "config/.env.production", 0o644);
     write(&dir, "store/app.p12", "\u{0}bin");
     chmod(&dir, "store/app.p12", 0o600);
     git(&dir, &["add", "-f", "store/app.p12"]);
     let notice = keyfiles::session_notice(&dir).expect("a notice");
     assert!(!notice.contains('\n'), "{notice}");
+    // An ignored 0644 env file is fine: env-style files get no permission check.
+    assert!(!notice.contains(" .env ("), "{notice}");
     assert!(
-        notice.contains(".env (env file with values: group/world-readable)"),
+        notice.contains("deploy/server.key (private key: group/world-readable)"),
         "{notice}"
     );
     assert!(
@@ -245,7 +256,16 @@ fn sweep_is_silent_on_a_tidy_project() {
     git(&dir, &["init", "-q"]);
     write(&dir, ".gitignore", ".env\n*.key\n");
     write(&dir, ".env", "API_KEY=x1\n");
-    chmod(&dir, ".env", 0o600);
+    chmod(&dir, ".env", 0o644);
+    write(
+        &dir,
+        "local.key",
+        &format!(
+            "{0}BEGIN PRIVATE KEY{0}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n{0}END PRIVATE KEY{0}\n",
+            "-----"
+        ),
+    );
+    chmod(&dir, "local.key", 0o600);
     write(&dir, ".env.example", "API_KEY=\n");
     write(&dir, "id_ed25519.pub", "ssh-ed25519 AAAA u@h\n");
     write(

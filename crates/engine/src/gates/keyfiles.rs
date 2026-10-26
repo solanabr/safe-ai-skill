@@ -17,7 +17,8 @@
 //!
 //! [`session_notice`] sweeps the project (bounded: depth, entry, sniff and time caps; skips
 //! `.git`, `node_modules`, `target` and other dependency or build trees) and reports in one line
-//! each key file that is group/world-readable, tracked by git, or not covered by `.gitignore`.
+//! each key file that is tracked by git or not covered by `.gitignore`, and each private key
+//! (not env-style files, which are routinely `0644`) that is group/world-readable.
 //! [`decide_bash`] gates `git add`, `git commit -a` / `git commit <paths>` and `git stash` that
 //! would stage such a file:
 //!
@@ -26,7 +27,7 @@
 //! | staging a key file | ask | ask | deny | deny |
 //!
 //! Headless turns the ask into a deny upstream. Git is never run: tracked files come from the
-//! binary `.git/index`, read by hand as `verify::gittracked` does, and ignore rules from the
+//! binary `.git/index` through [`gittracked::index_files`], and ignore rules from the
 //! `.gitignore` files, `.git/info/exclude` and the default global ignore file. File contents are
 //! never printed.
 //!
@@ -43,6 +44,7 @@ use crate::gate::Verdict;
 use crate::gates::bash::MAX_PARSE_BYTES;
 use crate::gates::secretpath::{self, Class, Sniffed, Suspect};
 use crate::policy::tier::Tier;
+use crate::verify::gittracked::{self, IndexFile};
 
 // ---- patterns ----------------------------------------------------------------------------
 
@@ -195,24 +197,28 @@ fn name_candidate(name: &str) -> bool {
 /// Largest file whose content is read to decide (an env file or a PEM is far smaller).
 const CONTENT_BYTES: usize = 256 * 1024;
 
+/// A key file's description, and whether it is a private key (whose permissions the sweep
+/// checks; env-style files are routinely `0644` and only their git status is reported).
+type Kind = (&'static str, bool);
+
 /// Whether the file at `full` (named `name`) is a key file, and what it is. `exists` is false
 /// for an index entry with no file on disk: then only name-decided patterns count.
-fn key_kind(full: &Path, name: &str, exists: bool) -> Option<&'static str> {
+fn key_kind(full: &Path, name: &str, exists: bool) -> Option<Kind> {
     if !name_candidate(name) {
         return None;
     }
     let lower = name.to_ascii_lowercase();
     let text = full.to_string_lossy();
     match secretpath::classify_with_homes(&text, &secretpath::homes()) {
-        Class::HardDeny(what) => return Some(what),
+        Class::HardDeny(what) => return Some((what, false)),
         Class::Env => {
             if !exists || env_has_value(full) {
-                return Some("env file with values");
+                return Some(("env file with values", false));
             }
             return None;
         }
         Class::Suspect(Suspect::PemKey) => {
-            return (exists && has_key_block(full)).then_some("private key");
+            return (exists && has_key_block(full)).then_some(("private key", true));
         }
         Class::Suspect(Suspect::IdJson) | Class::Schema | Class::Template | Class::Plain => {}
     }
@@ -225,7 +231,7 @@ fn key_kind(full: &Path, name: &str, exists: bool) -> Option<&'static str> {
             Evidence::PrivateKeyBlock => exists && has_key_block(full),
         };
         if hit {
-            return Some(p.what);
+            return Some((p.what, true));
         }
     }
     None
@@ -271,27 +277,11 @@ fn env_has_value(path: &Path) -> bool {
 
 // ---- repository: index and ignore rules --------------------------------------------------
 
-/// Largest index read.
-const MAX_INDEX: u64 = 64 * 1024 * 1024;
-/// Index entry fields before the path.
-const ENTRY_FIXED: usize = 62;
-/// Longest index path.
-const MAX_NAME: usize = 4096;
-
-/// A tracked file whose name may be a key file.
-#[derive(Debug, Clone)]
-struct Tracked {
-    /// Repository-relative, `/`-separated, as the index spells it.
-    path: String,
-    mtime: u32,
-    size: u32,
-}
-
 /// What the sweep and the gate know about the enclosing repository.
 struct Repo {
     root: PathBuf,
     /// `None` when there is no index, or it cannot be parsed (nothing is claimed tracked).
-    tracked: Option<Vec<Tracked>>,
+    tracked: Option<Vec<IndexFile>>,
     /// Rules from outside the work tree (global ignore, `info/exclude`) and the root
     /// `.gitignore`.
     base_rules: Vec<Rule>,
@@ -315,9 +305,9 @@ fn read_capped(path: &Path, cap: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// The git directory of the work tree at `root` (a `.git` directory, or the target of a
-/// `gitdir:` file), and its common directory (worktrees keep `info/exclude` there).
-fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+/// The common git directory of the work tree at `root`, where `info/exclude` lives (a
+/// worktree's `.git` file names its own git dir, whose `commondir` names the shared one).
+fn common_dir(root: &Path) -> Option<PathBuf> {
     let dot = root.join(".git");
     let git = if dot.is_dir() {
         dot
@@ -342,8 +332,8 @@ fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
                 git.join(p)
             }
         })
-        .unwrap_or_else(|| git.clone());
-    Some((git, common))
+        .unwrap_or(git);
+    Some(common)
 }
 
 impl Repo {
@@ -357,14 +347,13 @@ impl Repo {
                 .join("git/ignore");
             load_rules(&global, "", &mut base_rules);
         }
-        let dirs = git_dirs(root);
-        if let Some((_, common)) = &dirs {
+        if let Some(common) = common_dir(root) {
             load_rules(&common.join("info/exclude"), "", &mut base_rules);
         }
         load_rules(&root.join(".gitignore"), "", &mut base_rules);
-        let tracked = dirs
-            .and_then(|(git, _)| read_capped(&git.join("index"), MAX_INDEX))
-            .and_then(|bytes| parse_index(&bytes));
+        let tracked = gittracked::index_files(root, |path| {
+            name_candidate(path.rsplit('/').next().unwrap_or(path))
+        });
         Repo {
             root: root.to_path_buf(),
             tracked,
@@ -372,7 +361,7 @@ impl Repo {
         }
     }
 
-    fn tracked_entry(&self, rel: &str) -> Option<&Tracked> {
+    fn tracked_entry(&self, rel: &str) -> Option<&IndexFile> {
         self.tracked
             .as_ref()?
             .iter()
@@ -412,98 +401,8 @@ fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
-fn be32(bytes: &[u8], at: usize) -> Option<u32> {
-    let end = at.checked_add(4)?;
-    Some(u32::from_be_bytes(bytes.get(at..end)?.try_into().ok()?))
-}
-
-fn varint(bytes: &[u8], at: &mut usize) -> Option<usize> {
-    let mut byte = *bytes.get(*at)?;
-    *at = at.checked_add(1)?;
-    let mut value = usize::from(byte & 0x7f);
-    while byte & 0x80 != 0 {
-        byte = *bytes.get(*at)?;
-        *at = at.checked_add(1)?;
-        value = value.checked_add(1)?.checked_mul(128)?;
-        value = value.checked_add(usize::from(byte & 0x7f))?;
-    }
-    Some(value)
-}
-
-/// The index entries whose base name may be a key file (versions 2 to 4). `None` for an index
-/// this parser does not fully understand.
-fn parse_index(bytes: &[u8]) -> Option<Vec<Tracked>> {
-    if bytes.get(..4) != Some(b"DIRC") {
-        return None;
-    }
-    let version = be32(bytes, 4)?;
-    if !(2..=4).contains(&version) {
-        return None;
-    }
-    let count = be32(bytes, 8)? as usize;
-    if count > bytes.len() {
-        return None;
-    }
-    let mut cursor = 12usize;
-    let mut name: Vec<u8> = Vec::new();
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let start = cursor;
-        let mtime = be32(bytes, start.checked_add(8)?)?;
-        let size = be32(bytes, start.checked_add(36)?)?;
-        let flags = bytes.get(start.checked_add(60)?..start.checked_add(62)?)?;
-        let flags = u16::from_be_bytes([flags[0], flags[1]]);
-        let mut name_at = start.checked_add(ENTRY_FIXED)?;
-        if version >= 3 && flags & 0x4000 != 0 {
-            name_at = name_at.checked_add(2)?;
-        }
-        if version == 4 {
-            let mut c = name_at;
-            let strip = varint(bytes, &mut c)?;
-            let rest = bytes.get(c..)?;
-            let nul = rest.iter().take(MAX_NAME + 1).position(|b| *b == 0)?;
-            name.truncate(name.len().checked_sub(strip)?);
-            name.extend_from_slice(&rest[..nul]);
-            if name.len() > MAX_NAME {
-                return None;
-            }
-            cursor = c.checked_add(nul)?.checked_add(1)?;
-        } else {
-            let rest = bytes.get(name_at..)?;
-            let nul = rest.iter().take(MAX_NAME + 1).position(|b| *b == 0)?;
-            name.clear();
-            name.extend_from_slice(&rest[..nul]);
-            let size = (name_at - start).checked_add(nul)?.checked_add(8)? & !7;
-            cursor = start.checked_add(size)?;
-        }
-        if cursor > bytes.len() {
-            return None;
-        }
-        let base = name.rsplit(|b| *b == b'/').next().unwrap_or(&name);
-        if std::str::from_utf8(base).is_ok_and(name_candidate) {
-            if let Ok(path) = std::str::from_utf8(&name) {
-                out.push(Tracked {
-                    path: path.to_string(),
-                    mtime,
-                    size,
-                });
-            }
-        }
-    }
-    // A split index keeps its entries in another file.
-    let mut ext = cursor;
-    while bytes.len().saturating_sub(ext) > 28 {
-        if bytes.get(ext..ext.checked_add(4)?)? == b"link" {
-            return None;
-        }
-        let size = be32(bytes, ext.checked_add(4)?)? as usize;
-        ext = ext.checked_add(8)?.checked_add(size)?;
-    }
-    Some(out)
-}
-
 /// Whether the work-tree file differs from its index entry (size or modification second).
-fn modified(full: &Path, entry: &Tracked) -> bool {
+fn modified(full: &Path, entry: &IndexFile) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(full) else {
         return false;
     };
@@ -736,7 +635,7 @@ pub struct Found {
     pub rel: String,
     /// What it is.
     pub what: &'static str,
-    /// Readable by group or others.
+    /// A private key readable by group or others (env-style files are not checked).
     pub readable: bool,
     /// Listed in the git index.
     pub tracked: bool,
@@ -814,11 +713,11 @@ impl Walk<'_> {
                 }
                 self.sniffs += 1;
                 let path = entry.path();
-                if let Some(what) = key_kind(&path, name, true) {
+                if let Some((what, private_key)) = key_kind(&path, name, true) {
                     let ignored = is_ignored(rules, &child, false);
                     let tracked = self.repo.tracked_entry(&child).is_some();
                     self.out.push(Found {
-                        readable: group_or_world_readable(&path),
+                        readable: private_key && group_or_world_readable(&path),
                         rel: child,
                         what,
                         tracked,
@@ -913,11 +812,11 @@ pub fn sweep(cwd: &Path, caps: Caps) -> Vec<Found> {
             let full = root.join(&t.path);
             let exists = full.is_file();
             let name = t.path.rsplit('/').next().unwrap_or(&t.path);
-            if let Some(what) = key_kind(&full, name, exists) {
+            if let Some((what, private_key)) = key_kind(&full, name, exists) {
                 found.push(Found {
                     rel: t.path.clone(),
                     what,
-                    readable: exists && group_or_world_readable(&full),
+                    readable: private_key && exists && group_or_world_readable(&full),
                     tracked: true,
                     ignored: true,
                 });
@@ -1330,7 +1229,7 @@ fn staged_keys(stage: &Stage, dir: &Path) -> Vec<(String, &'static str)> {
                 continue;
             }
             let name = t.path.rsplit('/').next().unwrap_or(&t.path);
-            if let Some(what) = key_kind(&full, name, true) {
+            if let Some((what, _)) = key_kind(&full, name, true) {
                 push(t.path.clone(), what);
             }
         }
@@ -1346,7 +1245,7 @@ fn staged_keys(stage: &Stage, dir: &Path) -> Vec<(String, &'static str)> {
                 continue;
             }
             let name = rel.rsplit('/').next().unwrap_or(rel);
-            if let Some(what) = key_kind(&full, name, true) {
+            if let Some((what, _)) = key_kind(&full, name, true) {
                 push(rel.clone(), what);
             }
             continue;
