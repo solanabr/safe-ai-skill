@@ -6,6 +6,7 @@
 
 pub mod bash;
 pub mod configchange;
+pub mod containers;
 pub mod creddump;
 pub mod credpaths;
 pub mod encoded;
