@@ -122,7 +122,7 @@ pub fn classify(
             }
             found.hard(read::decide_mcp_args(tool_input, cwd, policy));
             found.tier(exfil::decide_mcp(t, tool_input, cwd, policy, tier));
-            let (d, meta) = mcp::decide(t, tool_input, &Context::build("", cwd), policy);
+            let (d, meta) = mcp::decide(t, tool_input, &Context::build_in("", cwd, dir), policy);
             // `gate-mcp` denies a value-moving MCP ask at High (no cluster is named).
             match d {
                 Decision::Ask { reason } if tier == Tier::High => {
@@ -186,7 +186,7 @@ fn bash_call(
         let (d, meta) = bash::over_cap(policy);
         found.meta(d, &meta);
     } else if bash::may_concern(command) {
-        let (d, meta) = bash::decide(command, &Context::build(command, cwd), policy);
+        let (d, meta) = bash::decide(command, &Context::build_in(command, cwd, dir), policy);
         // A command found inside another one joins as a tier verdict (no grant lifts it).
         if nested {
             found.hard(d);

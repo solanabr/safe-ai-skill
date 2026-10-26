@@ -82,9 +82,25 @@ impl Context {
     /// The defaults are resolved only when some solana-family command in `command` names no
     /// cluster of its own, so a command that needs none never runs `solana config get`.
     pub fn build(command: &str, cwd: &Path) -> Context {
+        Self::build_with(command, cwd, None)
+    }
+
+    /// [`Context::build`] with its state (spend ledger, CLI cluster cache) in `dir`, a data
+    /// dir the caller already resolved, instead of one resolved again from the environment.
+    /// An unresolved `dir` stores nothing.
+    pub fn build_in(command: &str, cwd: &Path, dir: &DataDir) -> Context {
+        Self::build_with(command, cwd, Some(dir))
+    }
+
+    fn build_with(command: &str, cwd: &Path, dir: Option<&DataDir>) -> Context {
         let parsed = shell::parse(command);
         let cli = OnceCell::new();
-        let cli_net = || *cli.get_or_init(|| cli_network(cwd));
+        let cli_net = || {
+            *cli.get_or_init(|| match dir {
+                Some(d) => cli_network_in(Some(d.clone())),
+                None => cli_network(cwd),
+            })
+        };
         let needs_default = |anchor: bool| {
             parsed.commands.iter().any(|c| {
                 c.is_family()
@@ -105,7 +121,7 @@ impl Context {
         Context {
             network,
             anchor_network,
-            plugin_data: plugin_data_dir(),
+            plugin_data: dir.map_or_else(plugin_data_dir, |d| d.path.clone()),
             project_dir: project_dir(cwd),
         }
     }
@@ -158,9 +174,12 @@ fn solana_config_timeout() -> Duration {
 /// timeout, a missing binary or any failure is [`Network::Unknown`]), cached for 60 s in the
 /// authenticated `netcache.json` of a trusted data dir.
 pub fn cli_network(cwd: &Path) -> Network {
-    let dir = datadir::data_dir_with_cwd(Some(cwd))
-        .ok()
-        .filter(|d| d.trusted);
+    cli_network_in(datadir::data_dir_with_cwd(Some(cwd)).ok())
+}
+
+/// [`cli_network`] caching in `dir` (only when it is trusted).
+fn cli_network_in(dir: Option<DataDir>) -> Network {
+    let dir = dir.filter(|d| d.trusted);
     let now = now_secs();
     let fingerprint = cli_config_fingerprint();
     if let Some(dir) = &dir {
