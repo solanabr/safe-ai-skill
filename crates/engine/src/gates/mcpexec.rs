@@ -3,8 +3,9 @@
 //!
 //! - Shell code (a `code` whose `language` is absent or `shell`/`bash`/`sh`/`zsh`, every
 //!   `command`/`cmd`/`script` string, every entry of a `commands` list) runs through the same
-//!   decisions as the two Bash entries: the on-chain gate, default-wallet destruction,
-//!   credential reads, env writes, and the secret-read gate with its indirection prefilter.
+//!   decisions as the two Bash entries: the on-chain gate, a nested Claude Code session, a
+//!   blocked pack, every Bash-command tier gate ([`shellcmd::tier_verdict`], the list
+//!   `gate-bash-secrets` uses), and the secret-read gate with its indirection prefilter.
 //! - Other languages: each string literal is read-checked as a path, and a literal holding
 //!   whitespace also runs the shell decisions (`os.system("cat .env")`). A literal naming an env
 //!   file the tier lets the code read is denied at every tier when the code shows network use,
@@ -21,8 +22,9 @@ use serde_json::{Map, Value};
 
 use crate::context::shell;
 use crate::context::Context;
+use crate::datadir::DataDir;
 use crate::gate::{GateMeta, Scope, Verdict};
-use crate::gates::{bash, creddump, envread, envwrite, read, secretpath, secrets, wallet};
+use crate::gates::{bash, envread, envwrite, read, secretpath, secrets, shellcmd, tamper};
 use crate::io::Decision;
 use crate::policy::tier::Tier;
 use crate::policy::Policy;
@@ -47,8 +49,13 @@ enum Code<'a> {
 }
 
 /// The verdict for the code in an MCP payload, with a hard-guard meta; `Defer` when there is
-/// no code or none of it concerns a gate.
-pub fn decide(payload: Option<&Value>, cwd: &Path, policy: &Policy) -> (Decision, GateMeta) {
+/// no code or none of it concerns a gate. Gate state (the spend ledger, pack state) is in `dir`.
+pub fn decide(
+    payload: Option<&Value>,
+    cwd: &Path,
+    policy: &Policy,
+    dir: &DataDir,
+) -> (Decision, GateMeta) {
     let mut codes = Vec::new();
     let complete = match payload {
         Some(value) => collect(value, 0, &mut codes),
@@ -60,9 +67,9 @@ pub fn decide(payload: Option<&Value>, cwd: &Path, policy: &Policy) -> (Decision
         let verdict = match code {
             Code::Shell(command) => {
                 checked += 1;
-                shell_verdict(command, cwd, policy)
+                shell_verdict(command, cwd, policy, dir)
             }
-            Code::Other(text) => other_verdict(text, cwd, policy, &mut checked),
+            Code::Other(text) => other_verdict(text, cwd, policy, dir, &mut checked),
         };
         best = stricter(best, verdict);
         if matches!(best.0, Decision::Deny { .. }) {
@@ -83,7 +90,12 @@ pub fn decide(payload: Option<&Value>, cwd: &Path, policy: &Policy) -> (Decision
 }
 
 /// The Bash entries' decisions for one shell `command` (strictest; an allow counts as none).
-fn shell_verdict(command: &str, cwd: &Path, policy: &Policy) -> (Decision, GateMeta) {
+fn shell_verdict(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+    dir: &DataDir,
+) -> (Decision, GateMeta) {
     if command.trim().is_empty() {
         return (Decision::Defer, GateMeta::unknown());
     }
@@ -93,23 +105,19 @@ fn shell_verdict(command: &str, cwd: &Path, policy: &Policy) -> (Decision, GateM
         return bash::over_cap(policy);
     }
     if bash::may_concern(command) {
-        let ctx = Context::build(command, cwd);
+        let ctx = Context::build_in(command, cwd, dir);
         best = stricter(best, bash::decide(command, &ctx, policy));
     }
-    for verdict in [
-        wallet::decide_bash(command, cwd, policy, tier),
-        creddump::decide(command, cwd, policy, tier),
-        envwrite::decide_cli(command, cwd, policy, tier),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if matches!(verdict, Verdict::Ask(_) | Verdict::Deny(_)) {
-            best = stricter(
-                best,
-                (verdict.into(), GateMeta::new(Scope::SecretRead, true)),
-            );
-        }
+    let tier_verdict = shellcmd::strictest([
+        shellcmd::blocked_pack_verdict(dir, command, cwd, tier),
+        shellcmd::nested_claude_verdict(tamper::decide_nested_claude(command), tier),
+        shellcmd::tier_verdict(command, cwd, policy, dir),
+    ]);
+    if let Some(verdict) = tier_verdict {
+        best = stricter(
+            best,
+            (verdict.into(), GateMeta::new(Scope::SecretRead, true)),
+        );
     }
     let secret = bash::with_indirection_prefilter(
         secrets::decide(command, cwd, policy),
@@ -126,6 +134,7 @@ fn other_verdict(
     text: &str,
     cwd: &Path,
     policy: &Policy,
+    dir: &DataDir,
     checked: &mut usize,
 ) -> (Decision, GateMeta) {
     if shell::mentions_family(text) {
@@ -165,7 +174,7 @@ fn other_verdict(
         }
         best = stricter(best, (path, GateMeta::new(Scope::SecretRead, true)));
         if literal.contains(char::is_whitespace) {
-            best = stricter(best, shell_verdict(literal, cwd, policy));
+            best = stricter(best, shell_verdict(literal, cwd, policy, dir));
         }
         if matches!(best.0, Decision::Deny { .. }) {
             break;
@@ -314,8 +323,17 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
 
+    /// A real, empty, canonical project dir (a fake one has no drive letter on Windows, so a
+    /// `.env` in it is not seen as inside the project there). One per test process.
     fn cwd() -> PathBuf {
-        PathBuf::from("/nonexistent-cwd")
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("safe-ai-skill-mcpexec-unit-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::canonicalize(&dir).unwrap()
+        })
+        .clone()
     }
 
     fn verdict(payload: Value) -> Decision {
@@ -323,7 +341,12 @@ mod tests {
     }
 
     fn verdict_with(payload: Value, policy: &Policy) -> Decision {
-        let (d, meta) = decide(Some(&payload), &cwd(), policy);
+        let (d, meta) = decide(
+            Some(&payload),
+            &cwd(),
+            policy,
+            &crate::datadir::unresolved(),
+        );
         assert!(meta.hard_guard, "{payload}");
         d
     }
@@ -431,7 +454,7 @@ mod tests {
         assert_eq!(label(payload.clone()), "ask");
         let mut high = Policy::default();
         high.runtime.tier = Tier::High;
-        let (d, _) = decide(Some(&payload), &cwd(), &high);
+        let (d, _) = decide(Some(&payload), &cwd(), &high, &crate::datadir::unresolved());
         assert_eq!(d.label(), "deny");
     }
 
