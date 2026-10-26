@@ -482,6 +482,7 @@ out=$(run_engine "$@") || status=$?
 
 # Codex: only nothing, or one line of the expected answer, reaches Codex; anything else (a
 # second line, which Codex could not parse, included) blocks.
+# shellcheck disable=SC2016 # backticks are literal text in two of these messages
 case $kind/$status in
   codex/0 | codex_post/0 | opencode/0)
     out=${out%.}

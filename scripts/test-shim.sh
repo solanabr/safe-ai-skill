@@ -494,11 +494,12 @@ cache_matrix() {
   expect_ran sha
   expect_ran safe-ai-skill-linux-x64
   check
-  [ -f "$cache" ] && [ ! -L "$cache" ] || fail "no cache file at $cache"
+  if [ ! -f "$cache" ] || [ -L "$cache" ]; then fail "no cache file at $cache"; fi
   check
-  case $(ls -l "$cache" 2>/dev/null) in
-    -rw-------*) ;;
-    *) fail "cache mode is $(ls -l "$cache" 2>/dev/null | cut -c1-10), want -rw-------" ;;
+  mode=$(stat -c %A "$cache" 2>/dev/null || stat -f %Sp "$cache" 2>/dev/null)
+  case $mode in
+    -rw-------) ;;
+    *) fail "cache mode is $mode, want -rw-------" ;;
   esac
   check
   [ -z "$(find "$data_dir" -name '.shim-verified-*')" ] || fail "a temp file was left behind"
