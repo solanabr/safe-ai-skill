@@ -92,6 +92,14 @@ contract:
   PreToolUse gates ask, non-PreToolUse hooks exit 0 with a stderr line.
 - **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash`, `gate-mcp` and `gate-skill`
   exit 2 (block); the rest exit 0 with a stderr line.
+- **Contracts by event.** Three entries are not PreToolUse gates and answer in their own channel:
+  - `gate-permission` (`PermissionRequest`, which ignores exit 2): a tamper, crash or strict case is
+    `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny",…}}}`
+    with exit 0; when the engine cannot run it prints nothing, so Claude Code shows its own prompt.
+  - `gate-config` (`ConfigChange`): a tamper or crash is `{"decision":"block","reason":…}` with
+    exit 0, the answer that event honours; when the engine cannot run it continues (strict mode
+    exits 2, which that event also honours).
+  - `session-end` (`SessionEnd`): informational, always continues.
 - **Verified-hash cache.** After a full sha256 match the shim records the binary's fingerprint (device, inode, size, mtime, ctime from `stat` at a fixed system path) beside the stamped hash in `$CLAUDE_PLUGIN_DATA/shim-verified-<platform>` (0600, owned by the binary's owner, not a symlink). A later call skips the hash and the executable-format probe only when that line equals the stamped hash plus the current fingerprint; anything else is a full check and only a pass is cached. A binary whose ctime does not predate the check is never cached. Off on Windows and when `CLAUDE_PLUGIN_DATA` is unset, relative or unwritable; `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off from any source. See SECURITY.md for the residual.
 - **Tools come from fixed system directories.** `fixed_tool` resolves `uname`, `grep`, `od`, `tr`, `cut`, `stat` and `date` (and the sha256 tool) from `/usr/bin`, `/bin` and `/run/current-system/sw/bin`, never from `PATH`, which a repository's settings `env` can set. Under the test seam (a `.sha-tools-from-path` file beside the shim) they come from `PATH`. A host with no `uname` there is an environment failure (reported as `no uname in …`), not an unsupported-platform fail-open; a missing `grep`, `od`, `tr` or `cut` degrades only the helper that used it.
 - `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
@@ -106,7 +114,7 @@ contract:
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
 
-`hooks.json` entries (matcher, subcommand, `onFailure`): `Bash` → `gate-bash` (block), `gate-bash-secrets`; `Write|Edit|MultiEdit|NotebookEdit` → `gate-tamper`; `Read|Grep|Glob` → `gate-read`; `WebFetch` → `gate-webfetch`; `mcp__.*` → `gate-mcp`; ConfigChange (`user_settings|project_settings|local_settings`) → `gate-config`; `Skill` → `gate-skill` (block); PostToolUse `Bash|Read|Grep|mcp__.*` → `redact`, `Bash` → `pending-notice`; PostToolUseFailure → `failure-notice`; UserPromptSubmit → `prompt-guard` and `gate-prompt-expansion`; UserPromptExpansion → `gate-prompt-expansion`; SessionStart → `verify session`. Every entry other than `gate-bash` and `gate-skill` is `continue`. The Codex template (`adapters/codex/hooks.json`) wires `gate-bash`, `gate-bash-secrets`, `gate-tamper` (on `apply_patch`) and `gate-mcp` only; the opencode plugin wires those plus `gate-read`. Neither has `gate-webfetch`.
+`hooks.json` entries (matcher, subcommand, `onFailure`): `Bash` → `gate-bash` (block), `gate-bash-secrets`; `Write|Edit|MultiEdit|NotebookEdit` → `gate-tamper`; `Read|Grep|Glob` → `gate-read`; `WebFetch` → `gate-webfetch`; `mcp__.*` → `gate-mcp`; ConfigChange (`user_settings|project_settings|local_settings`) → `gate-config`; `Skill` → `gate-skill` (block); PermissionRequest → `gate-permission` (block); SessionEnd → `session-end`; PostToolUse `Bash|Read|Grep|mcp__.*` → `redact`, `Bash` → `pending-notice`; PostToolUseFailure → `failure-notice`; UserPromptSubmit → `prompt-guard` and `gate-prompt-expansion`; UserPromptExpansion → `gate-prompt-expansion`; SessionStart → `verify session`. Every entry other than `gate-bash`, `gate-skill` and `gate-permission` is `continue`. The Codex template (`adapters/codex/hooks.json`) wires `gate-bash`, `gate-bash-secrets`, `gate-tamper` (on `apply_patch`) and `gate-mcp` only; the opencode plugin wires those plus `gate-read`. Neither has `gate-webfetch`.
 
 CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
 
@@ -187,9 +195,10 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | `gates/exfil.rs` | The exfil tripwire (#19): `decide_bash` (called from `gate-bash-secrets`), `decide_mcp` (`gate-mcp`) and `decide_webfetch` (`gate-webfetch`). Host list per tier from `exfil-hosts.list`, secret-shaped data and blobs to non-developer hosts, `git push` to a same-line remote, browser scripts. Secret uploads by path are denied by `gates/secrets.rs`; an env read beside a network command by `gates/creddump.rs` (`envread::to_network`). |
 | `gates/tamper.rs` | The self-grant tripwire (protected paths: `decide_bash`, `decide_file`, `decide_nested_claude`) and the content-aware checks (`decide_file_content`, `decide_bash_writes`): settings, hooks, git config, `.mcp.json`, lifecycle scripts, kit tier. `gate-tamper` covers Write/Edit/MultiEdit/NotebookEdit; `gate-bash-secrets` the Bash forms. |
 | `gates/fetchexec.rs` | Download-and-run (`decide`): a download then run, a downloaded script piped to an interpreter, undeclared one-shot runners, `cargo install --git` outside the allowlist, mainnet Node scripts. Called from `gate-bash-secrets`. |
-| `gates/encoded.rs` | Encoded payloads: `expand` returns decoded texts (depth 3, 64 KiB) and `decide` asks on an undecodable one. `main.rs::encoded_bash_verdict` runs each decoded text through `bash::decide`, `secrets::decide`, `exfil::decide_bash`, `fetchexec::decide`, `tamper::decide_bash_writes`, `envread::decide_bash`, `wallet::decide_bash`, `creddump::decide` and `envwrite::decide_cli`, and takes the strictest verdict. |
+| `gates/shellcmd.rs` | The one list of gates a shell command text goes through, shared by `gate-bash-secrets` (`tier_verdict`), `gate-bash` (`encoded_verdict`), `PermissionRequest` (`flat_verdict`, its caller walks nested commands) and the MCP command runners (`mcpexec`, `tier_verdict`). `inner_verdict` judges a text found inside another (a decoded payload, a `git submodule foreach` or `rebase --exec` string) through `bash::decide`, `secrets::decide` and the whole list; `strictest` picks the verdict (deny over ask, the later on a tie). A gate added to the list reaches every entry. |
+| `gates/encoded.rs` | Encoded payloads: `expand` returns decoded texts (depth 3, 64 KiB), including payloads that reach a shell behind a wrapper, `source`, a process substitution, a command word or a subshell or group, and `decide` asks on an undecodable one. `shellcmd::encoded_verdict` runs each decoded text through `shellcmd::inner_verdict` and takes the strictest verdict. |
 | `gates/envread.rs` (env dumps) | `decide_bash`: `/proc/*/environ`, `ps e`, printing a secret-named variable (deny) and a dump piped away or written to a file (ask). The names come from `redact::is_secret_env_name`; the matching value blanking is `redact::scrub_env_lines`. |
-| `gates/mcp.rs`, `gates/mcpexec.rs` | MCP name/action classification (`mcp.sensitive_name_pattern`, routed actions, staking and token transfers as hard guards) and the Bash checks for shell code run through an MCP executor. |
+| `gates/mcp.rs`, `gates/mcpexec.rs` | MCP name/action classification (`mcp.sensitive_name_pattern`, routed actions, staking and token transfers as hard guards) and the Bash checks for shell code run through an MCP executor: a blocked pack, a nested `claude`, and `shellcmd::tier_verdict`, with gate state in the caller's data dir. |
 | `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
 | `verify/gitobj.rs`, `verify/history.rs` | Read-only git object reader (loose objects, `.idx` v1/v2 + `.pack` v2/v3, OFS/REF deltas; no git process, `gitdir:`/`commondir` confined to the pack or its submodule dir, FIFO-safe opens) under a time/byte/object `Budget` that every tree walk charges, and the history scan `verify::check::check_dir` (`verify add|check`, `install`, once per directory via `check_dir_with`; never the sweep) runs over it: every blob through `rules::scan_blob` under each distinct name, docs-described commits that touch code (`docs_commit_code` report-only, combo `docs_commit_sink` on added lines), and `history_unscanned` for anything left unread. |
 
@@ -424,44 +433,55 @@ pub fn gates::gitguard::decide_git_config_risk(command: &str, tier: Tier) -> Opt
 pub fn gates::gitguard::inner_commands(command: &str) -> Vec<String>;      // `submodule foreach` / `rebase --exec` strings, re-judged by every Bash gate
 pub fn gates::mcp::decide_name(tool_name: &str, tier: Tier) -> Option<Verdict>;   // NAME_RULES: refuse a tool by name from a tier up, before its arguments
 pub fn gates::tamper::decide_nested_claude_flags(command: &str, tier: Tier) -> Option<Verdict>; // weakening flags, `claude mcp add`, `setup-token`, `plugin disable`
-pub fn gates::configchange::decide(input: &Value) -> Option<Verdict>;      // ConfigChange: Deny only when the file now turns protection off
+pub fn gates::configchange::decide(input: &Value) -> Option<Verdict>;      // ConfigChange: Deny only when the file adds a disabling switch its snapshot lacks
+pub fn gates::configchange::record_baseline(cwd: Option<&Path>, homes: &ConfigHomes, dir: &DataDir); // SessionStart: snapshot the switches the settings files hold
+pub fn gates::shellcmd::tier_verdict(command: &str, cwd: &Path, policy: &Policy, dir: &DataDir) -> Option<Verdict>; // the shared Bash-command gate list
 pub fn gates::encoded::expand(command: &str) -> Vec<String>;      // decoded payload texts
 pub fn gates::encoded::decide(command: &str) -> Option<Verdict>;  // undecodable payload → Ask
 pub fn gates::envread::decide_bash(command: &str) -> Option<Verdict>;   // env dumps
 pub fn gates::containers::decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>; // container privilege guard, run by gate-bash-secrets
-pub fn gates::keyfiles::decide_bash(command: &str, cwd: &Path, tier: Tier) -> Option<Verdict>;         // git add / commit -a / stash of a key file, run by gate-bash-secrets
-pub fn gates::keyfiles::session_notice(cwd: &Path) -> Option<String>;                                  // SessionStart notice (bounded sweep)
+pub fn gates::keyfiles::decide_bash(command: &str, cwd: &Path, tier: Tier) -> Option<Verdict>;         // git add / commit -a / stash -u|-a of a key file, via shellcmd
+pub fn gates::keyfiles::session_notice(cwd: &Path, plugin_data: &Path) -> Option<SessionNotice>;       // SessionStart notice (bounded sweep), once per project and finding set
 pub fn gates::permreq::decide(tool: &str, tool_input: Option<&Value>, permission_mode: Option<&str>, cwd: &Path, policy: &Policy, dir: &DataDir) -> Option<Value>; // PermissionRequest answer
 pub fn report::session_start(dir: &DataDir, session_id: &str, cwd: &Path, now: u64) -> Option<String>; // start marker + recap line
 pub fn report::session_end(dir: &DataDir, raw: &[u8], now: u64) -> Option<SessionReport>;              // writes reports/<sid>.json
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
-> `gitguard` runs inside `gate-bash-secrets`' tier verdict (`git_verdict` in `main.rs`) and
-> its `inner_commands` strings go back through `inner_text_verdict`, the same path decoded
+> `gitguard` is in the `shellcmd` list, so `gate-bash-secrets`' tier verdict runs it, and its
+> `inner_commands` strings go back through `shellcmd::inner_verdict`, the same path decoded
 > payloads take. Off acts as Relaxed. `mcp::decide_name` runs first in `gate-mcp`, as a hard
 > guard. `tamper` also owns the `Surface` table (code-on-next-build files, managed settings,
 > a project's `.safe-ai-skill/`, and at High the user-scope `~/.claude` policy surface), applied
 > by `decide_file_content_at` and `decide_bash_writes` with the tier. `gate-config` reads
-> the settings file named by the `ConfigChange` payload and answers
-> `{"decision":"block","reason":…}` only when `tamper::settings_disable_reason` says the text
-> turns protection off; it has no previous text, so it cannot see a removal. `fetchexec` reads
+> the settings file named by the `ConfigChange` payload and compares the switches
+> `tamper::settings_disable_reasons` finds in it with a snapshot (`configchange.json`, MAC'd,
+> trusted data dir only, at most 64 paths) of what it held when a change was last let through;
+> it answers `{"decision":"block","reason":…}` only for a switch the snapshot lacks. The
+> snapshot is written on a let-through and by `configchange::record_baseline`, called from
+> `verify session` before the agent acts, and never on a block; with no snapshot every switch
+> is new. It has no previous text, so it cannot see a removal. `fetchexec` reads
 > `Cargo.toml`/`Cargo.lock`, `go.mod` and the Python manifests for its High rules. `credpaths`
 > adds the stores that environment variables move (`ENV_STORES`, rebuilt only when one of
 > those variables changes) and a hard-link check by device and inode.
-> `containers` and `keyfiles::decide_bash` are two more entries of `gate-bash-secrets`' tier
-> verdict (`strictest([...])` in `main.rs`, also run on inner commands), so they inherit its
+> `containers` and `keyfiles::decide_bash` are two more entries of the `shellcmd` list
+> (run on inner commands too, and by `PermissionRequest` and the MCP runners), so they inherit its
 > headless post-processor and its Codex and opencode reach. `containers` reads compose files
 > (512 KiB cap) and judges services as it judges flags. `keyfiles` never runs git: it reads the
 > index through `verify::gittracked`; its SessionStart sweep is capped at depth 8, 20,000
-> entries, 64 content sniffs and 250 ms, and `DOMAIN_PACKS` is the (empty) slot a domain pack
+> entries, 64 content sniffs and 250 ms (the tracked-file pass shares that budget, then judges
+> by bare name), and `session_notice(cwd, plugin_data)` returns a `SessionNotice { user, model }`
+> reported once per project and finding set (`tips/keyfiles-<project hash>`); `verify session`
+> prints only `user`. `DOMAIN_PACKS` is the (empty) slot a domain pack
 > fills with its own key-file patterns.
 > `permreq` is the `PermissionRequest` gate (`gate-permission`, `onFailure: block`). It does not
 > go through `gate::decide` or `relax::apply`: it calls the PreToolUse gates' decision functions
 > itself, keeps only hard-guard results (a deny, or an ask whose `GateMeta` is not grantable),
 > and answers `hookSpecificOutput.decision.behavior = "deny"` when the session is unattended
 > (headless, `dontAsk`, unknown mode) or a gate denies in `auto`/`acceptEdits`/`bypassPermissions`,
-> else a `systemMessage` warning or nothing. It never emits `allow`. Its denies are audited as
+> else a `systemMessage` warning or nothing. It never emits `allow`. Its gate `Context` is built
+> with `Context::build_in` in the data dir the hook resolved, so a test with an unresolved dir
+> stores nothing. Its denies are audited as
 > `permission_request`.
 > `report` runs on the SessionStart and SessionEnd hooks only, never on a gate path. `session-end`
 > prints nothing (Claude Code discards SessionEnd output and allows it 1.5 s) and always exits 0;
@@ -488,7 +508,11 @@ names and keeps user rules; `json.rs` edits the file preserving key order and in
 It never writes `sandbox.enabled: false` (Off removes the key), writes atomically, and refuses a
 symlinked `.claude` or settings file. The record (tier, rule-set version, entries, scalars) is the
 MAC'd state file `firewall.json` in the data dir, never a key in the settings file. Raising applies
-at once; lowering parks a `PendingKind::Firewall` request for the confirmation code. `check`
+at once; lowering parks a `PendingKind::Firewall` request for the confirmation code. Rule set 2
+writes the project root and the repository's `.git` as absolute paths (`MachineInputs`,
+`Target::git_dir`) and retires the relative `.git` entry (`RETIRED`, still owned until removed).
+`json.rs` reads a repeated key as its last occurrence, as Claude Code does; `apply` refuses a file
+that repeats a managed key (`duplicate_keys`) and `check` reports `duplicate-key` drift. `check`
 exits non-zero on drift. At High the output carries a caveat: Claude Code ignores repository
 `allowRead`/`allowWrite`, and counts `settings.local.json` as repository settings outside git or
 when tracked.
