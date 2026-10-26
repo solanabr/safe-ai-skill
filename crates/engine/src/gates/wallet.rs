@@ -965,6 +965,14 @@ fn clobber(cmd: &SimpleCommand, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -
         Some(Hit::Wallet(t)) => Some(t),
         _ => None,
     };
+    // A source landing in `dest` under its own name over a wallet already there.
+    let into_dir = |dest: &Word, sources: &[&Word]| {
+        dirs.resolve_all(&dest.text, homes).iter().find_map(|dir| {
+            sources
+                .iter()
+                .find_map(|s| wallets.hit_in_dir(dir, &s.text))
+        })
+    };
     if program == "dd" {
         return words
             .iter()
@@ -985,9 +993,20 @@ fn clobber(cmd: &SimpleCommand, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -
     if DELETE_OR_MOVE.contains(&program.as_str()) {
         // `mv`'s destination overwrites; every other operand of these is deleted or moved away.
         let found = if program == "mv" {
-            paths.split_last().and_then(|(dest, sources)| {
-                hit(dest, false).or_else(|| sources.iter().find_map(|w| hit(w, true)))
-            })
+            match target_dir(&words) {
+                // `mv -t DIR SRC...`: DIR receives the sources and is not itself moved.
+                Some((dir, raw)) => {
+                    let sources: Vec<&Word> =
+                        paths.iter().copied().filter(|p| p.text != raw).collect();
+                    sources
+                        .iter()
+                        .find_map(|w| hit(w, true))
+                        .or_else(|| into_dir(&dir, &sources))
+                }
+                None => paths.split_last().and_then(|(dest, sources)| {
+                    hit(dest, false).or_else(|| sources.iter().find_map(|w| hit(w, true)))
+                }),
+            }
         } else {
             paths.iter().find_map(|w| hit(w, true))
         };
@@ -1000,55 +1019,48 @@ fn clobber(cmd: &SimpleCommand, dirs: &Dirs, homes: &Homes, wallets: &Wallets) -
             .map(|t| format!("`{program}` removes or overwrites {t}"));
     }
     if CLOBBER_DEST.contains(&program.as_str()) {
-        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
-        let target_dir = texts
-            .iter()
-            .position(|a| *a == "-t" || *a == "--target-directory")
-            .and_then(|i| words.get(i + 1))
-            .copied()
-            .or_else(|| {
-                words
-                    .iter()
-                    .copied()
-                    .find(|w| w.text.starts_with("--target-directory="))
-            });
-        let owned_dir;
-        let (dest, sources): (&Word, Vec<&Word>) = match target_dir {
-            Some(dir) => {
-                owned_dir = Word {
-                    text: dir
-                        .text
-                        .strip_prefix("--target-directory=")
-                        .unwrap_or(&dir.text)
-                        .to_string(),
-                    ..dir.clone()
-                };
-                let sources = paths
-                    .iter()
-                    .copied()
-                    .filter(|p| p.text != dir.text)
-                    .collect();
-                (&owned_dir, sources)
+        let target = target_dir(&words);
+        let (dest, sources): (&Word, Vec<&Word>) = match &target {
+            Some((dir, raw)) => {
+                let sources = paths.iter().copied().filter(|p| p.text != *raw).collect();
+                (dir, sources)
             }
             None => {
                 let (last, rest) = paths.split_last()?;
                 (*last, rest.to_vec())
             }
         };
-        if let Some(t) = hit(dest, false) {
-            return Some(format!("`{program}` overwrites {t}"));
-        }
-        return dirs
-            .resolve_all(&dest.text, homes)
-            .iter()
-            .find_map(|dir| {
-                sources
-                    .iter()
-                    .find_map(|s| wallets.hit_in_dir(dir, &s.text))
-            })
+        return hit(dest, false)
+            .or_else(|| into_dir(dest, &sources))
             .map(|t| format!("`{program}` overwrites {t}"));
     }
     None
+}
+
+/// The `-t DIR` / `--target-directory[=]DIR` operand of a file command, as the directory word
+/// and the raw operand text it came from.
+fn target_dir(words: &[&Word]) -> Option<(Word, String)> {
+    let dir = words
+        .iter()
+        .position(|w| w.text == "-t" || w.text == "--target-directory")
+        .and_then(|i| words.get(i + 1))
+        .or_else(|| {
+            words
+                .iter()
+                .find(|w| w.text.starts_with("--target-directory="))
+        })?;
+    let text = dir
+        .text
+        .strip_prefix("--target-directory=")
+        .unwrap_or(&dir.text)
+        .to_string();
+    Some((
+        Word {
+            text,
+            ..(*dir).clone()
+        },
+        dir.text.clone(),
+    ))
 }
 
 /// A file-clobbering program fed its operands by `xargs` (the parser's `$XARGS` word): when
@@ -1206,5 +1218,27 @@ mod tests {
         assert!(redirect_target("echo x > ~/.config/solana/*.json", cwd, &h, &w).is_some());
         assert!(redirect_target("echo x > out.json 2>&1", cwd, &h, &w).is_none());
         assert!(redirect_target("echo x >&2", cwd, &h, &w).is_none());
+    }
+
+    #[test]
+    fn mv_target_directory_receives_and_is_not_moved() {
+        let h = homes("/h");
+        let w = Wallets {
+            paths: vec![(
+                "/h/.config/solana/id.json".into(),
+                "/h/.config/solana/id.json".into(),
+            )],
+            canonical: Vec::new(),
+        };
+        let cwd = Dirs {
+            known: vec![PathBuf::from("/p")],
+            unknown: false,
+        };
+        let clobbers = |line: &str| clobber(&shell::parse(line).commands[0], &cwd, &h, &w);
+        assert_eq!(clobbers("mv -t /h notes.txt"), None);
+        assert_eq!(clobbers("mv --target-directory=/ notes.txt"), None);
+        assert!(clobbers("mv -t /tmp /h/.config/solana").is_some());
+        assert!(clobbers("mv -t /h/.config/solana id.json").is_some());
+        assert!(clobbers("mv -t /tmp ~/.config/solana/id.json").is_some());
     }
 }
