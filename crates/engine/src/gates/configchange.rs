@@ -70,7 +70,7 @@ pub fn decide_with(input: &Value, homes: &ConfigHomes, dir: &DataDir) -> Option<
     let path = settings_path(input, source, homes)?;
     let text = crate::policy::tier::read_bounded(&path, MAX_SETTINGS_READ).unwrap_or_default();
     let now = reasons(&text, source);
-    let key = path.to_string_lossy().into_owned();
+    let key = snapshot_key(&path);
     let mut snapshots = load_snapshots(dir);
     let seen = snapshots.get(&key);
     let new = now.iter().find(|w| seen.is_none_or(|s| !s.contains(*w)));
@@ -108,7 +108,7 @@ pub fn record_baseline(cwd: Option<&std::path::Path>, homes: &ConfigHomes, dir: 
             continue;
         };
         let text = crate::policy::tier::read_bounded(&path, MAX_SETTINGS_READ).unwrap_or_default();
-        let key = path.to_string_lossy().into_owned();
+        let key = snapshot_key(&path);
         if snapshots.len() >= MAX_SNAPSHOTS && !snapshots.contains_key(&key) {
             snapshots.pop_first();
         }
@@ -117,6 +117,16 @@ pub fn record_baseline(cwd: Option<&std::path::Path>, homes: &ConfigHomes, dir: 
     if snapshots != before {
         let _ = statefile::store(dir, SNAPSHOT_FILE, &snapshots);
     }
+}
+
+/// The snapshot key for a settings file: its components rejoined with the platform separator
+/// and any Windows verbatim prefix dropped, so the payload's `file_path` (Claude Code may mix
+/// `/` and `\\` on Windows) and the path [`settings_path`] builds name the same entry.
+fn snapshot_key(path: &std::path::Path) -> String {
+    let joined: PathBuf = path.components().collect();
+    crate::firewall::target::simplified(joined)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The disabling switches in settings `text` from `source`.
@@ -220,6 +230,23 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn snapshot_keys_ignore_separator_spelling() {
+        let a = std::path::Path::new("/tmp/x/.claude").join("settings.json");
+        let b = std::path::Path::new("/tmp/x").join(".claude/settings.json");
+        assert_eq!(snapshot_key(&a), snapshot_key(&b));
+        assert_eq!(
+            snapshot_key(std::path::Path::new("/tmp//x/./.claude/settings.json")),
+            snapshot_key(&a)
+        );
+        if cfg!(windows) {
+            let mixed = std::path::Path::new(r"C:\Users\me\.claude/settings.json");
+            let verbatim = std::path::Path::new(r"\\?\C:\Users\me\.claude\settings.json");
+            assert_eq!(snapshot_key(mixed), r"C:\Users\me\.claude\settings.json");
+            assert_eq!(snapshot_key(verbatim), snapshot_key(mixed));
+        }
     }
 
     #[test]
