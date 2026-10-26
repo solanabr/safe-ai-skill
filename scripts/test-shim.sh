@@ -31,6 +31,13 @@ unset SAFE_AI_SKILL_STRICT SAFE_AI_SKILL_DISABLE SAFE_AI_SKILL_SHIM_CACHE CLAUDE
 # The real platform, for the cases that run a native executable as the engine.
 host_s=$(uname -s)
 host_m=$(uname -m)
+case $host_s/$host_m in
+  Darwin/arm64) host_plat=darwin-arm64 ;;
+  Darwin/x86_64) host_plat=darwin-x64 ;;
+  Linux/x86_64) host_plat=linux-x64 ;;
+  Linux/aarch64 | Linux/arm64) host_plat=linux-arm64 ;;
+  *) host_plat= ;;
+esac
 native_true=
 for d in /usr/bin /bin; do
   if [ -z "$native_true" ] && [ -f "$d/true" ]; then native_true=$d/true; fi
@@ -167,6 +174,9 @@ fresh() {
   mkdir -p "$bin_dir" "$data_dir/bin" "$project_dir/.claude" "$marks" "$case_dir/crates/engine"
   : >"$case_dir/crates/engine/Cargo.toml"
   cp "$shim_src" "$bin_dir/safe-ai-skill"
+  # The test seam: the shim takes uname, od, grep and its sha256 tool from PATH, so the
+  # fakes below apply. A case that tests the fixed system paths removes it.
+  : >"$bin_dir/.sha-tools-from-path"
   chmod +x "$bin_dir/safe-ai-skill"
   engine "$data_dir/bin/safe-ai-skill" planted
   u_s=Linux
@@ -179,6 +189,7 @@ fresh() {
   no_stamp=
   e_path=
   e_tmpdir=
+  e_nofake=
   e_cache=
   e_data=$data_dir
   stale=1
@@ -187,7 +198,7 @@ fresh() {
 # launch <args...>: exec the case's shim under $sh_cmd in the case environment (by bare name
 # from its own directory when $bare is set). Called in a subshell.
 launch() {
-  PATH=$fakebin:${e_path:-$PATH}
+  if [ -n "$e_nofake" ]; then PATH=${e_path:-$PATH}; else PATH=$fakebin:${e_path:-$PATH}; fi
   FAKE_MARKS=$marks
   CLAUDE_PLUGIN_DATA=$e_data
   CLAUDE_PROJECT_DIR=$project_dir
@@ -1112,16 +1123,83 @@ matrix() {
 
   # Without the test seam the shim takes its sha256 tool from fixed system paths, so a PATH
   # without one still verifies the prebuilt.
-  if [ -x /usr/bin/sha256sum ] || [ -x /bin/sha256sum ] || [ -x /sbin/sha256sum ] ||
-    [ -x /usr/bin/shasum ]; then
+  if [ -n "$host_plat" ] && { [ -x /usr/bin/sha256sum ] || [ -x /bin/sha256sum ] ||
+    [ -x /sbin/sha256sum ] || [ -x /usr/bin/shasum ]; }; then
     fresh
-    engine "$bin_dir/safe-ai-skill-linux-x64" ok
+    rm -f "$bin_dir/.sha-tools-from-path"
+    engine "$bin_dir/safe-ai-skill-$host_plat" ok
     e_path=$minbin
     t "the sha256 tool comes from a fixed system path, not PATH"
     run gate-read
     expect_rc 0
-    expect_ran safe-ai-skill-linux-x64
+    expect_ran "safe-ai-skill-$host_plat"
   fi
+
+  # uname comes from a system dir: a PATH without uname, or with one that lies, can't pick
+  # the platform or make the shim fail open.
+  if [ -n "$host_plat" ] && { [ -x /usr/bin/uname ] || [ -x /bin/uname ]; }; then
+    for how in missing lying; do
+      fresh
+      rm -f "$bin_dir/.sha-tools-from-path"
+      for p in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+        engine "$bin_dir/safe-ai-skill-$p" ok
+      done
+      e_path=$minbin
+      case $how in
+        missing) e_nofake=1 ;;
+        lying) u_s=SunOS && u_m=sun4v ;;
+      esac
+      t "a PATH with a $how uname still runs this host's prebuilt"
+      run gate-read
+      expect_rc 0
+      expect_no_err
+      expect_out "ran=safe-ai-skill-$host_plat args=gate-read stdin=$payload_text"
+      run_solana gate-bash
+      expect_rc 0
+      expect_ran "safe-ai-skill-$host_plat"
+    done
+  fi
+
+  # No uname in a system dir (simulated under the seam by a PATH without one) is an
+  # environment failure under the usual contract, not a silent pass.
+  fresh
+  engine "$bin_dir/safe-ai-skill-linux-x64" ok
+  e_nofake=1
+  e_path=$minbin
+  t "no uname: gate-read fails open with one stderr line naming uname"
+  run gate-read
+  expect_rc 0
+  expect_no_out
+  expect_err_lines 1
+  expect_err_has uname
+  t "no uname: gate-bash on the Solana surface asks"
+  run_solana gate-bash
+  expect_rc 0
+  expect_ask
+  t "no uname: gate-skill asks"
+  run gate-skill
+  expect_rc 0
+  expect_ask
+  t "no uname: gate-mcp gives no opinion"
+  run gate-mcp
+  expect_rc 0
+  expect_no_out
+  t "no uname: SessionStart reports the firewall INACTIVE"
+  run verify session
+  expect_rc 0
+  expect_notice INACTIVE
+  expect_notice uname
+  t "no uname: a Codex hook denies"
+  run adapt codex gate-bash
+  expect_rc 0
+  expect_codex_deny
+  t "no uname: SAFE_AI_SKILL_STRICT=1 fails closed"
+  e_strict=1
+  run gate-read
+  expect_rc 2
+  e_strict=
+  t "no uname: no prebuilt ran"
+  expect_not_ran safe-ai-skill-linux-x64
 
   # Engine output never touches a file: a same-user process rewriting
   # $TMPDIR/safe-ai-skill.*/out can't turn a deny into an allow, and the shim creates no
