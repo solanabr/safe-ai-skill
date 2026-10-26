@@ -1480,25 +1480,21 @@ fn cmd_verify_session() -> ExitCode {
         platform::session_notices()
     };
     let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
-    let notices: Vec<String> = [
-        effective.ignored_notice(),
-        loosenings,
-        codex_scope,
-        safe_ai_skill::gates::keyfiles::session_notice(&cwd),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(platform_notices)
-    .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
-        format!(
-            "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+    let key_hygiene = safe_ai_skill::gates::keyfiles::session_notice(&cwd, &dir.path);
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
+        .into_iter()
+        .flatten()
+        .chain(platform_notices)
+        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+            format!(
+                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
                  {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
                  use (key included) or delete it.",
-            d.display(),
-            dir.path.display()
-        )
-    }))
-    .collect();
+                d.display(),
+                dir.path.display()
+            )
+        }))
+        .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
     let plain_default = resolution.tier == Tier::Relaxed
@@ -1506,6 +1502,7 @@ fn cmd_verify_session() -> ExitCode {
         && resolution.notes.is_empty();
     let quiet = plain_default
         && notices.is_empty()
+        && key_hygiene.is_none()
         && res.system_message.is_empty()
         && res.additional_context.is_empty();
     if !quiet {
@@ -1553,6 +1550,13 @@ fn cmd_verify_session() -> ExitCode {
             }
             field.push_str(&text);
         }
+    }
+    // Key hygiene: the remedy (untrack, chmod) is the user's to run, so only they see it.
+    if let Some(k) = key_hygiene {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&k.user);
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
     // user's systemMessage only. Never under Codex: a code is confirmed through Claude Code's
