@@ -228,7 +228,9 @@ fn sweep_reports_readable_tracked_and_unignored_key_files() {
     write(&dir, "store/app.p12", "\u{0}bin");
     chmod(&dir, "store/app.p12", 0o600);
     git(&dir, &["add", "-f", "store/app.p12"]);
-    let notice = keyfiles::session_notice(&dir).expect("a notice");
+    let notice = keyfiles::session_notice(&dir, &data_dir("n"))
+        .expect("a notice")
+        .user;
     assert!(!notice.contains('\n'), "{notice}");
     // An ignored 0644 env file is fine: env-style files get no permission check.
     assert!(!notice.contains(" .env ("), "{notice}");
@@ -280,7 +282,7 @@ fn sweep_is_silent_on_a_tidy_project() {
     write(&dir, "target/debug/.env", "LEAK=1\n");
     write(&dir, "src/main.rs", "fn main() {}\n");
     git(&dir, &["add", ".gitignore", ".env.example", "src/main.rs"]);
-    assert_eq!(keyfiles::session_notice(&dir), None);
+    assert_eq!(keyfiles::session_notice(&dir, &data_dir("tidy")), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -292,7 +294,9 @@ fn sweep_lists_tracked_key_files_removed_from_the_tree() {
     write(&dir, "deploy/release.jks", "\u{0}\u{1}");
     git(&dir, &["add", "deploy/release.jks"]);
     std::fs::remove_file(dir.join("deploy/release.jks")).unwrap();
-    let notice = keyfiles::session_notice(&dir).expect("a notice");
+    let notice = keyfiles::session_notice(&dir, &data_dir("n"))
+        .expect("a notice")
+        .user;
     assert!(
         notice.contains("deploy/release.jks (Java key store: tracked by git)"),
         "{notice}"
@@ -304,7 +308,7 @@ fn sweep_lists_tracked_key_files_removed_from_the_tree() {
 fn sweep_skips_a_home_directory_without_a_repository() {
     let home = isolate();
     write(&home, ".env", "API_KEY=x\n");
-    assert_eq!(keyfiles::session_notice(&home), None);
+    assert_eq!(keyfiles::session_notice(&home, &data_dir("home")), None);
     let _ = std::fs::remove_file(home.join(".env"));
 }
 
@@ -317,7 +321,7 @@ fn sweep_is_bounded() {
     }
     write(&dir, "deep/a/b/c/d/e/f/g/h/i/j/.env", "K=v\n");
     let start = Instant::now();
-    let _ = keyfiles::session_notice(&dir);
+    let _ = keyfiles::session_notice(&dir, &data_dir("bounded"));
     assert!(start.elapsed().as_millis() < 2000);
     let found = keyfiles::sweep(&dir, keyfiles::SESSION_CAPS);
     assert!(
@@ -381,7 +385,218 @@ fn bench() {
         cases.len()
     );
     let t = Instant::now();
-    let _ = keyfiles::session_notice(&empty);
+    let _ = keyfiles::session_notice(&empty, &data_dir("bench"));
     println!("bench: session sweep of an empty repo {:?}", t.elapsed());
     let _ = std::fs::remove_dir_all(&empty);
+}
+
+// ---- regressions -------------------------------------------------------------------------
+
+/// A tracked path with a multi-byte character next to a pathspec's length used to slice the
+/// string inside the character and panic, losing the whole Bash verdict.
+#[test]
+fn non_ascii_tracked_paths_do_not_panic() {
+    let dir = temp("utf8");
+    git(&dir, &["init", "-q"]);
+    write(&dir, "aé/.env", "API_KEY=sk_live_utf8\n");
+    write(&dir, "ab/.env", "API_KEY=sk_live_ab\n");
+    write(&dir, "ab/x.rs", "x\n");
+    git(&dir, &["add", "-f", "aé/.env", "ab/.env", "ab/x.rs"]);
+    write(&dir, "aé/.env", "API_KEY=sk_live_utf8_changed\n");
+    write(&dir, "ab/.env", "API_KEY=sk_live_ab_changed\n");
+    for command in [
+        "git add ab",
+        "git add aé",
+        "git add a",
+        "git commit -a -m x",
+        "git add é",
+    ] {
+        let _ = keyfiles::decide_bash(command, &dir, Tier::High);
+    }
+    match keyfiles::decide_bash("git add ab", &dir, Tier::High) {
+        Some(safe_ai_skill::gate::Verdict::Deny(reason)) => {
+            assert!(reason.contains("ab/.env"), "{reason}");
+            assert!(!reason.contains("aé/.env"), "{reason}");
+        }
+        other => panic!("want a deny, got {other:?}"),
+    }
+    match keyfiles::decide_bash("git add aé", &dir, Tier::High) {
+        Some(safe_ai_skill::gate::Verdict::Deny(reason)) => {
+            assert!(reason.contains("aé/.env"), "{reason}")
+        }
+        other => panic!("want a deny, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stash stays in the local repository: a modified tracked env file is not flagged, while
+/// an untracked one swept in by `-u` / `--include-untracked` / `-a` / `--all` still is.
+#[test]
+fn stash_skips_tracked_files_and_flags_untracked_ones_only_when_included() {
+    let dir = temp("stash");
+    git(&dir, &["init", "-q"]);
+    write(&dir, ".env.development", "API_URL=http://localhost\n");
+    git(&dir, &["add", "-f", ".env.development"]);
+    write(&dir, ".env.development", "API_URL=http://localhost:9\n");
+    for command in [
+        "git stash",
+        "git stash push",
+        "git stash push -- .env.development",
+        "git stash save wip",
+        "git stash -u",
+        "git stash --all",
+    ] {
+        assert_eq!(
+            keyfiles::decide_bash(command, &dir, Tier::High),
+            None,
+            "{command}"
+        );
+    }
+    write(&dir, ".env.local", "API_KEY=sk_live_untracked\n");
+    for command in ["git stash", "git stash push", "git stash --keep-index"] {
+        assert_eq!(
+            keyfiles::decide_bash(command, &dir, Tier::High),
+            None,
+            "{command}"
+        );
+    }
+    for command in [
+        "git stash -u",
+        "git stash --include-untracked",
+        "git stash push -a",
+        "git stash push --all",
+    ] {
+        match keyfiles::decide_bash(command, &dir, Tier::High) {
+            Some(safe_ai_skill::gate::Verdict::Deny(reason)) => {
+                assert!(reason.contains(".env.local"), "{command}: {reason}");
+                assert!(!reason.contains(".env.development"), "{command}: {reason}");
+            }
+            other => panic!("{command}: want a deny, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plugin data dir of the test's own, never the real one.
+fn data_dir(tag: &str) -> PathBuf {
+    let d = temp(&format!("data-{tag}"));
+    std::env::set_var("CLAUDE_PLUGIN_DATA", &d);
+    d
+}
+
+/// Intentionally committed files (a React Native debug keystore, a committed
+/// `.env.development`) are reported once, not every session; a changed finding set is
+/// reported again. The model-facing text never prescribes `git rm --cached`.
+#[cfg(unix)]
+#[test]
+fn session_notice_is_once_per_project_and_finding_set() {
+    let dir = temp("once");
+    let data = data_dir("once");
+    git(&dir, &["init", "-q"]);
+    write(&dir, "android/app/debug.keystore", "\u{0}\u{1}jks");
+    write(&dir, ".env.development", "API_URL=http://localhost\n");
+    git(
+        &dir,
+        &[
+            "add",
+            "-f",
+            "android/app/debug.keystore",
+            ".env.development",
+        ],
+    );
+    let first = keyfiles::session_notice(&dir, &data).expect("a notice");
+    assert!(
+        first.user.contains("android/app/debug.keystore"),
+        "{}",
+        first.user
+    );
+    assert!(first.user.contains("git rm --cached"), "{}", first.user);
+    assert!(
+        first.model.contains("android/app/debug.keystore"),
+        "{}",
+        first.model
+    );
+    assert!(!first.model.contains("git rm"), "{}", first.model);
+    assert!(!first.model.contains("chmod"), "{}", first.model);
+    assert!(!first.user.contains('\n') && !first.model.contains('\n'));
+    assert_eq!(keyfiles::session_notice(&dir, &data), None);
+    assert_eq!(keyfiles::session_notice(&dir, &data), None);
+    // Another project with the same names is its own project.
+    let other = temp("once-other");
+    git(&other, &["init", "-q"]);
+    write(&other, ".env.development", "API_URL=http://localhost\n");
+    git(&other, &["add", "-f", ".env.development"]);
+    assert!(keyfiles::session_notice(&other, &data).is_some());
+    // A new finding changes the set: reported again, listing everything.
+    write(&dir, "deploy/release.p12", "\u{0}bin");
+    let again = keyfiles::session_notice(&dir, &data).expect("a notice for the new set");
+    assert!(again.user.contains("deploy/release.p12"), "{}", again.user);
+    assert!(again.user.contains("debug.keystore"), "{}", again.user);
+    assert_eq!(keyfiles::session_notice(&dir, &data), None);
+    // Back to the old set: that is a change too.
+    std::fs::remove_file(dir.join("deploy/release.p12")).unwrap();
+    assert!(keyfiles::session_notice(&dir, &data).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&other);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Tracked files the walk did not reach share the sweep's sniff budget: once it is spent,
+/// only name-decided patterns count (a `.pem` then needs its content and is not reported).
+#[cfg(unix)]
+#[test]
+fn tracked_loop_shares_the_sniff_budget() {
+    let dir = temp("budget");
+    git(&dir, &["init", "-q"]);
+    let key = format!(
+        "{0}BEGIN PRIVATE KEY{0}\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n{0}END PRIVATE KEY{0}\n",
+        "-----"
+    );
+    for i in 0..4 {
+        write(&dir, &format!("k/k{i}.pem"), &key);
+    }
+    // Visited after `k/` (subdirectories go in name order), so past the budget.
+    write(&dir, "z/z.p12", "\u{0}bin");
+    write(&dir, "z/.env.production", "DB_PASSWORD=budget_pw\n");
+    git(&dir, &["add", "-f", "k", "z"]);
+    let full = keyfiles::sweep(&dir, keyfiles::SESSION_CAPS);
+    assert_eq!(full.len(), 6, "{full:?}");
+    let caps = keyfiles::Caps {
+        sniffs: 1,
+        ..keyfiles::SESSION_CAPS
+    };
+    let capped = keyfiles::sweep(&dir, caps);
+    let pems = capped.iter().filter(|f| f.rel.ends_with(".pem")).count();
+    assert_eq!(pems, 1, "{capped:?}");
+    assert!(capped.iter().any(|f| f.rel == "z/z.p12"), "{capped:?}");
+    assert!(
+        capped.iter().any(|f| f.rel == "z/.env.production"),
+        "{capped:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Timing check: 20,000 tracked certificates (none a key) used to take seconds at session
+/// start. `cargo test --release --test ex_g5-keyfiles -- --ignored --nocapture tracked_certs`.
+#[test]
+#[ignore]
+fn tracked_certs_sweep_timing() {
+    let dir = temp("certs");
+    git(&dir, &["init", "-q"]);
+    let cert = format!(
+        "{0}BEGIN CERTIFICATE{0}\n{1}\n{0}END CERTIFICATE{0}\n",
+        "-----",
+        "MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkq".repeat(40)
+    );
+    for i in 0..20_000 {
+        write(&dir, &format!("certs/c{}/c{i}.pem", i % 100), &cert);
+    }
+    git(&dir, &["add", "-f", "certs"]);
+    let t = Instant::now();
+    let found = keyfiles::sweep(&dir, keyfiles::SESSION_CAPS);
+    let took = t.elapsed();
+    println!("tracked_certs_sweep_timing: 20000 tracked certs swept in {took:?}");
+    assert!(found.is_empty(), "{found:?}");
+    assert!(took.as_millis() < 1000, "{took:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
