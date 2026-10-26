@@ -241,7 +241,7 @@ mod tests {
             r#"{"permissions":{"deny":["Read(./secret)"],"allow":["Bash(ls)"]},"model":"x"}"#,
         )
         .unwrap();
-        let m = run(&doc, Tier::Medium, &Owned::default());
+        let m = run(&doc, Tier::High, &Owned::default());
         assert_eq!(
             m.doc.at("permissions.deny").unwrap().strings(),
             ["Read(./secret)", "Bash(bash -c *)"]

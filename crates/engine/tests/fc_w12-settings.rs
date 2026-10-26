@@ -123,7 +123,8 @@ fn medium_and_high_add_their_rules() {
     let e = Env::new("high");
     ok(e.apply(Some(Tier::Medium), Tier::Relaxed));
     let d = e.doc();
-    assert_eq!(strings(&d, "permissions.deny"), ["Bash(bash -c *)"]);
+    // The `bash -c` deny is written at High only.
+    assert!(strings(&d, "permissions.deny").is_empty());
     assert!(strings(&d, "sandbox.filesystem.denyRead").contains(&"~/.npmrc".to_string()));
     assert!(strings(&d, "sandbox.network.deniedDomains").contains(&"api.telegram.org".into()));
     assert!(d
@@ -360,17 +361,29 @@ fn check_and_show_report_drift() {
     assert!(note.contains("declared"), "{note}");
 
     // A recorded rule removed from the file.
-    let text = e.text().replace("      \"Bash(bash -c *)\"\n", "");
-    let text = text.replace("\"deny\": [\n    ]", "\"deny\": []");
+    let text = e.text().replace("        \"~/.npmrc\",\n", "");
+    assert_ne!(text, e.text(), "the Medium denyRead holds ~/.npmrc");
     std::fs::write(e.settings(), text).unwrap();
     let r = firewall::check(&e.ctx(Tier::Medium));
     assert!(r.drift.iter().any(|d| d.kind == "absent"), "{r:?}");
-    assert!(r.absent.iter().any(|a| a.contains("bash -c")));
+    assert!(r.absent.iter().any(|a| a.contains(".npmrc")));
 
     let s = firewall::show(&e.ctx(Tier::Medium));
     assert_eq!(s["action"], "show");
     assert_eq!(s["enforced"], "medium");
-    assert!(s["declared_block"]["lists"]["permissions.deny"].as_u64() == Some(1));
+    // No permission deny at Medium; the sandbox lists carry the block.
+    assert_eq!(
+        s["declared_block"]["lists"]["permissions.deny"]
+            .as_u64()
+            .unwrap_or(0),
+        0
+    );
+    assert!(
+        s["declared_block"]["lists"]["sandbox.filesystem.denyRead"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
 
     // Re-apply restores it.
     ok(e.apply(None, Tier::Medium));
@@ -401,7 +414,7 @@ fn session_resync_reapplies_an_older_rule_set_and_never_lowers() {
     let m = Env::new("resync-raise");
     ok(m.apply(None, Tier::Relaxed));
     assert!(firewall::session_resync(&m.ctx(Tier::Medium)).is_some());
-    assert_eq!(strings(&m.doc(), "permissions.deny"), ["Bash(bash -c *)"]);
+    assert!(strings(&m.doc(), "sandbox.filesystem.denyRead").contains(&"~/.npmrc".to_string()));
 }
 
 #[test]

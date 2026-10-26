@@ -24,8 +24,8 @@ use crate::policy::tier::Tier;
 /// - 1: first rule set (X1–X9, P14, P21 from kit rule set 10).
 pub const RULE_SET_VERSION: u32 = 1;
 
-/// `DENY_BASH_C` (l.1032–1034), Medium and High (l.1747): a skill's set-up line reaches
-/// Claude Code's permission rules only, never a hook (P14).
+/// `DENY_BASH_C` (l.1032–1034), written at High only (the kit: Medium and High, l.1747): a
+/// skill's set-up line reaches Claude Code's permission rules only, never a hook (P14).
 pub const DENY_BASH_C: &[&str] = &["Bash(bash -c *)"];
 
 /// `EXCLUDED_COMMANDS` (l.1393–1402), Relaxed and up (l.1777). Each entry is a hole kept for
@@ -272,8 +272,9 @@ pub fn plan(tier: Tier, domains: &[&str], machine: &MachineInputs) -> Block {
     let medium_up = tier >= Tier::Medium;
     let high = tier == Tier::High;
 
+    // High only (user decision 2026-10-26); the kit also denies it at Medium.
     let i = idx("permissions.deny");
-    if medium_up {
+    if high {
         push_all(&mut lists[i].1, DENY_BASH_C);
     }
 
@@ -366,7 +367,8 @@ mod tests {
         let md = plan(Tier::Medium, D, &m);
         let h = plan(Tier::High, D, &m);
         assert!(r.list("permissions.deny").is_empty());
-        assert_eq!(md.list("permissions.deny"), ["Bash(bash -c *)"]);
+        assert!(md.list("permissions.deny").is_empty());
+        assert_eq!(h.list("permissions.deny"), ["Bash(bash -c *)"]);
         assert!(r.list("sandbox.filesystem.allowRead").is_empty());
         assert!(h
             .list("sandbox.filesystem.denyRead")
