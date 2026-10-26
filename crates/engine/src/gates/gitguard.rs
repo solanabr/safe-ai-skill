@@ -7,7 +7,7 @@
 //! |---|---|---|---|---|
 //! | E5 | force push (`--force*`, `-f` clusters, `+refspec`, not `--dry-run`), `gh pr merge` | – | ask | deny |
 //! | E6 | `rebase` (not `--abort/--continue/…`), `filter-branch/-repo`, `commit --amend`, `stash drop/clear`, `branch/tag -d`, `branch -D/-f` | – | – | ask |
-//! | E8 | `clean`, `restore`, `checkout --`, `reset --ha*`, `reflog expire/delete/drop`, `prune`, `gc --prune*`, `push --mirror` | deny | deny | deny |
+//! | E8 | `clean` (not `-n`/`--dry-run`), `restore` (not `--staged` alone), `checkout --`, `reset --ha*`, `reflog expire/delete/drop`, `prune`, `gc --prune*`, `push --mirror` | deny | deny | deny |
 //! | E10 | `git --config-env`, `git --exec-path=<dir>`, `GIT_CONFIG_COUNT/KEY_n/VALUE_n`, `GIT_CONFIG_PARAMETERS`, `GIT_EXEC_PATH` | deny | deny | deny |
 //! | E11 | `GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS` (+ `GIT_TEMPLATE_DIR`) | – | – | ask |
 //! | E12 | `--receive-pack`/`--exec` on push, `--upload-pack` on pull/fetch/clone/ls-remote (+ `clone -u`, `archive --exec`) | deny | deny | deny |
@@ -312,6 +312,42 @@ fn texts(words: &[Word]) -> impl Iterator<Item = &str> {
     words.iter().map(|w| w.text.as_str())
 }
 
+/// The options of a git subcommand, up to `--` (after it, every word is a path).
+fn options(words: &[Word]) -> impl Iterator<Item = &str> {
+    texts(words)
+        .take_while(|t| *t != "--")
+        .filter(|t| t.starts_with('-'))
+}
+
+/// `git clean -n` / `--dry-run` (alone or in a cluster such as `-nd`) only lists.
+fn clean_dry_run(rest: &[Word]) -> bool {
+    options(rest).any(|t| t == "--dry-run" || (!t.starts_with("--") && t[1..].contains('n')))
+}
+
+/// `git restore --staged` / `-S` without `--worktree` / `-W` only unstages: the working tree
+/// is untouched. `-s` takes a value, so the rest of its cluster is that value.
+fn restore_index_only(rest: &[Word]) -> bool {
+    let (mut staged, mut worktree) = (false, false);
+    for t in options(rest) {
+        match t {
+            "--staged" => staged = true,
+            "--worktree" => worktree = true,
+            _ if t.starts_with("--") => {}
+            _ => {
+                for c in t[1..].chars() {
+                    match c {
+                        'S' => staged = true,
+                        'W' => worktree = true,
+                        's' => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    staged && !worktree
+}
+
 fn git_findings(walk: &GitWalk<'_>, tier: Tier, out: &mut Vec<Finding>) {
     const FIX_RUN: &str = "if the user wants it, they run it themselves";
     if walk.config_env {
@@ -333,11 +369,11 @@ fn git_findings(walk: &GitWalk<'_>, tier: Tier, out: &mut Vec<Finding>) {
     let any = |pred: &dyn Fn(&str) -> bool| texts(rest).any(pred);
     match sub {
         // E8: uncommitted work and the reflog record are in no reflog.
-        "clean" => out.push(deny_every_tier(
+        "clean" if !clean_dry_run(rest) => out.push(deny_every_tier(
             "runs git clean, deleting untracked files",
             FIX_RUN,
         )),
-        "restore" => out.push(deny_every_tier(
+        "restore" if !restore_index_only(rest) => out.push(deny_every_tier(
             "runs git restore, overwriting the working tree",
             FIX_RUN,
         )),
@@ -1392,7 +1428,7 @@ mod tests {
         for cmd in [
             "git clean -fdx",
             "git clean",
-            "git --no-pager clean -n",
+            "git --no-pager clean -fd",
             "git -C . restore .",
             "git checkout -- .",
             "git reset --ha HEAD",
