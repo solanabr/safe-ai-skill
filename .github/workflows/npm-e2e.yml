@@ -23,8 +23,36 @@ on:
   workflow_call:
 
 jobs:
+  # The scheduled run tests whatever version the manifest declares; before that version is
+  # released there is nothing to download, so skip with a notice. Every other trigger runs
+  # unconditionally (a missing release there is a real failure).
+  release-present:
+    name: release for manifest version exists
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' npm/package.json | head -n1)
+          if [ "$EVENT" != schedule ] || gh release view "v${version}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No GitHub Release v${version} yet; skipping the scheduled npm install e2e."
+          fi
+
   npm-install:
     name: npm install + verify + exec / ${{ matrix.os }}
+    needs: release-present
+    if: needs.release-present.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,6 +90,8 @@ jobs:
   # containers on arm64.
   npm-install-container:
     name: npm install + exec / ${{ matrix.image }} / ${{ matrix.os }}
+    needs: release-present
+    if: needs.release-present.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
