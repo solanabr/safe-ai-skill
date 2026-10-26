@@ -1436,6 +1436,13 @@ fn cmd_verify_session() -> ExitCode {
     let dir = state_dir(&cwd);
     let plugin_data = dir.path.clone();
     let now = now_secs();
+    // The disabling switches the settings files already hold, before the agent acts, so one
+    // the user set does not make `gate-config` block every later edit of its file.
+    safe_ai_skill::gates::configchange::record_baseline(
+        Some(&cwd),
+        &safe_ai_skill::gates::tamper::ConfigHomes::from_env(),
+        &dir,
+    );
 
     // 1.0 state is migrated once, before anything creates the state key; then the spend
     // ledger is started (or repaired), which creates the key on a first run.
