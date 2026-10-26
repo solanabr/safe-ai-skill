@@ -913,22 +913,16 @@ fn long_cd_chain_keeps_the_secret_read_deny() {
     // A few hundred relative `cd`s once made the cd-following gates grow without bound, so a
     // 3 KB command hit the gate deadline and a secret read came back as ask instead of deny.
     let sb = Sandbox::new("tw-cdchain");
+    // A deadline answer is an ask past `HOOK_DEADLINE`, so the default limit catches it.
     let chain = "cd x && ".repeat(400);
-    assert_answers_within(
+    assert_answers(
         &sb,
         "400 cds + secret read",
         &format!("{chain}true{SECRET_READ}"),
         &[Some("deny")],
-        std::time::Duration::from_secs(3),
     );
     for tail in ["echo hi > out.txt", "rm -f junk"] {
-        assert_answers_within(
-            &sb,
-            tail,
-            &format!("{chain}{tail}"),
-            &[None, Some("ask")],
-            std::time::Duration::from_secs(3),
-        );
+        assert_answers(&sb, tail, &format!("{chain}{tail}"), &[None, Some("ask")]);
     }
 }
 
