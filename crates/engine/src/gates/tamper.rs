@@ -3296,6 +3296,9 @@ struct Places {
     vars: Vec<(String, String)>,
 }
 
+/// Most directories [`Places`] follows through a chain of `cd`s (see [`Places::cd`]).
+const MAX_PLACES: usize = 64;
+
 impl Places {
     /// Every absolute spelling of `raw` (none when it holds an expansion); after a directory
     /// change the gate cannot follow, a relative path is also placed under a stand-in dir so
@@ -3318,6 +3321,12 @@ impl Places {
     }
 
     fn cd(&mut self, cmd: &SimpleCommand, homes: &ConfigHomes) {
+        // Every relative `cd` maps each known dir again, so the set grows with the chain; past
+        // the cap the location is unknown, which keeps relative paths classified (`/?`).
+        if self.known.len() >= MAX_PLACES {
+            self.unknown = true;
+            return;
+        }
         let target = cmd.words.iter().skip(1).find(|w| !w.text.starts_with('-'));
         match target {
             Some(w) if !w.splits => {

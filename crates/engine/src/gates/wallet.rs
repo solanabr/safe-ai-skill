@@ -420,6 +420,9 @@ struct Dirs {
     unknown: bool,
 }
 
+/// Most directories [`Dirs`] follows through a chain of `cd`s (see [`Dirs::step`]).
+const MAX_DIRS: usize = 64;
+
 impl Dirs {
     fn new(cwd: &Path, parsed: &shell::Parsed) -> Dirs {
         let has_cd = parsed
@@ -442,6 +445,12 @@ impl Dirs {
                 return;
             }
             _ => return,
+        }
+        // Each relative `cd` resolves against every known dir, so the set grows with the chain;
+        // past the cap the location is unknown, as for a `cd` the gate cannot follow.
+        if self.known.len() >= MAX_DIRS {
+            self.unknown = true;
+            return;
         }
         let target = cmd
             .words
