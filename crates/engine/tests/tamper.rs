@@ -782,8 +782,41 @@ fn timed_bash(sb: &Sandbox, command: &str) -> (Run, std::time::Duration) {
 /// work budget's 2 s deadline is what keeps the hook inside it.
 const HOOK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Claude Code's timeout for the Bash hooks (`timeout` in hooks.json): a hook still running
+/// past it is skipped, which fails open.
+const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The binary's own deadline for a PreToolUse gate (`GATE_DEADLINE` in main.rs): past it the
+/// gate stops and answers `ask`.
+const GATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// How long an input built to exhaust the gate may take to be answered. The gate stops at
+/// [`GATE_DEADLINE`] at the latest, so this is that plus the process's own overhead (spawn,
+/// a 1 MiB stdin, exit). A release build must still answer inside [`HOOK_TIMEOUT`]; a debug
+/// build is several times slower outside the deadline-bounded part, more so on a Windows
+/// runner, and is not what ships, so it gets more slack.
+fn exhaustion_limit() -> std::time::Duration {
+    let slack_ms = match (cfg!(debug_assertions), cfg!(windows)) {
+        (false, _) => 1_500,
+        (true, false) => 6_000,
+        (true, true) => 12_000,
+    };
+    GATE_DEADLINE + std::time::Duration::from_millis(slack_ms)
+}
+
 /// `command` must be answered with one of `allowed` (`None` = no opinion), exit 0, in time.
 fn assert_answers(sb: &Sandbox, what: &str, command: &str, allowed: &[Option<&str>]) {
+    assert_answers_within(sb, what, command, allowed, HOOK_DEADLINE);
+}
+
+/// [`assert_answers`] with `limit` in place of [`HOOK_DEADLINE`].
+fn assert_answers_within(
+    sb: &Sandbox,
+    what: &str,
+    command: &str,
+    allowed: &[Option<&str>],
+    limit: std::time::Duration,
+) {
     let (run, took) = timed_bash(sb, command);
     assert_eq!(run.code, Some(0), "{what}: crashed\nstderr: {}", run.stderr);
     let got = verdict(&run);
@@ -792,7 +825,7 @@ fn assert_answers(sb: &Sandbox, what: &str, command: &str, allowed: &[Option<&st
         "{what}: got {got:?}, want one of {allowed:?}\nstderr: {}",
         run.stderr
     );
-    assert!(took < HOOK_DEADLINE, "{what}: took {took:?}");
+    assert!(took < limit, "{what}: took {took:?}, limit {limit:?}");
 }
 
 const SECRET_READ: &str = "; cat ~/.config/solana/id.json";
@@ -848,9 +881,14 @@ fn unclosed_braces_are_linear() {
 fn work_budget_exhaustion_asks() {
     // A chain of relative `cd`s just under the 1 MiB stdin cap (so the payload is read, not
     // refused as oversized) is more than the tripwire will inspect: it must ask (a hard
-    // guard), never answer with no opinion.
+    // guard), never answer with no opinion. The work budget's own reason shows the budget
+    // stopped the scan, not the gate deadline. The time limits only check that the answer is
+    // bounded (see `exhaustion_limit`): a gate's deadline answer lands just past 8 s by
+    // construction, so the 8 s `HOOK_DEADLINE` would fail it on timing alone.
     let sb = Sandbox::new("tw-budget");
     let chain = "cd x && ".repeat(((1 << 20) - 4096) / 8);
+    let limit = exhaustion_limit();
+    assert!(cfg!(debug_assertions) || limit < HOOK_TIMEOUT, "{limit:?}");
     let (run, took) = timed_bash(&sb, &chain);
     assert_eq!(verdict(&run).as_deref(), Some("ask"), "{}", run.stderr);
     assert!(
@@ -858,12 +896,15 @@ fn work_budget_exhaustion_asks() {
         "{}",
         reason(&run)
     );
-    assert!(took < HOOK_DEADLINE, "took {took:?}");
-    assert_answers(
+    assert!(took < limit, "took {took:?}, limit {limit:?}");
+    // With a secret read after the chain the answer may come from the gate deadline instead
+    // of the budget; either way it must be deny or ask, in bounded time.
+    assert_answers_within(
         &sb,
         "cd chain + secret read",
         &format!("{chain}true{SECRET_READ}"),
         &[Some("deny"), Some("ask")],
+        limit,
     );
 }
 

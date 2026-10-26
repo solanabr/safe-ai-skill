@@ -838,6 +838,29 @@ mod tests {
         PathBuf::from("/nonexistent-cwd")
     }
 
+    /// A real project directory, canonical and unique to the test, removed on drop. A fake
+    /// cwd like [`here`] has no drive letter on Windows, so it never holds a project env file.
+    struct Project(PathBuf);
+
+    impl Project {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir =
+                std::env::temp_dir().join(format!("sas-read-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(std::fs::canonicalize(&dir).unwrap())
+        }
+    }
+
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn decide(path: &str) -> Decision {
         decide_path(path, &here(), &policy())
     }
@@ -1071,13 +1094,14 @@ mod tests {
 
     #[test]
     fn mcp_paths_with_spaces_are_checked() {
+        let proj = Project::new("mcp-spaces");
         let v = serde_json::json!({ "path": "my dir/.env" });
         assert!(matches!(
-            decide_mcp_args(Some(&v), &here(), &high()),
+            decide_mcp_args(Some(&v), &proj.0, &high()),
             Decision::Deny { .. }
         ));
         assert_eq!(
-            decide_mcp_args(Some(&v), &here(), &policy()),
+            decide_mcp_args(Some(&v), &proj.0, &policy()),
             Decision::Defer
         );
     }

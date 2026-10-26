@@ -6,7 +6,8 @@
 //! hooks.json does (Bash: `gate-bash` and `gate-bash-secrets`, strictest wins; Read/Grep:
 //! `gate-read`; `mcp__*`: `gate-mcp`) in a fresh project and home.
 //!
-//! Row fields beyond the common ones: `env` (extra variables, `{HOME}`/`{CWD}` substituted),
+//! Row fields beyond the common ones: `env` (extra variables, `{HOME}`/`{CWD}` substituted; a
+//! list value is a path list joined with the platform separator),
 //! `links` (`[kind, from, to]`, kind `hard` or `sym`, `~/` the home) and, for a Grep the gate
 //! rewrites, `want: "rewrite"` with `glob_has` (text the rewritten glob must exclude).
 
@@ -32,6 +33,19 @@ fn substitute(value: &Value, cwd: &Path, home: &Path) -> Value {
                 .collect(),
         ),
         other => other.clone(),
+    }
+}
+
+/// An `env` value: a string as is, or a list joined into a path list with the platform's
+/// separator (`:` on Unix, `;` on Windows), so a `KUBECONFIG`-style list splits the same way
+/// everywhere.
+fn env_value(value: &Value) -> String {
+    match value {
+        Value::Array(parts) => std::env::join_paths(parts.iter().map(|p| p.as_str().unwrap()))
+            .unwrap()
+            .into_string()
+            .unwrap(),
+        other => other.as_str().unwrap().to_string(),
     }
 }
 
@@ -121,10 +135,7 @@ fn run_row(row: &Value) -> (String, String, Option<String>) {
         .as_object()
         .map(|o| {
             o.iter()
-                .map(|(k, v)| {
-                    let v = substitute(v, &proj, &home);
-                    (k.clone(), v.as_str().unwrap().to_string())
-                })
+                .map(|(k, v)| (k.clone(), env_value(&substitute(v, &proj, &home))))
                 .collect()
         })
         .unwrap_or_default();
