@@ -22,7 +22,9 @@ struct Env {
 impl Env {
     fn new(tag: &str) -> Env {
         let root = TempDir::outside_home(&format!("w12-{tag}"));
-        let project = std::fs::canonicalize(root.path()).unwrap().join("proj");
+        // Spelled as the firewall spells it (no Windows verbatim prefix).
+        let project =
+            firewall::target::simplified(std::fs::canonicalize(root.path()).unwrap()).join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let data_path = std::fs::canonicalize(root.path()).unwrap().join("data");
         std::fs::create_dir_all(&data_path).unwrap();
@@ -215,10 +217,11 @@ fn lowering_is_parked_and_writes_nothing() {
     assert!(done.contains("relaxed"), "{done}");
     let fresh = Env::new("lower-fresh");
     ok(fresh.apply(None, Tier::Relaxed));
-    // The block names each project's root, so compare with the roots masked.
+    // The block names each project's root, so compare with the roots masked (as the JSON
+    // text spells them: a Windows `\` is written `\\`).
     let masked = |env: &Env| {
-        env.text()
-            .replace(env.project.to_string_lossy().as_ref(), "<root>")
+        let root = Value::String(env.project.to_string_lossy().into_owned()).to_string();
+        env.text().replace(&root, "\"<root>\"")
     };
     assert_eq!(masked(&e), masked(&fresh));
     let choice = safe_ai_skill::tierstate::user_choice(&e.data, &e.project);
@@ -398,6 +401,10 @@ fn duplicated_keys_are_refused_and_reported() {
     assert!(note.contains("repeats"), "{note}");
 }
 
+// Off Windows only: on Windows Claude Code keeps `settings.local.json` in the starting
+// directory, not at the repository root (firewall::target), so a subdirectory session writes
+// there and names no repository root or `.git` (covered by the target unit tests).
+#[cfg(not(windows))]
 #[test]
 fn project_root_is_written_absolute_from_a_subdirectory_at_high() {
     let e = Env::new("rootsub");
@@ -453,6 +460,10 @@ fn project_root_is_written_absolute_from_a_subdirectory_at_high() {
     assert!(firewall::check(&ctx).drift.is_empty());
 }
 
+// Off Windows only: on Windows Claude Code keeps `settings.local.json` in the starting
+// directory, not at the repository root (firewall::target), so a subdirectory session writes
+// there and names no repository root or `.git` (covered by the target unit tests).
+#[cfg(not(windows))]
 #[test]
 fn repo_git_dir_is_written_absolute_from_a_subdirectory() {
     let e = Env::new("gitsub");
