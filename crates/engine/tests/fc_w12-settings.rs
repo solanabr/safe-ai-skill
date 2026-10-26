@@ -340,6 +340,110 @@ fn invalid_json_is_refused_and_left() {
 }
 
 #[test]
+fn duplicated_keys_are_refused_and_reported() {
+    let e = Env::new("dupkeys");
+    let text = "{\n  \"sandbox\": {\n    \"enabled\": true\n  },\n  \"sandbox\": {\n    \"enabled\": false\n  }\n}\n";
+    write(&e.settings(), text);
+    let err = match e.apply(Some(Tier::Relaxed), Tier::Relaxed) {
+        Outcome::Error(m) => m,
+        o => panic!("expected a refusal, got {o:?}"),
+    };
+    assert!(err.contains("sandbox"), "{err}");
+    assert!(err.contains("settings.local.json"), "{err}");
+    assert_eq!(e.text(), text, "the file is left as it is");
+    assert!(matches!(
+        statefile::load::<firewall::RecordFile>(&e.data, RECORD_FILE),
+        statefile::Loaded::Missing
+    ));
+    // What Claude Code reads (the last occurrence) is what the floor sees.
+    assert_eq!(firewall::inferred_tier(&e.doc()), None);
+
+    // Applied first, then duplicated by hand: check reports it.
+    let d = Env::new("dupkeys-after");
+    ok(d.apply(None, Tier::Relaxed));
+    let applied = d.text();
+    let dup = applied.replacen(
+        "{\n",
+        "{\n  \"sandbox\": {\n    \"enabled\": false\n  },\n",
+        1,
+    );
+    // The writer appends its block after the user's keys, so put the user's copy last.
+    let last = format!(
+        "{},\n  \"sandbox\": {{\n    \"enabled\": false\n  }}\n}}\n",
+        applied.trim_end().trim_end_matches('}').trim_end()
+    );
+    for t in [dup, last] {
+        std::fs::write(d.settings(), &t).unwrap();
+        let v = match firewall::run(&Command::Check, &d.ctx(Tier::Relaxed)) {
+            Outcome::Drift(v) => v,
+            o => panic!("{o:?}"),
+        };
+        assert!(
+            v["drift"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["kind"] == "duplicate-key"),
+            "{v}"
+        );
+        assert!(matches!(d.apply(None, Tier::Relaxed), Outcome::Error(_)));
+        assert_eq!(d.text(), t);
+    }
+    let note = firewall::session_note(&d.ctx(Tier::Relaxed)).unwrap();
+    assert!(note.contains("repeats"), "{note}");
+}
+
+#[test]
+fn repo_git_dir_is_written_absolute_from_a_subdirectory() {
+    let e = Env::new("gitsub");
+    std::fs::create_dir_all(e.project.join(".git")).unwrap();
+    let sub = e.project.join("a/b");
+    std::fs::create_dir_all(&sub).unwrap();
+    let ctx = Ctx {
+        dir: &e.data,
+        cwd: &sub,
+        effective: Tier::Relaxed,
+        home: None,
+        now: 1_000,
+    };
+    let apply = Command::Apply {
+        tier: None,
+        project: false,
+        dry_run: false,
+    };
+    ok(firewall::run(&apply, &ctx));
+    let w = strings(&e.doc(), "sandbox.filesystem.allowWrite");
+    let abs = e.project.join(".git").to_string_lossy().into_owned();
+    assert!(w.contains(&abs), "{w:?}");
+    assert!(!w.contains(&".git".to_string()), "{w:?}");
+
+    // A record from rule set 1 owns the relative `.git`: the resync removes it.
+    let mut text = e.text().replace(&format!("\"{abs}\""), "\".git\"");
+    assert!(text.contains("\".git\""));
+    std::fs::write(e.settings(), &text).unwrap();
+    let mut file: firewall::RecordFile = match statefile::load(&e.data, RECORD_FILE) {
+        statefile::Loaded::Valid(f) => f,
+        _ => panic!(),
+    };
+    for rec in file.targets.values_mut() {
+        rec.rule_set_version = 1;
+        for v in rec.rule_ids.values_mut() {
+            for x in v.iter_mut() {
+                if *x == abs {
+                    *x = ".git".to_string();
+                }
+            }
+        }
+    }
+    statefile::store(&e.data, RECORD_FILE, &file).unwrap();
+    assert!(firewall::session_resync(&ctx).is_some());
+    text = e.text();
+    let w = strings(&e.doc(), "sandbox.filesystem.allowWrite");
+    assert!(w.contains(&abs), "{text}");
+    assert!(!w.contains(&".git".to_string()), "{text}");
+}
+
+#[test]
 fn check_and_show_report_drift() {
     let e = Env::new("drift");
     let v = match firewall::run(&Command::Check, &e.ctx(Tier::Relaxed)) {
