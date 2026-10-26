@@ -613,7 +613,8 @@ pub fn check(ctx: &Ctx<'_>) -> Report {
     let p = prior(ctx.dir, &t.key());
     let mut drift = Vec::new();
     let mut absent = Vec::new();
-    if matches!(p, Prior::FailClosed | Prior::Untrusted(_)) {
+    // An untrusted dir that never held a record has nothing to report: it was never applied.
+    if matches!(p, Prior::FailClosed | Prior::Untrusted(Some(_))) {
         drift.push(Drift {
             kind: "record",
             message: "the firewall record failed authentication, was deleted, or sits in an \

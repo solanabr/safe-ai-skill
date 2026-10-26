@@ -35,6 +35,9 @@ const ASK4: [&str; 4] = ["ask"; 4];
 const NO4: [&str; 4] = [""; 4];
 /// Ask below High, deny at High.
 const ASK_HIGH_DENY: [&str; 4] = ["ask", "ask", "ask", "deny"];
+/// ai-kit's tool-name deny (P17): today's verdict below Medium, deny from Medium up.
+const MEDIUM_UP_DENY: [&str; 4] = ["", "", "deny", "deny"];
+const ASK_MEDIUM_UP_DENY: [&str; 4] = ["ask", "ask", "deny", "deny"];
 
 // ---------------------------------------------------------------------------------------
 // hooks.json
@@ -950,7 +953,12 @@ fn mcp_executor_code_gets_the_bash_checks() {
         ),
         ("mcp__fs__read_file", json!({ "path": "my dir/.env" })),
     ] {
-        check(&format!("{tool} {input}"), w.x4(tool, &input), ENV_READ);
+        let want = if tool == "mcp__fs__read_file" {
+            ENV_READ
+        } else {
+            MEDIUM_UP_DENY
+        };
+        check(&format!("{tool} {input}"), w.x4(tool, &input), want);
     }
     // Code that names it and writes reads and writes it (Medium and High deny); sending it
     // off the machine is denied at every tier.
@@ -998,7 +1006,7 @@ fn mcp_executor_code_gets_the_bash_checks() {
             exec,
             &json!({ "code": "solana program deploy --final x.so -ud" }),
         ),
-        ASK4,
+        ASK_MEDIUM_UP_DENY,
     );
     check(
         "ctx_execute mainnet transfer",
@@ -1006,7 +1014,7 @@ fn mcp_executor_code_gets_the_bash_checks() {
             exec,
             &json!({ "code": format!("solana transfer {D} 0.5 -um") }),
         ),
-        ASK_HIGH_DENY,
+        ASK_MEDIUM_UP_DENY,
     );
     check(
         "ctx_execute python solana",
@@ -1014,7 +1022,7 @@ fn mcp_executor_code_gets_the_bash_checks() {
             exec,
             &json!({ "language": "python", "code": "subprocess.run(['solana', 'balance'])" }),
         ),
-        ASK_HIGH_DENY,
+        ASK_MEDIUM_UP_DENY,
     );
     // A within-cap devnet transfer is allowed in Bash, never through an executor.
     check(
@@ -1023,7 +1031,7 @@ fn mcp_executor_code_gets_the_bash_checks() {
             exec,
             &json!({ "code": format!("solana transfer {D} 0.01 -ud") }),
         ),
-        NO4,
+        MEDIUM_UP_DENY,
     );
     for (tool, input) in [
         (
@@ -1035,7 +1043,11 @@ fn mcp_executor_code_gets_the_bash_checks() {
             json!({ "language": "python", "code": "print('hello world')" }),
         ),
     ] {
-        check(&format!("{tool} {input}"), w.x4(tool, &input), NO4);
+        check(
+            &format!("{tool} {input}"),
+            w.x4(tool, &input),
+            MEDIUM_UP_DENY,
+        );
     }
     // Padding past the argument limit asks rather than ending the scan.
     let padded = json!({ "a": vec!["x"; 1025], "path": "notes.txt" });

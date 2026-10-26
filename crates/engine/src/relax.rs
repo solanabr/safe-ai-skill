@@ -247,6 +247,12 @@ fn activate(dir: &DataDir, confirmed: &confirm::Confirmed, now: u64) -> ConfirmO
         PendingKind::Grant => activate_grant(dir, payload, now),
         PendingKind::Mode => activate_mode(dir, payload, now),
         PendingKind::Tier => activate_tier(dir, payload, now),
+        PendingKind::Firewall => crate::firewall::apply_confirmed(
+            dir,
+            payload,
+            crate::datadir::passwd_home().as_deref(),
+            now,
+        ),
         // `verify trust` / `verify approve`: performed (and audited) by the supply-chain state.
         PendingKind::Trust | PendingKind::Approve => {
             crate::verify::apply_confirmed(dir, confirmed).map_err(|e| e.to_string())
@@ -317,7 +323,7 @@ fn store_tier(dir: &DataDir, change: &tierstate::Change, now: u64) -> Result<Str
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::Grant => "grant_create",
-        PendingKind::Mode | PendingKind::Tier => "tier_set",
+        PendingKind::Mode | PendingKind::Tier | PendingKind::Firewall => "tier_set",
         PendingKind::Trust => "verify_trust",
         PendingKind::Approve => "verify_approve",
     }

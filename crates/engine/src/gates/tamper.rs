@@ -229,6 +229,7 @@ const SUBCOMMANDS: &[&str] = &[
     "status",
     "mode",
     "tier",
+    "firewall",
     "env",
     "adapt",
     "--version",
@@ -3085,7 +3086,7 @@ fn git_risky(text: &str) -> BTreeSet<String> {
 }
 
 /// Whether git setting `key` (lowercase, dotted) set to `value` makes git run a program.
-fn risky_git_key(key: &str, value: &str) -> bool {
+pub(crate) fn risky_git_key(key: &str, value: &str) -> bool {
     let tool_key = matches!(
         key,
         "editor" | "pager" | "core.editor" | "core.pager" | "sequence.editor"

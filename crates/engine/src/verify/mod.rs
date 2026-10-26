@@ -2480,7 +2480,7 @@ pub fn apply_confirmed(dir: &DataDir, confirmed: &Confirmed) -> Result<String, E
     match confirmed.kind {
         PendingKind::Trust => apply_trust(dir, &confirmed.payload),
         PendingKind::Approve => apply_approve(dir, &confirmed.payload),
-        PendingKind::Grant | PendingKind::Mode | PendingKind::Tier => {
+        PendingKind::Grant | PendingKind::Mode | PendingKind::Tier | PendingKind::Firewall => {
             Err(Error::Other("not a verify confirmation".to_string()))
         }
     }

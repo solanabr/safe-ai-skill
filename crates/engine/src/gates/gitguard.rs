@@ -694,72 +694,7 @@ fn exec_key(key: &str, value: &str) -> bool {
                     | ("credential", "helper")
                     | ("diff", "external")
             ));
-    kit || tamper_risky_key(&k, value)
-}
-
-/// A copy of `tamper::risky_git_key` (private there; W10 owns that file).
-fn tamper_risky_key(key: &str, value: &str) -> bool {
-    let tool_key = matches!(
-        key,
-        "editor" | "pager" | "core.editor" | "core.pager" | "sequence.editor"
-    ) || key.starts_with("pager.");
-    if tool_key && is_known_editor_or_pager(value) {
-        return false;
-    }
-    let builtin_fsmonitor = matches!(value.to_ascii_lowercase().as_str(), "true" | "false" | "");
-    if !key.contains('.') {
-        return matches!(key, "hookspath" | "pager" | "sshcommand" | "editor")
-            || (key == "fsmonitor" && !builtin_fsmonitor);
-    }
-    let (first, last) = (
-        key.split('.').next().unwrap_or(""),
-        key.rsplit('.').next().unwrap_or(""),
-    );
-    match key {
-        "core.hookspath"
-        | "core.pager"
-        | "core.sshcommand"
-        | "core.editor"
-        | "core.gitproxy"
-        | "core.askpass"
-        | "sequence.editor"
-        | "diff.external"
-        | "gpg.program"
-        | "gpg.ssh.program"
-        | "gpg.x509.program"
-        | "uploadpack.packobjectshook"
-        | "include.path" => return true,
-        "core.fsmonitor" => return !builtin_fsmonitor,
-        _ => {}
-    }
-    match (first, last) {
-        ("alias", _) => value.starts_with('!'),
-        ("filter", "clean" | "smudge" | "process") => true,
-        ("diff", "textconv" | "command") => true,
-        ("merge", "driver") => true,
-        ("includeif", "path") => true,
-        ("pager", _) => true,
-        ("credential", "helper") => value.starts_with('!') || value.contains('/'),
-        _ => false,
-    }
-}
-
-fn is_known_editor_or_pager(value: &str) -> bool {
-    const KNOWN: &[&str] = &[
-        "vim",
-        "vi",
-        "nvim",
-        "nano",
-        "emacs",
-        "code --wait",
-        "subl -w",
-        "less",
-        "more",
-        "cat",
-        "delta",
-    ];
-    let words: Vec<&str> = value.split_whitespace().collect();
-    KNOWN.contains(&words.join(" ").to_ascii_lowercase().as_str())
+    kit || crate::gates::tamper::risky_git_key(&k, value)
 }
 
 // ---- gh ----------------------------------------------------------------------------------
