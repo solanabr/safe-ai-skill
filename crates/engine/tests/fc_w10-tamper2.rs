@@ -88,6 +88,10 @@ fn fixture_rows_get_their_verdicts() {
     let mut count = 0;
     for line in FIXTURE.lines().filter(|l| !l.trim().is_empty()) {
         let row: Value = serde_json::from_str(line).unwrap();
+        // A macOS system path: on Windows it resolves under the drive root instead.
+        if row["unix_only"].as_bool() == Some(true) && !cfg!(unix) {
+            continue;
+        }
         let want = row["want"].as_str().unwrap();
         let (id, got) = run_row(&row);
         let label = match got {
