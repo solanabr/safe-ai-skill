@@ -192,6 +192,9 @@ Gates that judge command text, tool arguments or file content rather than a path
 | … undecodable (variable, substitution, fetched body) or nested past 3 levels | ask | ask | ask | deny |
 | Token transfer (`spl-token transfer`, MCP token transfer) on mainnet or an unidentified cluster | ask | ask | ask | deny |
 | MCP staking, delegation or token transfer, however routed | ask | ask | ask | deny |
+| Key files: `git add`, `commit -a`, `commit <paths>` or `stash` that would stage a key or secret file | ask | ask | deny | deny |
+| Containers: `--privileged`, extra capabilities, host namespaces, devices, mounts of the host root, system dirs, home, credential stores or runtime sockets | ask | ask | ask | deny |
+| PermissionRequest: a hard-guard call whose prompt nobody would see (headless, `dontAsk`, unknown mode), or a denied call in an auto-approving mode | deny | deny | deny | deny |
 
 Production env files (`.env.production`, `.env.prod*`) are in the [project `.env` table](#project-env-files).
 
@@ -315,6 +318,66 @@ Strings that git itself runs as shell code, `git submodule foreach CMD` and `git
 **Usability floor.** These pass silently at every tier: `git push` (not forced), `commit`, `pull`, `fetch`, `status`, `log`, `diff`, `checkout -b`, `switch`, `stash` and `stash pop`, `reset --soft` and `reset HEAD <file>`, `restore --staged`, `clean -n`/`--dry-run`, `rebase --abort`/`--continue`, `gc`, and read-only `gh pr`, `gh run` and `gh secret list`.
 
 **Not seen:** a subcommand or `gh api` endpoint held in a variable, text the shell assembles at run time, git run from a script file, and environment assignments inside a here-document or a double-quoted substitution. The settings manager's sandbox block excludes `git push`, `pull` and `fetch` (and `gh pr`, `run`, `issue`) from the sandbox so they can authenticate, so for those the hook sees what the sandbox does not.
+
+## Key-file hygiene
+
+`gates/keyfiles.rs` watches the key and secret files in a project, in two places: a `SessionStart` notice and a gate on the git commands that stage files. It never runs git and never prints a file's contents: tracked files come from the binary `.git/index`, and ignore rules from the `.gitignore` files, `.git/info/exclude` and git's default global ignore file.
+
+A **key file** is one whose name (and, for some names, content) says it holds key material or secrets: the engine's own secret names (env files with at least one `KEY=value` line, dotenvx key files and the other hard-deny names; templates such as `.env.example` are excluded), `*.pem` and `*.key` that hold a private-key block (certificates do not), OpenSSH private keys (`id_rsa`, `id_ed25519`, …), PKCS#8, PKCS#12, Java key stores and PuTTY keys. `*.pub` is never a key file. The pattern list is general on purpose: formats specific to one ecosystem, such as a Solana keypair JSON, belong to a domain pack through an extension slot (`DOMAIN_PACKS`), and that slot is empty in the engine, so without a pack those files are covered only where the engine's secret-name rules already name them.
+
+- **SessionStart notice.** One line naming each key file that git tracks, that no ignore rule covers, or (private keys only; env-style files are routinely `0644`) that is group/world-readable, with the fix: `chmod 600`, an ignore entry, `git rm --cached`. The sweep is bounded (depth 8, 20,000 entries, 64 content checks, 250 ms) and skips `.git`, `node_modules`, `target` and other dependency or build trees. A clean project prints nothing. The notice is part of the SessionStart report, so it also reaches the model, as the names of the files.
+- **Staging gate.** It runs in `gate-bash-secrets`, so also under Codex and opencode, and judges `git add`, `git commit -a`, `git commit <paths>` and `git stash` that would stage such a file:
+
+| What | Off | Relaxed | Medium | High |
+|---|---|---|---|---|
+| Staging a key file | ask | ask | deny | deny |
+
+Headless turns the ask into a deny.
+
+**Limits.** A pathspec held in a variable or read from a file, `core.excludesFile` set to a non-default path, ignore rules git reads from elsewhere, and `cd` targets that are not literal words are not seen. The sweep stops at its caps, so a very large tree can go partly unchecked. The gate protects against staging by the agent; a file already committed is only reported, and removing it from history is yours to do.
+
+## PermissionRequest hardening
+
+Claude Code runs a `PermissionRequest` hook when it is about to ask you to approve a tool call. `gate-permission` (`gates/permreq.rs`, registered with `onFailure: block`) judges that call again with the same decision functions the PreToolUse gates use, nothing re-implemented, for `Bash`, the file tools, `Read`, `Grep`, `Glob`, `WebFetch` and MCP tools. On a healthy run a PreToolUse gate has already denied or asked, so this hook matters when one of those hooks failed to answer, and when something other than you can approve the prompt: another `PermissionRequest` hook, a host that answers permission prompts, or a permission mode that does not wait for you.
+
+A **hard-guard** call is a deny, or an ask no grant may relax. A grantable ask is left to you as usual. For a hard-guard call:
+
+| Session | Answer |
+|---|---|
+| Headless, `dontAsk`, or a permission mode this engine does not know | deny, with the reason and why it is not left to an automatic approval |
+| `auto`, `acceptEdits` or `bypassPermissions`, and a gate denies the call | deny (PreToolUse would have denied it too) |
+| `auto`, `acceptEdits` or `bypassPermissions`, and a gate only asks | left to you: Claude Code still shows a hook-forced prompt in these modes |
+| `default`, `manual` or `plan` | left to you, with a one-line `systemMessage` warning |
+
+The hook **never allows**, so it cannot weaken a verdict, and a call with no hard-guard class gets no output. Each deny it issues is written to the audit log with the class `permission_request`. The verdict does not depend on the tier beyond what the PreToolUse gates decide.
+
+**Limits.** Claude Code has no field that adds text to the permission dialog on this event, so the warning is a `systemMessage`. How this hook ranks against other `PermissionRequest` hooks or a host's permission prompt tool ("whichever decides first applies") is not documented, so it cannot promise to be the one that decides. It is a Claude Code hook event only: neither Codex nor opencode has it.
+
+## Container privilege guard
+
+`gates/containers.rs` judges container runs in `gate-bash-secrets` (so also under Codex and opencode, where an `ask` is a deny). It covers `docker`, `podman`, `nerdctl` and `finch` `run`, `create` and `exec` (and the `container run|create|exec` spellings), and `compose up|run|create` (`docker compose`, `podman compose`, `nerdctl compose`, `docker-compose`, `podman-compose`), whose compose files are read, bounded to 512 KiB, and their services judged the same way. Positions come from the shell parser, so a commit message that names `--privileged` is data, and flags after the image belong to the container's own command.
+
+| What the run requests | Off / Relaxed | Medium | High |
+|---|---|---|---|
+| Privileged mode, a capability beyond Docker's default set, or a security option that turns confinement off | ask | ask | deny |
+| The host's PID, network, IPC, user, UTS or cgroup namespace (`--pid=host`, `network_mode: host`, …) | ask | ask | deny |
+| A host device (`--device`, `devices:`) | ask | ask | deny |
+| A bind mount of `/`, a system tree (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, …), the home directory, a credential store, a runtime socket or the runtime's state directory; `podman run --rootfs` on one of those | ask | ask | deny |
+
+Off acts as Relaxed, and headless turns every ask into a deny. Ordinary runs (published ports, named volumes, the project directory, `$(pwd)`) and every other subcommand (`build`, `ps`, `logs`, `pull`, …) stay silent. Routine `/etc` mounts such as the time zone, name resolution and CA bundles are not flagged.
+
+**Limits.** A compose file on standard input (`-f -`), `COMPOSE_FILE`, compose `include:` or `extends:` files, Kubernetes manifests (`podman kube play`), a flag held in a variable, and a host path spelled through a variable other than the home ones (`$PWD/..`) are not seen. Docker cleanup is a separate open item (see [Known holes](#known-holes)).
+
+## Session report
+
+`report.rs` records what the firewall did in a session, for you. It is informational: it never blocks, and nothing in it runs on the gate hot path.
+
+- **SessionStart** writes a start marker for the session (start time, a hash of the project root, and a snapshot of the spend ledger and grant budgets), then, if the previous session in the same project had at least one deny or ask and has not been shown yet, adds one line to the SessionStart message **shown to you**, not to the model. Otherwise it prints nothing.
+- **SessionEnd** (`session-end` hook) reads this session's lines from the audit log, diffs the spend ledger and grant budgets against the marker, and writes `reports/<session>.json` in the plugin data dir plus a per-project pointer the next recap reads. A report holds the decision counts, the denies and asks counted by gate class, the top three reasons (redacted with the output scrubber, cut to 200 characters, with how often each came up), the grants whose budget was drawn on, and the SOL added to the daily spend ledger. Claude Code discards a SessionEnd hook's output and gives it a 1.5 s budget, so the scan is bounded in bytes and time and prints nothing. The newest 200 reports are kept; start markers older than 30 days are pruned.
+- **Privacy.** The report stores a hash of the project root, never the path. Reasons are redacted before they are stored.
+- **Source.** The report is derived from `audit.jsonl`, the spend ledger and `grants.json`, read without repairing anything.
+
+**Limits.** The audit log cannot tell a grant-relaxed allow from a natural one, so "grants used" shows only grants whose spent budget rose, which means budgeted (value) scopes. The spend ledger and grant budgets are global, so a concurrent session's spend lands in the delta. A session that never reaches `SessionEnd` (killed) gets no report. A forked session gets no start marker, because the `SessionStart` hook is registered for `startup`, `resume`, `clear` and `compact`; its report then covers only the last 24 hours of audit lines and carries no spend baseline. Under Codex and opencode there is no `session-end` entry, so there are no reports and no recap.
 
 ## Environment dumps
 

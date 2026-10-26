@@ -34,6 +34,16 @@
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill failure-notice", "timeout": 10, "onFailure": "continue" }
       ]}
     ],
+    "PermissionRequest": [
+      { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Read|Grep|Glob|WebFetch|mcp__.*", "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-permission", "timeout": 15, "onFailure": "block" }
+      ]}
+    ],
+    "SessionEnd": [
+      { "hooks": [
+        { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill session-end", "timeout": 5, "onFailure": "continue" }
+      ]}
+    ],
     "ConfigChange": [
       { "matcher": "user_settings|project_settings|local_settings", "hooks": [
         { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/safe-ai-skill gate-config", "timeout": 10, "onFailure": "continue" }

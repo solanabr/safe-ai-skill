@@ -1,0 +1,555 @@
+{"id": "priv-off", "tool": "Bash", "tool_input": {"command": "docker run --privileged -it ubuntu bash"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --privileged -it ubuntu bash"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-medium", "tool": "Bash", "tool_input": {"command": "docker run --privileged -it ubuntu bash"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-high", "tool": "Bash", "tool_input": {"command": "docker run --privileged -it ubuntu bash"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --privileged -it ubuntu bash"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-eq-off", "tool": "Bash", "tool_input": {"command": "docker run --privileged=true ubuntu"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-eq-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --privileged=true ubuntu"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-eq-medium", "tool": "Bash", "tool_input": {"command": "docker run --privileged=true ubuntu"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-eq-high", "tool": "Bash", "tool_input": {"command": "docker run --privileged=true ubuntu"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-eq-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --privileged=true ubuntu"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-podman-off", "tool": "Bash", "tool_input": {"command": "podman run --rm --privileged alpine sh"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-podman-relaxed", "tool": "Bash", "tool_input": {"command": "podman run --rm --privileged alpine sh"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-podman-medium", "tool": "Bash", "tool_input": {"command": "podman run --rm --privileged alpine sh"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-podman-high", "tool": "Bash", "tool_input": {"command": "podman run --rm --privileged alpine sh"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-podman-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman run --rm --privileged alpine sh"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-nerdctl-off", "tool": "Bash", "tool_input": {"command": "nerdctl run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-nerdctl-relaxed", "tool": "Bash", "tool_input": {"command": "nerdctl run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-nerdctl-medium", "tool": "Bash", "tool_input": {"command": "nerdctl run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-nerdctl-high", "tool": "Bash", "tool_input": {"command": "nerdctl run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-nerdctl-relaxed-hl", "tool": "Bash", "tool_input": {"command": "nerdctl run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-create-off", "tool": "Bash", "tool_input": {"command": "docker create --privileged nginx"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-create-relaxed", "tool": "Bash", "tool_input": {"command": "docker create --privileged nginx"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-create-medium", "tool": "Bash", "tool_input": {"command": "docker create --privileged nginx"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-create-high", "tool": "Bash", "tool_input": {"command": "docker create --privileged nginx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-create-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker create --privileged nginx"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-container-run-off", "tool": "Bash", "tool_input": {"command": "docker container run --privileged nginx"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-container-run-relaxed", "tool": "Bash", "tool_input": {"command": "docker container run --privileged nginx"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-container-run-medium", "tool": "Bash", "tool_input": {"command": "docker container run --privileged nginx"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-container-run-high", "tool": "Bash", "tool_input": {"command": "docker container run --privileged nginx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-container-run-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker container run --privileged nginx"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-exec-off", "tool": "Bash", "tool_input": {"command": "docker exec --privileged -it web sh"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-exec-relaxed", "tool": "Bash", "tool_input": {"command": "docker exec --privileged -it web sh"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-exec-medium", "tool": "Bash", "tool_input": {"command": "docker exec --privileged -it web sh"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-exec-high", "tool": "Bash", "tool_input": {"command": "docker exec --privileged -it web sh"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-exec-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker exec --privileged -it web sh"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-sudo-off", "tool": "Bash", "tool_input": {"command": "sudo docker run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-sudo-relaxed", "tool": "Bash", "tool_input": {"command": "sudo docker run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-sudo-medium", "tool": "Bash", "tool_input": {"command": "sudo docker run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-sudo-high", "tool": "Bash", "tool_input": {"command": "sudo docker run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-sudo-relaxed-hl", "tool": "Bash", "tool_input": {"command": "sudo docker run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-caffeinate-off", "tool": "Bash", "tool_input": {"command": "caffeinate -i docker run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-caffeinate-relaxed", "tool": "Bash", "tool_input": {"command": "caffeinate -i docker run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-caffeinate-medium", "tool": "Bash", "tool_input": {"command": "caffeinate -i docker run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-caffeinate-high", "tool": "Bash", "tool_input": {"command": "caffeinate -i docker run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-caffeinate-relaxed-hl", "tool": "Bash", "tool_input": {"command": "caffeinate -i docker run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-global-opt-off", "tool": "Bash", "tool_input": {"command": "docker --context prod -H unix:///var/run/docker.sock run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-global-opt-relaxed", "tool": "Bash", "tool_input": {"command": "docker --context prod -H unix:///var/run/docker.sock run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-global-opt-medium", "tool": "Bash", "tool_input": {"command": "docker --context prod -H unix:///var/run/docker.sock run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-global-opt-high", "tool": "Bash", "tool_input": {"command": "docker --context prod -H unix:///var/run/docker.sock run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-global-opt-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker --context prod -H unix:///var/run/docker.sock run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-shc-off", "tool": "Bash", "tool_input": {"command": "bash -c 'docker run --privileged alpine'"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-shc-relaxed", "tool": "Bash", "tool_input": {"command": "bash -c 'docker run --privileged alpine'"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-shc-medium", "tool": "Bash", "tool_input": {"command": "bash -c 'docker run --privileged alpine'"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-shc-high", "tool": "Bash", "tool_input": {"command": "bash -c 'docker run --privileged alpine'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-shc-relaxed-hl", "tool": "Bash", "tool_input": {"command": "bash -c 'docker run --privileged alpine'"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-chain-off", "tool": "Bash", "tool_input": {"command": "cd /tmp && docker run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-chain-relaxed", "tool": "Bash", "tool_input": {"command": "cd /tmp && docker run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-chain-medium", "tool": "Bash", "tool_input": {"command": "cd /tmp && docker run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-chain-high", "tool": "Bash", "tool_input": {"command": "cd /tmp && docker run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-chain-relaxed-hl", "tool": "Bash", "tool_input": {"command": "cd /tmp && docker run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "priv-escaped-off", "tool": "Bash", "tool_input": {"command": "d\\ocker run --privileged alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "priv-escaped-relaxed", "tool": "Bash", "tool_input": {"command": "d\\ocker run --privileged alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "priv-escaped-medium", "tool": "Bash", "tool_input": {"command": "d\\ocker run --privileged alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "priv-escaped-high", "tool": "Bash", "tool_input": {"command": "d\\ocker run --privileged alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "priv-escaped-relaxed-hl", "tool": "Bash", "tool_input": {"command": "d\\ocker run --privileged alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "cap-sysadmin-off", "tool": "Bash", "tool_input": {"command": "docker run --cap-add SYS_ADMIN alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "cap-sysadmin-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --cap-add SYS_ADMIN alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "cap-sysadmin-medium", "tool": "Bash", "tool_input": {"command": "docker run --cap-add SYS_ADMIN alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "cap-sysadmin-high", "tool": "Bash", "tool_input": {"command": "docker run --cap-add SYS_ADMIN alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "cap-sysadmin-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --cap-add SYS_ADMIN alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "cap-all-off", "tool": "Bash", "tool_input": {"command": "docker run --cap-add=ALL alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "cap-all-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --cap-add=ALL alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "cap-all-medium", "tool": "Bash", "tool_input": {"command": "docker run --cap-add=ALL alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "cap-all-high", "tool": "Bash", "tool_input": {"command": "docker run --cap-add=ALL alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "cap-all-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --cap-add=ALL alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "cap-prefixed-off", "tool": "Bash", "tool_input": {"command": "docker run --cap-add cap_sys_ptrace alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "cap-prefixed-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --cap-add cap_sys_ptrace alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "cap-prefixed-medium", "tool": "Bash", "tool_input": {"command": "docker run --cap-add cap_sys_ptrace alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "cap-prefixed-high", "tool": "Bash", "tool_input": {"command": "docker run --cap-add cap_sys_ptrace alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "cap-prefixed-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --cap-add cap_sys_ptrace alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "pid-host-off", "tool": "Bash", "tool_input": {"command": "docker run --pid=host alpine ps"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "pid-host-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --pid=host alpine ps"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "pid-host-medium", "tool": "Bash", "tool_input": {"command": "docker run --pid=host alpine ps"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "pid-host-high", "tool": "Bash", "tool_input": {"command": "docker run --pid=host alpine ps"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "pid-host-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --pid=host alpine ps"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "pid-host-sep-off", "tool": "Bash", "tool_input": {"command": "docker run --pid host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "pid-host-sep-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --pid host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "pid-host-sep-medium", "tool": "Bash", "tool_input": {"command": "docker run --pid host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "pid-host-sep-high", "tool": "Bash", "tool_input": {"command": "docker run --pid host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "pid-host-sep-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --pid host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "net-host-off", "tool": "Bash", "tool_input": {"command": "docker run --network host solanalabs/solana"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "net-host-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --network host solanalabs/solana"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "net-host-medium", "tool": "Bash", "tool_input": {"command": "docker run --network host solanalabs/solana"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "net-host-high", "tool": "Bash", "tool_input": {"command": "docker run --network host solanalabs/solana"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "net-host-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --network host solanalabs/solana"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "net-host-short-off", "tool": "Bash", "tool_input": {"command": "docker run --net=host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "net-host-short-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --net=host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "net-host-short-medium", "tool": "Bash", "tool_input": {"command": "docker run --net=host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "net-host-short-high", "tool": "Bash", "tool_input": {"command": "docker run --net=host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "net-host-short-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --net=host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "ipc-host-off", "tool": "Bash", "tool_input": {"command": "docker run --ipc=host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "ipc-host-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --ipc=host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "ipc-host-medium", "tool": "Bash", "tool_input": {"command": "docker run --ipc=host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "ipc-host-high", "tool": "Bash", "tool_input": {"command": "docker run --ipc=host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "ipc-host-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --ipc=host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "userns-host-off", "tool": "Bash", "tool_input": {"command": "podman run --userns=host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "userns-host-relaxed", "tool": "Bash", "tool_input": {"command": "podman run --userns=host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "userns-host-medium", "tool": "Bash", "tool_input": {"command": "podman run --userns=host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "userns-host-high", "tool": "Bash", "tool_input": {"command": "podman run --userns=host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "userns-host-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman run --userns=host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "uts-host-off", "tool": "Bash", "tool_input": {"command": "docker run --uts=host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "uts-host-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --uts=host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "uts-host-medium", "tool": "Bash", "tool_input": {"command": "docker run --uts=host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "uts-host-high", "tool": "Bash", "tool_input": {"command": "docker run --uts=host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "uts-host-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --uts=host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "seccomp-off", "tool": "Bash", "tool_input": {"command": "docker run --security-opt seccomp=unconfined alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "seccomp-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --security-opt seccomp=unconfined alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "seccomp-medium", "tool": "Bash", "tool_input": {"command": "docker run --security-opt seccomp=unconfined alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "seccomp-high", "tool": "Bash", "tool_input": {"command": "docker run --security-opt seccomp=unconfined alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "seccomp-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --security-opt seccomp=unconfined alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "apparmor-off", "tool": "Bash", "tool_input": {"command": "docker run --security-opt apparmor=unconfined alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "apparmor-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --security-opt apparmor=unconfined alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "apparmor-medium", "tool": "Bash", "tool_input": {"command": "docker run --security-opt apparmor=unconfined alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "apparmor-high", "tool": "Bash", "tool_input": {"command": "docker run --security-opt apparmor=unconfined alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "apparmor-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --security-opt apparmor=unconfined alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "label-disable-off", "tool": "Bash", "tool_input": {"command": "podman run --security-opt label=disable alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "label-disable-relaxed", "tool": "Bash", "tool_input": {"command": "podman run --security-opt label=disable alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "label-disable-medium", "tool": "Bash", "tool_input": {"command": "podman run --security-opt label=disable alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "label-disable-high", "tool": "Bash", "tool_input": {"command": "podman run --security-opt label=disable alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "label-disable-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman run --security-opt label=disable alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "device-off", "tool": "Bash", "tool_input": {"command": "docker run --device /dev/sda:/dev/xvda alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "device-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --device /dev/sda:/dev/xvda alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "device-medium", "tool": "Bash", "tool_input": {"command": "docker run --device /dev/sda:/dev/xvda alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "device-high", "tool": "Bash", "tool_input": {"command": "docker run --device /dev/sda:/dev/xvda alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "device-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --device /dev/sda:/dev/xvda alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "device-eq-off", "tool": "Bash", "tool_input": {"command": "docker run --device=/dev/fuse alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "device-eq-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --device=/dev/fuse alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "device-eq-medium", "tool": "Bash", "tool_input": {"command": "docker run --device=/dev/fuse alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "device-eq-high", "tool": "Bash", "tool_input": {"command": "docker run --device=/dev/fuse alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "device-eq-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --device=/dev/fuse alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "device-rule-off", "tool": "Bash", "tool_input": {"command": "docker run --device-cgroup-rule='c 1:* rmw' alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "device-rule-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --device-cgroup-rule='c 1:* rmw' alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "device-rule-medium", "tool": "Bash", "tool_input": {"command": "docker run --device-cgroup-rule='c 1:* rmw' alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "device-rule-high", "tool": "Bash", "tool_input": {"command": "docker run --device-cgroup-rule='c 1:* rmw' alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "device-rule-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --device-cgroup-rule='c 1:* rmw' alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-off", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-high", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-ro-off", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host:ro alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-ro-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host:ro alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-ro-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host:ro alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-ro-high", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host:ro alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-ro-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /:/host:ro alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-long-off", "tool": "Bash", "tool_input": {"command": "docker run --volume=/:/host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-long-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --volume=/:/host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-long-medium", "tool": "Bash", "tool_input": {"command": "docker run --volume=/:/host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-long-high", "tool": "Bash", "tool_input": {"command": "docker run --volume=/:/host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-long-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --volume=/:/host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-attached-off", "tool": "Bash", "tool_input": {"command": "docker run -v/:/host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-attached-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v/:/host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-attached-medium", "tool": "Bash", "tool_input": {"command": "docker run -v/:/host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-attached-high", "tool": "Bash", "tool_input": {"command": "docker run -v/:/host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-attached-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v/:/host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-cluster-off", "tool": "Bash", "tool_input": {"command": "docker run -itv /:/host alpine sh"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-cluster-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -itv /:/host alpine sh"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-cluster-medium", "tool": "Bash", "tool_input": {"command": "docker run -itv /:/host alpine sh"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-cluster-high", "tool": "Bash", "tool_input": {"command": "docker run -itv /:/host alpine sh"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-cluster-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -itv /:/host alpine sh"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-mount-off", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=/,target=/host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-mount-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=/,target=/host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-mount-medium", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=/,target=/host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-mount-high", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=/,target=/host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-mount-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=/,target=/host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-root-mount-src-off", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,src=/,dst=/host alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-root-mount-src-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,src=/,dst=/host alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-root-mount-src-medium", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,src=/,dst=/host alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-root-mount-src-high", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,src=/,dst=/host alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-root-mount-src-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,src=/,dst=/host alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-sock-off", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-sock-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-sock-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-sock-high", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-sock-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-sock-run-off", "tool": "Bash", "tool_input": {"command": "docker run -v /run/docker.sock:/var/run/docker.sock alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-sock-run-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /run/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-sock-run-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /run/docker.sock:/var/run/docker.sock alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-sock-run-high", "tool": "Bash", "tool_input": {"command": "docker run -v /run/docker.sock:/var/run/docker.sock alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-sock-run-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /run/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-podman-sock-off", "tool": "Bash", "tool_input": {"command": "podman run -v /run/podman/podman.sock:/run/podman.sock alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-podman-sock-relaxed", "tool": "Bash", "tool_input": {"command": "podman run -v /run/podman/podman.sock:/run/podman.sock alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-podman-sock-medium", "tool": "Bash", "tool_input": {"command": "podman run -v /run/podman/podman.sock:/run/podman.sock alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-podman-sock-high", "tool": "Bash", "tool_input": {"command": "podman run -v /run/podman/podman.sock:/run/podman.sock alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-podman-sock-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman run -v /run/podman/podman.sock:/run/podman.sock alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-colima-sock-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.colima/default/docker.sock:/var/run/docker.sock alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-colima-sock-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.colima/default/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-colima-sock-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.colima/default/docker.sock:/var/run/docker.sock alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-colima-sock-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.colima/default/docker.sock:/var/run/docker.sock alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-colima-sock-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.colima/default/docker.sock:/var/run/docker.sock alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-ssh-agent-off", "tool": "Bash", "tool_input": {"command": "docker run -v $SSH_AUTH_SOCK:/ssh-agent alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-ssh-agent-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v $SSH_AUTH_SOCK:/ssh-agent alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-ssh-agent-medium", "tool": "Bash", "tool_input": {"command": "docker run -v $SSH_AUTH_SOCK:/ssh-agent alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-ssh-agent-high", "tool": "Bash", "tool_input": {"command": "docker run -v $SSH_AUTH_SOCK:/ssh-agent alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-ssh-agent-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v $SSH_AUTH_SOCK:/ssh-agent alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-var-run-off", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run:/var/run alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-var-run-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run:/var/run alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-var-run-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run:/var/run alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-var-run-high", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run:/var/run alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-var-run-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /var/run:/var/run alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-docker-state-off", "tool": "Bash", "tool_input": {"command": "docker run -v /var/lib/docker:/d alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-docker-state-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /var/lib/docker:/d alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-docker-state-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /var/lib/docker:/d alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-docker-state-high", "tool": "Bash", "tool_input": {"command": "docker run -v /var/lib/docker:/d alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-docker-state-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /var/lib/docker:/d alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-etc-off", "tool": "Bash", "tool_input": {"command": "docker run -v /etc:/host-etc alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-etc-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /etc:/host-etc alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-etc-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /etc:/host-etc alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-etc-high", "tool": "Bash", "tool_input": {"command": "docker run -v /etc:/host-etc alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-etc-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /etc:/host-etc alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-shadow-off", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/shadow:/s alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-shadow-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/shadow:/s alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-shadow-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/shadow:/s alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-shadow-high", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/shadow:/s alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-shadow-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/shadow:/s alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-proc-off", "tool": "Bash", "tool_input": {"command": "docker run -v /proc:/hp alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-proc-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /proc:/hp alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-proc-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /proc:/hp alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-proc-high", "tool": "Bash", "tool_input": {"command": "docker run -v /proc:/hp alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-proc-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /proc:/hp alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-home-tilde-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~:/h alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-home-tilde-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~:/h alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-home-tilde-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~:/h alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-home-tilde-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~:/h alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-home-tilde-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~:/h alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-home-var-off", "tool": "Bash", "tool_input": {"command": "docker run -v \"$HOME\":/h alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-home-var-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v \"$HOME\":/h alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-home-var-medium", "tool": "Bash", "tool_input": {"command": "docker run -v \"$HOME\":/h alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-home-var-high", "tool": "Bash", "tool_input": {"command": "docker run -v \"$HOME\":/h alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-home-var-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v \"$HOME\":/h alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-home-brace-off", "tool": "Bash", "tool_input": {"command": "docker run -v ${HOME}:/h alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-home-brace-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ${HOME}:/h alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-home-brace-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ${HOME}:/h alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-home-brace-high", "tool": "Bash", "tool_input": {"command": "docker run -v ${HOME}:/h alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-home-brace-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ${HOME}:/h alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-home-abs-off", "tool": "Bash", "tool_input": {"command": "docker run -v /Users/alice:/h alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-home-abs-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /Users/alice:/h alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-home-abs-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /Users/alice:/h alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-home-abs-high", "tool": "Bash", "tool_input": {"command": "docker run -v /Users/alice:/h alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-home-abs-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /Users/alice:/h alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-home-linux-off", "tool": "Bash", "tool_input": {"command": "docker run -v /home/bob/:/h alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-home-linux-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /home/bob/:/h alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-home-linux-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /home/bob/:/h alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-home-linux-high", "tool": "Bash", "tool_input": {"command": "docker run -v /home/bob/:/h alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-home-linux-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /home/bob/:/h alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-users-off", "tool": "Bash", "tool_input": {"command": "docker run -v /Users:/u alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-users-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /Users:/u alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-users-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /Users:/u alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-users-high", "tool": "Bash", "tool_input": {"command": "docker run -v /Users:/u alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-users-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /Users:/u alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-ssh-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.ssh:/root/.ssh alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-ssh-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.ssh:/root/.ssh alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-ssh-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.ssh:/root/.ssh alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-ssh-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.ssh:/root/.ssh alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-ssh-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.ssh:/root/.ssh alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-ssh-home-off", "tool": "Bash", "tool_input": {"command": "docker run -v $HOME/.ssh:/root/.ssh:ro alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-ssh-home-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v $HOME/.ssh:/root/.ssh:ro alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-ssh-home-medium", "tool": "Bash", "tool_input": {"command": "docker run -v $HOME/.ssh:/root/.ssh:ro alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-ssh-home-high", "tool": "Bash", "tool_input": {"command": "docker run -v $HOME/.ssh:/root/.ssh:ro alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-ssh-home-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v $HOME/.ssh:/root/.ssh:ro alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-aws-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.aws:/root/.aws amazon/aws-cli s3 ls"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-aws-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.aws:/root/.aws amazon/aws-cli s3 ls"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-aws-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.aws:/root/.aws amazon/aws-cli s3 ls"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-aws-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.aws:/root/.aws amazon/aws-cli s3 ls"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-aws-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.aws:/root/.aws amazon/aws-cli s3 ls"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-solana-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana:/root/.config/solana solanalabs/solana"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-solana-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana:/root/.config/solana solanalabs/solana"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-solana-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana:/root/.config/solana solanalabs/solana"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-solana-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana:/root/.config/solana solanalabs/solana"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-solana-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana:/root/.config/solana solanalabs/solana"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-solana-id-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana/id.json:/id.json alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-solana-id-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana/id.json:/id.json alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-solana-id-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana/id.json:/id.json alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-solana-id-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana/id.json:/id.json alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-solana-id-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.config/solana/id.json:/id.json alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-gnupg-off", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.gnupg:/g alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-gnupg-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.gnupg:/g alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-gnupg-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.gnupg:/g alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-gnupg-high", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.gnupg:/g alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-gnupg-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ~/.gnupg:/g alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "mount-dotdot-root-off", "tool": "Bash", "tool_input": {"command": "docker run -v ../../../../../../../../:/up alpine"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "mount-dotdot-root-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ../../../../../../../../:/up alpine"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "mount-dotdot-root-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ../../../../../../../../:/up alpine"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "mount-dotdot-root-high", "tool": "Bash", "tool_input": {"command": "docker run -v ../../../../../../../../:/up alpine"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "mount-dotdot-root-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ../../../../../../../../:/up alpine"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "rootfs-off", "tool": "Bash", "tool_input": {"command": "podman run --rootfs / ls"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "rootfs-relaxed", "tool": "Bash", "tool_input": {"command": "podman run --rootfs / ls"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "rootfs-medium", "tool": "Bash", "tool_input": {"command": "podman run --rootfs / ls"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "rootfs-high", "tool": "Bash", "tool_input": {"command": "podman run --rootfs / ls"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "rootfs-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman run --rootfs / ls"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "compose-run-priv-off", "tool": "Bash", "tool_input": {"command": "docker compose run --privileged app"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "compose-run-priv-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose run --privileged app"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "compose-run-priv-medium", "tool": "Bash", "tool_input": {"command": "docker compose run --privileged app"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "compose-run-priv-high", "tool": "Bash", "tool_input": {"command": "docker compose run --privileged app"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "compose-run-priv-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose run --privileged app"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "compose-run-mount-off", "tool": "Bash", "tool_input": {"command": "docker compose run -v ~/.ssh:/root/.ssh app"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "compose-run-mount-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose run -v ~/.ssh:/root/.ssh app"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "compose-run-mount-medium", "tool": "Bash", "tool_input": {"command": "docker compose run -v ~/.ssh:/root/.ssh app"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "compose-run-mount-high", "tool": "Bash", "tool_input": {"command": "docker compose run -v ~/.ssh:/root/.ssh app"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "compose-run-mount-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose run -v ~/.ssh:/root/.ssh app"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "compose-up-priv-off", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  app:\n    image: alpine\n    privileged: true\n"}}
+{"id": "compose-up-priv-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  app:\n    image: alpine\n    privileged: true\n"}}
+{"id": "compose-up-priv-medium", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  app:\n    image: alpine\n    privileged: true\n"}}
+{"id": "compose-up-priv-high", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  app:\n    image: alpine\n    privileged: true\n"}}
+{"id": "compose-up-priv-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  app:\n    image: alpine\n    privileged: true\n"}}
+{"id": "compose-up-sock-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "services:\n  agent:\n    image: portainer/agent\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}}
+{"id": "compose-up-sock-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "services:\n  agent:\n    image: portainer/agent\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}}
+{"id": "compose-up-sock-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "services:\n  agent:\n    image: portainer/agent\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}}
+{"id": "compose-up-sock-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"docker-compose.yml": "services:\n  agent:\n    image: portainer/agent\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}}
+{"id": "compose-up-sock-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"docker-compose.yml": "services:\n  agent:\n    image: portainer/agent\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n"}}
+{"id": "compose-up-legacy-off", "tool": "Bash", "tool_input": {"command": "docker-compose up -d"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "version: '3'\nservices:\n  web:\n    image: nginx\n    network_mode: host\n"}}
+{"id": "compose-up-legacy-relaxed", "tool": "Bash", "tool_input": {"command": "docker-compose up -d"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "version: '3'\nservices:\n  web:\n    image: nginx\n    network_mode: host\n"}}
+{"id": "compose-up-legacy-medium", "tool": "Bash", "tool_input": {"command": "docker-compose up -d"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"docker-compose.yml": "version: '3'\nservices:\n  web:\n    image: nginx\n    network_mode: host\n"}}
+{"id": "compose-up-legacy-high", "tool": "Bash", "tool_input": {"command": "docker-compose up -d"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"docker-compose.yml": "version: '3'\nservices:\n  web:\n    image: nginx\n    network_mode: host\n"}}
+{"id": "compose-up-legacy-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker-compose up -d"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"docker-compose.yml": "version: '3'\nservices:\n  web:\n    image: nginx\n    network_mode: host\n"}}
+{"id": "compose-up-file-off", "tool": "Bash", "tool_input": {"command": "docker compose -f infra/stack.yml up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    pid: host\n    cap_add:\n      - SYS_ADMIN\n"}}
+{"id": "compose-up-file-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose -f infra/stack.yml up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    pid: host\n    cap_add:\n      - SYS_ADMIN\n"}}
+{"id": "compose-up-file-medium", "tool": "Bash", "tool_input": {"command": "docker compose -f infra/stack.yml up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    pid: host\n    cap_add:\n      - SYS_ADMIN\n"}}
+{"id": "compose-up-file-high", "tool": "Bash", "tool_input": {"command": "docker compose -f infra/stack.yml up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    pid: host\n    cap_add:\n      - SYS_ADMIN\n"}}
+{"id": "compose-up-file-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose -f infra/stack.yml up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    pid: host\n    cap_add:\n      - SYS_ADMIN\n"}}
+{"id": "compose-up-file-eq-off", "tool": "Bash", "tool_input": {"command": "docker compose --file=infra/stack.yml up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    devices:\n      - /dev/kvm\n"}}
+{"id": "compose-up-file-eq-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose --file=infra/stack.yml up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    devices:\n      - /dev/kvm\n"}}
+{"id": "compose-up-file-eq-medium", "tool": "Bash", "tool_input": {"command": "docker compose --file=infra/stack.yml up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    devices:\n      - /dev/kvm\n"}}
+{"id": "compose-up-file-eq-high", "tool": "Bash", "tool_input": {"command": "docker compose --file=infra/stack.yml up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    devices:\n      - /dev/kvm\n"}}
+{"id": "compose-up-file-eq-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose --file=infra/stack.yml up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"infra/stack.yml": "services:\n  m:\n    image: x\n    devices:\n      - /dev/kvm\n"}}
+{"id": "compose-cd-off", "tool": "Bash", "tool_input": {"command": "cd infra && docker compose up -d"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"infra/compose.yml": "services:\n  m:\n    image: x\n    volumes:\n      - /:/host\n"}}
+{"id": "compose-cd-relaxed", "tool": "Bash", "tool_input": {"command": "cd infra && docker compose up -d"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"infra/compose.yml": "services:\n  m:\n    image: x\n    volumes:\n      - /:/host\n"}}
+{"id": "compose-cd-medium", "tool": "Bash", "tool_input": {"command": "cd infra && docker compose up -d"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"infra/compose.yml": "services:\n  m:\n    image: x\n    volumes:\n      - /:/host\n"}}
+{"id": "compose-cd-high", "tool": "Bash", "tool_input": {"command": "cd infra && docker compose up -d"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"infra/compose.yml": "services:\n  m:\n    image: x\n    volumes:\n      - /:/host\n"}}
+{"id": "compose-cd-relaxed-hl", "tool": "Bash", "tool_input": {"command": "cd infra && docker compose up -d"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"infra/compose.yml": "services:\n  m:\n    image: x\n    volumes:\n      - /:/host\n"}}
+{"id": "compose-long-bind-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - type: bind\n        source: ~/.aws\n        target: /root/.aws\n"}}
+{"id": "compose-long-bind-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - type: bind\n        source: ~/.aws\n        target: /root/.aws\n"}}
+{"id": "compose-long-bind-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - type: bind\n        source: ~/.aws\n        target: /root/.aws\n"}}
+{"id": "compose-long-bind-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - type: bind\n        source: ~/.aws\n        target: /root/.aws\n"}}
+{"id": "compose-long-bind-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - type: bind\n        source: ~/.aws\n        target: /root/.aws\n"}}
+{"id": "compose-home-interp-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - ${HOME}/.ssh:/root/.ssh:ro\n"}}
+{"id": "compose-home-interp-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - ${HOME}/.ssh:/root/.ssh:ro\n"}}
+{"id": "compose-home-interp-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - ${HOME}/.ssh:/root/.ssh:ro\n"}}
+{"id": "compose-home-interp-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - ${HOME}/.ssh:/root/.ssh:ro\n"}}
+{"id": "compose-home-interp-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - ${HOME}/.ssh:/root/.ssh:ro\n"}}
+{"id": "compose-anchor-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "x-base: &base\n  privileged: true\nservices:\n  m:\n    <<: *base\n    image: x\n"}}
+{"id": "compose-anchor-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "x-base: &base\n  privileged: true\nservices:\n  m:\n    <<: *base\n    image: x\n"}}
+{"id": "compose-anchor-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "x-base: &base\n  privileged: true\nservices:\n  m:\n    <<: *base\n    image: x\n"}}
+{"id": "compose-anchor-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "x-base: &base\n  privileged: true\nservices:\n  m:\n    <<: *base\n    image: x\n"}}
+{"id": "compose-anchor-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "x-base: &base\n  privileged: true\nservices:\n  m:\n    <<: *base\n    image: x\n"}}
+{"id": "compose-override-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n", "compose.override.yaml": "services:\n  m:\n    security_opt:\n      - seccomp:unconfined\n"}}
+{"id": "compose-override-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n", "compose.override.yaml": "services:\n  m:\n    security_opt:\n      - seccomp:unconfined\n"}}
+{"id": "compose-override-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n", "compose.override.yaml": "services:\n  m:\n    security_opt:\n      - seccomp:unconfined\n"}}
+{"id": "compose-override-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n", "compose.override.yaml": "services:\n  m:\n    security_opt:\n      - seccomp:unconfined\n"}}
+{"id": "compose-override-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n", "compose.override.yaml": "services:\n  m:\n    security_opt:\n      - seccomp:unconfined\n"}}
+{"id": "compose-driver-bind-off", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - h:/h\nvolumes:\n  h:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n"}}
+{"id": "compose-driver-bind-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - h:/h\nvolumes:\n  h:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n"}}
+{"id": "compose-driver-bind-medium", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - h:/h\nvolumes:\n  h:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n"}}
+{"id": "compose-driver-bind-high", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - h:/h\nvolumes:\n  h:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n"}}
+{"id": "compose-driver-bind-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    volumes:\n      - h:/h\nvolumes:\n  h:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n"}}
+{"id": "compose-podman-off", "tool": "Bash", "tool_input": {"command": "podman compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    ipc: host\n"}}
+{"id": "compose-podman-relaxed", "tool": "Bash", "tool_input": {"command": "podman compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    ipc: host\n"}}
+{"id": "compose-podman-medium", "tool": "Bash", "tool_input": {"command": "podman compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    ipc: host\n"}}
+{"id": "compose-podman-high", "tool": "Bash", "tool_input": {"command": "podman compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    ipc: host\n"}}
+{"id": "compose-podman-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    ipc: host\n"}}
+{"id": "compose-podman-compose-off", "tool": "Bash", "tool_input": {"command": "podman-compose up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    userns_mode: host\n"}}
+{"id": "compose-podman-compose-relaxed", "tool": "Bash", "tool_input": {"command": "podman-compose up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    userns_mode: host\n"}}
+{"id": "compose-podman-compose-medium", "tool": "Bash", "tool_input": {"command": "podman-compose up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    userns_mode: host\n"}}
+{"id": "compose-podman-compose-high", "tool": "Bash", "tool_input": {"command": "podman-compose up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    userns_mode: host\n"}}
+{"id": "compose-podman-compose-relaxed-hl", "tool": "Bash", "tool_input": {"command": "podman-compose up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    userns_mode: host\n"}}
+{"id": "compose-create-off", "tool": "Bash", "tool_input": {"command": "docker compose create"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: 'true'\n"}}
+{"id": "compose-create-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose create"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: 'true'\n"}}
+{"id": "compose-create-medium", "tool": "Bash", "tool_input": {"command": "docker compose create"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: 'true'\n"}}
+{"id": "compose-create-high", "tool": "Bash", "tool_input": {"command": "docker compose create"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: 'true'\n"}}
+{"id": "compose-create-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose create"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: 'true'\n"}}
+{"id": "compose-projdir-off", "tool": "Bash", "tool_input": {"command": "docker compose --project-directory infra up"}, "tier": "off", "headless": false, "want": "A", "cwd_files": {"infra/compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "compose-projdir-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose --project-directory infra up"}, "tier": "relaxed", "headless": false, "want": "A", "cwd_files": {"infra/compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "compose-projdir-medium", "tool": "Bash", "tool_input": {"command": "docker compose --project-directory infra up"}, "tier": "medium", "headless": false, "want": "A", "cwd_files": {"infra/compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "compose-projdir-high", "tool": "Bash", "tool_input": {"command": "docker compose --project-directory infra up"}, "tier": "high", "headless": false, "want": "D", "cwd_files": {"infra/compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "compose-projdir-relaxed-hl", "tool": "Bash", "tool_input": {"command": "docker compose --project-directory infra up"}, "tier": "relaxed", "headless": true, "want": "D", "cwd_files": {"infra/compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-validator-off", "tool": "Bash", "tool_input": {"command": "docker run --rm -p 8899:8899 image"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-validator-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --rm -p 8899:8899 image"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-validator-medium", "tool": "Bash", "tool_input": {"command": "docker run --rm -p 8899:8899 image"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-validator-high", "tool": "Bash", "tool_input": {"command": "docker run --rm -p 8899:8899 image"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-validator-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --rm -p 8899:8899 image"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-validator-full-off", "tool": "Bash", "tool_input": {"command": "docker run -d --name validator -p 8899:8899 -p 8900:8900 solanalabs/solana:v1.18.26 solana-test-validator"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-validator-full-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -d --name validator -p 8899:8899 -p 8900:8900 solanalabs/solana:v1.18.26 solana-test-validator"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-validator-full-medium", "tool": "Bash", "tool_input": {"command": "docker run -d --name validator -p 8899:8899 -p 8900:8900 solanalabs/solana:v1.18.26 solana-test-validator"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-validator-full-high", "tool": "Bash", "tool_input": {"command": "docker run -d --name validator -p 8899:8899 -p 8900:8900 solanalabs/solana:v1.18.26 solana-test-validator"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-validator-full-high-hl", "tool": "Bash", "tool_input": {"command": "docker run -d --name validator -p 8899:8899 -p 8900:8900 solanalabs/solana:v1.18.26 solana-test-validator"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-named-vol-off", "tool": "Bash", "tool_input": {"command": "docker run -v pgdata:/var/lib/postgresql/data postgres:16"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-named-vol-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v pgdata:/var/lib/postgresql/data postgres:16"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-named-vol-medium", "tool": "Bash", "tool_input": {"command": "docker run -v pgdata:/var/lib/postgresql/data postgres:16"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-named-vol-high", "tool": "Bash", "tool_input": {"command": "docker run -v pgdata:/var/lib/postgresql/data postgres:16"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-named-vol-high-hl", "tool": "Bash", "tool_input": {"command": "docker run -v pgdata:/var/lib/postgresql/data postgres:16"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-project-dot-off", "tool": "Bash", "tool_input": {"command": "docker run --rm -v .:/app -w /app node:20 npm test"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-project-dot-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --rm -v .:/app -w /app node:20 npm test"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-project-dot-medium", "tool": "Bash", "tool_input": {"command": "docker run --rm -v .:/app -w /app node:20 npm test"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-project-dot-high", "tool": "Bash", "tool_input": {"command": "docker run --rm -v .:/app -w /app node:20 npm test"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-project-dot-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --rm -v .:/app -w /app node:20 npm test"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-project-pwd-off", "tool": "Bash", "tool_input": {"command": "docker run --rm -v \"$(pwd)\":/work -w /work rust:1 cargo build"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-project-pwd-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --rm -v \"$(pwd)\":/work -w /work rust:1 cargo build"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-project-pwd-medium", "tool": "Bash", "tool_input": {"command": "docker run --rm -v \"$(pwd)\":/work -w /work rust:1 cargo build"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-project-pwd-high", "tool": "Bash", "tool_input": {"command": "docker run --rm -v \"$(pwd)\":/work -w /work rust:1 cargo build"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-project-pwd-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --rm -v \"$(pwd)\":/work -w /work rust:1 cargo build"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-project-PWD-off", "tool": "Bash", "tool_input": {"command": "docker run --rm -v $PWD:/work rust:1 cargo test"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-project-PWD-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --rm -v $PWD:/work rust:1 cargo test"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-project-PWD-medium", "tool": "Bash", "tool_input": {"command": "docker run --rm -v $PWD:/work rust:1 cargo test"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-project-PWD-high", "tool": "Bash", "tool_input": {"command": "docker run --rm -v $PWD:/work rust:1 cargo test"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-project-PWD-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --rm -v $PWD:/work rust:1 cargo test"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-project-sub-off", "tool": "Bash", "tool_input": {"command": "docker run -v ./data:/data alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-project-sub-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v ./data:/data alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-project-sub-medium", "tool": "Bash", "tool_input": {"command": "docker run -v ./data:/data alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-project-sub-high", "tool": "Bash", "tool_input": {"command": "docker run -v ./data:/data alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-project-sub-high-hl", "tool": "Bash", "tool_input": {"command": "docker run -v ./data:/data alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-anon-vol-off", "tool": "Bash", "tool_input": {"command": "docker run -v /data alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-anon-vol-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /data alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-anon-vol-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /data alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-anon-vol-high", "tool": "Bash", "tool_input": {"command": "docker run -v /data alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-anon-vol-high-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /data alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-localtime-off", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/localtime:/etc/localtime:ro alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-localtime-relaxed", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/localtime:/etc/localtime:ro alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-localtime-medium", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/localtime:/etc/localtime:ro alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-localtime-high", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/localtime:/etc/localtime:ro alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-localtime-high-hl", "tool": "Bash", "tool_input": {"command": "docker run -v /etc/localtime:/etc/localtime:ro alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-mount-volume-off", "tool": "Bash", "tool_input": {"command": "docker run --mount type=volume,source=cache,target=/cache alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-mount-volume-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --mount type=volume,source=cache,target=/cache alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-mount-volume-medium", "tool": "Bash", "tool_input": {"command": "docker run --mount type=volume,source=cache,target=/cache alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-mount-volume-high", "tool": "Bash", "tool_input": {"command": "docker run --mount type=volume,source=cache,target=/cache alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-mount-volume-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --mount type=volume,source=cache,target=/cache alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-mount-bind-project-off", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=./src,target=/src alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-mount-bind-project-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=./src,target=/src alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-mount-bind-project-medium", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=./src,target=/src alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-mount-bind-project-high", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=./src,target=/src alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-mount-bind-project-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --mount type=bind,source=./src,target=/src alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-tmpfs-off", "tool": "Bash", "tool_input": {"command": "docker run --tmpfs /tmp alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-tmpfs-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --tmpfs /tmp alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-tmpfs-medium", "tool": "Bash", "tool_input": {"command": "docker run --tmpfs /tmp alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-tmpfs-high", "tool": "Bash", "tool_input": {"command": "docker run --tmpfs /tmp alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-tmpfs-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --tmpfs /tmp alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-cap-default-off", "tool": "Bash", "tool_input": {"command": "docker run --cap-add NET_BIND_SERVICE nginx"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-cap-default-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --cap-add NET_BIND_SERVICE nginx"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-cap-default-medium", "tool": "Bash", "tool_input": {"command": "docker run --cap-add NET_BIND_SERVICE nginx"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-cap-default-high", "tool": "Bash", "tool_input": {"command": "docker run --cap-add NET_BIND_SERVICE nginx"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-cap-default-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --cap-add NET_BIND_SERVICE nginx"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-cap-drop-off", "tool": "Bash", "tool_input": {"command": "docker run --cap-drop ALL nginx"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-cap-drop-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --cap-drop ALL nginx"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-cap-drop-medium", "tool": "Bash", "tool_input": {"command": "docker run --cap-drop ALL nginx"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-cap-drop-high", "tool": "Bash", "tool_input": {"command": "docker run --cap-drop ALL nginx"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-cap-drop-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --cap-drop ALL nginx"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-no-new-priv-off", "tool": "Bash", "tool_input": {"command": "docker run --security-opt no-new-privileges alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-no-new-priv-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --security-opt no-new-privileges alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-no-new-priv-medium", "tool": "Bash", "tool_input": {"command": "docker run --security-opt no-new-privileges alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-no-new-priv-high", "tool": "Bash", "tool_input": {"command": "docker run --security-opt no-new-privileges alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-no-new-priv-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --security-opt no-new-privileges alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-priv-false-off", "tool": "Bash", "tool_input": {"command": "docker run --privileged=false alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-priv-false-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --privileged=false alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-priv-false-medium", "tool": "Bash", "tool_input": {"command": "docker run --privileged=false alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-priv-false-high", "tool": "Bash", "tool_input": {"command": "docker run --privileged=false alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-priv-false-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --privileged=false alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-net-bridge-off", "tool": "Bash", "tool_input": {"command": "docker run --network mynet alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-net-bridge-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --network mynet alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-net-bridge-medium", "tool": "Bash", "tool_input": {"command": "docker run --network mynet alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-net-bridge-high", "tool": "Bash", "tool_input": {"command": "docker run --network mynet alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-net-bridge-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --network mynet alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-pid-container-off", "tool": "Bash", "tool_input": {"command": "docker run --pid=container:web alpine"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-pid-container-relaxed", "tool": "Bash", "tool_input": {"command": "docker run --pid=container:web alpine"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-pid-container-medium", "tool": "Bash", "tool_input": {"command": "docker run --pid=container:web alpine"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-pid-container-high", "tool": "Bash", "tool_input": {"command": "docker run --pid=container:web alpine"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-pid-container-high-hl", "tool": "Bash", "tool_input": {"command": "docker run --pid=container:web alpine"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-after-image-off", "tool": "Bash", "tool_input": {"command": "docker run alpine ls --privileged -v /:/x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-after-image-relaxed", "tool": "Bash", "tool_input": {"command": "docker run alpine ls --privileged -v /:/x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-after-image-medium", "tool": "Bash", "tool_input": {"command": "docker run alpine ls --privileged -v /:/x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-after-image-high", "tool": "Bash", "tool_input": {"command": "docker run alpine ls --privileged -v /:/x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-after-image-high-hl", "tool": "Bash", "tool_input": {"command": "docker run alpine ls --privileged -v /:/x"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-exec-plain-off", "tool": "Bash", "tool_input": {"command": "docker exec -it web sh"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-exec-plain-relaxed", "tool": "Bash", "tool_input": {"command": "docker exec -it web sh"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-exec-plain-medium", "tool": "Bash", "tool_input": {"command": "docker exec -it web sh"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-exec-plain-high", "tool": "Bash", "tool_input": {"command": "docker exec -it web sh"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-exec-plain-high-hl", "tool": "Bash", "tool_input": {"command": "docker exec -it web sh"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-build-off", "tool": "Bash", "tool_input": {"command": "docker build -t app ."}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-build-relaxed", "tool": "Bash", "tool_input": {"command": "docker build -t app ."}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-build-medium", "tool": "Bash", "tool_input": {"command": "docker build -t app ."}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-build-high", "tool": "Bash", "tool_input": {"command": "docker build -t app ."}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-build-high-hl", "tool": "Bash", "tool_input": {"command": "docker build -t app ."}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-build-sock-arg-off", "tool": "Bash", "tool_input": {"command": "docker build --build-arg X=/var/run/docker.sock -t app ."}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-build-sock-arg-relaxed", "tool": "Bash", "tool_input": {"command": "docker build --build-arg X=/var/run/docker.sock -t app ."}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-build-sock-arg-medium", "tool": "Bash", "tool_input": {"command": "docker build --build-arg X=/var/run/docker.sock -t app ."}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-build-sock-arg-high", "tool": "Bash", "tool_input": {"command": "docker build --build-arg X=/var/run/docker.sock -t app ."}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-build-sock-arg-high-hl", "tool": "Bash", "tool_input": {"command": "docker build --build-arg X=/var/run/docker.sock -t app ."}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-ps-off", "tool": "Bash", "tool_input": {"command": "docker ps -a"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-ps-relaxed", "tool": "Bash", "tool_input": {"command": "docker ps -a"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-ps-medium", "tool": "Bash", "tool_input": {"command": "docker ps -a"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-ps-high", "tool": "Bash", "tool_input": {"command": "docker ps -a"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-ps-high-hl", "tool": "Bash", "tool_input": {"command": "docker ps -a"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-logs-off", "tool": "Bash", "tool_input": {"command": "docker logs -f validator"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-logs-relaxed", "tool": "Bash", "tool_input": {"command": "docker logs -f validator"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-logs-medium", "tool": "Bash", "tool_input": {"command": "docker logs -f validator"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-logs-high", "tool": "Bash", "tool_input": {"command": "docker logs -f validator"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-logs-high-hl", "tool": "Bash", "tool_input": {"command": "docker logs -f validator"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-pull-off", "tool": "Bash", "tool_input": {"command": "docker pull solanalabs/solana:stable"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-pull-relaxed", "tool": "Bash", "tool_input": {"command": "docker pull solanalabs/solana:stable"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-pull-medium", "tool": "Bash", "tool_input": {"command": "docker pull solanalabs/solana:stable"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-pull-high", "tool": "Bash", "tool_input": {"command": "docker pull solanalabs/solana:stable"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-pull-high-hl", "tool": "Bash", "tool_input": {"command": "docker pull solanalabs/solana:stable"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-compose-up-off", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "off", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  db:\n    image: postgres\n    ports:\n      - '5432:5432'\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./init:/docker-entrypoint-initdb.d\nvolumes:\n  pgdata: {}\n"}}
+{"id": "b-compose-up-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "relaxed", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  db:\n    image: postgres\n    ports:\n      - '5432:5432'\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./init:/docker-entrypoint-initdb.d\nvolumes:\n  pgdata: {}\n"}}
+{"id": "b-compose-up-medium", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "medium", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  db:\n    image: postgres\n    ports:\n      - '5432:5432'\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./init:/docker-entrypoint-initdb.d\nvolumes:\n  pgdata: {}\n"}}
+{"id": "b-compose-up-high", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "high", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  db:\n    image: postgres\n    ports:\n      - '5432:5432'\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./init:/docker-entrypoint-initdb.d\nvolumes:\n  pgdata: {}\n"}}
+{"id": "b-compose-up-high-hl", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "high", "headless": true, "want": "-", "cwd_files": {"compose.yaml": "services:\n  db:\n    image: postgres\n    ports:\n      - '5432:5432'\n    volumes:\n      - pgdata:/var/lib/postgresql/data\n      - ./init:/docker-entrypoint-initdb.d\nvolumes:\n  pgdata: {}\n"}}
+{"id": "b-compose-no-file-off", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-compose-no-file-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-compose-no-file-medium", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-compose-no-file-high", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-compose-no-file-high-hl", "tool": "Bash", "tool_input": {"command": "docker compose up -d"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-compose-down-off", "tool": "Bash", "tool_input": {"command": "docker compose down -v"}, "tier": "off", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-down-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose down -v"}, "tier": "relaxed", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-down-medium", "tool": "Bash", "tool_input": {"command": "docker compose down -v"}, "tier": "medium", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-down-high", "tool": "Bash", "tool_input": {"command": "docker compose down -v"}, "tier": "high", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-down-high-hl", "tool": "Bash", "tool_input": {"command": "docker compose down -v"}, "tier": "high", "headless": true, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-logs-off", "tool": "Bash", "tool_input": {"command": "docker compose logs -f"}, "tier": "off", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-logs-relaxed", "tool": "Bash", "tool_input": {"command": "docker compose logs -f"}, "tier": "relaxed", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-logs-medium", "tool": "Bash", "tool_input": {"command": "docker compose logs -f"}, "tier": "medium", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-logs-high", "tool": "Bash", "tool_input": {"command": "docker compose logs -f"}, "tier": "high", "headless": false, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-compose-logs-high-hl", "tool": "Bash", "tool_input": {"command": "docker compose logs -f"}, "tier": "high", "headless": true, "want": "-", "cwd_files": {"compose.yaml": "services:\n  m:\n    image: x\n    privileged: true\n"}}
+{"id": "b-commit-msg-off", "tool": "Bash", "tool_input": {"command": "git commit -m 'docs: explain docker run --privileged -v /:/host'"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-commit-msg-relaxed", "tool": "Bash", "tool_input": {"command": "git commit -m 'docs: explain docker run --privileged -v /:/host'"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-commit-msg-medium", "tool": "Bash", "tool_input": {"command": "git commit -m 'docs: explain docker run --privileged -v /:/host'"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-commit-msg-high", "tool": "Bash", "tool_input": {"command": "git commit -m 'docs: explain docker run --privileged -v /:/host'"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-commit-msg-high-hl", "tool": "Bash", "tool_input": {"command": "git commit -m 'docs: explain docker run --privileged -v /:/host'"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-echo-off", "tool": "Bash", "tool_input": {"command": "echo \"never run docker with --privileged\""}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-echo-relaxed", "tool": "Bash", "tool_input": {"command": "echo \"never run docker with --privileged\""}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-echo-medium", "tool": "Bash", "tool_input": {"command": "echo \"never run docker with --privileged\""}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-echo-high", "tool": "Bash", "tool_input": {"command": "echo \"never run docker with --privileged\""}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-echo-high-hl", "tool": "Bash", "tool_input": {"command": "echo \"never run docker with --privileged\""}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-grep-off", "tool": "Bash", "tool_input": {"command": "grep -rn 'docker.sock' docs/"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-grep-relaxed", "tool": "Bash", "tool_input": {"command": "grep -rn 'docker.sock' docs/"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-grep-medium", "tool": "Bash", "tool_input": {"command": "grep -rn 'docker.sock' docs/"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-grep-high", "tool": "Bash", "tool_input": {"command": "grep -rn 'docker.sock' docs/"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-grep-high-hl", "tool": "Bash", "tool_input": {"command": "grep -rn 'docker.sock' docs/"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-anchor-off", "tool": "Bash", "tool_input": {"command": "anchor test"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-anchor-relaxed", "tool": "Bash", "tool_input": {"command": "anchor test"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-anchor-medium", "tool": "Bash", "tool_input": {"command": "anchor test"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-anchor-high", "tool": "Bash", "tool_input": {"command": "anchor test"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-anchor-high-hl", "tool": "Bash", "tool_input": {"command": "anchor test"}, "tier": "high", "headless": true, "want": "-"}
+{"id": "b-npm-off", "tool": "Bash", "tool_input": {"command": "npm install"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "b-npm-relaxed", "tool": "Bash", "tool_input": {"command": "npm install"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "b-npm-medium", "tool": "Bash", "tool_input": {"command": "npm install"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "b-npm-high", "tool": "Bash", "tool_input": {"command": "npm install"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "b-npm-high-hl", "tool": "Bash", "tool_input": {"command": "npm install"}, "tier": "high", "headless": true, "want": "-"}

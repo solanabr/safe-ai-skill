@@ -89,6 +89,9 @@ mkdir -p "$PROJ/.claude"
 git -C "$PROJ" init -q
 printf '# Live test project\n\nThrowaway project for the safe-ai-skill live smoke test.\n' >"$PROJ/README.md"
 printf 'FAKE_API_KEY=fake_live_test_value_7f3a\n' >"$PROJ/.env"
+# A fake private key (not a real key) for the key-file hygiene case.
+mkdir -p "$PROJ/deploy"
+printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'ZmFrZS1rZXktZm9yLXRoZS1saXZlLXRlc3Q=' '-----END OPENSSH PRIVATE KEY-----' >"$PROJ/deploy/server.key"
 if [ -n "$KIT" ]; then
   echo "installing ai-kit from $KIT (without its safe-ai-skill plugin)…"
   SOLANA_AI_KIT_LOCAL_SRC="$KIT" bash "$KIT/install.sh" --no-safe-ai-skill "$PROJ" >"$WORK/kit-install.log" 2>&1 \

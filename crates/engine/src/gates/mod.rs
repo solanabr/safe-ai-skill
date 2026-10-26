@@ -6,6 +6,7 @@
 
 pub mod bash;
 pub mod configchange;
+pub mod containers;
 pub mod creddump;
 pub mod credpaths;
 pub mod encoded;
@@ -14,8 +15,10 @@ pub mod envwrite;
 pub mod exfil;
 pub mod fetchexec;
 pub mod gitguard;
+pub mod keyfiles;
 pub mod mcp;
 pub mod mcpexec;
+pub mod permreq;
 pub mod read;
 pub mod secretpath;
 pub mod secrets;

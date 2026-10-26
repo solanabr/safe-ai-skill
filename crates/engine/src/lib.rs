@@ -52,6 +52,7 @@ pub mod promptguard;
 pub mod redact;
 pub mod registry;
 pub mod relax;
+pub mod report;
 pub mod rugcheck;
 pub mod sandbox;
 pub mod seedphrase;

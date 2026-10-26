@@ -298,6 +298,44 @@ fn index_covers(bytes: &[u8], target: &str) -> Result<bool, ()> {
 
 /// [`index_covers`], with the work it did.
 fn scan_index(bytes: &[u8], target: &str) -> Result<(bool, usize), ()> {
+    let target = fold(target);
+    let target = target.as_bytes();
+    walk_index(bytes, |entry| {
+        let kind = entry.mode & MODE_TYPE;
+        let container = kind == MODE_GITLINK || kind == MODE_DIR || entry.name.ends_with(b"/");
+        let hit = match relation(entry.name, target) {
+            Rel::Equal | Rel::Inside => true,
+            Rel::Contains => container,
+            Rel::Apart => false,
+        };
+        // The prefix compared.
+        (entry.name.len().min(target.len()), hit)
+    })
+}
+
+/// One index entry, as [`walk_index`] hands it over.
+pub(crate) struct IndexEntry<'a> {
+    /// The path, repository-relative and `/`-separated, as git spells it.
+    pub name: &'a [u8],
+    /// The entry mode (file type and permission bits).
+    pub mode: u32,
+    /// Modification time in seconds, truncated to 32 bits as git stores it.
+    pub mtime: u32,
+    /// File size, truncated to 32 bits as git stores it.
+    pub size: u32,
+}
+
+/// Visit every entry of an index (versions 2 to 4). `visit` returns the work it did (charged
+/// on top of the entry's bytes) and whether to stop. `Ok((stopped, work))`; `Err` for anything
+/// this parser does not fully understand (an unknown version, a truncated or split index, a
+/// path over [`MAX_NAME`], more than [`MAX_WORK`]).
+///
+/// Work is linear in the index size: a version-4 path is rebuilt in one reused buffer (the
+/// previous path truncated, the new suffix appended).
+fn walk_index(
+    bytes: &[u8],
+    mut visit: impl FnMut(&IndexEntry<'_>) -> (usize, bool),
+) -> Result<(bool, usize), ()> {
     if bytes.get(..4) != Some(b"DIRC") {
         return Err(());
     }
@@ -310,14 +348,14 @@ fn scan_index(bytes: &[u8], target: &str) -> Result<(bool, usize), ()> {
     if count > bytes.len() {
         return Err(());
     }
-    let target = fold(target);
-    let target = target.as_bytes();
     let mut cursor = 12usize;
     let mut name: Vec<u8> = Vec::new();
     let mut work = 0usize;
     for _ in 0..count {
         let start = cursor;
+        let mtime = be32(bytes, at(start, 8)?).ok_or(())?;
         let mode = be32(bytes, at(start, 24)?).ok_or(())?;
+        let size = be32(bytes, at(start, 36)?).ok_or(())?;
         let flag_bytes = bytes.get(at(start, 60)?..at(start, 62)?).ok_or(())?;
         let flags = u16::from_be_bytes([flag_bytes[0], flag_bytes[1]]);
         let mut name_at = at(start, ENTRY_FIXED)?;
@@ -356,23 +394,22 @@ fn scan_index(bytes: &[u8], target: &str) -> Result<(bool, usize), ()> {
         if cursor > bytes.len() {
             return Err(());
         }
-        // The entry's bytes read, the name copied (at most what was read) and the prefix
-        // compared.
+        let (extra, stop) = visit(&IndexEntry {
+            name: &name,
+            mode,
+            mtime,
+            size,
+        });
+        // The entry's bytes read, the name copied (at most what was read) and the visitor's
+        // own work.
         work = work
             .saturating_add(cursor.saturating_sub(start))
-            .saturating_add(name.len().min(target.len()))
+            .saturating_add(extra)
             .saturating_add(ENTRY_WORK);
         if work > MAX_WORK {
             return Err(());
         }
-        let kind = mode & MODE_TYPE;
-        let container = kind == MODE_GITLINK || kind == MODE_DIR || name.ends_with(b"/");
-        let hit = match relation(&name, target) {
-            Rel::Equal | Rel::Inside => true,
-            Rel::Contains => container,
-            Rel::Apart => false,
-        };
-        if hit {
+        if stop {
             return Ok((true, work));
         }
     }
@@ -387,6 +424,48 @@ fn scan_index(bytes: &[u8], target: &str) -> Result<(bool, usize), ()> {
         ext = at(at(ext, 8)?, size)?;
     }
     Ok((false, work))
+}
+
+/// A tracked file [`index_files`] kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexFile {
+    /// Repository-relative, `/`-separated, as the index spells it.
+    pub path: String,
+    /// Modification time in seconds, truncated to 32 bits.
+    pub mtime: u32,
+    /// File size, truncated to 32 bits.
+    pub size: u32,
+}
+
+/// The index entries of the work tree at `root` whose path `keep` accepts (non-UTF-8 paths are
+/// skipped), read from `.git/index` (or the index of the `gitdir:` a `.git` file names) without
+/// running git. `Some(empty)` when there is no index yet; `None` when it cannot be resolved,
+/// read or parsed.
+pub(crate) fn index_files(
+    root: &Path,
+    mut keep: impl FnMut(&str) -> bool,
+) -> Option<Vec<IndexFile>> {
+    let index = index_path(&root.join(".git"), root)?;
+    let bytes = match read_bounded(&index) {
+        Slurp::Missing => return Some(Vec::new()),
+        Slurp::Unreadable => return None,
+        Slurp::Data(bytes) => bytes,
+    };
+    let mut out = Vec::new();
+    walk_index(&bytes, |entry| {
+        if let Ok(path) = std::str::from_utf8(entry.name) {
+            if keep(path) {
+                out.push(IndexFile {
+                    path: path.to_string(),
+                    mtime: entry.mtime,
+                    size: entry.size,
+                });
+            }
+        }
+        (0, false)
+    })
+    .ok()?;
+    Some(out)
 }
 
 #[cfg(test)]
@@ -797,5 +876,26 @@ mod tests {
         let tracked = pack(&root, "s/t");
         git(&root, &["add", "s/t"]);
         assert!(tracking_any(&[&tracked, &tracked.canonicalize().unwrap()]).is_tracked());
+    }
+
+    #[test]
+    fn index_files_lists_kept_entries_with_size() {
+        let dir = temp("index-files");
+        git(&dir, &["init", "-q"]);
+        fs::create_dir_all(dir.join("a")).unwrap();
+        fs::write(dir.join("a/x.key"), "12345").unwrap();
+        fs::write(dir.join("b.rs"), "x").unwrap();
+        git(&dir, &["add", "a/x.key", "b.rs"]);
+        let files = index_files(&dir, |p| p.ends_with(".key")).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a/x.key");
+        assert_eq!(files[0].size, 5);
+        assert_eq!(index_files(&dir, |_| true).unwrap().len(), 2);
+        let fresh = temp("index-files-fresh");
+        git(&fresh, &["init", "-q"]);
+        assert_eq!(index_files(&fresh, |_| true), Some(Vec::new()));
+        assert_eq!(index_files(&temp("index-files-none"), |_| true), None);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&fresh);
     }
 }
