@@ -23,9 +23,8 @@ use safe_ai_skill::context::Context;
 use safe_ai_skill::datadir::{self, DataDir};
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gate::{GateMeta, Scope};
-use safe_ai_skill::gates::{
-    creddump, encoded, envread, envwrite, exfil, fetchexec, mcpexec, read, tamper, wallet,
-};
+use safe_ai_skill::gates::shellcmd::{self, strictest};
+use safe_ai_skill::gates::{envwrite, exfil, mcpexec, read, tamper, wallet};
 use safe_ai_skill::io::{self, Decision, HookInput, Unreadable};
 use safe_ai_skill::policy::tier::{self, EnvRead, Tier};
 use safe_ai_skill::policy::{self, Policy};
@@ -358,16 +357,6 @@ fn load_runtime(cwd: &Path, dir: &DataDir) -> (Policy, tier::Resolution) {
     )
 }
 
-/// The strictest of the tier gates' verdicts (`deny` > `ask`); `None` when none asks or
-/// denies. Tier gates only tighten: an `allow` from one is ignored.
-fn strictest(verdicts: impl IntoIterator<Item = Option<Verdict>>) -> Option<Verdict> {
-    verdicts
-        .into_iter()
-        .flatten()
-        .filter(|v| matches!(v, Verdict::Ask(_) | Verdict::Deny(_)))
-        .max_by_key(verdict_rank)
-}
-
 fn verdict_rank(v: &Verdict) -> u8 {
     match v {
         Verdict::NoOpinion => 0,
@@ -603,80 +592,14 @@ fn cmd_gate_bash() -> ExitCode {
     // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
     // entry as well as from `gate-bash-secrets`.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
-    let nested_verdict = nested_claude_verdict(nested, effective.tier());
-    let encoded_verdict = encoded_bash_verdict(command, &cwd, &effective);
+    let nested_verdict = shellcmd::nested_claude_verdict(nested, effective.tier());
+    let encoded_verdict = shellcmd::encoded_verdict(command, &cwd, &effective, &dir);
     let (decision, meta) = join_tier(
         strictest([wallet_verdict, nested_verdict, encoded_verdict]),
         decision,
         meta,
     );
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
-}
-
-/// An encoded payload piped or eval'd into a shell, decoded and judged by the bash and
-/// secrets gates (strictest wins); an undecodable payload asks, a deny at High.
-fn encoded_bash_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
-    let tier = effective.tier();
-    let mut all = vec![encoded::decide(command).map(|v| match v {
-        Verdict::Ask(reason) if tier == Tier::High => {
-            Verdict::Deny(format!("{reason} Denied at tier high."))
-        }
-        v => v,
-    })];
-    for decoded in encoded::expand(command) {
-        all.push(inner_text_verdict(&decoded, cwd, effective));
-    }
-    strictest(all)
-}
-
-/// A command text found inside another one (a decoded payload, a `git submodule foreach` or
-/// `rebase --exec` string), judged by every Bash gate as if it had been typed.
-fn inner_text_verdict(text: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
-    use safe_ai_skill::gates::{bash, gitguard, secrets};
-    let as_verdict = |d: Decision| match d {
-        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
-        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
-        _ => None,
-    };
-    let tier = effective.tier();
-    let ctx = Context::build(text, cwd);
-    strictest([
-        as_verdict(bash::decide(text, &ctx, effective).0),
-        as_verdict(secrets::decide(text, cwd, effective)),
-        wallet::decide_bash(text, cwd, effective, tier),
-        creddump::decide(text, cwd, effective, tier),
-        envwrite::decide_cli(text, cwd, effective, tier),
-        exfil::decide_bash(text, cwd, effective, tier),
-        fetchexec::decide(text, cwd, effective, tier),
-        tamper::decide_bash_writes(text, cwd, effective, tier),
-        envread::decide_bash(text),
-        gitguard::decide(text, cwd, effective, tier),
-        safe_ai_skill::gates::containers::decide(text, cwd, effective, tier),
-        safe_ai_skill::gates::keyfiles::decide_bash(text, cwd, tier),
-    ])
-}
-
-/// The git gate on `command`, plus every `submodule foreach` / `rebase --exec` string in it
-/// judged by all the Bash gates.
-fn git_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
-    use safe_ai_skill::gates::gitguard;
-    let mut all = vec![gitguard::decide(command, cwd, effective, effective.tier())];
-    for inner in gitguard::inner_commands(command) {
-        all.push(inner_text_verdict(&inner, cwd, effective));
-    }
-    strictest(all)
-}
-
-/// [`tamper::decide_nested_claude`] as a tier verdict: its `ask` is a deny at High.
-fn nested_claude_verdict(decision: Decision, tier: Tier) -> Option<Verdict> {
-    match decision {
-        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
-        Decision::Ask { reason } if tier == Tier::High => {
-            Some(Verdict::Deny(format!("{reason} Denied at tier high.")))
-        }
-        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
-        _ => None,
-    }
 }
 
 fn cmd_gate_bash_secrets() -> ExitCode {
@@ -697,23 +620,11 @@ fn cmd_gate_bash_secrets() -> ExitCode {
             return finish_pretooluse(deny, &meta, &effective, &dir, &input, &raw);
         }
     }
-    if let Some(deny) = blocked_pack(verify::enforce::bash_verdict(&dir, command, &cwd), tier) {
+    if let Some(deny) = shellcmd::blocked_pack_verdict(&dir, command, &cwd, tier) {
         return finish_blocked_pack(deny, &effective, &dir, &input, &raw);
     }
-    // The D8 v2 tier gates (one call line each); the strictest joins the secrets decision.
-    let tier_verdict = strictest([
-        wallet::decide_bash(command, &cwd, &effective, tier),
-        creddump::decide(command, &cwd, &effective, tier),
-        envwrite::decide_cli(command, &cwd, &effective, tier),
-        exfil::decide_bash(command, &cwd, &effective, tier),
-        fetchexec::decide(command, &cwd, &effective, tier),
-        tamper::decide_bash_writes(command, &cwd, &effective, tier),
-        envread::decide_bash(command),
-        encoded_bash_verdict(command, &cwd, &effective),
-        git_verdict(command, &cwd, &effective),
-        safe_ai_skill::gates::containers::decide(command, &cwd, &effective, tier),
-        safe_ai_skill::gates::keyfiles::decide_bash(command, &cwd, tier),
-    ]);
+    // Every Bash-command tier gate (one shared list); the strictest joins the secrets decision.
+    let tier_verdict = shellcmd::tier_verdict(command, &cwd, &effective, &dir);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
     let (decision, meta) = safe_ai_skill::gates::bash::with_indirection_prefilter(
@@ -807,7 +718,7 @@ fn cmd_gate_mcp() -> ExitCode {
         other => other,
     };
     // Code the server runs gets the Bash checks, under a hard guard (no grant lifts it).
-    let (exec, exec_meta) = mcpexec::decide(payload, &cwd, &effective);
+    let (exec, exec_meta) = mcpexec::decide(payload, &cwd, &effective, &dir);
     let (decision, meta) = if decision_rank(&exec) > decision_rank(&decision) {
         (exec, exec_meta)
     } else {
@@ -1525,6 +1436,13 @@ fn cmd_verify_session() -> ExitCode {
     let dir = state_dir(&cwd);
     let plugin_data = dir.path.clone();
     let now = now_secs();
+    // The disabling switches the settings files already hold, before the agent acts, so one
+    // the user set does not make `gate-config` block every later edit of its file.
+    safe_ai_skill::gates::configchange::record_baseline(
+        Some(&cwd),
+        &safe_ai_skill::gates::tamper::ConfigHomes::from_env(),
+        &dir,
+    );
 
     // 1.0 state is migrated once, before anything creates the state key; then the spend
     // ledger is started (or repaired), which creates the key on a first run.
@@ -1569,25 +1487,21 @@ fn cmd_verify_session() -> ExitCode {
         platform::session_notices()
     };
     let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
-    let notices: Vec<String> = [
-        effective.ignored_notice(),
-        loosenings,
-        codex_scope,
-        safe_ai_skill::gates::keyfiles::session_notice(&cwd),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(platform_notices)
-    .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
-        format!(
-            "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+    let key_hygiene = safe_ai_skill::gates::keyfiles::session_notice(&cwd, &dir.path);
+    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
+        .into_iter()
+        .flatten()
+        .chain(platform_notices)
+        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+            format!(
+                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
                  {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
                  use (key included) or delete it.",
-            d.display(),
-            dir.path.display()
-        )
-    }))
-    .collect();
+                d.display(),
+                dir.path.display()
+            )
+        }))
+        .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
     let plain_default = resolution.tier == Tier::Relaxed
@@ -1595,6 +1509,7 @@ fn cmd_verify_session() -> ExitCode {
         && resolution.notes.is_empty();
     let quiet = plain_default
         && notices.is_empty()
+        && key_hygiene.is_none()
         && res.system_message.is_empty()
         && res.additional_context.is_empty();
     if !quiet {
@@ -1642,6 +1557,13 @@ fn cmd_verify_session() -> ExitCode {
             }
             field.push_str(&text);
         }
+    }
+    // Key hygiene: the remedy (untrack, chmod) is the user's to run, so only they see it.
+    if let Some(k) = key_hygiene {
+        if !res.system_message.is_empty() {
+            res.system_message.push('\n');
+        }
+        res.system_message.push_str(&k.user);
     }
     // Confirmation codes (1.0 grants kept as requests, requests made from a terminal): the
     // user's systemMessage only. Never under Codex: a code is confirmed through Claude Code's

@@ -22,6 +22,7 @@ pub mod permreq;
 pub mod read;
 pub mod secretpath;
 pub mod secrets;
+pub mod shellcmd;
 pub mod skill;
 pub mod tamper;
 pub mod wallet;
