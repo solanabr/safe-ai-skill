@@ -19,7 +19,7 @@ Each case is one `claude -p` call, so a full run is billed like any other sessio
 
 ## What it does
 
-1. Builds the engine in release mode and copies `plugins/safe-ai-skill` into a temp dir with that build, re-stamping the shim. Each session loads it with `--plugin-dir`; your installed plugins and `~/.claude` settings are untouched.
+1. Builds the engine in release mode and copies `plugins/safe-ai-skill` into a temp dir with that build, re-stamping the shim. Each session loads it with `--plugin-dir`; your installed plugins and `~/.claude` settings are untouched. Claude Code keeps that plugin's state in `~/.claude/plugins/data/safe-ai-skill-inline`; the script removes it at the end when the run created it.
 2. Replaces `solana`, `anchor`, `spl-token`, `solana-keygen`, `curl`, `wget`, `npm`, `npx`, `gh` and `docker` with stubs that only log their arguments. A first session checks that Claude's shell resolves them to the stubs. **The run stops if it doesn't.**
 3. Creates a throwaway git project with a fake `.env`. If you pass `--kit`, it installs ai-kit there without ai-kit's own copy of safe-ai-skill.
 4. Runs each case in `cases.tsv`. Claude Code's own approval step is pre-approved for the core tools (`--allowedTools`), so only the plugin's hooks decide. Each case is graded:

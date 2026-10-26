@@ -38,7 +38,16 @@ command -v cargo >/dev/null || { echo "cargo not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 not on PATH" >&2; exit 1; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sas-live.XXXXXX")
-[ "$KEEP" = 1 ] || trap 'rm -rf "$WORK"' EXIT
+# Claude Code keeps a --plugin-dir plugin's state in ~/.claude/plugins/data/<name>-inline.
+# Remove it afterwards only when this run created it.
+INLINE_DATA="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/data/safe-ai-skill-inline"
+INLINE_EXISTED=0
+[ -e "$INLINE_DATA" ] && INLINE_EXISTED=1
+cleanup() {
+  [ "$INLINE_EXISTED" = 1 ] || rm -rf "$INLINE_DATA"
+  [ "$KEEP" = 1 ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
 echo "work dir: $WORK"
 
 # ── engine + plugin copy ────────────────────────────────────────────────────────────────
