@@ -2086,6 +2086,7 @@ const BASH_NEEDLES: &[&str] = &[
     "pkg",
     "set-script",
     ".cargo",
+    ".safe-ai-skill",
     "/.config",
     ".config/",
     ".zsh",
@@ -2232,6 +2233,8 @@ enum Surface {
     NextBuild,
     Managed,
     UserPolicy,
+    /// A project's `.safe-ai-skill/` dir other than its `policy.yaml` (P6).
+    PolicyDir,
 }
 
 impl Surface {
@@ -2239,7 +2242,7 @@ impl Surface {
     fn applies(self, tier: Tier) -> bool {
         match self {
             Surface::UserPolicy => tier == Tier::High,
-            Surface::NextBuild | Surface::Managed => true,
+            Surface::NextBuild | Surface::Managed | Surface::PolicyDir => true,
         }
     }
 
@@ -2253,8 +2256,13 @@ impl Surface {
             }
             Surface::Managed => "is an administrator's managed settings file",
             Surface::UserPolicy => {
-                "is Claude Code configuration it loads or runs (agents, commands, skills, \
-                 plugins, schedules, shell snapshots or the local install), locked at tier high"
+                "is Claude Code configuration it loads or runs (credentials, agents, commands, \
+                 skills, plugins, schedules, shell snapshots or the local install), locked at \
+                 tier high"
+            }
+            Surface::PolicyDir => {
+                "is in the project's safe-ai-skill policy dir, where only `policy.yaml` (which \
+                 can only tighten) is open to agents"
             }
         };
         let fix = match self {
@@ -2319,6 +2327,7 @@ const USER_POLICY_DIRS: &[&str] = &[
 
 /// User-scope Claude Code files loaded as policy.
 const USER_POLICY_FILES: &[&str] = &[
+    ".credentials.json",
     "scheduled_tasks.json",
     "loop.md",
     "daemon.json",
@@ -2342,10 +2351,17 @@ fn rel_to<'a>(norm: &'a str, root: &Path) -> Option<&'a str> {
 }
 
 /// The surface a normalised absolute path is, if any.
-fn surface(norm: &str, homes: &ConfigHomes) -> Option<Surface> {
+fn surface(norm: &str, cwd: &Path, homes: &ConfigHomes) -> Option<Surface> {
     let name = norm.rsplit('/').next().unwrap_or("");
     if name == "managed-settings.json" {
         return Some(Surface::Managed);
+    }
+    for root in std::iter::once(cwd).chain(homes.project_dir.as_deref()) {
+        if let Some(rel) = rel_to(norm, root) {
+            if is_under(rel, ".safe-ai-skill") && rel != ".safe-ai-skill/policy.yaml" {
+                return Some(Surface::PolicyDir);
+            }
+        }
     }
     if norm.ends_with("/.cargo/config.toml")
         || SYSTEM_NEXT_BUILD_DIRS.iter().any(|d| is_under(norm, d))
@@ -2374,10 +2390,10 @@ fn surface(norm: &str, homes: &ConfigHomes) -> Option<Surface> {
 }
 
 /// The surface `path` is, as given or with symlinks resolved.
-fn surface_of(path: &Path, homes: &ConfigHomes) -> Option<Surface> {
-    surface(&normalize_path(&path.to_string_lossy()), homes).or_else(|| {
+fn surface_of(path: &Path, cwd: &Path, homes: &ConfigHomes) -> Option<Surface> {
+    surface(&normalize_path(&path.to_string_lossy()), cwd, homes).or_else(|| {
         let real = resolve_existing(path)?;
-        surface(&normalize_path(&real.to_string_lossy()), homes)
+        surface(&normalize_path(&real.to_string_lossy()), cwd, homes)
     })
 }
 
@@ -2385,7 +2401,7 @@ fn surface_of(path: &Path, homes: &ConfigHomes) -> Option<Surface> {
 fn surface_paths(cwd: &Path, homes: &ConfigHomes) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::iter::once(cwd)
         .chain(homes.project_dir.as_deref())
-        .map(|root| root.join(".cargo/config.toml"))
+        .flat_map(|root| [root.join(".cargo/config.toml"), root.join(".safe-ai-skill")])
         .collect();
     out.extend(["/Library/LaunchAgents", "/Library/LaunchDaemons"].map(PathBuf::from));
     if let Some(home) = &homes.home {
@@ -2407,7 +2423,12 @@ fn surface_paths(cwd: &Path, homes: &ConfigHomes) -> Vec<PathBuf> {
 
 /// The surfaces `touch` reaches: its own paths, glob matches against `known`, and for a delete
 /// the existing surfaces below it.
-fn surface_targets(touch: &Touch, known: &[PathBuf], homes: &ConfigHomes) -> Vec<Surface> {
+fn surface_targets(
+    touch: &Touch,
+    known: &[PathBuf],
+    cwd: &Path,
+    homes: &ConfigHomes,
+) -> Vec<Surface> {
     let mut out = Vec::new();
     let delete = matches!(touch.op, Op::Delete | Op::Find(_));
     for path in &touch.paths {
@@ -2421,18 +2442,18 @@ fn surface_targets(touch: &Touch, known: &[PathBuf], homes: &ConfigHomes) -> Vec
                             .match_indices('/')
                             .any(|(i, _)| crate::gates::bash::glob_match(&key, &kk[..i])));
                 if hit {
-                    out.extend(surface(&kk, homes));
+                    out.extend(surface(&kk, cwd, homes));
                 }
             }
             continue;
         }
-        out.extend(surface_of(path, homes));
+        out.extend(surface_of(path, cwd, homes));
         if delete {
             let prefix = format!("{}/", key.trim_end_matches('/'));
             for k in known {
                 let kk = normalize_path(&k.to_string_lossy());
                 if kk.starts_with(&prefix) && crate::localfs::exists(k) {
-                    out.extend(surface(&kk, homes));
+                    out.extend(surface(&kk, cwd, homes));
                 }
             }
         }
@@ -2567,7 +2588,7 @@ pub fn decide_file_content_at(
         let Some(path) = absolute_in(raw, cwd, homes) else {
             continue;
         };
-        if let Some(s) = surface_of(&path, homes).filter(|s| s.applies(tier)) {
+        if let Some(s) = surface_of(&path, cwd, homes).filter(|s| s.applies(tier)) {
             let shown: String = raw.chars().take(160).collect();
             return Some(Verdict::Deny(s.reason(&shown, true)));
         }
@@ -3680,7 +3701,7 @@ pub fn decide_bash_writes_at(
     }
     let surfaces = surface_paths(cwd, homes);
     for touch in &touches {
-        for s in surface_targets(touch, &surfaces, homes) {
+        for s in surface_targets(touch, &surfaces, cwd, homes) {
             if let Some(v) = surface_verdict(s, touch, tier) {
                 if matches!(v, Verdict::Deny(_)) {
                     return Some(v);

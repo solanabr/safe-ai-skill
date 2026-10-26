@@ -100,3 +100,20 @@
 {"id": "cc-policy-unblockable", "tool": "ConfigChange", "tool_input": {"hook_event_name": "ConfigChange", "source": "policy_settings", "cwd": "{CWD}", "file_path": "{CWD}/.claude/settings.json"}, "tier": "relaxed", "headless": false, "want": "none", "cwd_files": {"proj/.claude/settings.json": "{\"disableAllHooks\":true}"}}
 {"id": "cc-skills", "tool": "ConfigChange", "tool_input": {"hook_event_name": "ConfigChange", "source": "skills", "cwd": "{CWD}", "file_path": "{CWD}/.claude/settings.json"}, "tier": "relaxed", "headless": false, "want": "none", "cwd_files": {"proj/.claude/settings.json": "{\"disableAllHooks\":true}"}}
 {"id": "cc-missing-file", "tool": "ConfigChange", "tool_input": {"hook_event_name": "ConfigChange", "source": "project_settings", "cwd": "{CWD}", "file_path": "{CWD}/.claude/nope.json"}, "tier": "relaxed", "headless": false, "want": "none", "cwd_files": {"proj/.claude/settings.json": "{}"}}
+{"id": "p6-arbitrary-off", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/a", "content": "x\n"}, "tier": "off", "headless": false, "want": "deny"}
+{"id": "p6-arbitrary-relaxed", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/a", "content": "x\n"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "p6-arbitrary-medium", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/a", "content": "x\n"}, "tier": "medium", "headless": false, "want": "deny"}
+{"id": "p6-arbitrary-high", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/a", "content": "x\n"}, "tier": "high", "headless": false, "want": "deny"}
+{"id": "p6-nested", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/sub/x.yaml", "content": "x\n"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "p6-edit-overlay", "tool": "Edit", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/notes.md", "old_string": "a", "new_string": "b"}, "tier": "relaxed", "headless": false, "want": "deny", "cwd_files": {"proj/.safe-ai-skill/notes.md": "a\n"}}
+{"id": "p6-bash-echo", "tool": "Bash", "tool_input": {"command": "echo x > .safe-ai-skill/a"}, "tier": "relaxed", "headless": false, "want": "deny"}
+{"id": "p6-bash-rm-dir", "tool": "Bash", "tool_input": {"command": "rm -rf .safe-ai-skill"}, "tier": "off", "headless": false, "want": "deny", "cwd_files": {"proj/.safe-ai-skill/policy.yaml": "{}\n"}}
+{"id": "p6-benign-policy-yaml", "tool": "Write", "tool_input": {"file_path": "{CWD}/.safe-ai-skill/policy.yaml", "content": "x\n"}, "tier": "high", "headless": false, "want": "none"}
+{"id": "p6-benign-other-dir", "tool": "Write", "tool_input": {"file_path": "{CWD}/safe-ai-skill/notes.md", "content": "x\n"}, "tier": "high", "headless": false, "want": "none"}
+{"id": "p6-benign-cat", "tool": "Bash", "tool_input": {"command": "cat .safe-ai-skill/policy.yaml"}, "tier": "high", "headless": false, "want": "none"}
+{"id": "p7-credentials-off", "tool": "Write", "tool_input": {"file_path": "~/.claude/.credentials.json", "content": "x\n"}, "tier": "off", "headless": false, "want": "none"}
+{"id": "p7-credentials-relaxed", "tool": "Write", "tool_input": {"file_path": "~/.claude/.credentials.json", "content": "x\n"}, "tier": "relaxed", "headless": false, "want": "none"}
+{"id": "p7-credentials-medium", "tool": "Write", "tool_input": {"file_path": "~/.claude/.credentials.json", "content": "x\n"}, "tier": "medium", "headless": false, "want": "none"}
+{"id": "p7-credentials-high", "tool": "Write", "tool_input": {"file_path": "~/.claude/.credentials.json", "content": "x\n"}, "tier": "high", "headless": false, "want": "deny"}
+{"id": "p7-bash-high", "tool": "Bash", "tool_input": {"command": "echo '{}' > ~/.claude/.credentials.json"}, "tier": "high", "headless": false, "want": "deny"}
+{"id": "p7-bash-relaxed", "tool": "Bash", "tool_input": {"command": "echo '{}' > ~/.claude/.credentials.json"}, "tier": "relaxed", "headless": false, "want": "none"}
