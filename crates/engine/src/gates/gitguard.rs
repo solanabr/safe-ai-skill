@@ -15,7 +15,7 @@
 //! | E14 | `gh api` writes to workflow dispatches, deployments, environments | ask | deny | deny |
 //! | E15 | `gh api` (any) | – | deny | deny |
 //! | E15 | `gh repo delete`, `gh issue delete`, `gh alias`, `gh api -X DELETE repos/O/R` | deny | deny | deny |
-//! | E7 | `git config` / `git -c` keys that run a program ([`decide_git_config_risk`]) | (tamper asks) | deny | deny |
+//! | E7 | `git config` / `git -c` keys that run a program, `config --edit` ([`decide_git_config_risk`]) | ask | deny | deny |
 //!
 //! Positions are read from [`shell::parse`], so a commit message or an issue body naming any of
 //! these is data. Strings git itself runs as shell code (`git submodule foreach CMD`, `git
@@ -69,18 +69,19 @@ pub fn decide(command: &str, _cwd: &Path, _policy: &Policy, tier: Tier) -> Optio
 }
 
 /// E7 alignment: a `git config` write (or a one-shot `git -c key=value`) of a key that makes git
-/// run a program is denied from Medium up. `None` at Relaxed and Off, where the tamper gate's
-/// own ask stands. Keys: the kit's `GITEXEC` set (`alias.*`, `core.pager`, `core.editor`,
-/// `core.hooksPath`, `sequence.editor`, `credential.helper`, `diff.external`, any value, plus
-/// `git config --edit` and a `--rename-section` onto one of their sections) joined with the
+/// run a program is denied from Medium up and asked at Relaxed and Off. Keys: the kit's
+/// `GITEXEC` set (`alias.*`, `core.pager`, `core.editor`, `core.hooksPath`, `sequence.editor`,
+/// `credential.helper`, `diff.external`, any value, plus `git config --edit` and a
+/// `--rename-section` onto one of their sections), the viewer and browser commands `git help`
+/// runs (`man.viewer`, `man.<tool>.cmd|path`, `web.browser`, `browser.<tool>.cmd|path`), and the
 /// tamper gate's wider set (fsmonitor, sshCommand, gpg programs, filter and merge drivers,
 /// include paths, …).
 pub fn decide_git_config_risk(command: &str, tier: Tier) -> Option<Verdict> {
-    if tier < Tier::Medium || command.len() > MAX_PARSE_BYTES || !may_concern(command) {
+    if command.len() > MAX_PARSE_BYTES || !may_concern(command) {
         return None;
     }
     let mut out = Vec::new();
-    scan(command, tier, 0, Mode::ConfigOnly, &mut out);
+    scan(command, effective(tier), 0, Mode::ConfigOnly, &mut out);
     verdict(out)
 }
 
@@ -164,33 +165,177 @@ fn scan(text: &str, tier: Tier, depth: usize, mode: Mode, out: &mut Vec<Finding>
     if mode == Mode::All {
         env_scan(text, tier, 0, out);
     }
-    for cmd in &shell::parse(text).commands {
-        match cmd.program().as_str() {
-            "git" => {
-                let Some(walk) = git_walk(&cmd.words) else {
-                    continue;
-                };
-                if mode == Mode::All {
-                    git_findings(&walk, tier, out);
-                }
-                if tier >= Tier::Medium {
-                    if let Some(why) = config_risk(&walk) {
-                        out.push(Finding::Deny(format!(
-                            "safe-ai-skill git guard: this {why}, which outlives the command that \
-                             sets it; the {} tier denies it, so ask the user to set the key \
-                             themselves.",
-                            tier.label()
-                        )));
-                    }
-                }
-            }
-            "gh" if mode == Mode::All => gh_findings(cmd, tier, out),
-            _ => {}
-        }
-        for code in git_code_strings(cmd) {
-            scan(&code, tier, depth + 1, mode, out);
+    let parsed = shell::parse(text);
+    // git or gh behind a prefix program the parser does not strip (`arch -x86_64 git …`,
+    // `taskset 0x1 git …`), read from the parsed words and from the raw statements, since a
+    // wrapper option the parser misreads can swallow the program word itself.
+    let mut peeled: Vec<SimpleCommand> = Vec::new();
+    for cmd in &parsed.commands {
+        if !matches!(cmd.program().as_str(), "git" | "gh") {
+            peeled.extend(peel(&cmd.words));
         }
     }
+    let (stmts, _) = env_statements(text);
+    for st in &stmts {
+        let words: Vec<Word> = st
+            .iter()
+            .skip_while(|w| w.assignment().is_some())
+            .map(|w| Word {
+                text: w.text.clone(),
+                quoted: w.quoted_at.is_some(),
+                ..Word::default()
+            })
+            .collect();
+        if words
+            .first()
+            .is_some_and(|w| RUNNERS.contains(&base_name(&w.text).as_str()))
+        {
+            peeled.extend(peel(&words));
+        }
+    }
+    for cmd in parsed.commands.iter().chain(&peeled) {
+        judge(cmd, tier, depth, mode, out);
+    }
+}
+
+/// Judge one simple command whose program may be git or gh.
+fn judge(cmd: &SimpleCommand, tier: Tier, depth: usize, mode: Mode, out: &mut Vec<Finding>) {
+    match cmd.program().as_str() {
+        "git" => {
+            let Some(walk) = git_walk(&cmd.words) else {
+                return;
+            };
+            if mode == Mode::All {
+                git_findings(&walk, tier, out);
+            }
+            if let Some(why) = config_risk(&walk) {
+                out.push(if tier >= Tier::Medium {
+                    Finding::Deny(format!(
+                        "safe-ai-skill git guard: this {why}; the {} tier denies it, so ask the user to \
+                         set the key themselves.",
+                        tier.label()
+                    ))
+                } else {
+                    Finding::Ask(format!(
+                        "safe-ai-skill git guard: this {why}; confirm the key and the program \
+                         before approving."
+                    ))
+                });
+            }
+        }
+        "gh" if mode == Mode::All => gh_findings(cmd, tier, out),
+        _ => {}
+    }
+    for code in git_code_strings(cmd) {
+        scan(&code, tier, depth + 1, mode, out);
+    }
+}
+
+/// Prefix programs that run the rest of their argv as a command.
+const RUNNERS: &[&str] = &[
+    "env",
+    "sudo",
+    "doas",
+    "nice",
+    "nohup",
+    "time",
+    "timeout",
+    "stdbuf",
+    "ionice",
+    "chrt",
+    "taskset",
+    "numactl",
+    "arch",
+    "xargs",
+    "setsid",
+    "unbuffer",
+    "chronic",
+    "caffeinate",
+    "command",
+    "builtin",
+    "exec",
+    "noglob",
+    "nocorrect",
+    "watch",
+    "flock",
+    "chroot",
+    "prlimit",
+    "cpulimit",
+    "trickle",
+    "nsenter",
+    "unshare",
+    "runuser",
+    "pkexec",
+    "sg",
+    "faketime",
+    "firejail",
+    "systemd-run",
+    "proxychains",
+    "proxychains4",
+    "torsocks",
+    "tsocks",
+    "strace",
+    "ltrace",
+    "valgrind",
+    "catchsegv",
+    "rlwrap",
+    "xvfb-run",
+    "dbus-run-session",
+    "ssh-agent",
+];
+
+/// Prefix programs whose first positional is not the command (`chroot DIR cmd`, `flock FILE cmd`).
+const POSITIONAL_RUNNERS: &[&str] = &["chroot", "flock", "sg", "runuser", "timeout", "taskset"];
+
+/// The git or gh command a chain of [`RUNNERS`] runs, if `words` is one: every word before it
+/// is a runner, an option, an option's value, a number or mask (`5`, `0x1`), an assignment or a
+/// runner's positional operand. `None` when a word in between is another program.
+fn peel(words: &[Word]) -> Option<SimpleCommand> {
+    let first = base_name(&words.first()?.text);
+    let leftover = |t: &str| t.starts_with('-') || is_number(t);
+    if !RUNNERS.contains(&first.as_str()) && !leftover(&words[0].text) {
+        return None;
+    }
+    let mut prev_runner = Some(first);
+    let mut prev_option = false;
+    for (i, w) in words.iter().enumerate().skip(1) {
+        let t = w.text.as_str();
+        let base = base_name(t);
+        if matches!(base.as_str(), "git" | "gh") {
+            return Some(SimpleCommand {
+                words: words[i..].to_vec(),
+                indirect: true,
+                writes_file: false,
+                canonical: false,
+            });
+        }
+        let positional = prev_runner
+            .as_deref()
+            .is_some_and(|r| POSITIONAL_RUNNERS.contains(&r));
+        let assignment = t.split_once('=').is_some_and(|(n, _)| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        let runner = RUNNERS.contains(&base.as_str());
+        if !(t.starts_with('-')
+            || is_number(t)
+            || assignment
+            || runner
+            || prev_option
+            || positional)
+        {
+            return None;
+        }
+        prev_option = t.starts_with('-') && !t.contains('=');
+        prev_runner = runner.then_some(base);
+    }
+    None
+}
+
+/// A count, priority, duration or CPU mask: `5`, `0x1`, `1.5s`, `0-3,7`.
+fn is_number(t: &str) -> bool {
+    t.starts_with(|c: char| c.is_ascii_digit())
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ',' | '-' | ':'))
 }
 
 // ---- git ---------------------------------------------------------------------------------
@@ -693,6 +838,9 @@ fn exec_key(key: &str, value: &str) -> bool {
                     | ("sequence", "editor")
                     | ("credential", "helper")
                     | ("diff", "external")
+                    | ("man", "viewer" | "cmd" | "path")
+                    | ("web", "browser")
+                    | ("browser", "cmd" | "path")
             ));
     kit || crate::gates::tamper::risky_git_key(&k, value)
 }
@@ -1432,7 +1580,7 @@ mod tests {
             "git -c core.fsmonitor=/tmp/x status",
             "git config --rename-section foo core",
         ] {
-            assert_eq!(v(cmd, Tier::Relaxed), None, "{cmd}");
+            assert_eq!(v(cmd, Tier::Relaxed), Some("ask"), "{cmd}");
             assert_eq!(v(cmd, Tier::Medium), Some("deny"), "{cmd}");
             assert_eq!(d(cmd, Tier::High), "D", "{cmd}");
         }
