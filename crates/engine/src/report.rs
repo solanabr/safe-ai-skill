@@ -1,7 +1,7 @@
 //! Session report: what the firewall did in one session (informational; never blocks).
 //!
 //! - **SessionStart** ([`session_start`]): writes a start marker for the session
-//!   (`reports/<sid>.start.json`: start time, project, spend-ledger and grant-budget snapshot)
+//!   (`reports/<sid>.start.json`: start time, project hash, spend-ledger and grant-budget snapshot)
 //!   and returns a one-line recap of the previous session in this project when it had any deny
 //!   or ask, once. Silent otherwise.
 //! - **SessionEnd** ([`session_end`]): reads this session's lines from `audit.jsonl` (tail
@@ -64,7 +64,7 @@ const CLASSES_IN_LINE: usize = 3;
 pub struct StartMarker {
     /// Epoch seconds the session first started.
     pub started_at: u64,
-    /// Project root the session ran in.
+    /// Hash of the project root the session ran in ([`project_key`]).
     pub project: String,
     /// The spend ledger at start: `(epoch day, total SOL)`; `None` when not authenticated.
     pub spend: Option<(u64, f64)>,
@@ -112,7 +112,7 @@ pub struct SessionReport {
     pub schema: u32,
     /// Session id.
     pub session_id: String,
-    /// Project root.
+    /// Hash of the project root ([`project_key`]).
     pub project: String,
     /// SessionEnd `reason` (`clear`, `resume`, `logout`, `prompt_input_exit`, `other`).
     pub end_reason: String,
@@ -590,11 +590,10 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The project a session belongs to: its git toplevel, else the canonical cwd.
+/// The project a session belongs to, as a hash of its git toplevel (else the canonical cwd):
+/// reports never store a project path in the plugin data dir.
 pub fn project_key(cwd: &Path) -> String {
-    crate::policy::tier::project_root(cwd)
-        .to_string_lossy()
-        .into_owned()
+    project_hash(&crate::policy::tier::project_root(cwd).to_string_lossy())
 }
 
 fn project_hash(project: &str) -> String {
