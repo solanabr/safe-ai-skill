@@ -140,6 +140,11 @@ no tool it can't verify the binary and fails open with a notice, like any other 
 harness skips the fixed paths with a `.sha-tools-from-path` file beside its copy of the shim;
 writing there needs the same access as rewriting the shim.
 
+After a full match the shim caches the binary's fingerprint (device, inode, size, mtime, ctime) in
+`$CLAUDE_PLUGIN_DATA/shim-verified-<platform>` and skips the hash on later calls while the
+fingerprint and the stamped constant still match; a re-stamped shim or a replaced binary is a miss
+and is hashed again. `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off. The residual is in `SECURITY.md`.
+
 **The shim is the trust anchor.** The pins are only as good as the shim that holds them, and
 anything that can write the plugin's `bin/` can rewrite the shim (and its constants) as easily as
 the binary. The shim's own integrity rests on the H5 write tripwire, which denies the agent's

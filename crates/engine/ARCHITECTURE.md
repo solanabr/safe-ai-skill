@@ -5,7 +5,7 @@ a single binary (hot path: gates fire on every Bash/Read/MCP call) plus a thin l
 tests and the binary share one module tree.
 
 This document maps the modules, the hook contract and the state they share. Signatures below
-are the public surface as of 1.1.0.
+describe the tree on this branch (unreleased changes included); the source and rustdoc are authoritative.
 
 ---
 
@@ -43,7 +43,7 @@ unix. No tokio, no async. A new dependency needs review (binary size, supply cha
 
 ## Request flow (owned by `main.rs`)
 
-For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp` / `gate-skill`):
+For a PreToolUse gate (`gate-bash` / `gate-bash-secrets` / `gate-read` / `gate-mcp` / `gate-webfetch` / `gate-tamper` / `gate-skill`):
 
 ```
 stdin → io::read_payload                           # bytes (≤ 1 MiB + 1) + parse or Unreadable
@@ -92,6 +92,7 @@ contract:
   PreToolUse gates ask, non-PreToolUse hooks exit 0 with a stderr line.
 - **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash`, `gate-mcp` and `gate-skill`
   exit 2 (block); the rest exit 0 with a stderr line.
+- **Verified-hash cache.** After a full sha256 match the shim records the binary's fingerprint (device, inode, size, mtime, ctime from `stat` at a fixed system path) beside the stamped hash in `$CLAUDE_PLUGIN_DATA/shim-verified-<platform>` (0600, owned by the binary's owner, not a symlink). A later call skips the hash and the executable-format probe only when that line equals the stamped hash plus the current fingerprint; anything else is a full check and only a pass is cached. A binary whose ctime does not predate the check is never cached. Off on Windows and when `CLAUDE_PLUGIN_DATA` is unset, relative or unwritable; `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off from any source. See SECURITY.md for the residual.
 - `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
   turns the hooks off, but is ignored in strict mode or when the committed project
   `.claude/settings.json` mentions it; SessionStart reports either way.
@@ -101,6 +102,8 @@ contract:
   policy, lists or state for a command that cannot concern it. `onFailure`
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
+
+`hooks.json` entries (matcher, subcommand, `onFailure`): `Bash` → `gate-bash` (block), `gate-bash-secrets`; `Write|Edit|MultiEdit|NotebookEdit` → `gate-tamper`; `Read|Grep|Glob` → `gate-read`; `WebFetch` → `gate-webfetch`; `mcp__.*` → `gate-mcp`; `Skill` → `gate-skill` (block); PostToolUse `Bash|Read|Grep|mcp__.*` → `redact`, `Bash` → `pending-notice`; PostToolUseFailure → `failure-notice`; UserPromptSubmit → `prompt-guard` and `gate-prompt-expansion`; UserPromptExpansion → `gate-prompt-expansion`; SessionStart → `verify session`. Every entry other than `gate-bash` and `gate-skill` is `continue`. The Codex template (`adapters/codex/hooks.json`) wires `gate-bash`, `gate-bash-secrets`, `gate-tamper` (on `apply_patch`) and `gate-mcp` only; the opencode plugin wires those plus `gate-read`. Neither has `gate-webfetch`.
 
 CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
 
@@ -176,8 +179,13 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | `lists.rs` | Parses the embedded `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!`, `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
 | `gates/credpaths.rs`, `gates/creddump.rs` | Credential path classification and directory-Grep exclusion globs from `credentials.list`; the command-form readers (`gh auth token`, `git credential fill`, `security … -w`, `op read`, …) and any Bash word or `NAME=` prefix value naming a store (metadata-only programs excepted; an `ssh`/`scp`/`sftp` identity and `ssh-keygen -y -f` exempt). Deny at every tier. |
 | `gates/envread.rs`, `gates/envwrite.rs` | Project env files (`.env`/`.env.*` inside the project root, by name and resolved path) by tier, as solana-ai-kit: raw reads `(tier, env_read, project)` open at Off/Relaxed/Medium and denied at High (`env_read: deny` denies at every tier; other env files always deny); writes (Write/Edit/MultiEdit, agent `env set\|unset`, the Bash writes `creddump` recognises) denied at Medium (other env files Medium and High). A command line that reads an env file and runs a network program or network code denies at every tier. |
-| `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet, Unknown or testnet, ask on identified localnet/devnet, never grantable) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). A line joining two or more gated actions, or any hard-guard ask, is never grantable; a command over 256 KiB or with more than 2048 expansions asks unparsed. |
-| `gates/exfil.rs` | The call line for the naive-exfil tripwire in `gate-bash-secrets` and `gate-mcp`. Deferred (#19): it has no opinion in 1.1.0. Secret uploads by path are denied by `gates/secrets.rs`; an env read beside a network command by `gates/creddump.rs` (`envread::to_network`). |
+| `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet or Unknown, hard-guard ask on identified localnet/devnet/testnet, never grantable; `class_u` in `bash.rs`) and `spl-token transfer` amounts (token units, no opinion on identified devnet/testnet/localnet, ask elsewhere) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). A line joining two or more gated actions, or any hard-guard ask, is never grantable; a command over 256 KiB or with more than 2048 expansions asks unparsed. |
+| `gates/exfil.rs` | The exfil tripwire (#19): `decide_bash` (called from `gate-bash-secrets`), `decide_mcp` (`gate-mcp`) and `decide_webfetch` (`gate-webfetch`). Host list per tier from `exfil-hosts.list`, secret-shaped data and blobs to non-developer hosts, `git push` to a same-line remote, browser scripts. Secret uploads by path are denied by `gates/secrets.rs`; an env read beside a network command by `gates/creddump.rs` (`envread::to_network`). |
+| `gates/tamper.rs` | The self-grant tripwire (protected paths: `decide_bash`, `decide_file`, `decide_nested_claude`) and the content-aware checks (`decide_file_content`, `decide_bash_writes`): settings, hooks, git config, `.mcp.json`, lifecycle scripts, kit tier. `gate-tamper` covers Write/Edit/MultiEdit/NotebookEdit; `gate-bash-secrets` the Bash forms. |
+| `gates/fetchexec.rs` | Download-and-run (`decide`): a download then run, a downloaded script piped to an interpreter, undeclared one-shot runners, `cargo install --git` outside the allowlist, mainnet Node scripts. Called from `gate-bash-secrets`. |
+| `gates/encoded.rs` | Encoded payloads: `expand` returns decoded texts (depth 3, 64 KiB) and `decide` asks on an undecodable one. `main.rs::encoded_bash_verdict` runs each decoded text through `bash::decide`, `secrets::decide`, `exfil::decide_bash`, `fetchexec::decide`, `tamper::decide_bash_writes`, `envread::decide_bash`, `wallet::decide_bash`, `creddump::decide` and `envwrite::decide_cli`, and takes the strictest verdict. |
+| `gates/envread.rs` (env dumps) | `decide_bash`: `/proc/*/environ`, `ps e`, printing a secret-named variable (deny) and a dump piped away or written to a file (ask). The names come from `redact::is_secret_env_name`; the matching value blanking is `redact::scrub_env_lines`. |
+| `gates/mcp.rs`, `gates/mcpexec.rs` | MCP name/action classification (`mcp.sensitive_name_pattern`, routed actions, staking and token transfers as hard guards) and the Bash checks for shell code run through an MCP executor. |
 | `verify/` (`tier_action`, `gittracked.rs`) | Per-tier supply-chain action (report at Off, deny in place from Relaxed, HIGH heuristic denies at High); `on_block: move` never moves a git-tracked pack or submodule path (reads `.gitmodules` and `.git/index`, never runs git). |
 | `verify/gitobj.rs`, `verify/history.rs` | Read-only git object reader (loose objects, `.idx` v1/v2 + `.pack` v2/v3, OFS/REF deltas; no git process, `gitdir:`/`commondir` confined to the pack or its submodule dir, FIFO-safe opens) under a time/byte/object `Budget` that every tree walk charges, and the history scan `verify::check::check_dir` (`verify add|check`, `install`, once per directory via `check_dir_with`; never the sweep) runs over it: every blob through `rules::scan_blob` under each distinct name, docs-described commits that touch code (`docs_commit_code` report-only, combo `docs_commit_sink` on added lines), and `history_unscanned` for anything left unread. |
 
@@ -257,7 +265,7 @@ pub struct SecretsPolicy {
     pub env_read: String,                   // `tier` (default) or `deny`; a project can only tighten; the user's choice is tier.json
     pub deny_read_globs: Vec<String>, pub allow_read_globs: Vec<String>,
     pub key_material_extra_globs: Vec<String>, // union with credentials.list
-    pub exfil_hosts_extra: Vec<String>,     // union with exfil-hosts.list (for the planned tripwire)
+    pub exfil_hosts_extra: Vec<String>,     // union with exfil-hosts.list (read by the exfil tripwire; ignored at Off)
 }
 pub struct TogglePolicy { pub enabled: bool }
 pub struct SupplyChainPolicy {
@@ -402,6 +410,14 @@ pub fn gates::mcp::decide(tool_name: &str, payload: Option<&serde_json::Value>, 
 pub fn gates::tamper::decide_bash(command: &str, protected: &Protected) -> Decision;                  // Deny | Ask | Defer
 pub fn gates::tamper::decide_bash_within(command: &str, protected: &Protected, budget: &mut Budget) -> Decision; // Deny | Ask | Defer
 pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &Path, protected: &Protected) -> Decision; // Deny | Defer
+pub fn gates::tamper::decide_bash_writes(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;   // content-aware Bash writes
+pub fn gates::exfil::decide_bash(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;
+pub fn gates::exfil::decide_mcp(tool: &str, payload: Option<&Value>, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;
+pub fn gates::exfil::decide_webfetch(url: &str, prompt: &str, policy: &Policy, tier: Tier) -> Option<Verdict>;
+pub fn gates::fetchexec::decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;
+pub fn gates::encoded::expand(command: &str) -> Vec<String>;      // decoded payload texts
+pub fn gates::encoded::decide(command: &str) -> Option<Verdict>;  // undecodable payload → Ask
+pub fn gates::envread::decide_bash(command: &str) -> Option<Verdict>;   // env dumps
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
@@ -416,6 +432,8 @@ pub fn gates::tamper::decide_file(tool_input: Option<&serde_json::Value>, cwd: &
 ```rust
 pub fn redact::scrub(text: &str) -> Option<String>;
 pub fn redact::scrub_response(response: &Value, values: &[KnownValue]) -> Option<Value>;
+pub fn redact::scrub_env_lines(text: &str) -> Option<String>;   // env-dump value blanking (Bash output)
+pub fn redact::is_secret_env_name(name: &str) -> bool;          // shared with gates::envread
 pub fn promptguard::check(prompt: &str) -> Option<String>;
 ```
 
@@ -562,7 +580,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-tamper` · `gate-skill` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-webfetch` · `gate-tamper` · `gate-skill` ·
 `gate-prompt-expansion` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·

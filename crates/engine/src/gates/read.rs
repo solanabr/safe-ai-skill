@@ -334,7 +334,7 @@ fn hard_deny(what: &str) -> Decision {
 /// The verdict for a raw read of an env-class file, by tier, `env_read` and whether it is a
 /// project env file ([`envread::verdict`]); a deny names the `safe-ai-skill env` commands.
 pub fn env_verdict(file: &str, project: bool, policy: &Policy, varlock: bool) -> Decision {
-    envread::decision(policy, project, env_reason(file, varlock))
+    envread::decision_for(policy, file, project, env_reason(file, varlock))
 }
 
 /// The actionable env-class message (spec D3.3, D3.8.6). `varlock` adds the varlock hint.

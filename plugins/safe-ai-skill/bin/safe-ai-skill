@@ -32,8 +32,25 @@
 # touches a file, where another process of the same user could rewrite a verdict.
 # CLI subcommands run the engine with live output and keep its exit status; an
 # environment failure exits 1. Nothing outside this directory is ever executed (no cargo
-# build, no $CLAUDE_PLUGIN_DATA binary), and nothing is cached, so a failed probe never
-# outlives the run that saw it.
+# build, no $CLAUDE_PLUGIN_DATA binary).
+#
+# Verified-hash cache. Hashing the prebuilt costs more than the engine run it guards, so
+# after a full sha256 match (and format check) the shim records the binary's fingerprint
+# (device, inode, size, mtime, ctime, from `stat` at a fixed system path) beside the
+# stamped hash in $CLAUDE_PLUGIN_DATA/shim-verified-<plat> (written to a temp file and
+# moved in place, mode 0600). A later run skips the hash only when that file is a regular
+# file (not a symlink) of mode 0600 owned by the binary's owner, and its line equals this
+# shim's stamped hash plus the binary's current fingerprint. Anything else (no cache, a
+# mismatch, stat failing or printing something unexpected) means a full sha256 check, so
+# only a pass is ever cached and a failed probe never outlives the run that saw it.
+# Why this is safe: ctime can't be set by a user process, so modifying or replacing the
+# binary (rename, copy, touch -m included) changes the fingerprint and forces a rehash; a
+# binary changed within its ctime's second is never cached (its ctime must predate the
+# check); and an attacker able to rewrite both the binary and the cache can already
+# rewrite this shim. Off on Windows, where a user process can set ctime, and when
+# CLAUDE_PLUGIN_DATA is unset, relative or not a writable dir.
+# SAFE_AI_SKILL_SHIM_CACHE=0 turns the cache off (every hook call hashes the binary,
+# which is slower); it is honoured from any source, since it only makes the shim stricter.
 
 set -fu
 
@@ -293,12 +310,129 @@ exec_format_ok() {
   return 1
 }
 
+# fixed_tool <name>: sets tool to <name> from /usr/bin or /bin (from PATH under the test
+# seam, as for the sha256 tool), or to empty. No subshell: it runs on every hook call.
+fixed_tool() {
+  tool=
+  if [ -e "$self_dir/.sha-tools-from-path" ]; then
+    tool=$(command -v "$1" 2>/dev/null) || tool=
+    return 0
+  fi
+  for d in /usr/bin /bin; do
+    if [ -z "$tool" ] && [ -f "$d/$1" ] && [ -x "$d/$1" ]; then tool=$d/$1; fi
+  done
+}
+
+# file_stats <file>...: one line per file, "uid perms dev ino size mtime ctime <times>",
+# from BSD/macOS `stat -f` or GNU/busybox `stat -c`, the host's flavour tried first. Each
+# flavour is a separate capture, so a failed one leaves nothing behind.
+file_stats() {
+  if [ "$family" = darwin ]; then
+    "$stat_tool" -f '%u %Lp %d %i %z %m %c %Fm|%Fc' "$@" 2>/dev/null ||
+      "$stat_tool" -c '%u %a %d %i %s %Y %Z %y|%z' "$@" 2>/dev/null
+  else
+    "$stat_tool" -c '%u %a %d %i %s %Y %Z %y|%z' "$@" 2>/dev/null ||
+      "$stat_tool" -f '%u %Lp %d %i %z %m %c %Fm|%Fc' "$@" 2>/dev/null
+  fi
+}
+
+# stat_split <line>: sets s_uid, s_perm, s_ctime (whole seconds) and s_fp (everything but
+# uid and perms) from one file_stats line; fails on any other shape.
+stat_chars='0123456789 .:+|-'
+stat_split() {
+  case $1 in
+    '' | *[!$stat_chars]*) return 1 ;;
+  esac
+  IFS=' '
+  # shellcheck disable=SC2086 # split the line into fields; globbing is off (set -f)
+  set -- $1
+  IFS=' 	
+'
+  [ "$#" -ge 8 ] || return 1
+  s_uid=$1 s_perm=$2 s_ctime=$7
+  case $s_uid$s_ctime in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  shift 2
+  s_fp=$*
+}
+
+# cache_hit: whether the cache vouches for $bin (see the header). Any doubt is a miss.
+cache_hit() {
+  [ -n "$cache" ] && [ ! -L "$bin" ] && [ -f "$cache" ] && [ ! -L "$cache" ] || return 1
+  stats=$(file_stats "$bin" "$cache") || return 1
+  case $stats in
+    *"$cache_nl"*"$cache_nl"*) return 1 ;;
+    *"$cache_nl"*) ;;
+    *) return 1 ;;
+  esac
+  stat_split "${stats#*"$cache_nl"}" || return 1
+  c_uid=$s_uid c_perm=$s_perm
+  stat_split "${stats%%"$cache_nl"*}" || return 1
+  [ "$c_perm" = 600 ] && [ "$c_uid" = "$s_uid" ] || return 1
+  IFS= read -r have <"$cache" 2>/dev/null || return 1
+  [ "$have" = "v1 $plat $want_sha $s_fp" ]
+}
+
+# cache_begin: on a miss, the time and the fingerprint before hashing (pre_fp empty when
+# the cache can't be written). cache_store: after the checks pass, record the fingerprint
+# if the binary didn't change meanwhile and its ctime predates the check.
+cache_begin() {
+  pre_fp=
+  [ -n "$cache" ] && [ ! -L "$bin" ] && [ ! -L "$cache" ] || return 0
+  [ -d "$CLAUDE_PLUGIN_DATA" ] && [ -w "$CLAUDE_PLUGIN_DATA" ] || return 0
+  fixed_tool date
+  [ -n "$tool" ] || return 0
+  now=$("$tool" +%s 2>/dev/null) || return 0
+  case $now in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  stats=$(file_stats "$bin") || return 0
+  stat_split "$stats" || return 0
+  [ "$s_ctime" -lt "$now" ] || return 0
+  pre_fp=$s_fp
+}
+cache_store() {
+  [ -n "$pre_fp" ] || return 0
+  stats=$(file_stats "$bin") || return 0
+  stat_split "$stats" || return 0
+  [ "$s_fp" = "$pre_fp" ] || return 0
+  if [ -e "$cache" ] || [ -L "$cache" ]; then
+    [ -f "$cache" ] && [ ! -L "$cache" ] || return 0
+  fi
+  tmp=$CLAUDE_PLUGIN_DATA/.shim-verified-$plat.$$
+  (
+    umask 077
+    set -C
+    printf 'v1 %s %s %s\n' "$plat" "$want_sha" "$pre_fp" >"$tmp"
+  ) 2>/dev/null || return 0
+  mv -f "$tmp" "$cache" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
 if [ -z "$plat" ]; then env_failure 'unsupported platform'; fi
 bin=$self_dir/safe-ai-skill-$plat$ext
 if [ ! -f "$bin" ]; then env_failure 'no engine binary for this platform'; fi
 if [ ! -x "$bin" ]; then env_failure 'engine binary is not executable'; fi
-if ! sha256_ok "$bin"; then tampered; fi
-if ! exec_format_ok "$bin"; then env_failure "engine binary is not an executable for $label"; fi
+
+cache=
+cache_nl='
+'
+if [ "${SAFE_AI_SKILL_SHIM_CACHE:-}" != 0 ] && [ "$family" != windows ] &&
+  [ "${#want_sha}" -eq 64 ]; then
+  case ${CLAUDE_PLUGIN_DATA:-} in
+    /*) cache=$CLAUDE_PLUGIN_DATA/shim-verified-$plat ;;
+  esac
+fi
+stat_tool=
+if [ -n "$cache" ]; then fixed_tool stat && stat_tool=$tool; fi
+if [ -z "$stat_tool" ]; then cache=; fi
+
+if ! cache_hit; then
+  cache_begin
+  if ! sha256_ok "$bin"; then tampered; fi
+  if ! exec_format_ok "$bin"; then env_failure "engine binary is not an executable for $label"; fi
+  cache_store
+fi
 
 if [ "$kind" = cli ]; then
   "$bin" "$@"
@@ -348,6 +482,7 @@ out=$(run_engine "$@") || status=$?
 
 # Codex: only nothing, or one line of the expected answer, reaches Codex; anything else (a
 # second line, which Codex could not parse, included) blocks.
+# shellcheck disable=SC2016 # backticks are literal text in two of these messages
 case $kind/$status in
   codex/0 | codex_post/0 | opencode/0)
     out=${out%.}

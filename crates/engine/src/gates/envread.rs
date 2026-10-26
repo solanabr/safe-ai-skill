@@ -11,8 +11,11 @@
 //! |-------------------------------------------------------|------|---------|--------|------|
 //! | project env file (`env_read: tier`, the default)      | n/o  | n/o     | n/o    | deny |
 //! | project env file, the user's `env_read: deny`         | deny | deny    | deny   | deny |
+//! | production project env file (`.env.production`, `.env.prod*`, [`production_verdict`], D5) | n/o | deny | deny | deny |
 //! | other env files (`.envrc`, `*.env`, `.dev.vars`, the Solana CLI config, any env file outside the project) | deny | deny | deny | deny |
 //! | env data flowing into a network sink (`creddump::env_to_network`) | deny | deny | deny | deny |
+//! | Bash: `/proc/*/environ`, `ps e`, printing a secret-named variable ([`decide_bash`], D2) | deny | deny | deny | deny |
+//! | Bash: bare `printenv`/`env`/`export -p`/`set`/`declare -p` (values blanked by `redact`) | n/o | n/o | n/o | n/o |
 //!
 //! At the tiers that open them the model sees the values: the guarantee is that a value does not
 //! additionally reach a third party, not that the model never sees it (SECURITY.md). Only the
@@ -386,6 +389,48 @@ pub fn decision(policy: &Policy, project: bool, reason: String) -> Decision {
     verdict(rt.tier, rt.env_read, project, reason).map_or(Decision::Defer, Decision::from)
 }
 
+/// Whether a file name is a production env file (`.env.production`, `.env.prod`,
+/// `.env.prod*`, case-insensitive, not a template; decision D5): a project env file name whose raw read counts
+/// as a secret from tier Relaxed up ([`production_verdict`]).
+pub fn is_production_env_name(name: &str) -> bool {
+    const TEMPLATES: &[&str] = &[".example", ".sample", ".template", ".dist", ".schema"];
+    let lower = name.trim().to_ascii_lowercase();
+    lower.starts_with(".env.prod")
+        && !TEMPLATES.iter().any(|t| lower.ends_with(t))
+        && is_project_env_name(&lower)
+}
+
+/// The verdict for a raw read of the project env file `file` (decision D5 on top of
+/// [`verdict`]): a production env file ([`is_production_env_name`], by the name as given) is
+/// denied at Relaxed, Medium and High, as a secret; Off keeps the project-file row.
+pub fn production_verdict(
+    tier: Tier,
+    env_read: EnvRead,
+    file: &str,
+    project: bool,
+    reason: String,
+) -> Option<Verdict> {
+    let name = Path::new(file.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if project && env_read == EnvRead::Tier && tier != Tier::Off && is_production_env_name(&name) {
+        let reason = with_env_commands(reason);
+        return Some(Verdict::Deny(format!(
+            "safe-ai-skill: `{name}` holds production secrets, so its raw read is denied from tier relaxed up. {reason}"
+        )));
+    }
+    verdict(tier, env_read, project, reason)
+}
+
+/// [`production_verdict`] for the policy's runtime tier context, as a [`Decision`]: the
+/// call-line form for `read::env_verdict`, which knows the file.
+pub fn decision_for(policy: &Policy, file: &str, project: bool, reason: String) -> Decision {
+    let rt = &policy.runtime;
+    production_verdict(rt.tier, rt.env_read, file, project, reason)
+        .map_or(Decision::Defer, Decision::from)
+}
+
 /// The deny for env values from `file` that can flow into a network sink.
 pub fn to_network(file: &str) -> Verdict {
     Verdict::Deny(format!(
@@ -406,6 +451,433 @@ fn with_env_commands(reason: String) -> String {
         );
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------
+// Env dumps in Bash (decision D2)
+// ---------------------------------------------------------------------------------------
+
+/// Bytes that must appear in a command for [`decide_bash`] to parse it: an expansion, a
+/// `/proc` path, a printer of named variables, or interpreter env access.
+const ENV_DUMP_PREFILTER: &[&str] = &[
+    "$", "/proc", "environ", "printenv", "declare", "typeset", "getenv", "ENV", "env.", "env::",
+    "ps ",
+];
+
+/// Programs that print their arguments.
+const ECHOERS: &[&str] = &["echo", "printf", "print"];
+
+/// Interpreter print calls, for code that reads a secret-named variable inside one.
+const CODE_PRINTERS: &[&str] = &[
+    "print", "console.", "puts", "stdout", "stderr", "warn", "say", "echo", "dump(", "pp ",
+];
+
+/// Interpreter env reads followed by the variable name: `os.environ['K']`, `os.getenv("K")`,
+/// `process.env.K`, `ENV["K"]`, `$ENV{K}`, `Deno.env.get("K")`, `env::var("K")`.
+const CODE_ENV_READS: &[&str] = &[
+    "environ[",
+    "environ.get(",
+    "getenv(",
+    "process.env.",
+    "process.env[",
+    "ENV[",
+    "ENV.fetch(",
+    "$ENV{",
+    "env.get(",
+    "env::var(",
+];
+
+/// The verdict for a Bash `command` that prints environment values (decision D2), at every
+/// tier (Off is not DISABLE, as in `creddump`); `None` is no opinion:
+///
+/// - **Deny** a read of a process environment file: `/proc/<pid|self|thread-self>/environ`
+///   (and `/proc/*/task/*/environ`) named in any word, redirect, `xargs -a` file or
+///   interpreter code (`cat`, `xargs -0 -a`, `strings`, `tr … <`, `python3 -c "open(…)"`),
+///   a glob that can match it, or `environ` after a `cd`/variable into `/proc`; and `ps`
+///   with BSD `e` or `-E` (prints each process's environment).
+/// - **Deny** printing a secret-named variable ([`crate::redact::is_secret_env_name`]): `echo`,
+///   `printf` (not `printf -v`) and zsh `print` of `$X`/`${X…}` (also inside `bash -c`,
+///   `$(…)` and after `source .env &&`), any `${!x}`/`${(P)x}` indirection in them,
+///   `printenv NAME`, `declare -p NAME`/`typeset -p NAME`, a here-string `<<< "$X"`, and
+///   interpreter code printing an env read of one (`print(os.environ['X'])`,
+///   `console.log(process.env.X)`). `${#X}` (length) and `${X:+set}` print no value.
+/// - **No opinion** on bare dumps (`printenv`, `env`, `export -p`, `set`, `declare -p`, and
+///   their `| grep x` filters): the PostToolUse hook blanks the secret-named values in their
+///   output ([`crate::redact::scrub_env_lines`]).
+///
+/// A cheap byte prefilter ([`ENV_DUMP_PREFILTER`]) runs before parsing. Residual: a value
+/// copied to an innocently named variable first (`k=$HELIUS_API_KEY; echo $k`), `eval`
+/// with built names, and a script file that prints it.
+pub fn decide_bash(command: &str) -> Option<Verdict> {
+    if (command.contains('|') || command.contains('>')) && dump_leaves_redaction(command) {
+        return Some(Verdict::Ask(
+            "safe-ai-skill: this env dump is transformed or written to a file before it is shown, which hides its secret values from redaction; run the bare `printenv` / `env` (secret values are blanked) or filter it with `grep` — approve to proceed".to_string(),
+        ));
+    }
+    if !ENV_DUMP_PREFILTER.iter().any(|p| command.contains(p)) {
+        return None;
+    }
+    if names_proc_environ(command) {
+        return Some(Verdict::Deny(proc_environ_reason()));
+    }
+    let parsed = crate::context::shell::parse(command);
+    if proc_environ_in(&parsed) {
+        return Some(Verdict::Deny(proc_environ_reason()));
+    }
+    if let Some(name) = herestring_secret(command) {
+        return Some(Verdict::Deny(print_reason(&name)));
+    }
+    for cmd in &parsed.commands {
+        if let Some(name) = printed_secret(cmd) {
+            return Some(Verdict::Deny(print_reason(&name)));
+        }
+    }
+    let mut code: Vec<&str> = parsed.stdin_code.iter().map(String::as_str).collect();
+    for cmd in &parsed.commands {
+        if let Some(at) = crate::context::shell::interpreter_at(&cmd.words) {
+            code.extend(cmd.words.iter().skip(at + 1).map(|w| w.text.as_str()));
+        }
+    }
+    code.iter()
+        .find_map(|c| code_prints_secret(c))
+        .map(|name| Verdict::Deny(print_reason(&name)))
+}
+
+/// Commands an env dump may be piped into and keep its output redactable: filters that pass
+/// `NAME=value` lines through unchanged.
+const DUMP_SAFE_FILTERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "rg", "sort", "uniq", "head", "tail", "less", "more", "wc", "cat",
+];
+
+/// Whether a bare env dump (`env`, `printenv`, `export -p`, `set`, `declare -p`/`-x`,
+/// `typeset -p`/`-x`) is piped into anything but a [`DUMP_SAFE_FILTERS`] filter (or a
+/// keys-only `cut -d= -f1`), or written to a file: the PostToolUse redaction then cannot see
+/// its `NAME=value` lines (decision D2 allows the bare dump because of that redaction).
+fn dump_leaves_redaction(command: &str) -> bool {
+    split_unquoted(command, &[";", "&&", "||", "\n"])
+        .iter()
+        .any(|pipeline| {
+            let stages = split_unquoted(pipeline, &["|"]);
+            let Some(first) = stages.first() else {
+                return false;
+            };
+            let (dump, rest) = split_redirect(first);
+            if !is_env_dump(&dump) {
+                return false;
+            }
+            rest.contains('>') || stages.iter().skip(1).any(|stage| !is_safe_filter(stage))
+        })
+}
+
+/// The words of a stage before its first unquoted `>`, and the remainder.
+fn split_redirect(stage: &str) -> (Vec<String>, String) {
+    let at = stage.find('>').unwrap_or(stage.len());
+    let words = stage[..at].split_whitespace().map(str::to_string).collect();
+    (words, stage[at..].to_string())
+}
+
+fn is_env_dump(words: &[String]) -> bool {
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["env"]
+        | ["env", "-0"]
+        | ["printenv"]
+        | ["printenv", "-0"]
+        | ["set"]
+        | ["export"]
+        | ["export", "-p"] => true,
+        ["declare" | "typeset", flags] => {
+            flags.starts_with('-') && (flags.contains('p') || flags.contains('x'))
+        }
+        _ => false,
+    }
+}
+
+fn is_safe_filter(stage: &str) -> bool {
+    let words: Vec<&str> = stage.split_whitespace().collect();
+    match words.split_first() {
+        // Keys only (`cut -d= -f1`), or a column range that keeps each line's `NAME=` prefix.
+        Some((&"cut", args)) => {
+            args.iter().any(|a| a.starts_with("-c1"))
+                || (args.contains(&"-f1")
+                    && !args.iter().any(|a| a.starts_with("-f") && *a != "-f1"))
+        }
+        Some((cmd, _)) => DUMP_SAFE_FILTERS.contains(cmd) && !stage.contains('>'),
+        None => false,
+    }
+}
+
+/// `text` split on any of `seps` outside single and double quotes.
+fn split_unquoted(text: &str, seps: &[&str]) -> Vec<String> {
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    let (mut single, mut double) = (false, false);
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' && !double {
+            single = !single;
+        } else if c == '"' && !single {
+            double = !double;
+        } else if !single && !double {
+            let rest = &text[i..];
+            // A lone `|` must not be half of `||`.
+            let sep = seps
+                .iter()
+                .find(|s| rest.starts_with(**s) && !(**s == "|" && rest.starts_with("||")));
+            if let Some(sep) = sep {
+                out.push(std::mem::take(&mut cur));
+                for _ in 1..sep.chars().count() {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        cur.push(c);
+    }
+    out.push(cur);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn proc_environ_reason() -> String {
+    "safe-ai-skill: reading a process environment (`/proc/*/environ`, `ps e`) prints every secret in it unredacted, denied at every tier; run `printenv` or `env` instead, whose output has secret values blanked.".to_string()
+}
+
+fn print_reason(name: &str) -> String {
+    format!(
+        "safe-ai-skill: printing the secret-named variable {name} puts its value in the transcript, denied at every tier; check it is set with `[ -n \"${name}\" ] && echo set` or `echo ${{#{name}}}`, and pass it straight to the command that needs it."
+    )
+}
+
+/// Whether `text` names a `/proc/…/environ` path: a `/proc/` run (up to whitespace, a quote
+/// or shell punctuation) whose last segment is, or is a glob that matches, `environ`.
+fn names_proc_environ(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.match_indices("/proc/").any(|(at, _)| {
+        let run = &lower[at..];
+        let end = run
+            .find(|c: char| c.is_whitespace() || "'\"`;|&<>(),".contains(c))
+            .unwrap_or(run.len());
+        let path = run[..end].trim_end_matches('/');
+        path.rsplit('/')
+            .next()
+            .is_some_and(|seg| glob_matches(seg, "environ"))
+    })
+}
+
+/// Whether the parse reaches `/proc/…/environ` beyond a literal path: any word or redirect
+/// naming one (quotes removed), or a `/proc` directory or variable value on the line and a
+/// later word whose last segment matches `environ` (`cd /proc/self && cat environ`,
+/// `p=/proc/self; cat $p/environ`).
+fn proc_environ_in(parsed: &crate::context::shell::Parsed) -> bool {
+    let words = || parsed.commands.iter().flat_map(|c| c.words.iter());
+    let extra = || {
+        parsed
+            .input_files
+            .iter()
+            .chain(&parsed.arg_files)
+            .chain(&parsed.assigned_values)
+            .chain(&parsed.stdin_code)
+    };
+    if words().any(|w| names_proc_environ(&w.text)) || extra().any(|f| names_proc_environ(f)) {
+        return true;
+    }
+    let proc_dir = words()
+        .map(|w| w.text.as_str())
+        .chain(extra().map(String::as_str))
+        .any(|t| {
+            let t = t.trim_end_matches('/');
+            t == "/proc" || t.starts_with("/proc/")
+        });
+    if proc_dir {
+        let segment = |t: &str| {
+            t.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|seg| glob_matches(&seg.to_ascii_lowercase(), "environ"))
+        };
+        if words().skip(1).any(|w| segment(&w.text)) || extra().any(|f| segment(f)) {
+            return true;
+        }
+    }
+    parsed.commands.iter().any(ps_prints_env)
+}
+
+/// `ps` with a BSD `e` option word (`ps eww`, `ps auxe`) or `-E`: it prints each process's
+/// environment.
+fn ps_prints_env(cmd: &crate::context::shell::SimpleCommand) -> bool {
+    if cmd.program() != "ps" {
+        return false;
+    }
+    let bsd = cmd.words.get(1).is_some_and(|w| {
+        !w.text.is_empty()
+            && w.text.bytes().all(|b| b.is_ascii_alphabetic())
+            && w.text.contains('e')
+    });
+    bsd || cmd
+        .words
+        .iter()
+        .skip(1)
+        .any(|w| w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('E'))
+}
+
+/// A shell glob match (`*`, `?`, `[…]` taken as any one character) of `pattern` against
+/// `name`, byte-wise.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8], depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..], depth + 1)),
+            Some((b'?', rest)) => !n.is_empty() && go(rest, &n[1..], depth),
+            Some((b'[', rest)) => match rest.iter().position(|&b| b == b']') {
+                Some(close) => !n.is_empty() && go(&rest[close + 1..], &n[1..], depth),
+                None => n.first() == Some(&b'[') && go(rest, &n[1..], depth),
+            },
+            Some((c, rest)) => n.first() == Some(c) && go(rest, &n[1..], depth),
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes(), 0)
+}
+
+/// The secret-named variable a simple command prints, if any ([`decide_bash`]).
+fn printed_secret(cmd: &crate::context::shell::SimpleCommand) -> Option<String> {
+    let program = cmd.program();
+    let args = cmd.words.get(1..).unwrap_or_default();
+    match program.as_str() {
+        p if ECHOERS.contains(&p) => {
+            if p == "printf" && args.first().is_some_and(|w| w.text == "-v") {
+                return None;
+            }
+            args.iter()
+                .filter(|w| w.dynamic)
+                .find_map(|w| secret_reference(&w.text))
+        }
+        "printenv" => args
+            .iter()
+            .filter(|w| !w.text.starts_with('-'))
+            .find(|w| crate::redact::is_secret_env_name(&w.text) || w.dynamic)
+            .and_then(|w| {
+                if w.dynamic {
+                    secret_reference(&w.text)
+                } else {
+                    Some(w.text.clone())
+                }
+            }),
+        "declare" | "typeset"
+            if args
+                .iter()
+                .any(|w| w.text.starts_with('-') && w.text.contains('p')) =>
+        {
+            args.iter()
+                .filter(|w| !w.text.starts_with('-'))
+                .find(|w| crate::redact::is_secret_env_name(&w.text))
+                .map(|w| w.text.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The first secret-named variable `text` expands (`$X`, `${X}`, `${X:-d}`, `${X:0:4}`), or
+/// `${!x}`/`${(P)x}` indirection (its target is unknown). `${#X}`, `${X:+…}`/`${X+…}`, and
+/// `${!prefix*}`/`${!arr[@]}` (names, not values) print no value.
+fn secret_reference(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if bytes.get(i) == Some(&b'{') {
+            let close = text[i..].find('}').map_or(text.len(), |c| i + c);
+            let inner = &text[i + 1..close];
+            i = close;
+            if let Some(target) = inner.strip_prefix('!') {
+                if !(target.ends_with('*')
+                    || target.ends_with('@')
+                    || target.ends_with("[@]")
+                    || target.ends_with("[*]"))
+                {
+                    return Some(format!("${{!{target}}} (indirection)"));
+                }
+                continue;
+            }
+            if inner.starts_with('(') && inner.split(')').next().is_some_and(|f| f.contains('P')) {
+                return Some(format!("${{{inner}}} (indirection)"));
+            }
+            if inner.starts_with('#') {
+                continue;
+            }
+            let name_end = inner
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(inner.len());
+            let (name, rest) = inner.split_at(name_end);
+            if rest.starts_with(":+") || rest.starts_with('+') {
+                continue;
+            }
+            if crate::redact::is_secret_env_name(name) {
+                return Some(name.to_string());
+            }
+        } else {
+            let end = text[i..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(text.len(), |e| i + e);
+            let name = &text[i..end];
+            if name.bytes().next().is_some_and(|b| !b.is_ascii_digit())
+                && crate::redact::is_secret_env_name(name)
+            {
+                return Some(name.to_string());
+            }
+            i = end;
+        }
+    }
+    None
+}
+
+/// A secret-named variable expanded in a here-string (`cat <<< "$X"`): the parser drops
+/// here-string words fed to programs other than shells, so the raw text is read.
+fn herestring_secret(command: &str) -> Option<String> {
+    command.match_indices("<<<").find_map(|(at, _)| {
+        let rest = command[at + 3..].trim_start();
+        let end = rest
+            .find(|c: char| c.is_whitespace() || ";|&)".contains(c))
+            .unwrap_or(rest.len());
+        let word = rest[..end].trim_matches(|c| c == '"');
+        (!rest.starts_with('\''))
+            .then(|| secret_reference(word))
+            .flatten()
+    })
+}
+
+/// A secret-named variable that interpreter `code` reads ([`CODE_ENV_READS`]) inside a print
+/// call ([`CODE_PRINTERS`]) in the same statement (back to the last `;` or newline).
+fn code_prints_secret(code: &str) -> Option<String> {
+    for read in CODE_ENV_READS {
+        for (at, _) in code.match_indices(read) {
+            let after = &code[at + read.len()..];
+            let after = after.trim_start_matches(['\'', '"', ' ', '`']);
+            let end = after
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(after.len());
+            let name = &after[..end];
+            if !crate::redact::is_secret_env_name(name) {
+                continue;
+            }
+            let statement_start = code[..at].rfind([';', '\n']).map_or(0, |p| p + 1);
+            let statement = code[statement_start..at].to_ascii_lowercase();
+            // Ruby's `p ENV["K"]` prints too.
+            let ruby_p = statement.trim_start().starts_with("p ");
+            if ruby_p || CODE_PRINTERS.iter().any(|p| statement.contains(p)) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

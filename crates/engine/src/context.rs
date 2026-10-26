@@ -141,6 +141,19 @@ pub fn anchor_network(cwd: &Path, cli: impl FnOnce() -> Network) -> Network {
     }
 }
 
+/// [`SOLANA_CONFIG_TIMEOUT`]; test builds (`test-hooks`) may raise it with
+/// `SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS` so a loaded test machine doesn't read Unknown.
+fn solana_config_timeout() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    SOLANA_CONFIG_TIMEOUT
+}
+
 /// The CLI config's cluster: `solana config get`, bounded at [`SOLANA_CONFIG_TIMEOUT`] (a
 /// timeout, a missing binary or any failure is [`Network::Unknown`]), cached for 60 s in the
 /// authenticated `netcache.json` of a trusted data dir.
@@ -155,7 +168,7 @@ pub fn cli_network(cwd: &Path) -> Network {
             return classify_url(&url);
         }
     }
-    let Some(url) = solana_config_rpc_url(SOLANA_CONFIG_TIMEOUT) else {
+    let Some(url) = solana_config_rpc_url(solana_config_timeout()) else {
         return Network::Unknown;
     };
     if let Some(dir) = &dir {
@@ -204,8 +217,17 @@ fn classify_url(raw: &str) -> Network {
         Some(("http" | "https" | "ws" | "wss", rest)) => rest,
         _ => return Network::Unknown,
     };
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // WHATWG (the `url` crate the CLIs connect through) ends the authority at `\` too for these
+    // schemes: `https://evil.example\@api.devnet.solana.com` is the host `evil.example`.
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let (authority, after) = rest.split_at(end);
+    // Anything a URL parser could strip, decode or read differently identifies nothing.
+    if !authority
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '@' | '[' | ']'))
+    {
+        return Network::Unknown;
+    }
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     let host = if host_port.starts_with('[') {
         host_port.find(']').map_or(host_port, |i| &host_port[..=i])
@@ -360,9 +382,44 @@ fn config_file_network(file: &str, base: Option<&Path>) -> Network {
     let Some(text) = read_small_file(&path) else {
         return Network::Unknown;
     };
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("json_rpc_url:"))
-        .map_or(Network::Unknown, classify_url)
+    config_text_network(&text)
+}
+
+/// The cluster a CLI config file's text names: its one top-level `json_rpc_url`.
+///
+/// The CLI reads the file as YAML, so a line scan alone can be fooled (a `json_rpc_url:` line
+/// inside a block scalar or a nested map). The file must parse as one YAML mapping whose
+/// `json_rpc_url` is a string, and exactly one unindented line may spell that key, with the
+/// same plain or quoted value. Anything else (duplicate, flow, anchor or alias syntax, a
+/// second document, a parse error) is [`Network::Unknown`].
+fn config_text_network(text: &str) -> Network {
+    let mut top_level = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("json_rpc_url:"));
+    let (Some(spelled), None) = (top_level.next(), top_level.next()) else {
+        return Network::Unknown;
+    };
+    let spelled = spelled.trim();
+    let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(text)
+    else {
+        return Network::Unknown;
+    };
+    let Some(serde_yaml::Value::String(parsed)) = map.get("json_rpc_url") else {
+        return Network::Unknown;
+    };
+    let unquoted = spelled
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| {
+            spelled
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+        })
+        .unwrap_or(spelled);
+    if unquoted != parsed {
+        return Network::Unknown;
+    }
+    classify_url(parsed)
 }
 
 /// Read a regular file of at most [`MAX_CONFIG_BYTES`]; `None` otherwise (a FIFO or device
@@ -398,6 +455,51 @@ pub struct Argv<'a> {
     ambiguous_value: bool,
 }
 
+/// Whether the shell may turn one word into a different number of words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Splits {
+    /// It stays one word.
+    No,
+    /// Only through an unquoted glob or brace character (`*`, `?`, `[`, `{`): no expansion.
+    Glob,
+    /// Through an expansion (`$X`, `$(…)`, `"$@"`): its text is unknown.
+    Yes,
+}
+
+impl Splits {
+    /// Whether this word, the value of flag `name`, is a URL whose glob leaves its cluster as
+    /// spelled ([`inert_url_glob`]).
+    fn inert_as_url(self, name: &str, value: &str) -> bool {
+        self == Splits::Glob && URL_FLAGS.contains(&name) && inert_url_glob(value)
+    }
+}
+
+/// Whether an RPC URL spelled with an unquoted glob (`https://api.mainnet-beta.solana.com/?x`)
+/// names the same cluster whatever the shell does with the glob. True only when the scheme and
+/// host (`http(s)://` or `ws(s)://`, up to the first `/`) hold no glob, brace or expansion
+/// character and there is no brace or expansion anywhere: then every glob character sits in a
+/// later path component, so the shell leaves the word as written (no match), fails the
+/// command (zsh `nomatch`, bash `failglob`), or yields words that all start with that same
+/// `scheme://host/`. The CLI reads the first as its URL and rejects the rest as extra
+/// positionals: none can be an amount, a subcommand or a pubkey.
+fn inert_url_glob(value: &str) -> bool {
+    const SPECIAL: [char; 6] = ['*', '?', '[', '{', '$', '`'];
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return false;
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "ws" | "wss"
+    ) {
+        return false;
+    }
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let (authority, _) = rest.split_at(slash);
+    !authority.contains(SPECIAL) && !value.contains(['{', '$', '`'])
+}
+
 /// How one word relates to the words around it.
 enum Kind<'a> {
     /// A positional word.
@@ -415,27 +517,35 @@ enum Kind<'a> {
 impl<'a> Argv<'a> {
     /// Split a tokenized command (`tokens[0]` is the program word).
     pub fn parse(tokens: &'a [String]) -> Argv<'a> {
-        let words: Vec<(&'a str, bool)> = tokens
+        let words: Vec<(&'a str, Splits)> = tokens
             .iter()
             .skip(1)
-            .map(|t| (t.as_str(), false))
+            .map(|t| (t.as_str(), Splits::No))
             .filter(|(word, _)| !is_fd_duplication(word))
             .collect();
         Argv::parse_words(&words)
     }
 
     /// Split a parsed shell command (`words[0]` is the program word). A word the shell may
-    /// split or glob ([`shell::Word::splits`]) makes every position from it on uncertain.
+    /// split or glob ([`shell::Word::splits`]) makes every position from it on uncertain,
+    /// except a URL flag's value whose glob cannot change its cluster ([`inert_url_glob`]).
     pub fn from_shell(words: &'a [shell::Word]) -> Argv<'a> {
-        let words: Vec<(&'a str, bool)> = words
+        let words: Vec<(&'a str, Splits)> = words
             .iter()
             .skip(1)
-            .map(|w| (w.text.as_str(), w.splits))
+            .map(|w| {
+                let splits = match (w.splits, w.dynamic) {
+                    (false, _) => Splits::No,
+                    (true, false) => Splits::Glob,
+                    (true, true) => Splits::Yes,
+                };
+                (w.text.as_str(), splits)
+            })
             .collect();
         Argv::parse_words(&words)
     }
 
-    fn parse_words(words: &[(&'a str, bool)]) -> Argv<'a> {
+    fn parse_words(words: &[(&'a str, Splits)]) -> Argv<'a> {
         let mut argv = Argv {
             positionals: Vec::new(),
             uncertain_from: None,
@@ -445,7 +555,11 @@ impl<'a> Argv<'a> {
         let mut i = 0;
         while let Some(&(word, splits)) = words.get(i) {
             i += 1;
-            if splits {
+            let inert = match kind(word) {
+                Kind::Attached(name, value) => splits.inert_as_url(name, value),
+                _ => false,
+            };
+            if splits != Splits::No && !inert {
                 // Its words, flags included, are unknowable: so is everything after it.
                 argv.ambiguous_value = true;
                 argv.mark_uncertain();
@@ -469,7 +583,8 @@ impl<'a> Argv<'a> {
                     Some(value) if !is_flag_like(value) => {
                         argv.flags.push((name, Some(value)));
                         i += 1;
-                        if words.get(i - 1).is_some_and(|&(_, s)| s) {
+                        let value_splits = words.get(i - 1).map_or(Splits::No, |&(_, s)| s);
+                        if value_splits != Splits::No && !value_splits.inert_as_url(name, value) {
                             argv.ambiguous_value = true;
                             argv.mark_uncertain();
                         }

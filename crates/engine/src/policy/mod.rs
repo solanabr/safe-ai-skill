@@ -41,7 +41,7 @@ spend:
   hard_tx_sol_max: 10.0
   daily_sol_max: 5.0
 mcp:
-  sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
+  sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow|trade|buy|sell|drain|deposit|execute|submit|authority|launch|deploy|close|unstake|deactivate"
 swap:
   rugcheck: true
   rugcheck_max_score: 40
@@ -330,7 +330,7 @@ impl Default for McpPolicy {
     fn default() -> Self {
         McpPolicy {
             sensitive_name_pattern:
-                "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow"
+                "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow|trade|buy|sell|drain|deposit|execute|submit|authority|launch|deploy|close|unstake|deactivate"
                     .into(),
         }
     }

@@ -757,11 +757,6 @@ fn f3_class_u_denies_on_mainnet() {
 }
 
 #[test]
-fn f3_class_u_denies_on_testnet() {
-    class_u_denies("f3-u-t", "-ut");
-}
-
-#[test]
 fn f3_class_u_denies_on_a_missing_config_file() {
     class_u_denies("f3-u-c", "-C missing.yml");
 }
@@ -778,10 +773,11 @@ fn f3_class_u_denies_with_no_identified_cluster() {
 }
 
 #[test]
-fn f3_class_u_on_devnet_asks_no_grant_relaxes_it_and_headless_denies() {
+fn f3_class_u_on_devnet_or_testnet_asks_no_grant_relaxes_it_and_headless_denies() {
     let w = World::new("f3-u-dev");
     w.grant_everything();
     let mut cmds = class_u("-ud");
+    cmds.extend(class_u("-ut"));
     cmds.extend(class_u_templates().iter().map(|t| t.replace("{c}", "-ul")));
     for cmd in cmds {
         // The data dir holds a confirmed grant of every scope: still an ask.
@@ -838,10 +834,16 @@ fn f3_class_c_on_mainnet_or_unknown() {
         ] {
             let cmd = cmd.trim_end();
             check(cmd, w.x4("Bash", &bash(cmd)), ASK_HIGH_DENY);
+            // A token amount is never covered by a SOL grant (D3).
+            let granted_want = if cmd.starts_with("spl-token transfer") {
+                ASK_HIGH_DENY
+            } else {
+                ["allow", "allow", "allow", "deny"]
+            };
             check(
                 &format!("granted {cmd}"),
                 granted.x4("Bash", &bash(cmd)),
-                ["allow", "allow", "allow", "deny"],
+                granted_want,
             );
             if cluster == "-um" {
                 check(
@@ -1813,7 +1815,8 @@ fn i22_interpreter_code_naming_an_env_file_is_a_read() {
         "uv run python -c \"print(open('.env').read())\"",
         "uv run --with requests python -c \"print(open('.env').read())\"",
         "poetry run python -c \"print(open('.env').read())\"",
-        "npx tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
+        // `npx tsx` (an undeclared runner) also asks under D4; `gap_w4-fetchexec` covers it.
+        "tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "ts-node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "pypy3 -c \"print(open('.env').read())\"",
         "Rscript -e \"readLines('.env')\"",
@@ -1978,7 +1981,8 @@ fn i22_templates_and_metadata_have_no_opinion() {
         "file .env",
         "echo .env | xargs ls -la",
         "node -e \"console.log(process.env)\"",
-        "python3 -c \"import os; print(os.environ.get('KEY'))\"",
+        // Printing a secret-named variable is a deny under D2 (`gap_w3-envdump` covers it).
+        "python3 -c \"import os; print(os.environ.get('HOME'))\"",
         "node -e \"console.log('process.env')\"",
         "awk '$0 ~ \".env\"' .gitignore",
         "perl -ne \"print if /'\\.env'/\" src/config.py",

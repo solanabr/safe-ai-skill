@@ -984,7 +984,9 @@ fn invocation<'a>(args: &[&str], row: &Row, tier: Tier, paths: &'a Paths) -> Inv
         .home(&paths.home)
         .cwd(&paths.proj)
         .sandbox(row.ctx.sandbox)
-        .env("PATH", &paths.tools.display().to_string());
+        .env("PATH", &paths.tools.display().to_string())
+        // Hundreds of cells run in parallel; a stub `solana config get` can overrun 2 s.
+        .env("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS", "10000");
     // A row that names a contract 3.3 signal in its env is testing that signal alone; do not
     // add the blanket SAFE_AI_SKILL_HEADLESS on top of it.
     if row.ctx.headless
