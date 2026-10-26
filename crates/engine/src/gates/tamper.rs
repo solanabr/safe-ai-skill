@@ -82,7 +82,7 @@
 //!   separators: a relative name with a trailing dot or space (`safe-ai-skill-stbr.`), 8.3 short
 //!   names, `%USERPROFILE%`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -140,6 +140,11 @@ impl Budget {
             left: units,
             deadline: now.checked_add(time).unwrap_or(now),
         }
+    }
+
+    /// Whether the units or the time have run out, so later work cannot be paid for.
+    pub fn is_spent(&self) -> bool {
+        self.left == 0
     }
 
     /// Spend `units`; `Err` once the units or the time have run out (and from then on).
@@ -596,6 +601,15 @@ fn scan_nested(command: &str) -> NestedScan {
         .to_lowercase()
         .replace("\\\n", "")
         .replace(['\'', '"', '\\'], "");
+    // Every launch below is a word naming `claude`; without one there is nothing to find.
+    if !text.contains("claude") {
+        return NestedScan {
+            text,
+            found: false,
+            print: false,
+            invocations: Vec::new(),
+        };
+    }
     // Words with the separator that ended the previous one (`None`: whitespace).
     let mut words: Vec<(String, Option<char>)> = Vec::new();
     let mut word = String::new();
@@ -1095,16 +1109,27 @@ struct CdScan {
     dirs: Vec<Dir>,
     /// Per token: the index in `dirs` of the directory it runs in.
     at: Vec<usize>,
+    /// Each directory's classification, `(data_parent, plugins, protected)`. A long chain of
+    /// relative `cd`s revisits the same few hundred paths (each grows to `MAX_DIR`, then starts
+    /// over), and classifying one costs far more than the budget charges for it.
+    seen: HashMap<String, (bool, bool, bool)>,
 }
 
 impl CdScan {
     fn add(&mut self, path: Option<String>, protected: &Protected) -> usize {
         let (data_parent, plugins, inside) = match path.as_deref() {
-            Some(dir) => (
-                is_data_parent(dir, protected),
-                is_plugins_dir(dir),
-                is_protected_dir(dir, protected),
-            ),
+            Some(dir) => match self.seen.get(dir) {
+                Some(&known) => known,
+                None => {
+                    let class = (
+                        is_data_parent(dir, protected),
+                        is_plugins_dir(dir),
+                        is_protected_dir(dir, protected),
+                    );
+                    self.seen.insert(dir.to_string(), class);
+                    class
+                }
+            },
             None => (false, false, false),
         };
         self.enters_plugins |= plugins || data_parent;
@@ -1131,6 +1156,7 @@ fn scan_cds(
         enters_plugins: false,
         dirs: Vec::new(),
         at: Vec::with_capacity(toks.len()),
+        seen: HashMap::new(),
     };
     // Per token, scanning forward through words: the first one that is not a flag, and the
     // last word before a boundary. One backward pass, so a run of flags is not rescanned by
@@ -1918,6 +1944,27 @@ fn expand_home(word: &str, home: &str) -> String {
 
 /// Resolve `.`, `..` and repeated `/` in a `/`-separated string.
 fn lexical(path: &str) -> String {
+    // No empty, `.` or `..` component past a leading `/`: already resolved (a `cd` chain joins
+    // one word at a time onto a resolved directory).
+    let resolved = !(path == "."
+        || path == ".."
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || path.ends_with('/')
+        || path.ends_with("/.")
+        || path.ends_with("/..")
+        || path.contains("//")
+        || path.contains("/./")
+        || path.contains("/../"));
+    if resolved {
+        path.to_string()
+    } else {
+        resolve_components(path)
+    }
+}
+
+/// [`lexical`] without its shortcut.
+fn resolve_components(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for comp in path.split('/') {
@@ -3558,10 +3605,12 @@ pub fn decide_bash_writes_at(
     homes: &ConfigHomes,
     tier: Tier,
 ) -> Option<Verdict> {
-    let git_cmd = contains_ci(command, "git")
-        && (contains_ci(command, "config") || contains_ci(command, "core."));
-    let env_cmd = contains_ci(command, "launchctl") || contains_ci(command, "set-environment");
-    if !git_cmd && !env_cmd && !BASH_NEEDLES.iter().any(|n| contains_ci(command, n)) {
+    // Lowercased once: each needle is then one std substring search, not a windowed compare.
+    let lower = command.to_ascii_lowercase();
+    let names = |needle: &str| lower.contains(needle);
+    let git_cmd = names("git") && (names("config") || names("core."));
+    let env_cmd = names("launchctl") || names("set-environment");
+    if !git_cmd && !env_cmd && !BASH_NEEDLES.iter().any(|n| names(n)) {
         return None;
     }
     let mut strictest: Option<Verdict> = exported_switch(command).map(Verdict::Ask);
@@ -3685,7 +3734,7 @@ pub fn decide_bash_writes_at(
             && matches!(t.op, Op::Write(_) | Op::Delete | Op::Find(_))
             && t.raw.contains(['$', '`'])
     });
-    if computed && contains_ci(command, ".claude") {
+    if computed && names(".claude") {
         strictest = stricter(
             strictest,
             Verdict::Ask(
@@ -5025,6 +5074,18 @@ mod tests {
         assert_eq!(lexical("/.."), "/");
         assert_eq!(lexical("../a/../../b"), "../../b");
         assert_eq!(lexical(".safe-ai-skill/"), ".safe-ai-skill");
+        // The shortcut agrees with the full resolution on every short path over `a . /`.
+        let mut paths = vec![String::new()];
+        for _ in 0..7 {
+            let longer: Vec<String> = paths
+                .iter()
+                .flat_map(|p| ["a", ".", "/"].map(|c| format!("{p}{c}")))
+                .collect();
+            for p in &longer {
+                assert_eq!(lexical(p), resolve_components(p), "{p:?}");
+            }
+            paths = longer;
+        }
         assert_eq!(
             ifs_as_space("a${ifs}b$ifs c$ifsx${ifs:0:1}d"),
             "a b  c$ifsx d"

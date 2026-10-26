@@ -159,12 +159,19 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy) -> Decision {
     if matches!(nested, Decision::Deny { .. }) {
         return nested;
     }
-    let rpc_quiet = !names_http_redirect_env(command);
-    // After a `cd`, a relative env path resolves elsewhere than the hook cwd: `creddump`, which
-    // tracks the `cd` targets, decides env reads then (`secret_arg_decision` with no cwd).
-    let changes_dir = crate::context::shell::parse(command).cwd_changed;
-    let scan_cwd = (!changes_dir).then_some(cwd);
-    let scanned = scan_segments(command, policy, scan_cwd, rpc_quiet, &mut budget);
+    // Every check of the scan is paid for first, so with nothing left it could only find the
+    // command too complex: skip parsing it again.
+    let scanned = if budget.is_spent() {
+        tamper::too_complex()
+    } else {
+        let rpc_quiet = !names_http_redirect_env(command);
+        let parsed = crate::context::shell::parse(command);
+        // After a `cd`, a relative env path resolves elsewhere than the hook cwd: `creddump`,
+        // which tracks the `cd` targets, decides env reads then (`secret_arg_decision` with no
+        // cwd).
+        let scan_cwd = (!parsed.cwd_changed).then_some(cwd);
+        scan_parsed(command, parsed, policy, scan_cwd, rpc_quiet, &mut budget)
+    };
     match (tripwire, nested) {
         // Too complex for the tripwire: a secret read found anyway still denies.
         (ask @ Decision::Ask { .. }, _) | (_, ask @ Decision::Ask { .. })
@@ -184,11 +191,23 @@ fn scan_segments(
     rpc_quiet: bool,
     budget: &mut tamper::Budget,
 ) -> Decision {
+    let parsed = crate::context::shell::parse(command);
+    scan_parsed(command, parsed, policy, cwd, rpc_quiet, budget)
+}
+
+/// [`scan_segments`] over `command` already parsed.
+fn scan_parsed(
+    command: &str,
+    parsed: crate::context::shell::Parsed,
+    policy: &Policy,
+    cwd: Option<&Path>,
+    rpc_quiet: bool,
+    budget: &mut tamper::Budget,
+) -> Decision {
     // Per-segment secret-read / exfil scan. A clear secret access or upload is a hard
     // `Deny` and must win over the (softer, configurable) install-script gate, so capture
     // the strongest segment decision and short-circuit on a `Deny`.
     let mut segment_decision = Decision::Defer;
-    let parsed = crate::context::shell::parse(command);
     // A here-document body is the text a command reads on stdin, not words of the command
     // line: `cat > doc.md <<'EOF'` writing prose that names a keypair reads nothing. A body a
     // shell runs is parsed into indirect commands, which the loop below checks.
