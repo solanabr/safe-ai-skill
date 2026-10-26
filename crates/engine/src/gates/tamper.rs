@@ -2965,12 +2965,22 @@ fn settings_change(before: &str, after: &str) -> Option<String> {
     None
 }
 
-/// How settings text, taken as a whole, turns protection off: a switch it sets (a
-/// `safe-ai-skill@…` plugin set to `false`, `disableAllHooks`, `allowManagedHooksOnly`,
-/// `env.SAFE_AI_SKILL_DISABLE`, `permissions.defaultMode: bypassPermissions`), as the D1 deny
-/// judges it. For [`crate::gates::configchange`], which sees only the file as it now is.
-pub fn settings_disable_reason(text: &str) -> Option<String> {
-    settings_change("", text)
+/// The switches in settings text, taken as a whole, that turn protection off, for
+/// [`crate::gates::configchange`]: `disableAllHooks`, `allowManagedHooksOnly`,
+/// `env.SAFE_AI_SKILL_DISABLE`; a `safe-ai-skill@…` plugin set to `false` only when no other
+/// `safe-ai-skill@…` entry is `true` (an install under another marketplace stays on); and
+/// `permissions.defaultMode: bypassPermissions` only outside project scope, since Claude Code
+/// does not honor it from `.claude/settings.json` or `.claude/settings.local.json`
+/// (<https://code.claude.com/docs/en/permission-modes>, "Which mode a session starts in").
+pub fn settings_disable_reasons(text: &str, project_scope: bool) -> BTreeSet<String> {
+    let facts = settings_facts(text);
+    let plugin_on = facts.protecting.iter().any(|p| p.starts_with("plugin:"));
+    facts
+        .disabling
+        .into_iter()
+        .filter(|what| !(plugin_on && what.starts_with("turns off the `safe-ai-skill@")))
+        .filter(|what| !(project_scope && what.contains("`bypassPermissions`")))
+        .collect()
 }
 
 /// Why a whole new settings text drops protection by not being JSON: the client ignores a
