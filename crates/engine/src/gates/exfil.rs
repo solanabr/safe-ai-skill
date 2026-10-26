@@ -5,7 +5,8 @@
 //!
 //! - **Destinations.** `curl`/`wget`/httpie (`http`, `https`, `xh`)/`nc`/`ncat`/`socat`/`telnet`/
 //!   `ssh`/`scp`/`rsync`, `/dev/tcp/host/port` redirects, URLs inside interpreter one-liners
-//!   (`python -c`, `node -e`, heredoc code), MCP `url`/`uri`/`href` arguments, executor shell
+//!   (`python -c`, `node -e`, heredoc code), MCP destination arguments (`href`, keys ending in
+//!   `url`/`uri`/`endpoint`/`webhook`, strings in arrays included), executor shell
 //!   code, browser scripts (`browser_evaluate`, `browser_run_code`, `javascript_tool`) and
 //!   WebFetch ([`decide_webfetch`]).
 //! - **Hosts** are normalised: lowercase, userinfo, port and trailing dots stripped, percent
@@ -16,7 +17,9 @@
 //!   asks, since the request carries no body. Secret-shaped data ([`crate::redact`] detectors,
 //!   also after base64, hex or percent decoding, at most [`MAX_DECODE_DEPTH`] levels and
 //!   [`MAX_DECODE_BYTES`]) in the URL or body to a host off [`DEV_HOSTS`] denies. A base64 or
-//!   hex blob of [`BLOB_MIN`] characters or more, or one decoding to a byte array, asks.
+//!   hex blob of [`BLOB_MIN`] characters or more, or one decoding to a byte array, asks. A
+//!   base58 run decoding to 64 bytes denies only under a key name (`secretKey`, `keypair` …),
+//!   passes as a transaction signature, and otherwise asks as a blob.
 //!
 //! The `curl`/`wget` upload and POST checks stay in [`crate::gates::secrets`]: this gate does
 //! not repeat its POST-to-unknown-host ask. Call lines: `main::cmd_gate_bash_secrets`
@@ -336,7 +339,7 @@ pub fn decide_mcp(
     walk(payload, 0, &mut |key, value, siblings| {
         let lower = key.to_ascii_lowercase();
         match lower.as_str() {
-            "url" | "uri" | "href" => {
+            k if is_url_key(k) => {
                 let request = url_request(value, siblings);
                 verdicts.push(judge(&request, policy, tier, &mut budget));
             }
@@ -1051,10 +1054,22 @@ fn is_browser_script_tool(tool: &str) -> bool {
     .any(|w| t.contains(w))
 }
 
+/// An MCP argument key that names a destination: `href`, or one ending in `url`, `uri`,
+/// `endpoint` or `webhook` (`webhookURL`, `callback_uri`), singular or plural; `key` is
+/// lowercase.
+fn is_url_key(key: &str) -> bool {
+    let key = key.strip_suffix('s').unwrap_or(key);
+    key == "href"
+        || ["url", "uri", "endpoint", "webhook"]
+            .iter()
+            .any(|s| key.ends_with(s))
+}
+
 /// A payload string visitor: key, value, sibling map.
 type Visit<'v> = dyn FnMut(&str, &str, Option<&Map<String, Value>>) + 'v;
 
-/// Visit every string value under `value` with its key and sibling map.
+/// Visit every string value under `value` with its key and sibling map; a string inside an
+/// array is visited under the array's key (`commands` items as `command`).
 fn walk(value: &Value, depth: usize, visit: &mut Visit<'_>) {
     if depth > MAX_PAYLOAD_DEPTH {
         return;
@@ -1064,10 +1079,11 @@ fn walk(value: &Value, depth: usize, visit: &mut Visit<'_>) {
             for (key, v) in map {
                 match v {
                     Value::String(s) => visit(key, s, Some(map)),
-                    Value::Array(items) if key == "commands" => {
+                    Value::Array(items) => {
+                        let item_key = if key == "commands" { "command" } else { key };
                         for item in items {
                             match item {
-                                Value::String(s) => visit("command", s, Some(map)),
+                                Value::String(s) => visit(item_key, s, Some(map)),
                                 other => walk(other, depth + 1, visit),
                             }
                         }
@@ -1231,8 +1247,8 @@ enum Level {
 }
 
 /// What `text` carries, decoding base64 and hex runs up to [`MAX_DECODE_DEPTH`] levels while
-/// `budget` lasts. A base58 64-byte run after a `tx`/`signature` path segment is a transaction
-/// signature, not a key, and is left out.
+/// `budget` lasts. A base58 run decoding to 64 bytes is a secret key only when a key name such
+/// as `secretKey` or `keypair` precedes it ([`base58_runs`]).
 fn scan(text: &str, depth: usize, budget: &mut usize) -> Level {
     if text.is_empty() || *budget == 0 {
         return Level::None;
@@ -1241,11 +1257,10 @@ fn scan(text: &str, depth: usize, budget: &mut usize) -> Level {
     *budget -= take;
     let text = text.get(..take).unwrap_or(text);
     let decoded = percent_decode(text);
-    let cleaned = drop_signatures(&decoded);
+    let (cleaned, mut level) = base58_runs(&decoded);
     if redact::contains_key_material(&cleaned) {
         return Level::Secret;
     }
-    let mut level = Level::None;
     for token in
         cleaned.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_')))
     {
@@ -1308,34 +1323,137 @@ fn is_byte_array(text: &str) -> bool {
     items.len() >= 4 && items.iter().all(|i| i.parse::<u8>().is_ok())
 }
 
-/// `text` without base58 runs that follow a `tx`/`signature` path segment or query key.
-fn drop_signatures(text: &str) -> String {
+/// JSON-RPC methods whose params carry transaction signatures.
+const SIGNATURE_METHODS: &[&str] = &[
+    "getTransaction",
+    "getConfirmedTransaction",
+    "getParsedTransaction",
+    "getSignatureStatuses",
+    "getSignaturesForAddress",
+    "signatureSubscribe",
+];
+
+/// `text` without the base58 runs decoding to 64 bytes (a transaction signature and an Ed25519
+/// secret key share that shape) that are not named as keys, and [`Level::Blob`] if one of them
+/// was not named as a signature either. A run is a key after a name such as `secretKey`,
+/// `private_key`, `keypair` or `seed` (left in for [`redact::contains_key_material`]); a
+/// signature after `tx`, `sig` or `*signature` (path segment, query key or JSON key) or inside
+/// the params of a [`SIGNATURE_METHODS`] JSON-RPC call (dropped); anything else is a blob.
+fn base58_runs(text: &str) -> (String, Level) {
+    let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(['/', '=']) {
-        let (head, tail) = rest.split_at(i + 1);
-        out.push_str(head);
-        let before = head[..head.len() - 1]
-            .rsplit(['/', '?', '&'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let run = tail
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .unwrap_or(tail.len());
-        if matches!(
-            before.as_str(),
-            "tx" | "txs" | "transaction" | "transactions" | "signature" | "sig"
-        ) && bs58::decode(&tail[..run])
-            .into_vec()
-            .is_ok_and(|v| v.len() == 64)
-        {
-            rest = &tail[run..];
-        } else {
-            rest = tail;
+    let mut level = Level::None;
+    let mut rpc: Option<Vec<String>> = None;
+    let mut cursor = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_base58_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_base58_byte(bytes[i]) {
+            i += 1;
+        }
+        let run = &text[start..i];
+        if !redact::is_base58_secret_key(run) {
+            continue;
+        }
+        let name = name_before(&text[..start]);
+        if names_key(&name) {
+            continue;
+        }
+        let signature = names_signature(&name)
+            || rpc
+                .get_or_insert_with(|| rpc_signature_params(text))
+                .iter()
+                .any(|s| s == run);
+        if !signature {
+            level = Level::Blob;
+        }
+        out.push_str(&text[cursor..start]);
+        cursor = i;
+    }
+    out.push_str(&text[cursor..]);
+    (out, level)
+}
+
+fn is_base58_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l')
+}
+
+/// The lowercase name right before a value: a path segment, query key, flag or JSON key.
+fn name_before(head: &str) -> String {
+    let head = head.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ':' | '=' | '/' | '[')
+    });
+    let ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let from = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !ident(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    head[from..].to_ascii_lowercase()
+}
+
+fn names_key(name: &str) -> bool {
+    ["secret", "priv", "keypair", "seed", "mnemonic", "wallet"]
+        .iter()
+        .any(|w| name.contains(w))
+        || name.ends_with("key")
+        || name.ends_with("keys")
+        || name.trim_start_matches('-') == "sk"
+}
+
+fn names_signature(name: &str) -> bool {
+    matches!(
+        name,
+        "tx" | "txs" | "txn" | "txid" | "txids" | "txhash" | "transaction" | "transactions"
+    ) || ["signature", "signatures", "sig", "sigs"]
+        .iter()
+        .any(|s| name.ends_with(s))
+}
+
+/// Every string in the params of a [`SIGNATURE_METHODS`] JSON-RPC call (single or batch) in
+/// `text`, read whole or line by line.
+fn rpc_signature_params(text: &str) -> Vec<String> {
+    fn strings(value: &Value, depth: usize, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) if depth < MAX_PAYLOAD_DEPTH => {
+                items.iter().for_each(|v| strings(v, depth + 1, out))
+            }
+            Value::Object(map) if depth < MAX_PAYLOAD_DEPTH => {
+                map.values().for_each(|v| strings(v, depth + 1, out))
+            }
+            _ => {}
         }
     }
-    out.push_str(rest);
+    fn calls(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|v| calls(v, out)),
+            Value::Object(map) => {
+                let method = map.get("method").and_then(Value::as_str);
+                if method.is_some_and(|m| SIGNATURE_METHODS.contains(&m)) {
+                    if let Some(params) = map.get("params") {
+                        strings(params, 0, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if !text.contains("\"method\"") {
+        return out;
+    }
+    match serde_json::from_str::<Value>(text.trim()) {
+        Ok(value) => calls(&value, &mut out),
+        Err(_) => text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+            .for_each(|v| calls(&v, &mut out)),
+    }
     out
 }
 
@@ -1460,5 +1578,58 @@ mod tests {
         let secret = format!("?k={}", "ghp_".to_string() + &"a1B2".repeat(10));
         assert_eq!(scan(&secret, 0, &mut b), Level::Secret);
         assert_eq!(b64_decode("WzEsMiwzLDRd").unwrap(), b"[1,2,3,4]");
+    }
+
+    #[test]
+    fn base58_signatures_and_keys() {
+        let s = bs58::encode([7u8; 64]).into_string();
+        let level = |text: String| {
+            let mut b = MAX_DECODE_BYTES;
+            scan(&text, 0, &mut b)
+        };
+        assert_eq!(level(format!("/tx/{s}")), Level::None);
+        assert_eq!(level(format!("?txn_signature={s}")), Level::None);
+        assert_eq!(level(format!(r#"{{"sig": "{s}"}}"#)), Level::None);
+        assert_eq!(
+            level(format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["{s}"]}}"#
+            )),
+            Level::None
+        );
+        assert_eq!(level(format!("?v={s}")), Level::Blob);
+        assert_eq!(level(s.clone()), Level::Blob);
+        assert_eq!(
+            level(format!(r#"{{"method":"getBalance","params":["{s}"]}}"#)),
+            Level::Blob
+        );
+        for named in [
+            format!(r#"{{"secretKey":"{s}"}}"#),
+            format!("private_key={s}"),
+            format!("--keypair {s}"),
+            format!("/sk/{s}"),
+            format!(r#"{{"method":"getTransaction","params":[{{"privateKey":"{s}"}}]}}"#),
+        ] {
+            assert_eq!(level(named.clone()), Level::Secret, "{named}");
+        }
+        let arr: Vec<String> = (0..64).map(|i| i.to_string()).collect();
+        assert_eq!(level(format!("[{}]", arr.join(","))), Level::Secret);
+    }
+
+    #[test]
+    fn url_keys() {
+        for k in [
+            "url",
+            "uri",
+            "href",
+            "urls",
+            "webhookurl",
+            "redirect_uri",
+            "endpoints",
+        ] {
+            assert!(is_url_key(k), "{k}");
+        }
+        for k in ["command", "name", "query", "path", "rules"] {
+            assert!(!is_url_key(k), "{k}");
+        }
     }
 }
