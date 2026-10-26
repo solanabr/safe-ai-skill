@@ -48,7 +48,7 @@ const MAX_ANCESTORS: usize = 6;
 /// concern. A command holding none is no opinion without parsing.
 const TRIGGERS: &[&str] = &[
     "curl", "wget", "npx", "npm", "pnp", "yarn", "bun", "uv", "pipx", "cargo", "iex", "invoke-",
-    "node", "tsx", "deno",
+    "node", "tsx", "deno", "go",
 ];
 
 /// Hosts of the official installers a download-and-run is expected from: Anza's and Solana's
@@ -86,6 +86,108 @@ const NPM_ALLOW_SCOPES: &[&str] = &[
     "@solana-developers/",
     "@coral-xyz/",
     "@metaplex-foundation/",
+];
+
+/// The packages High lets a runner fetch undeclared: ai-kit's `KIT_FETCH_EXEC_ALLOW`
+/// (`.claude/hooks/fetch-exec-guard.sh:165-174`, main@72aca8c), exact names per ecosystem —
+/// the packages the kit's own commands run (`/scaffold`, `/generate-idl-client`, `/doctor`).
+/// Relaxed and Medium use the wider [`NPM_ALLOW`] / [`NPM_ALLOW_SCOPES`].
+const HIGH_NPM_ALLOW: &[&str] = &[
+    "create-solana-dapp",
+    "create-next-app",
+    "codama",
+    "solana-mobile",
+    "@colosseum-org/copilot-connect",
+    "@stbr/safe-ai-skill",
+];
+
+/// Crates High lets `cargo install` fetch undeclared (the kit's `rust|shank-cli`).
+const HIGH_CRATE_ALLOW: &[&str] = &["shank-cli"];
+
+/// The one `cargo install --git` High allows: the kit's `rust|avm --git
+/// https://github.com/solana-foundation/anchor`, matched whole.
+const HIGH_CARGO_GIT_ALLOW: (&str, &str) = ("avm", "https://github.com/solana-foundation/anchor");
+
+/// `cargo install` options whose next word is their value (the kit's `rust_optarg`).
+const CARGO_VALUE_FLAGS: &[&str] = &[
+    "--vers",
+    "--branch",
+    "--tag",
+    "--rev",
+    "--root",
+    "--target",
+    "--profile",
+    "--bin",
+    "--example",
+    "--features",
+    "--target-dir",
+    "--config",
+    "--message-format",
+    "--artifact-dir",
+    "-F",
+    "-j",
+    "--jobs",
+    "-Z",
+];
+
+/// `go run|install` flags whose next word is their value (the kit's `go_scan`).
+const GO_VALUE_FLAGS: &[&str] = &[
+    "-exec",
+    "-o",
+    "-tags",
+    "-mod",
+    "-ldflags",
+    "-gcflags",
+    "-asmflags",
+    "-buildmode",
+    "-overlay",
+    "-pkgdir",
+    "-toolexec",
+    "-covermode",
+    "-p",
+    "-C",
+];
+
+/// Wrappers the shell parser does not strip (`flock /tmp/l npx …`) or strips only partly
+/// (`nice --adj 5 uvx …` leaves `5` as the program).
+const LOCAL_WRAPPERS: &[&str] = &[
+    "flock",
+    "nice",
+    "ionice",
+    "taskset",
+    "chrt",
+    "timeout",
+    "nohup",
+    "arch",
+    "caffeinate",
+    "stdbuf",
+    "setsid",
+    "unshare",
+    "setpriv",
+    "numactl",
+    "cpulimit",
+    "systemd-run",
+    "time",
+    "sudo",
+    "doas",
+    "env",
+];
+
+/// Programs this gate reads behind a wrapper.
+const GATED_PROGRAMS: &[&str] = &[
+    "npx",
+    "pnpx",
+    "bunx",
+    "npm",
+    "pnpm",
+    "yarn",
+    "bun",
+    "uvx",
+    "uv",
+    "pipx",
+    "cargo",
+    "cargo-binstall",
+    "go",
 ];
 
 /// GitHub organizations `cargo install --git` may build from: Solana Labs, Anza, Anchor
@@ -142,7 +244,7 @@ pub fn decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<
         return None;
     }
     let mut found = Vec::new();
-    scan(command, cwd, 0, &mut found);
+    scan(command, cwd, tier, 0, &mut found);
     let install = policy.supply_chain.exec_install_scripts.as_str();
     found.retain(|f| !(matches!(f, Finding::FetchRun(_)) && install == "allow"));
     found.sort();
@@ -167,7 +269,9 @@ fn may_concern(command: &str) -> bool {
     if command.contains("$'") {
         return true;
     }
-    let plain: Vec<u8> = command
+    // A backslash-newline is deleted before the shell reads words (`np\⏎x`).
+    let joined = command.replace("\\\n", "");
+    let plain: Vec<u8> = joined
         .bytes()
         .filter(|b| !matches!(b, b'"' | b'\'' | b'\\'))
         .map(|b| b.to_ascii_lowercase())
@@ -178,7 +282,7 @@ fn may_concern(command: &str) -> bool {
 }
 
 /// Collect the findings of `text` (the command, or a `-c` script in it) into `out`.
-fn scan(text: &str, cwd: &Path, depth: usize, out: &mut Vec<Finding>) {
+fn scan(text: &str, cwd: &Path, tier: Tier, depth: usize, out: &mut Vec<Finding>) {
     if let Some(reason) = powershell(text) {
         out.push(Finding::FetchRun(reason));
     }
@@ -198,10 +302,16 @@ fn scan(text: &str, cwd: &Path, depth: usize, out: &mut Vec<Finding>) {
         if let Some(reason) = fetched_code(cmd) {
             out.push(Finding::FetchRun(reason));
         }
-        if let Some(reason) = runner(cmd, cwd) {
-            out.push(Finding::Unpinned(reason));
-        }
-        if let Some(reason) = cargo_git(cmd) {
+        let words = effective_words(&cmd.words);
+        for reason in [
+            runner(words, cwd, tier),
+            cargo_install(words, cwd, tier),
+            go_fetch(words, cwd, tier),
+            uv_run_with(words, cwd, tier),
+        ]
+        .into_iter()
+        .flatten()
+        {
             out.push(Finding::Unpinned(reason));
         }
         if let Some(reason) = mainnet_script(cmd, text, &parsed.assigned_values, cwd) {
@@ -747,8 +857,8 @@ struct RunnerCall {
 
 /// An ask reason when `cmd` runs a one-shot runner of a package `cwd`'s project does not
 /// declare and the allowlists do not name.
-fn runner(cmd: &SimpleCommand, cwd: &Path) -> Option<String> {
-    let call = runner_call(&cmd.words)?;
+fn runner(words: &[Word], cwd: &Path, tier: Tier) -> Option<String> {
+    let call = runner_call(words)?;
     let mut project: Option<Project> = None;
     for pkg in &call.packages {
         let spec = pkg.text.as_str();
@@ -759,7 +869,12 @@ fn runner(cmd: &SimpleCommand, cwd: &Path) -> Option<String> {
             Ecosystem::Npm => npm_name(spec),
             Ecosystem::Python => py_name(spec),
         };
-        if !pkg.dynamic && call.eco == Ecosystem::Npm && npm_allowed(&name) {
+        let allowed = if tier == Tier::High {
+            HIGH_NPM_ALLOW.contains(&name.as_str())
+        } else {
+            npm_allowed(&name)
+        };
+        if !pkg.dynamic && call.eco == Ecosystem::Npm && allowed {
             continue;
         }
         if !pkg.dynamic {
@@ -1048,37 +1163,329 @@ fn read_capped(path: &Path, cap: u64) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // cargo install --git
 
-/// An ask reason for `cargo install --git URL` outside [`CARGO_GIT_ORGS`] on github.com.
-fn cargo_git(cmd: &SimpleCommand) -> Option<String> {
-    if cmd.program() != "cargo" {
-        return None;
+/// `words` with the wrappers [`LOCAL_WRAPPERS`] removed, when one leads, together with their
+/// option values (flags, numbers, paths): `flock /tmp/l npx -y x` → `npx -y x`. A gated
+/// program spelled as a path (`/opt/homebrew/bin/npx`) is kept.
+fn effective_words(words: &[Word]) -> &[Word] {
+    let Some(first) = words.first() else {
+        return words;
+    };
+    let program = base_name(&first.text);
+    if !LOCAL_WRAPPERS.contains(&program.as_str()) && !is_value_word(&program) {
+        return words;
     }
-    let mut words = cmd
-        .words
-        .iter()
-        .skip(1)
-        .skip_while(|w| w.text.starts_with('+'));
-    if words.next().map(|w| w.text.as_str()) != Some("install") {
-        return None;
-    }
-    let rest: Vec<&Word> = words.collect();
-    let url = rest.iter().enumerate().find_map(|(i, w)| {
-        if let Some(v) = w.text.strip_prefix("--git=") {
-            Some((v.to_string(), w.dynamic))
-        } else if w.text == "--git" {
-            rest.get(i + 1).map(|n| (n.text.clone(), n.dynamic))
-        } else {
-            None
+    let mut i = 1;
+    while let Some(word) = words.get(i) {
+        let text = word.text.as_str();
+        let base = base_name(text);
+        if GATED_PROGRAMS.contains(&base.as_str()) {
+            break;
         }
+        if text.starts_with('-')
+            || text.contains('/')
+            || is_value_word(text)
+            || LOCAL_WRAPPERS.contains(&base.as_str())
+        {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    words.get(i..).unwrap_or_default()
+}
+
+/// Whether `word` reads as an option value (`5`, `0x1`, `1.5`, `+10`), not a program.
+fn is_value_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.starts_with(|c: char| c.is_ascii_digit() || c == '+')
+        && word
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, 'x' | '.' | ',' | '+' | '-'))
+}
+
+/// `cargo install`, `cargo binstall` and `cargo-binstall` (the kit's `rust_scan`,
+/// `fetch-exec-guard.awk:244-268`).
+///
+/// A `--git` source asks at Relaxed and Medium unless it is an official org's repository
+/// ([`official_git`]); at High only [`HIGH_CARGO_GIT_ALLOW`] passes. A registry crate, and an
+/// `--index`/`--registry` source, are no opinion at Relaxed and Medium (the kit reports and
+/// passes) and denied at High unless the project declares the crate (Cargo.toml dependencies,
+/// Cargo.lock) or it is on [`HIGH_CRATE_ALLOW`]. `--path`, `--list` and a bare `--version` fetch
+/// nothing.
+fn cargo_install(words: &[Word], cwd: &Path, tier: Tier) -> Option<String> {
+    let program = base_name(&words.first()?.text);
+    let mut rest = words.iter().skip(1).skip_while(|w| w.text.starts_with('+'));
+    let runner = match program.as_str() {
+        "cargo-binstall" => "cargo-binstall",
+        "cargo" => match rest.next().map(|w| w.text.as_str()) {
+            Some("install") => "cargo install",
+            Some("binstall") => "cargo binstall",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let rest: Vec<&Word> = rest.collect();
+    let mut git: Option<&Word> = None;
+    let mut git_text = String::new();
+    let mut registry = false;
+    let mut crates: Vec<&Word> = Vec::new();
+    let mut i = 0;
+    while let Some(word) = rest.get(i) {
+        let text = word.text.as_str();
+        i += 1;
+        if text == "--" {
+            continue;
+        }
+        if text == "--path" || text.starts_with("--path=") || text == "--list" {
+            return None;
+        }
+        let (name, attached) = match text.split_once('=') {
+            Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+            _ => (text, None),
+        };
+        if matches!(name, "--git" | "--index" | "--registry") {
+            let value = match attached {
+                Some(v) => Some((v.to_string(), *word)),
+                None => {
+                    i += 1;
+                    rest.get(i - 1).map(|n| (n.text.clone(), *n))
+                }
+            };
+            if name == "--git" {
+                if let Some((v, w)) = value {
+                    git_text = v;
+                    git = Some(w);
+                }
+            } else {
+                registry = true;
+            }
+            continue;
+        }
+        if text == "--version" || text == "-V" {
+            if i >= rest.len() {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        if text.starts_with('-') {
+            if CARGO_VALUE_FLAGS.contains(&text) {
+                i += 1;
+            }
+            continue;
+        }
+        crates.push(word);
+    }
+    let high = tier == Tier::High;
+    if let Some(git_word) = git {
+        let url = git_text.as_str();
+        let allowed = if high {
+            !git_word.dynamic
+                && crates.len() == 1
+                && crates
+                    .iter()
+                    .all(|c| (c.text.as_str(), url) == HIGH_CARGO_GIT_ALLOW && !c.dynamic)
+        } else {
+            !git_word.dynamic && official_git(url)
+        };
+        if allowed {
+            return None;
+        }
+        return Some(format!(
+            "`{runner} --git` builds and installs code from {url}, which is not a Solana Labs, \
+             Anza, Anchor or Solana Foundation repository the firewall allows — check the \
+             source, or approve to proceed."
+        ));
+    }
+    if !high {
+        return None;
+    }
+    if registry {
+        return Some(format!(
+            "`{runner}` fetches from a custom registry or index, which High does not allow — \
+             install from crates.io as a declared dependency, or drop to medium."
+        ));
+    }
+    let manifests = RustManifests::load(cwd);
+    let undeclared = crates.iter().find(|c| {
+        let name = c.text.split('@').next().unwrap_or(&c.text);
+        c.dynamic || !(HIGH_CRATE_ALLOW.contains(&name) || manifests.declares(name))
     })?;
-    let (url, dynamic) = url;
-    if !dynamic && official_git(&url) {
+    Some(format!(
+        "`{runner}` downloads and builds `{}`, which this project's Cargo.toml or Cargo.lock does \
+         not declare — add it as a dependency, or drop to medium.",
+        undeclared.text
+    ))
+}
+
+/// `Cargo.toml` dependency keys and `Cargo.lock` package names from the cwd upwards.
+struct RustManifests {
+    deps: Vec<String>,
+    locks: Vec<String>,
+}
+
+impl RustManifests {
+    fn load(cwd: &Path) -> RustManifests {
+        let mut deps = Vec::new();
+        let mut locks = Vec::new();
+        for dir in cwd.ancestors().take(MAX_ANCESTORS + 1) {
+            if let Some(text) = read_capped(&dir.join("Cargo.toml"), MAX_MANIFEST_BYTES) {
+                deps.extend(cargo_toml_deps(&text));
+            }
+            locks.extend(read_capped(&dir.join("Cargo.lock"), MAX_LOCK_BYTES));
+            if crate::localfs::exists(dir.join(".git")) {
+                break;
+            }
+        }
+        RustManifests { deps, locks }
+    }
+
+    fn declares(&self, name: &str) -> bool {
+        let needle = format!("name = \"{name}\"");
+        self.deps.iter().any(|d| d == name) || self.locks.iter().any(|l| l.contains(&needle))
+    }
+}
+
+/// The keys of every `[*dependencies]` table of a `Cargo.toml` (the kit's `dep_rust`).
+fn cargo_toml_deps(text: &str) -> Vec<String> {
+    let mut deps = Vec::new();
+    let mut in_deps = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_deps = line.ends_with("dependencies]");
+            continue;
+        }
+        if !in_deps || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            deps.push(key.trim().trim_matches('"').to_string());
+        }
+    }
+    deps
+}
+
+/// `go install pkg@version` / `go run pkg@version` (the kit's `go_scan`,
+/// `fetch-exec-guard.awk:270-286`): no opinion at Relaxed and Medium, denied at High unless the
+/// module is in the project's `go.mod`. Without `@version` Go only builds local code.
+fn go_fetch(words: &[Word], cwd: &Path, tier: Tier) -> Option<String> {
+    if tier != Tier::High || base_name(&words.first()?.text) != "go" {
+        return None;
+    }
+    let sub = words.get(1)?.text.as_str();
+    if !matches!(sub, "install" | "run") {
+        return None;
+    }
+    let mut i = 2;
+    let operand = loop {
+        let word = words.get(i)?;
+        let text = word.text.as_str();
+        i += 1;
+        if text == "--" {
+            continue;
+        }
+        if GO_VALUE_FLAGS.contains(&text) {
+            i += 1;
+            continue;
+        }
+        if !text.starts_with('-') {
+            break word;
+        }
+    };
+    let spec = operand.text.as_str();
+    if !spec.contains('@') || is_local_spec(spec) {
+        return None;
+    }
+    let module = spec.split('@').next().unwrap_or(spec);
+    if !operand.dynamic && go_mod_declares(cwd, module) {
         return None;
     }
     Some(format!(
-        "`cargo install --git` builds and installs code from {url}, which is not a Solana Labs, \
-         Anza, Anchor or Solana Foundation repository — check the source, or approve to proceed."
+        "`go {sub}` downloads and runs `{spec}`, which this project's go.mod does not declare — \
+         add it to go.mod, or drop to medium."
     ))
+}
+
+/// Whether a `go.mod` from the cwd upwards requires `module` or a module it lies under.
+fn go_mod_declares(cwd: &Path, module: &str) -> bool {
+    for dir in cwd.ancestors().take(MAX_ANCESTORS + 1) {
+        if let Some(text) = read_capped(&dir.join("go.mod"), MAX_MANIFEST_BYTES) {
+            for raw in text.lines() {
+                let line = raw.trim();
+                let line = line.strip_prefix("require").map_or(line, str::trim_start);
+                let name = line.split_whitespace().next().unwrap_or("");
+                if matches!(name, "" | "module" | "go" | "toolchain" | "(" | ")")
+                    || name.starts_with("//")
+                {
+                    continue;
+                }
+                if module == name || module.starts_with(&format!("{name}/")) {
+                    return true;
+                }
+            }
+        }
+        if crate::localfs::exists(dir.join(".git")) {
+            break;
+        }
+    }
+    false
+}
+
+/// `uv run --with PKG …` (the kit's `py_with_scan`, `fetch-exec-guard.awk:222-234`): an
+/// ephemeral environment around a downloaded package. No opinion at Relaxed and Medium, denied
+/// at High unless the project's Python manifests declare it. A bare `uv run` uses the project's
+/// own dependencies.
+fn uv_run_with(words: &[Word], cwd: &Path, tier: Tier) -> Option<String> {
+    if tier != Tier::High
+        || base_name(&words.first()?.text) != "uv"
+        || words.get(1).map(|w| w.text.as_str()) != Some("run")
+    {
+        return None;
+    }
+    let mut packages: Vec<Word> = Vec::new();
+    let mut i = 2;
+    while let Some(word) = words.get(i) {
+        let text = word.text.as_str();
+        i += 1;
+        if text == "-w" || text == "--with" {
+            packages.extend(words.get(i).cloned());
+            i += 1;
+        } else if let Some(v) = text
+            .strip_prefix("--with=")
+            .or_else(|| text.strip_prefix("-w="))
+        {
+            packages.push(Word {
+                text: v.to_string(),
+                ..word.clone()
+            });
+        }
+    }
+    let mut project: Option<Project> = None;
+    for pkg in packages.iter().flat_map(|p| {
+        p.text.split(',').map(move |t| Word {
+            text: t.trim().to_string(),
+            ..p.clone()
+        })
+    }) {
+        if pkg.text.is_empty() || (!pkg.dynamic && is_local_spec(&pkg.text)) {
+            continue;
+        }
+        let name = py_name(&pkg.text);
+        if !pkg.dynamic {
+            let project = project.get_or_insert_with(|| Project::load(cwd, Ecosystem::Python));
+            if project.declares(&name, Ecosystem::Python, false) {
+                continue;
+            }
+        }
+        return Some(format!(
+            "`uv run --with` downloads and runs `{}`, which this project's pyproject.toml, \
+             requirements or lockfile does not declare — add it as a dependency, or drop to \
+             medium.",
+            pkg.text
+        ));
+    }
+    None
 }
 
 /// Whether a git URL is on github.com under one of [`CARGO_GIT_ORGS`].
@@ -1302,6 +1709,99 @@ mod tests {
             decide(cmd, &dir, &policy, Tier::Relaxed),
             Some(Verdict::Deny(_))
         ));
+    }
+
+    fn high(command: &str) -> Option<Verdict> {
+        decide(
+            command,
+            &std::env::temp_dir(),
+            &Policy::default(),
+            Tier::High,
+        )
+    }
+
+    #[test]
+    fn high_ports_the_kit_fetch_exec_rule() {
+        let denied = [
+            "uv run --with some-random-pkg script.py",
+            "cargo install some-random-crate",
+            "cargo binstall some-random-crate",
+            "cargo-binstall some-random-crate",
+            "go install github.com/x/y@latest",
+            "go run github.com/x/y@v1.2.3",
+            "flock /tmp/l npx -y evil-pkg",
+            "nice -n 5 cargo install ripgrep",
+            "nice --adj 5 uvx some-random-cli",
+            "if true; then cargo install some-random-crate; fi",
+            "cargo \\\ninstall some-random-crate",
+            "np\\\nx -y some-random-cli",
+            "cargo install create-solana-dapp",
+            "cargo install codama",
+            "go install solana-mobile@latest",
+            "cargo install shank-cli-evil",
+            "cargo install evil-shank-cli",
+            "cargo install --git https://github.com/solana-foundation/anchor.git avm",
+            "cargo install --git https://github.com/solana-foundation/anchor avm-evil",
+            "cargo install --git https://github.com/solana-foundation/anchor",
+            "cargo install avm",
+            "cargo install --git https://github.com/coral-xyz/anchor avm",
+            "npx -y @solana/some-tool",
+        ];
+        for cmd in denied {
+            assert!(matches!(high(cmd), Some(Verdict::Deny(_))), "{cmd}");
+        }
+        let passed = [
+            "cargo install shank-cli",
+            "cargo install --git https://github.com/solana-foundation/anchor avm",
+            "npx create-solana-dapp@latest my-app",
+            "npx -y codama run js",
+            "cargo install --path .",
+            "cargo install --list",
+            "go install ./cmd/x",
+            "go run .",
+            "uv run script.py",
+            "cargo build",
+        ];
+        for cmd in passed {
+            assert_eq!(high(cmd), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn relaxed_keeps_new_forms_silent() {
+        for cmd in [
+            "cargo install --locked anchor-cli",
+            "cargo install some-random-crate",
+            "cargo binstall some-random-crate",
+            "go install github.com/x/y@latest",
+            "uv run --with some-random-pkg script.py",
+            "cargo install --git https://github.com/coral-xyz/anchor avm --locked",
+        ] {
+            assert!(!ask(cmd), "{cmd}");
+        }
+        assert!(ask("flock /tmp/l npx -y evil-pkg"));
+        assert!(ask("np\\\nx -y some-random-cli"));
+    }
+
+    #[test]
+    fn declared_crates_and_modules_pass_at_high() {
+        let dir = std::env::temp_dir().join(format!("fx-w4b-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"x\"\n[dev-dependencies]\nsome-random-crate = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("go.mod"),
+            "module m\nrequire (\n\tgithub.com/x/y v1.2.3\n)\n",
+        )
+        .unwrap();
+        let at = |c: &str| decide(c, &dir, &Policy::default(), Tier::High);
+        assert_eq!(at("cargo install some-random-crate"), None);
+        assert_eq!(at("go install github.com/x/y/cmd/z@v1.2.3"), None);
+        assert!(at("go install github.com/x/other@v1").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

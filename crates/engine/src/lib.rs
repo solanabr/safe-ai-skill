@@ -35,6 +35,7 @@ pub mod datadir;
 pub mod doctor;
 pub mod env;
 pub mod error;
+pub mod firewall;
 pub mod gate;
 pub mod gates;
 pub mod grants;

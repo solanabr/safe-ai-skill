@@ -554,6 +554,22 @@
         "exit": 0,
         "stdout": ""
       }
+    },
+    {
+      "name": "gate-config: theme change",
+      "args": [
+        "gate-config"
+      ],
+      "stdin": {
+        "hook_event_name": "ConfigChange",
+        "session_id": "conf",
+        "cwd": "{cwd}",
+        "source": "user_settings"
+      },
+      "expect": {
+        "exit": 0,
+        "stdout": ""
+      }
     }
   ]
 }

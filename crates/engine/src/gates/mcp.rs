@@ -3,9 +3,114 @@
 use serde_json::Value;
 
 use crate::context::Context;
-use crate::gate::{GateMeta, Scope};
+use crate::gate::{GateMeta, Scope, Verdict};
 use crate::io::Decision;
+use crate::policy::tier::Tier;
 use crate::policy::Policy;
+
+/// One of ai-kit's MCP tool-name denies (`firewall.sh` `DENY_MCP_*`): the tool on `server`
+/// is refused by name from tier `from` up, whatever its arguments.
+struct NameRule {
+    server: &'static str,
+    tool: &'static str,
+    from: Tier,
+    what: &'static str,
+}
+
+/// ai-kit's tool-name denies, tier for tier. Medium and High refuse context-mode's executor,
+/// fetcher and directory indexer (P17) and Playwright's code runner and raw HTTP client
+/// (P18); High also refuses Playwright's in-page evaluator (P18) and Cloudflare's `execute`
+/// (P19). Off and Relaxed keep every tool and rely on the content checks.
+const NAME_RULES: &[NameRule] = &[
+    NameRule {
+        server: "context-mode",
+        tool: "ctx_execute",
+        from: Tier::Medium,
+        what: "runs arbitrary code outside the OS sandbox",
+    },
+    NameRule {
+        server: "context-mode",
+        tool: "ctx_execute_file",
+        from: Tier::Medium,
+        what: "runs arbitrary code outside the OS sandbox",
+    },
+    NameRule {
+        server: "context-mode",
+        tool: "ctx_batch_execute",
+        from: Tier::Medium,
+        what: "runs arbitrary commands outside the OS sandbox",
+    },
+    NameRule {
+        server: "context-mode",
+        tool: "ctx_fetch_and_index",
+        from: Tier::Medium,
+        what: "fetches any URL outside the OS sandbox",
+    },
+    NameRule {
+        server: "context-mode",
+        tool: "ctx_index",
+        from: Tier::Medium,
+        what: "indexes any directory outside the read fence",
+    },
+    NameRule {
+        server: "playwright",
+        tool: "browser_run_code_unsafe",
+        from: Tier::Medium,
+        what: "runs arbitrary code in the Playwright process",
+    },
+    NameRule {
+        server: "playwright",
+        tool: "browser_network_request",
+        from: Tier::Medium,
+        what: "sends arbitrary HTTP requests outside the OS sandbox",
+    },
+    NameRule {
+        server: "playwright",
+        tool: "browser_evaluate",
+        from: Tier::High,
+        what: "runs arbitrary JavaScript in the page",
+    },
+    NameRule {
+        server: "cloudflare",
+        tool: "execute",
+        from: Tier::High,
+        what: "runs arbitrary JavaScript against the Cloudflare API",
+    },
+];
+
+/// ai-kit's tool-name rule for `tool_name` at `tier`: a deny when the tool is one the kit
+/// refuses by name at that tier (see [`NAME_RULES`]), `None` otherwise.
+///
+/// The server segment matches its name as added (`mcp__context-mode__…`) or as a plugin
+/// registers it (`mcp__plugin_<plugin>_context-mode__…`); the tool segment matches exactly.
+/// No allocation; below Medium it returns at the first comparison.
+pub fn decide_name(tool_name: &str, tier: Tier) -> Option<Verdict> {
+    if tier < Tier::Medium {
+        return None;
+    }
+    let rest = tool_name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    let rule = NAME_RULES
+        .iter()
+        .find(|r| r.tool == tool && tier >= r.from && server_is(server, r.server))?;
+    Some(Verdict::Deny(format!(
+        "safe-ai-skill refuses `{tool}` by name at tier {}, because it {}; run the work through \
+         Bash, where the sandbox and the Bash gates apply, or lower the tier with \
+         `safe-ai-skill tier`.",
+        tier.label(),
+        rule.what
+    )))
+}
+
+/// Whether the server segment `seg` is `name`, as added or under a plugin prefix
+/// (`plugin_<plugin>_<name>`).
+fn server_is(seg: &str, name: &str) -> bool {
+    seg == name
+        || (seg.starts_with("plugin_")
+            && seg.len() > name.len()
+            && seg.ends_with(name)
+            && seg.as_bytes()[seg.len() - name.len() - 1] == b'_')
+}
 
 /// Gate a sensitive MCP tool call.
 ///
@@ -29,7 +134,12 @@ pub fn decide(
     _ctx: &Context,
     policy: &Policy,
 ) -> (Decision, GateMeta) {
-    // High-risk MCP class gating runs first: a known-dangerous server/tool (wallet
+    // ai-kit's tool-name denies come first: from their tier up, the tool is refused whatever
+    // its arguments, under a hard guard so no grant lifts it.
+    if let Some(verdict) = decide_name(tool_name, policy.tier()) {
+        return (verdict.into(), GateMeta::new(Scope::Other, true));
+    }
+    // High-risk MCP class gating runs next: a known-dangerous server/tool (wallet
     // signing, key custody, …) is gated even when its verb is absent from the
     // sensitive-name pattern (e.g. `signTransaction` — "sign" *is* in the pattern, but
     // `signMessage` and key-custody surfaces may not be). This is the kit's most
@@ -616,6 +726,29 @@ fn truncate(addr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_rule_server_segment() {
+        assert!(server_is("context-mode", "context-mode"));
+        assert!(server_is(
+            "plugin_context-mode_context-mode",
+            "context-mode"
+        ));
+        assert!(!server_is("my-context-mode", "context-mode"));
+        assert!(!server_is("plugin_xcontext-mode", "context-mode"));
+        assert!(!server_is("context-mode2", "context-mode"));
+        assert!(decide_name("mcp__context-mode", Tier::High).is_none());
+        assert!(decide_name("context-mode__ctx_execute", Tier::High).is_none());
+        let Some(Verdict::Deny(reason)) = decide_name("mcp__cloudflare__execute", Tier::High)
+        else {
+            panic!("cloudflare execute is denied at high");
+        };
+        assert!(
+            reason.contains("`execute`") && reason.contains("tier high"),
+            "{reason}"
+        );
+        assert!(reason.ends_with("`safe-ai-skill tier`."), "{reason}");
+    }
     use serde_json::json;
     use std::path::Path;
 

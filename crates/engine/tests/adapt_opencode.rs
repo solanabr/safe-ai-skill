@@ -774,7 +774,8 @@ fn path_lines_in_shell_startup_files_deny() {
         "write",
         json!({ "filePath": zshrc.to_str().unwrap(), "content": "alias ll='ls -la'\n" }),
     );
-    assert_eq!(label(&run), "");
+    // Any agent edit to a shell startup file is denied at every tier (ai-kit's P3 row).
+    assert_eq!(label(&run), "deny");
 }
 
 /// Re-review 3a: `dir/*` does not name `.opencode` or `opencode.json`.

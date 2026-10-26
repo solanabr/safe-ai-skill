@@ -93,6 +93,7 @@ contract:
 - **Engine crash** (signal, or exit not in {0, 2, 3}): `gate-bash`, `gate-mcp` and `gate-skill`
   exit 2 (block); the rest exit 0 with a stderr line.
 - **Verified-hash cache.** After a full sha256 match the shim records the binary's fingerprint (device, inode, size, mtime, ctime from `stat` at a fixed system path) beside the stamped hash in `$CLAUDE_PLUGIN_DATA/shim-verified-<platform>` (0600, owned by the binary's owner, not a symlink). A later call skips the hash and the executable-format probe only when that line equals the stamped hash plus the current fingerprint; anything else is a full check and only a pass is cached. A binary whose ctime does not predate the check is never cached. Off on Windows and when `CLAUDE_PLUGIN_DATA` is unset, relative or unwritable; `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off from any source. See SECURITY.md for the residual.
+- **Tools come from fixed system directories.** `fixed_tool` resolves `uname`, `grep`, `od`, `tr`, `cut`, `stat` and `date` (and the sha256 tool) from `/usr/bin`, `/bin` and `/run/current-system/sw/bin`, never from `PATH`, which a repository's settings `env` can set. Under the test seam (a `.sha-tools-from-path` file beside the shim) they come from `PATH`. A host with no `uname` there is an environment failure (reported as `no uname in …`), not an unsupported-platform fail-open; a missing `grep`, `od`, `tr` or `cut` degrades only the helper that used it.
 - `SAFE_AI_SKILL_STRICT=1` turns every unusable case into exit 2. `SAFE_AI_SKILL_DISABLE=1`
   turns the hooks off, but is ignored in strict mode or when the committed project
   `.claude/settings.json` mentions it; SessionStart reports either way.
@@ -103,7 +104,7 @@ contract:
   needs Claude Code 2.1.295 or newer; older versions ignore it, so a hook that can't start
   never blocks.
 
-`hooks.json` entries (matcher, subcommand, `onFailure`): `Bash` → `gate-bash` (block), `gate-bash-secrets`; `Write|Edit|MultiEdit|NotebookEdit` → `gate-tamper`; `Read|Grep|Glob` → `gate-read`; `WebFetch` → `gate-webfetch`; `mcp__.*` → `gate-mcp`; `Skill` → `gate-skill` (block); PostToolUse `Bash|Read|Grep|mcp__.*` → `redact`, `Bash` → `pending-notice`; PostToolUseFailure → `failure-notice`; UserPromptSubmit → `prompt-guard` and `gate-prompt-expansion`; UserPromptExpansion → `gate-prompt-expansion`; SessionStart → `verify session`. Every entry other than `gate-bash` and `gate-skill` is `continue`. The Codex template (`adapters/codex/hooks.json`) wires `gate-bash`, `gate-bash-secrets`, `gate-tamper` (on `apply_patch`) and `gate-mcp` only; the opencode plugin wires those plus `gate-read`. Neither has `gate-webfetch`.
+`hooks.json` entries (matcher, subcommand, `onFailure`): `Bash` → `gate-bash` (block), `gate-bash-secrets`; `Write|Edit|MultiEdit|NotebookEdit` → `gate-tamper`; `Read|Grep|Glob` → `gate-read`; `WebFetch` → `gate-webfetch`; `mcp__.*` → `gate-mcp`; ConfigChange (`user_settings|project_settings|local_settings`) → `gate-config`; `Skill` → `gate-skill` (block); PostToolUse `Bash|Read|Grep|mcp__.*` → `redact`, `Bash` → `pending-notice`; PostToolUseFailure → `failure-notice`; UserPromptSubmit → `prompt-guard` and `gate-prompt-expansion`; UserPromptExpansion → `gate-prompt-expansion`; SessionStart → `verify session`. Every entry other than `gate-bash` and `gate-skill` is `continue`. The Codex template (`adapters/codex/hooks.json`) wires `gate-bash`, `gate-bash-secrets`, `gate-tamper` (on `apply_patch`) and `gate-mcp` only; the opencode plugin wires those plus `gate-read`. Neither has `gate-webfetch`.
 
 CLI subcommands (not hooks) run the engine with live output and keep its exit status; an environment failure exits 1 (2 under `SAFE_AI_SKILL_STRICT`).
 
@@ -415,18 +416,56 @@ pub fn gates::exfil::decide_bash(command: &str, cwd: &Path, policy: &Policy, tie
 pub fn gates::exfil::decide_mcp(tool: &str, payload: Option<&Value>, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;
 pub fn gates::exfil::decide_webfetch(url: &str, prompt: &str, policy: &Policy, tier: Tier) -> Option<Verdict>;
 pub fn gates::fetchexec::decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;
+pub fn gates::gitguard::decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>;     // git and gh, run by gate-bash-secrets
+pub fn gates::gitguard::decide_git_config_risk(command: &str, tier: Tier) -> Option<Verdict>;                  // exec-capable config keys (tamper shares it)
+pub fn gates::gitguard::inner_commands(command: &str) -> Vec<String>;      // `submodule foreach` / `rebase --exec` strings, re-judged by every Bash gate
+pub fn gates::mcp::decide_name(tool_name: &str, tier: Tier) -> Option<Verdict>;   // NAME_RULES: refuse a tool by name from a tier up, before its arguments
+pub fn gates::tamper::decide_nested_claude_flags(command: &str, tier: Tier) -> Option<Verdict>; // weakening flags, `claude mcp add`, `setup-token`, `plugin disable`
+pub fn gates::configchange::decide(input: &Value) -> Option<Verdict>;      // ConfigChange: Deny only when the file now turns protection off
 pub fn gates::encoded::expand(command: &str) -> Vec<String>;      // decoded payload texts
 pub fn gates::encoded::decide(command: &str) -> Option<Verdict>;  // undecodable payload → Ask
 pub fn gates::envread::decide_bash(command: &str) -> Option<Verdict>;   // env dumps
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
+> `gitguard` runs inside `gate-bash-secrets`' tier verdict (`git_verdict` in `main.rs`) and
+> its `inner_commands` strings go back through `inner_text_verdict`, the same path decoded
+> payloads take. Off acts as Relaxed. `mcp::decide_name` runs first in `gate-mcp`, as a hard
+> guard. `tamper` also owns the `Surface` table (code-on-next-build files, managed settings,
+> a project's `.safe-ai-skill/`, and at High the user-scope `~/.claude` policy surface), applied
+> by `decide_file_content_at` and `decide_bash_writes` with the tier. `gate-config` reads
+> the settings file named by the `ConfigChange` payload and answers
+> `{"decision":"block","reason":…}` only when `tamper::settings_disable_reason` says the text
+> turns protection off; it has no previous text, so it cannot see a removal. `fetchexec` reads
+> `Cargo.toml`/`Cargo.lock`, `go.mod` and the Python manifests for its High rules. `credpaths`
+> adds the stores that environment variables move (`ENV_STORES`, rebuilt only when one of
+> those variables changes) and a hard-link check by device and inode.
 > `tamper` is the self-grant tripwire: `secrets::decide` runs `decide_bash_within`
 > first (with the hook payload's `cwd` as the session directory), sharing one work `Budget`
 > (units plus a 2 s deadline) with its own scan; exhausting it asks ("command too complex to
 > inspect"), never no opinion. `gate-tamper`
 > (`Write|Edit|MultiEdit|NotebookEdit`) runs `decide_file`, audits as `tamper`, and skips
 > `relax::apply`.
+
+### `firewall`
+```rust
+pub fn firewall::run(cmd: &Command, ctx: &Ctx) -> Outcome;          // Ok | Drift | Park | Error
+pub fn firewall::parse_args(rest: &[String]) -> Result<Command, String>;
+pub fn firewall::session_note(ctx: &Ctx) -> Option<String>;          // SessionStart drift line (T3)
+pub fn firewall::session_resync(ctx: &Ctx) -> Option<String>;        // re-apply an older rule set or a lower enforced tier (T6); never lowers
+```
+`safe-ai-skill firewall apply|show|check` writes the sandbox block and permission denies a
+plugin cannot ship into the project's `.claude/settings.local.json` (`target.rs` finds it, at the
+main checkout's root for a linked worktree). `rules.rs` holds the per-tier tables
+(`RULE_SET_VERSION`) ported from the kit; `merge.rs` adds and removes only the entries the record
+names and keeps user rules; `json.rs` edits the file preserving key order and indentation.
+It never writes `sandbox.enabled: false` (Off removes the key), writes atomically, and refuses a
+symlinked `.claude` or settings file. The record (tier, rule-set version, entries, scalars) is the
+MAC'd state file `firewall.json` in the data dir, never a key in the settings file. Raising applies
+at once; lowering parks a `PendingKind::Firewall` request for the confirmation code. `check`
+exits non-zero on drift. At High the output carries a caveat: Claude Code ignores repository
+`allowRead`/`allowWrite`, and counts `settings.local.json` as repository settings outside git or
+when tracked.
 
 ### `redact` / `promptguard`
 ```rust
@@ -580,12 +619,12 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 
 ## Subcommands (`main.rs`, complete)
 
-`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-webfetch` · `gate-tamper` · `gate-skill` ·
+`gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-webfetch` · `gate-tamper` · `gate-skill` · `gate-config` ·
 `gate-prompt-expansion` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`tier [<name>] [--project] [--env-read deny|tier] | --clear` (`mode` is a deprecated alias) · `revoke` · `status` · `--version`. `allow`, a tier lowering and
+`tier [<name>] [--project] [--env-read deny|tier] | --clear` (`mode` is a deprecated alias) · `firewall apply [<tier>] [--project] [--dry-run] | show | check` · `revoke` · `status` · `--version`. `allow`, a tier lowering and
 `verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
 an argument error exits 1.
 

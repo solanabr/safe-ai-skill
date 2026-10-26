@@ -1,0 +1,48 @@
+{"id": "P17-ctx_execute-relaxed", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P17-ctx_execute-medium", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P17-ctx_execute-high", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_execute_file-relaxed", "tool": "mcp__context-mode__ctx_execute_file", "tool_input": {"path": "README.md", "language": "python", "code": "print(len(FILE_CONTENT))"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P17-ctx_execute_file-medium", "tool": "mcp__context-mode__ctx_execute_file", "tool_input": {"path": "README.md", "language": "python", "code": "print(len(FILE_CONTENT))"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P17-ctx_execute_file-high", "tool": "mcp__context-mode__ctx_execute_file", "tool_input": {"path": "README.md", "language": "python", "code": "print(len(FILE_CONTENT))"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_batch_execute-relaxed", "tool": "mcp__context-mode__ctx_batch_execute", "tool_input": {"commands": [{"label": "ls", "command": "ls"}], "queries": ["files"]}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P17-ctx_batch_execute-medium", "tool": "mcp__context-mode__ctx_batch_execute", "tool_input": {"commands": [{"label": "ls", "command": "ls"}], "queries": ["files"]}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P17-ctx_batch_execute-high", "tool": "mcp__context-mode__ctx_batch_execute", "tool_input": {"commands": [{"label": "ls", "command": "ls"}], "queries": ["files"]}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_fetch_and_index-relaxed", "tool": "mcp__context-mode__ctx_fetch_and_index", "tool_input": {"url": "https://docs.rs/tokio"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P17-ctx_fetch_and_index-medium", "tool": "mcp__context-mode__ctx_fetch_and_index", "tool_input": {"url": "https://docs.rs/tokio"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P17-ctx_fetch_and_index-high", "tool": "mcp__context-mode__ctx_fetch_and_index", "tool_input": {"url": "https://docs.rs/tokio"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_index-relaxed", "tool": "mcp__context-mode__ctx_index", "tool_input": {"path": "src"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P17-ctx_index-medium", "tool": "mcp__context-mode__ctx_index", "tool_input": {"path": "src"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P17-ctx_index-high", "tool": "mcp__context-mode__ctx_index", "tool_input": {"path": "src"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_execute-off", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P18-browser_run_code_unsafe-relaxed", "tool": "mcp__playwright__browser_run_code_unsafe", "tool_input": {"code": "await page.title()"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P18-browser_run_code_unsafe-medium", "tool": "mcp__playwright__browser_run_code_unsafe", "tool_input": {"code": "await page.title()"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P18-browser_run_code_unsafe-high", "tool": "mcp__playwright__browser_run_code_unsafe", "tool_input": {"code": "await page.title()"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P18-browser_network_request-relaxed", "tool": "mcp__playwright__browser_network_request", "tool_input": {"url": "https://example.com", "method": "GET"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P18-browser_network_request-medium", "tool": "mcp__playwright__browser_network_request", "tool_input": {"url": "https://example.com", "method": "GET"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P18-browser_network_request-high", "tool": "mcp__playwright__browser_network_request", "tool_input": {"url": "https://example.com", "method": "GET"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P18-browser_evaluate-relaxed", "tool": "mcp__playwright__browser_evaluate", "tool_input": {"function": "() => document.title"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P18-browser_evaluate-medium", "tool": "mcp__playwright__browser_evaluate", "tool_input": {"function": "() => document.title"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P18-browser_evaluate-high", "tool": "mcp__playwright__browser_evaluate", "tool_input": {"function": "() => document.title"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P19-cloudflare-execute-relaxed", "tool": "mcp__cloudflare__execute", "tool_input": {"code": "async () => cloudflare.request({ method: 'GET', path: '/zones' })"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P19-cloudflare-execute-medium", "tool": "mcp__cloudflare__execute", "tool_input": {"code": "async () => cloudflare.request({ method: 'GET', path: '/zones' })"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P19-cloudflare-execute-high", "tool": "mcp__cloudflare__execute", "tool_input": {"code": "async () => cloudflare.request({ method: 'GET', path: '/zones' })"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-plugin-ctx_execute-medium", "tool": "mcp__plugin_context-mode_context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P18-plugin-evaluate-high", "tool": "mcp__plugin_playwright_playwright__browser_evaluate", "tool_input": {"function": "() => document.title"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P17-ctx_execute-medium-headless", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "medium", "headless": true, "want": "D"}
+{"id": "P17-ctx_execute-relaxed-headless", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "relaxed", "headless": true, "want": "-"}
+{"id": "P17-ctx_execute-relaxed-cred", "tool": "mcp__context-mode__ctx_execute", "tool_input": {"language": "shell", "code": "cat ~/.ssh/id_rsa"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "B-ctx_search-high", "tool": "mcp__context-mode__ctx_search", "tool_input": {"queries": ["tokio"]}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-ctx_stats-high", "tool": "mcp__context-mode__ctx_stats", "tool_input": {}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-ctx_doctor-high", "tool": "mcp__context-mode__ctx_doctor", "tool_input": {}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-ctx_purge-high", "tool": "mcp__context-mode__ctx_purge", "tool_input": {}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-ctx_insight-high", "tool": "mcp__context-mode__ctx_insight", "tool_input": {}, "tier": "high", "headless": false, "want": "-"}
+{"id": "SAS-ctx_upgrade-high", "tool": "mcp__context-mode__ctx_upgrade", "tool_input": {}, "tier": "high", "headless": false, "want": "D"}
+{"id": "B-browser_navigate-high", "tool": "mcp__playwright__browser_navigate", "tool_input": {"url": "http://localhost:3000"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-browser_snapshot-high", "tool": "mcp__playwright__browser_snapshot", "tool_input": {}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-browser_click-high", "tool": "mcp__playwright__browser_click", "tool_input": {"element": "Connect", "ref": "e3"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-cloudflare-docs-high", "tool": "mcp__cloudflare__docs", "tool_input": {"query": "workers"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-cloudflare-search-high", "tool": "mcp__cloudflare__search", "tool_input": {"code": "async () => spec.paths"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-other-server-ctx_execute-medium", "tool": "mcp__other__ctx_execute", "tool_input": {"language": "shell", "code": "ls"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B-myplaywright-evaluate-high", "tool": "mcp__myplaywright__browser_evaluate", "tool_input": {"function": "() => document.title"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-cloudflare-execute-prefix-high", "tool": "mcp__cloudflare__execute_query", "tool_input": {"sql": "select 1"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B-ctx_execute_suffix-medium", "tool": "mcp__context-mode__ctx_executes", "tool_input": {}, "tier": "medium", "headless": false, "want": "-"}

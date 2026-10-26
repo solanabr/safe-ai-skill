@@ -103,6 +103,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-read", |_| cmd_gate_read()),
     ("gate-mcp", |_| cmd_gate_mcp()),
     ("gate-webfetch", |_| cmd_gate_webfetch()),
+    ("gate-config", |_| cmd_gate_config()),
     ("gate-tamper", |_| cmd_gate_tamper()),
     ("gate-skill", |_| cmd_gate_skill()),
     ("gate-prompt-expansion", |_| cmd_gate_prompt_expansion()),
@@ -117,6 +118,7 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("session", cmd_session),
     ("allow", cmd_allow),
     ("tier", cmd_tier),
+    ("firewall", cmd_firewall),
     ("mode", cmd_mode),
     ("revoke", |_| cmd_revoke()),
     ("status", |_| cmd_status()),
@@ -612,12 +614,6 @@ fn cmd_gate_bash() -> ExitCode {
 /// An encoded payload piped or eval'd into a shell, decoded and judged by the bash and
 /// secrets gates (strictest wins); an undecodable payload asks, a deny at High.
 fn encoded_bash_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
-    use safe_ai_skill::gates::{bash, secrets};
-    let as_verdict = |d: Decision| match d {
-        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
-        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
-        _ => None,
-    };
     let tier = effective.tier();
     let mut all = vec![encoded::decide(command).map(|v| match v {
         Verdict::Ask(reason) if tier == Tier::High => {
@@ -626,16 +622,43 @@ fn encoded_bash_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option
         v => v,
     })];
     for decoded in encoded::expand(command) {
-        let ctx = Context::build(&decoded, cwd);
-        all.push(as_verdict(bash::decide(&decoded, &ctx, effective).0));
-        all.push(as_verdict(secrets::decide(&decoded, cwd, effective)));
-        all.push(wallet::decide_bash(&decoded, cwd, effective, tier));
-        all.push(creddump::decide(&decoded, cwd, effective, tier));
-        all.push(envwrite::decide_cli(&decoded, cwd, effective, tier));
-        all.push(exfil::decide_bash(&decoded, cwd, effective, tier));
-        all.push(fetchexec::decide(&decoded, cwd, effective, tier));
-        all.push(tamper::decide_bash_writes(&decoded, cwd, effective, tier));
-        all.push(envread::decide_bash(&decoded));
+        all.push(inner_text_verdict(&decoded, cwd, effective));
+    }
+    strictest(all)
+}
+
+/// A command text found inside another one (a decoded payload, a `git submodule foreach` or
+/// `rebase --exec` string), judged by every Bash gate as if it had been typed.
+fn inner_text_verdict(text: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
+    use safe_ai_skill::gates::{bash, gitguard, secrets};
+    let as_verdict = |d: Decision| match d {
+        Decision::Deny { reason } => Some(Verdict::Deny(reason)),
+        Decision::Ask { reason } => Some(Verdict::Ask(reason)),
+        _ => None,
+    };
+    let tier = effective.tier();
+    let ctx = Context::build(text, cwd);
+    strictest([
+        as_verdict(bash::decide(text, &ctx, effective).0),
+        as_verdict(secrets::decide(text, cwd, effective)),
+        wallet::decide_bash(text, cwd, effective, tier),
+        creddump::decide(text, cwd, effective, tier),
+        envwrite::decide_cli(text, cwd, effective, tier),
+        exfil::decide_bash(text, cwd, effective, tier),
+        fetchexec::decide(text, cwd, effective, tier),
+        tamper::decide_bash_writes(text, cwd, effective, tier),
+        envread::decide_bash(text),
+        gitguard::decide(text, cwd, effective, tier),
+    ])
+}
+
+/// The git gate on `command`, plus every `submodule foreach` / `rebase --exec` string in it
+/// judged by all the Bash gates.
+fn git_verdict(command: &str, cwd: &Path, effective: &Policy) -> Option<Verdict> {
+    use safe_ai_skill::gates::gitguard;
+    let mut all = vec![gitguard::decide(command, cwd, effective, effective.tier())];
+    for inner in gitguard::inner_commands(command) {
+        all.push(inner_text_verdict(&inner, cwd, effective));
     }
     strictest(all)
 }
@@ -683,6 +706,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         tamper::decide_bash_writes(command, &cwd, &effective, tier),
         envread::decide_bash(command),
         encoded_bash_verdict(command, &cwd, &effective),
+        git_verdict(command, &cwd, &effective),
     ]);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
@@ -750,6 +774,11 @@ fn cmd_gate_mcp() -> ExitCode {
     let effective = load_effective_policy(&cwd, &dir);
     let tool = input.tool_name.clone().unwrap_or_default();
     let payload = input.mcp_payload();
+    // A tool refused by name at this tier is refused before its arguments are read.
+    if let Some(v) = safe_ai_skill::gates::mcp::decide_name(&tool, effective.tier()) {
+        let meta = GateMeta::new(Scope::Other, true);
+        return finish_pretooluse(v.into(), &meta, &effective, &dir, &input, &raw);
+    }
     // Path-like arguments get the read check first (`ctx_execute_file {path:".env"}`).
     let secret = read::decide_mcp_args(payload, &cwd, &effective);
     if !matches!(secret, Decision::Defer) {
@@ -817,6 +846,21 @@ fn cmd_gate_webfetch() -> ExitCode {
         exfil::decide_webfetch(field("url"), field("prompt"), &effective, effective.tier());
     let (decision, meta) = join_tier(verdict, Decision::Defer, GateMeta::new(Scope::Other, true));
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
+}
+
+/// `ConfigChange`: block a settings change that turns protection off (D1). The answer is a
+/// top-level `decision: "block"`; Claude Code ignores a block on `policy_settings`.
+fn cmd_gate_config() -> ExitCode {
+    let (raw, _) = read_input();
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return ExitCode::SUCCESS;
+    };
+    if let Some(Verdict::Deny(reason)) = safe_ai_skill::gates::configchange::decide(&payload) {
+        let _ = io::emit_value(Some(
+            serde_json::json!({ "decision": "block", "reason": reason }),
+        ));
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_gate_skill() -> ExitCode {
@@ -961,6 +1005,7 @@ fn strictest_verdict_of(
     strictest([
         wallet::decide_file(Some(file), cwd, effective, tier),
         envwrite::decide_file(Some(file), cwd, effective, tier),
+        tamper::decide_file_content(Some(file), cwd, effective, tier),
     ])
 }
 
@@ -1502,6 +1547,30 @@ fn cmd_verify_session() -> ExitCode {
             } else {
                 format!("{tier_text}\n{field}")
             };
+        }
+    }
+    // The firewall block: re-applied when this engine ships a newer rule set or the declared
+    // tier rose (never lowered), then any drift between declared and enforced (T3, T6).
+    if !adapt::is_foreign() {
+        let home = datadir::passwd_home();
+        let fw = safe_ai_skill::firewall::Ctx {
+            dir: &dir,
+            cwd: &cwd,
+            effective: resolution.tier,
+            home: home.as_deref(),
+            now,
+        };
+        let fw_notes = [
+            safe_ai_skill::firewall::session_resync(&fw),
+            safe_ai_skill::firewall::session_note(&fw),
+        ];
+        for text in fw_notes.into_iter().flatten() {
+            for field in [&mut res.system_message, &mut res.additional_context] {
+                if !field.is_empty() {
+                    field.push('\n');
+                }
+                field.push_str(&text);
+            }
         }
     }
     // Then install and platform notices (duplicate install, old Claude Code, Windows scope).
@@ -2314,7 +2383,7 @@ fn park_pending(
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::Grant => "grant_create",
-        PendingKind::Mode | PendingKind::Tier => "tier_set",
+        PendingKind::Mode | PendingKind::Tier | PendingKind::Firewall => "tier_set",
         PendingKind::Trust => "verify_trust",
         PendingKind::Approve => "verify_approve",
     }
@@ -2467,6 +2536,47 @@ fn cmd_tier(rest: &[String]) -> ExitCode {
             }
             Err(e) => cli_error("tier", &e.to_string()),
         },
+    }
+}
+
+/// `firewall apply [<tier>] [--project] [--dry-run] | show | check` — the Claude Code sandbox and
+/// permission block safe-ai-skill owns in `.claude/settings.local.json`. Raising applies at
+/// once; lowering is parked for the user's whole-prompt confirmation, like `tier`.
+fn cmd_firewall(rest: &[String]) -> ExitCode {
+    let cmd = match safe_ai_skill::firewall::parse_args(rest) {
+        Ok(c) => c,
+        Err(e) => return cli_error("firewall", &e),
+    };
+    let cwd = process_cwd();
+    let Some(dir) = cli_state_dir("firewall", &cwd) else {
+        return ExitCode::FAILURE;
+    };
+    let (_, resolution) = load_runtime(&cwd, &dir);
+    let home = datadir::passwd_home();
+    let ctx = safe_ai_skill::firewall::Ctx {
+        dir: &dir,
+        cwd: &cwd,
+        effective: resolution.tier,
+        home: home.as_deref(),
+        now: now_secs(),
+    };
+    match safe_ai_skill::firewall::run(&cmd, &ctx) {
+        safe_ai_skill::firewall::Outcome::Ok(v) => {
+            if v["status"] == "applied" {
+                let summary = format!("firewall {}", v["tier"].as_str().unwrap_or("?"));
+                audit_event(&dir.path, "tier_set", "firewall", &summary);
+            }
+            print_json(&v);
+            ExitCode::SUCCESS
+        }
+        safe_ai_skill::firewall::Outcome::Drift(v) => {
+            print_json(&v);
+            ExitCode::FAILURE
+        }
+        safe_ai_skill::firewall::Outcome::Park { summary, payload } => {
+            park_pending("firewall", &dir, PendingKind::Firewall, &summary, payload)
+        }
+        safe_ai_skill::firewall::Outcome::Error(e) => cli_error("firewall", &e),
     }
 }
 

@@ -1,0 +1,729 @@
+{"id": "B00-off", "tool": "Bash", "tool_input": {"command": "git push origin main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B00-relaxed", "tool": "Bash", "tool_input": {"command": "git push origin main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B00-medium", "tool": "Bash", "tool_input": {"command": "git push origin main"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B00-high", "tool": "Bash", "tool_input": {"command": "git push origin main"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B01-off", "tool": "Bash", "tool_input": {"command": "git push -u origin feat/x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B01-relaxed", "tool": "Bash", "tool_input": {"command": "git push -u origin feat/x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B01-medium", "tool": "Bash", "tool_input": {"command": "git push -u origin feat/x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B01-high", "tool": "Bash", "tool_input": {"command": "git push -u origin feat/x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B02-off", "tool": "Bash", "tool_input": {"command": "git commit -m 'wip: git clean later'"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B02-relaxed", "tool": "Bash", "tool_input": {"command": "git commit -m 'wip: git clean later'"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B02-medium", "tool": "Bash", "tool_input": {"command": "git commit -m 'wip: git clean later'"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B02-high", "tool": "Bash", "tool_input": {"command": "git commit -m 'wip: git clean later'"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B03-off", "tool": "Bash", "tool_input": {"command": "git pull"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B03-relaxed", "tool": "Bash", "tool_input": {"command": "git pull"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B03-medium", "tool": "Bash", "tool_input": {"command": "git pull"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B03-high", "tool": "Bash", "tool_input": {"command": "git pull"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B04-off", "tool": "Bash", "tool_input": {"command": "git pull --rebase"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B04-relaxed", "tool": "Bash", "tool_input": {"command": "git pull --rebase"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B04-medium", "tool": "Bash", "tool_input": {"command": "git pull --rebase"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B04-high", "tool": "Bash", "tool_input": {"command": "git pull --rebase"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B05-off", "tool": "Bash", "tool_input": {"command": "git fetch --prune"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B05-relaxed", "tool": "Bash", "tool_input": {"command": "git fetch --prune"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B05-medium", "tool": "Bash", "tool_input": {"command": "git fetch --prune"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B05-high", "tool": "Bash", "tool_input": {"command": "git fetch --prune"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B06-off", "tool": "Bash", "tool_input": {"command": "gh pr create --fill --base main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B06-relaxed", "tool": "Bash", "tool_input": {"command": "gh pr create --fill --base main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B06-medium", "tool": "Bash", "tool_input": {"command": "gh pr create --fill --base main"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B06-high", "tool": "Bash", "tool_input": {"command": "gh pr create --fill --base main"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B07-off", "tool": "Bash", "tool_input": {"command": "gh pr view 12 --json state"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B07-relaxed", "tool": "Bash", "tool_input": {"command": "gh pr view 12 --json state"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B07-medium", "tool": "Bash", "tool_input": {"command": "gh pr view 12 --json state"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B07-high", "tool": "Bash", "tool_input": {"command": "gh pr view 12 --json state"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B08-off", "tool": "Bash", "tool_input": {"command": "gh run view 99 --log"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B08-relaxed", "tool": "Bash", "tool_input": {"command": "gh run view 99 --log"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B08-medium", "tool": "Bash", "tool_input": {"command": "gh run view 99 --log"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B08-high", "tool": "Bash", "tool_input": {"command": "gh run view 99 --log"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B09-off", "tool": "Bash", "tool_input": {"command": "git status"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B09-relaxed", "tool": "Bash", "tool_input": {"command": "git status"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B09-medium", "tool": "Bash", "tool_input": {"command": "git status"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B09-high", "tool": "Bash", "tool_input": {"command": "git status"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B10-off", "tool": "Bash", "tool_input": {"command": "git log --oneline -5"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B10-relaxed", "tool": "Bash", "tool_input": {"command": "git log --oneline -5"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B10-medium", "tool": "Bash", "tool_input": {"command": "git log --oneline -5"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B10-high", "tool": "Bash", "tool_input": {"command": "git log --oneline -5"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B11-off", "tool": "Bash", "tool_input": {"command": "git diff HEAD~1"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B11-relaxed", "tool": "Bash", "tool_input": {"command": "git diff HEAD~1"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B11-medium", "tool": "Bash", "tool_input": {"command": "git diff HEAD~1"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B11-high", "tool": "Bash", "tool_input": {"command": "git diff HEAD~1"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B12-off", "tool": "Bash", "tool_input": {"command": "git checkout -b fix/x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B12-relaxed", "tool": "Bash", "tool_input": {"command": "git checkout -b fix/x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B12-medium", "tool": "Bash", "tool_input": {"command": "git checkout -b fix/x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B12-high", "tool": "Bash", "tool_input": {"command": "git checkout -b fix/x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B13-off", "tool": "Bash", "tool_input": {"command": "git switch main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B13-relaxed", "tool": "Bash", "tool_input": {"command": "git switch main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B13-medium", "tool": "Bash", "tool_input": {"command": "git switch main"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B13-high", "tool": "Bash", "tool_input": {"command": "git switch main"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B14-off", "tool": "Bash", "tool_input": {"command": "git stash"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B14-relaxed", "tool": "Bash", "tool_input": {"command": "git stash"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B14-medium", "tool": "Bash", "tool_input": {"command": "git stash"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B14-high", "tool": "Bash", "tool_input": {"command": "git stash"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B15-off", "tool": "Bash", "tool_input": {"command": "git stash pop"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B15-relaxed", "tool": "Bash", "tool_input": {"command": "git stash pop"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B15-medium", "tool": "Bash", "tool_input": {"command": "git stash pop"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B15-high", "tool": "Bash", "tool_input": {"command": "git stash pop"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B16-off", "tool": "Bash", "tool_input": {"command": "git branch -a"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B16-relaxed", "tool": "Bash", "tool_input": {"command": "git branch -a"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B16-medium", "tool": "Bash", "tool_input": {"command": "git branch -a"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B16-high", "tool": "Bash", "tool_input": {"command": "git branch -a"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B17-off", "tool": "Bash", "tool_input": {"command": "git branch --sort=-date"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B17-relaxed", "tool": "Bash", "tool_input": {"command": "git branch --sort=-date"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B17-medium", "tool": "Bash", "tool_input": {"command": "git branch --sort=-date"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B17-high", "tool": "Bash", "tool_input": {"command": "git branch --sort=-date"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B18-off", "tool": "Bash", "tool_input": {"command": "git tag v1.0.0"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B18-relaxed", "tool": "Bash", "tool_input": {"command": "git tag v1.0.0"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B18-medium", "tool": "Bash", "tool_input": {"command": "git tag v1.0.0"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B18-high", "tool": "Bash", "tool_input": {"command": "git tag v1.0.0"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B19-off", "tool": "Bash", "tool_input": {"command": "git remote -v"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B19-relaxed", "tool": "Bash", "tool_input": {"command": "git remote -v"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B19-medium", "tool": "Bash", "tool_input": {"command": "git remote -v"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B19-high", "tool": "Bash", "tool_input": {"command": "git remote -v"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B20-off", "tool": "Bash", "tool_input": {"command": "git config --get user.email"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B20-relaxed", "tool": "Bash", "tool_input": {"command": "git config --get user.email"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B20-medium", "tool": "Bash", "tool_input": {"command": "git config --get user.email"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B20-high", "tool": "Bash", "tool_input": {"command": "git config --get user.email"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B21-off", "tool": "Bash", "tool_input": {"command": "git config user.name"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B21-relaxed", "tool": "Bash", "tool_input": {"command": "git config user.name"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B21-medium", "tool": "Bash", "tool_input": {"command": "git config user.name"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B21-high", "tool": "Bash", "tool_input": {"command": "git config user.name"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B22-off", "tool": "Bash", "tool_input": {"command": "git reset HEAD file.rs"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B22-relaxed", "tool": "Bash", "tool_input": {"command": "git reset HEAD file.rs"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B22-medium", "tool": "Bash", "tool_input": {"command": "git reset HEAD file.rs"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B22-high", "tool": "Bash", "tool_input": {"command": "git reset HEAD file.rs"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B23-off", "tool": "Bash", "tool_input": {"command": "git reset --soft HEAD~1"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B23-relaxed", "tool": "Bash", "tool_input": {"command": "git reset --soft HEAD~1"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B23-medium", "tool": "Bash", "tool_input": {"command": "git reset --soft HEAD~1"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B23-high", "tool": "Bash", "tool_input": {"command": "git reset --soft HEAD~1"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B24-off", "tool": "Bash", "tool_input": {"command": "git worktree prune"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B24-relaxed", "tool": "Bash", "tool_input": {"command": "git worktree prune"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B24-medium", "tool": "Bash", "tool_input": {"command": "git worktree prune"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B24-high", "tool": "Bash", "tool_input": {"command": "git worktree prune"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B25-off", "tool": "Bash", "tool_input": {"command": "git remote prune origin"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B25-relaxed", "tool": "Bash", "tool_input": {"command": "git remote prune origin"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B25-medium", "tool": "Bash", "tool_input": {"command": "git remote prune origin"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B25-high", "tool": "Bash", "tool_input": {"command": "git remote prune origin"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B26-off", "tool": "Bash", "tool_input": {"command": "git gc"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B26-relaxed", "tool": "Bash", "tool_input": {"command": "git gc"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B26-medium", "tool": "Bash", "tool_input": {"command": "git gc"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B26-high", "tool": "Bash", "tool_input": {"command": "git gc"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B27-off", "tool": "Bash", "tool_input": {"command": "git rebase --abort"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B27-relaxed", "tool": "Bash", "tool_input": {"command": "git rebase --abort"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B27-medium", "tool": "Bash", "tool_input": {"command": "git rebase --abort"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B27-high", "tool": "Bash", "tool_input": {"command": "git rebase --abort"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B28-off", "tool": "Bash", "tool_input": {"command": "cargo build && git add -A && git commit -m x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B28-relaxed", "tool": "Bash", "tool_input": {"command": "cargo build && git add -A && git commit -m x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B28-medium", "tool": "Bash", "tool_input": {"command": "cargo build && git add -A && git commit -m x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B28-high", "tool": "Bash", "tool_input": {"command": "cargo build && git add -A && git commit -m x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B29-off", "tool": "Bash", "tool_input": {"command": "anchor build && git push"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B29-relaxed", "tool": "Bash", "tool_input": {"command": "anchor build && git push"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B29-medium", "tool": "Bash", "tool_input": {"command": "anchor build && git push"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B29-high", "tool": "Bash", "tool_input": {"command": "anchor build && git push"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B30-off", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_GLOBAL=/dev/null git status"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B30-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_GLOBAL=/dev/null git status"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B30-medium", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_GLOBAL=/dev/null git status"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B30-high", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_GLOBAL=/dev/null git status"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B31-off", "tool": "Bash", "tool_input": {"command": "GIT_PAGER=cat git log"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B31-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_PAGER=cat git log"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B31-medium", "tool": "Bash", "tool_input": {"command": "GIT_PAGER=cat git log"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B31-high", "tool": "Bash", "tool_input": {"command": "GIT_PAGER=cat git log"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B32-off", "tool": "Bash", "tool_input": {"command": "echo 'GIT_CONFIG_COUNT=1' >> notes.txt"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B32-relaxed", "tool": "Bash", "tool_input": {"command": "echo 'GIT_CONFIG_COUNT=1' >> notes.txt"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B32-medium", "tool": "Bash", "tool_input": {"command": "echo 'GIT_CONFIG_COUNT=1' >> notes.txt"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B32-high", "tool": "Bash", "tool_input": {"command": "echo 'GIT_CONFIG_COUNT=1' >> notes.txt"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "B33-off", "tool": "Bash", "tool_input": {"command": "cat > d.md <<'EOF'\ngit clean -fdx\nGIT_EXEC_PATH=/tmp\nEOF"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "B33-relaxed", "tool": "Bash", "tool_input": {"command": "cat > d.md <<'EOF'\ngit clean -fdx\nGIT_EXEC_PATH=/tmp\nEOF"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "B33-medium", "tool": "Bash", "tool_input": {"command": "cat > d.md <<'EOF'\ngit clean -fdx\nGIT_EXEC_PATH=/tmp\nEOF"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "B33-high", "tool": "Bash", "tool_input": {"command": "cat > d.md <<'EOF'\ngit clean -fdx\nGIT_EXEC_PATH=/tmp\nEOF"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E5-force-off", "tool": "Bash", "tool_input": {"command": "git push --force origin main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-force-relaxed", "tool": "Bash", "tool_input": {"command": "git push --force origin main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-force-medium", "tool": "Bash", "tool_input": {"command": "git push --force origin main"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-force-high", "tool": "Bash", "tool_input": {"command": "git push --force origin main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-plus-off", "tool": "Bash", "tool_input": {"command": "git push origin +main:main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-plus-relaxed", "tool": "Bash", "tool_input": {"command": "git push origin +main:main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-plus-medium", "tool": "Bash", "tool_input": {"command": "git push origin +main:main"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-plus-high", "tool": "Bash", "tool_input": {"command": "git push origin +main:main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-cluster-off", "tool": "Bash", "tool_input": {"command": "git push -fu origin main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-cluster-relaxed", "tool": "Bash", "tool_input": {"command": "git push -fu origin main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-cluster-medium", "tool": "Bash", "tool_input": {"command": "git push -fu origin main"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-cluster-high", "tool": "Bash", "tool_input": {"command": "git push -fu origin main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-lease-off", "tool": "Bash", "tool_input": {"command": "git push --force-with-lease"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-lease-relaxed", "tool": "Bash", "tool_input": {"command": "git push --force-with-lease"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-lease-medium", "tool": "Bash", "tool_input": {"command": "git push --force-with-lease"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-lease-high", "tool": "Bash", "tool_input": {"command": "git push --force-with-lease"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-prefixed-off", "tool": "Bash", "tool_input": {"command": "git --no-pager push -f"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-prefixed-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager push -f"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-prefixed-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager push -f"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-prefixed-high", "tool": "Bash", "tool_input": {"command": "git --no-pager push -f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-dry-off", "tool": "Bash", "tool_input": {"command": "git push -f --dry-run"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-dry-relaxed", "tool": "Bash", "tool_input": {"command": "git push -f --dry-run"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-dry-medium", "tool": "Bash", "tool_input": {"command": "git push -f --dry-run"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E5-dry-high", "tool": "Bash", "tool_input": {"command": "git push -f --dry-run"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E5-merge-off", "tool": "Bash", "tool_input": {"command": "gh pr merge 7 --squash --delete-branch"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-merge-relaxed", "tool": "Bash", "tool_input": {"command": "gh pr merge 7 --squash --delete-branch"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-merge-medium", "tool": "Bash", "tool_input": {"command": "gh pr merge 7 --squash --delete-branch"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-merge-high", "tool": "Bash", "tool_input": {"command": "gh pr merge 7 --squash --delete-branch"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-foreach-off", "tool": "Bash", "tool_input": {"command": "git submodule foreach 'git push --force'"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E5-foreach-relaxed", "tool": "Bash", "tool_input": {"command": "git submodule foreach 'git push --force'"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E5-foreach-medium", "tool": "Bash", "tool_input": {"command": "git submodule foreach 'git push --force'"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "E5-foreach-high", "tool": "Bash", "tool_input": {"command": "git submodule foreach 'git push --force'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E5-merge-hl", "tool": "Bash", "tool_input": {"command": "gh pr merge 7"}, "tier": "medium", "headless": true, "want": "D"}
+{"id": "E6-00-off", "tool": "Bash", "tool_input": {"command": "git rebase -i HEAD~3"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-00-relaxed", "tool": "Bash", "tool_input": {"command": "git rebase -i HEAD~3"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-00-medium", "tool": "Bash", "tool_input": {"command": "git rebase -i HEAD~3"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-00-high", "tool": "Bash", "tool_input": {"command": "git rebase -i HEAD~3"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-01-off", "tool": "Bash", "tool_input": {"command": "git rebase main"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-01-relaxed", "tool": "Bash", "tool_input": {"command": "git rebase main"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-01-medium", "tool": "Bash", "tool_input": {"command": "git rebase main"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-01-high", "tool": "Bash", "tool_input": {"command": "git rebase main"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-02-off", "tool": "Bash", "tool_input": {"command": "git filter-branch --tree-filter x HEAD"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-02-relaxed", "tool": "Bash", "tool_input": {"command": "git filter-branch --tree-filter x HEAD"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-02-medium", "tool": "Bash", "tool_input": {"command": "git filter-branch --tree-filter x HEAD"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-02-high", "tool": "Bash", "tool_input": {"command": "git filter-branch --tree-filter x HEAD"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-03-off", "tool": "Bash", "tool_input": {"command": "git filter-repo --invert-paths --path s"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-03-relaxed", "tool": "Bash", "tool_input": {"command": "git filter-repo --invert-paths --path s"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-03-medium", "tool": "Bash", "tool_input": {"command": "git filter-repo --invert-paths --path s"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-03-high", "tool": "Bash", "tool_input": {"command": "git filter-repo --invert-paths --path s"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-04-off", "tool": "Bash", "tool_input": {"command": "git commit --amend -m x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-04-relaxed", "tool": "Bash", "tool_input": {"command": "git commit --amend -m x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-04-medium", "tool": "Bash", "tool_input": {"command": "git commit --amend -m x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-04-high", "tool": "Bash", "tool_input": {"command": "git commit --amend -m x"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-05-off", "tool": "Bash", "tool_input": {"command": "git stash drop"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-05-relaxed", "tool": "Bash", "tool_input": {"command": "git stash drop"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-05-medium", "tool": "Bash", "tool_input": {"command": "git stash drop"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-05-high", "tool": "Bash", "tool_input": {"command": "git stash drop"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-06-off", "tool": "Bash", "tool_input": {"command": "git stash clear"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-06-relaxed", "tool": "Bash", "tool_input": {"command": "git stash clear"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-06-medium", "tool": "Bash", "tool_input": {"command": "git stash clear"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-06-high", "tool": "Bash", "tool_input": {"command": "git stash clear"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-07-off", "tool": "Bash", "tool_input": {"command": "git branch -d old"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-07-relaxed", "tool": "Bash", "tool_input": {"command": "git branch -d old"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-07-medium", "tool": "Bash", "tool_input": {"command": "git branch -d old"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-07-high", "tool": "Bash", "tool_input": {"command": "git branch -d old"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-08-off", "tool": "Bash", "tool_input": {"command": "git branch -D old"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-08-relaxed", "tool": "Bash", "tool_input": {"command": "git branch -D old"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-08-medium", "tool": "Bash", "tool_input": {"command": "git branch -D old"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-08-high", "tool": "Bash", "tool_input": {"command": "git branch -D old"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-09-off", "tool": "Bash", "tool_input": {"command": "git branch -f main HEAD~1"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-09-relaxed", "tool": "Bash", "tool_input": {"command": "git branch -f main HEAD~1"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-09-medium", "tool": "Bash", "tool_input": {"command": "git branch -f main HEAD~1"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-09-high", "tool": "Bash", "tool_input": {"command": "git branch -f main HEAD~1"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-10-off", "tool": "Bash", "tool_input": {"command": "git tag -d v1"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-10-relaxed", "tool": "Bash", "tool_input": {"command": "git tag -d v1"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-10-medium", "tool": "Bash", "tool_input": {"command": "git tag -d v1"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-10-high", "tool": "Bash", "tool_input": {"command": "git tag -d v1"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-11-off", "tool": "Bash", "tool_input": {"command": "git tag --delete v1"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-11-relaxed", "tool": "Bash", "tool_input": {"command": "git tag --delete v1"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-11-medium", "tool": "Bash", "tool_input": {"command": "git tag --delete v1"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-11-high", "tool": "Bash", "tool_input": {"command": "git tag --delete v1"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E6-continue-off", "tool": "Bash", "tool_input": {"command": "git rebase --continue"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E6-continue-relaxed", "tool": "Bash", "tool_input": {"command": "git rebase --continue"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E6-continue-medium", "tool": "Bash", "tool_input": {"command": "git rebase --continue"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E6-continue-high", "tool": "Bash", "tool_input": {"command": "git rebase --continue"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E6-hl", "tool": "Bash", "tool_input": {"command": "git commit --amend"}, "tier": "high", "headless": true, "want": "D"}
+{"id": "E8-00-off", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-00-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-00-medium", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-00-high", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-01-off", "tool": "Bash", "tool_input": {"command": "git clean"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-01-relaxed", "tool": "Bash", "tool_input": {"command": "git clean"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-01-medium", "tool": "Bash", "tool_input": {"command": "git clean"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-01-high", "tool": "Bash", "tool_input": {"command": "git clean"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-02-off", "tool": "Bash", "tool_input": {"command": "git restore ."}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-02-relaxed", "tool": "Bash", "tool_input": {"command": "git restore ."}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-02-medium", "tool": "Bash", "tool_input": {"command": "git restore ."}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-02-high", "tool": "Bash", "tool_input": {"command": "git restore ."}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-03-off", "tool": "Bash", "tool_input": {"command": "git restore --staged x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E8-03-relaxed", "tool": "Bash", "tool_input": {"command": "git restore --staged x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E8-03-medium", "tool": "Bash", "tool_input": {"command": "git restore --staged x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E8-03-high", "tool": "Bash", "tool_input": {"command": "git restore --staged x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E8-04-off", "tool": "Bash", "tool_input": {"command": "git checkout -- src/"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-04-relaxed", "tool": "Bash", "tool_input": {"command": "git checkout -- src/"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-04-medium", "tool": "Bash", "tool_input": {"command": "git checkout -- src/"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-04-high", "tool": "Bash", "tool_input": {"command": "git checkout -- src/"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-05-off", "tool": "Bash", "tool_input": {"command": "git reset --hard"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-05-relaxed", "tool": "Bash", "tool_input": {"command": "git reset --hard"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-05-medium", "tool": "Bash", "tool_input": {"command": "git reset --hard"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-05-high", "tool": "Bash", "tool_input": {"command": "git reset --hard"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-06-off", "tool": "Bash", "tool_input": {"command": "git reset --ha HEAD~1"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-06-relaxed", "tool": "Bash", "tool_input": {"command": "git reset --ha HEAD~1"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-06-medium", "tool": "Bash", "tool_input": {"command": "git reset --ha HEAD~1"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-06-high", "tool": "Bash", "tool_input": {"command": "git reset --ha HEAD~1"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-07-off", "tool": "Bash", "tool_input": {"command": "git reset HEAD --hard"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-07-relaxed", "tool": "Bash", "tool_input": {"command": "git reset HEAD --hard"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-07-medium", "tool": "Bash", "tool_input": {"command": "git reset HEAD --hard"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-07-high", "tool": "Bash", "tool_input": {"command": "git reset HEAD --hard"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-08-off", "tool": "Bash", "tool_input": {"command": "git reflog expire --expire=now --all"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-08-relaxed", "tool": "Bash", "tool_input": {"command": "git reflog expire --expire=now --all"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-08-medium", "tool": "Bash", "tool_input": {"command": "git reflog expire --expire=now --all"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-08-high", "tool": "Bash", "tool_input": {"command": "git reflog expire --expire=now --all"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-09-off", "tool": "Bash", "tool_input": {"command": "git reflog delete HEAD@{1}"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-09-relaxed", "tool": "Bash", "tool_input": {"command": "git reflog delete HEAD@{1}"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-09-medium", "tool": "Bash", "tool_input": {"command": "git reflog delete HEAD@{1}"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-09-high", "tool": "Bash", "tool_input": {"command": "git reflog delete HEAD@{1}"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-10-off", "tool": "Bash", "tool_input": {"command": "git reflog drop"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-10-relaxed", "tool": "Bash", "tool_input": {"command": "git reflog drop"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-10-medium", "tool": "Bash", "tool_input": {"command": "git reflog drop"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-10-high", "tool": "Bash", "tool_input": {"command": "git reflog drop"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-11-off", "tool": "Bash", "tool_input": {"command": "git prune"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-11-relaxed", "tool": "Bash", "tool_input": {"command": "git prune"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-11-medium", "tool": "Bash", "tool_input": {"command": "git prune"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-11-high", "tool": "Bash", "tool_input": {"command": "git prune"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-12-off", "tool": "Bash", "tool_input": {"command": "git gc --prune=now"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-12-relaxed", "tool": "Bash", "tool_input": {"command": "git gc --prune=now"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-12-medium", "tool": "Bash", "tool_input": {"command": "git gc --prune=now"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-12-high", "tool": "Bash", "tool_input": {"command": "git gc --prune=now"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-13-off", "tool": "Bash", "tool_input": {"command": "git gc --aggressive --prune"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-13-relaxed", "tool": "Bash", "tool_input": {"command": "git gc --aggressive --prune"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-13-medium", "tool": "Bash", "tool_input": {"command": "git gc --aggressive --prune"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-13-high", "tool": "Bash", "tool_input": {"command": "git gc --aggressive --prune"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-14-off", "tool": "Bash", "tool_input": {"command": "git push --mirror origin"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-14-relaxed", "tool": "Bash", "tool_input": {"command": "git push --mirror origin"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-14-medium", "tool": "Bash", "tool_input": {"command": "git push --mirror origin"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-14-high", "tool": "Bash", "tool_input": {"command": "git push --mirror origin"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-15-off", "tool": "Bash", "tool_input": {"command": "git -C sub clean -fd"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-15-relaxed", "tool": "Bash", "tool_input": {"command": "git -C sub clean -fd"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-15-medium", "tool": "Bash", "tool_input": {"command": "git -C sub clean -fd"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-15-high", "tool": "Bash", "tool_input": {"command": "git -C sub clean -fd"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-16-off", "tool": "Bash", "tool_input": {"command": "git --git-dir=.git clean -n"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E8-16-relaxed", "tool": "Bash", "tool_input": {"command": "git --git-dir=.git clean -n"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E8-16-medium", "tool": "Bash", "tool_input": {"command": "git --git-dir=.git clean -n"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E8-16-high", "tool": "Bash", "tool_input": {"command": "git --git-dir=.git clean -n"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E8-17-off", "tool": "Bash", "tool_input": {"command": "git -P reset --hard"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-17-relaxed", "tool": "Bash", "tool_input": {"command": "git -P reset --hard"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-17-medium", "tool": "Bash", "tool_input": {"command": "git -P reset --hard"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-17-high", "tool": "Bash", "tool_input": {"command": "git -P reset --hard"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-18-off", "tool": "Bash", "tool_input": {"command": "timeout 5 git clean -fd"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-18-relaxed", "tool": "Bash", "tool_input": {"command": "timeout 5 git clean -fd"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-18-medium", "tool": "Bash", "tool_input": {"command": "timeout 5 git clean -fd"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-18-high", "tool": "Bash", "tool_input": {"command": "timeout 5 git clean -fd"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-19-off", "tool": "Bash", "tool_input": {"command": "sh -c 'git clean -fdx'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-19-relaxed", "tool": "Bash", "tool_input": {"command": "sh -c 'git clean -fdx'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-19-medium", "tool": "Bash", "tool_input": {"command": "sh -c 'git clean -fdx'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-19-high", "tool": "Bash", "tool_input": {"command": "sh -c 'git clean -fdx'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-20-off", "tool": "Bash", "tool_input": {"command": "git rebase --exec 'git clean -fdx' main"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E8-20-relaxed", "tool": "Bash", "tool_input": {"command": "git rebase --exec 'git clean -fdx' main"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E8-20-medium", "tool": "Bash", "tool_input": {"command": "git rebase --exec 'git clean -fdx' main"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E8-20-high", "tool": "Bash", "tool_input": {"command": "git rebase --exec 'git clean -fdx' main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E8-noprune-off", "tool": "Bash", "tool_input": {"command": "git gc --no-prune"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E8-noprune-relaxed", "tool": "Bash", "tool_input": {"command": "git gc --no-prune"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E8-noprune-medium", "tool": "Bash", "tool_input": {"command": "git gc --no-prune"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E8-noprune-high", "tool": "Bash", "tool_input": {"command": "git gc --no-prune"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E8-reflogshow-off", "tool": "Bash", "tool_input": {"command": "git reflog show"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E8-reflogshow-relaxed", "tool": "Bash", "tool_input": {"command": "git reflog show"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E8-reflogshow-medium", "tool": "Bash", "tool_input": {"command": "git reflog show"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E8-reflogshow-high", "tool": "Bash", "tool_input": {"command": "git reflog show"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E8-helpclean-off", "tool": "Bash", "tool_input": {"command": "git --help clean"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E8-helpclean-relaxed", "tool": "Bash", "tool_input": {"command": "git --help clean"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E8-helpclean-medium", "tool": "Bash", "tool_input": {"command": "git --help clean"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E8-helpclean-high", "tool": "Bash", "tool_input": {"command": "git --help clean"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E10-00-off", "tool": "Bash", "tool_input": {"command": "git --config-env=core.fsmonitor=X status"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-00-relaxed", "tool": "Bash", "tool_input": {"command": "git --config-env=core.fsmonitor=X status"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-00-medium", "tool": "Bash", "tool_input": {"command": "git --config-env=core.fsmonitor=X status"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-00-high", "tool": "Bash", "tool_input": {"command": "git --config-env=core.fsmonitor=X status"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-01-off", "tool": "Bash", "tool_input": {"command": "git -P --config-env core.pager=X log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-01-relaxed", "tool": "Bash", "tool_input": {"command": "git -P --config-env core.pager=X log"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-01-medium", "tool": "Bash", "tool_input": {"command": "git -P --config-env core.pager=X log"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-01-high", "tool": "Bash", "tool_input": {"command": "git -P --config-env core.pager=X log"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-02-off", "tool": "Bash", "tool_input": {"command": "git --exec-path=/tmp/x ls-remote https://h/r"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-02-relaxed", "tool": "Bash", "tool_input": {"command": "git --exec-path=/tmp/x ls-remote https://h/r"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-02-medium", "tool": "Bash", "tool_input": {"command": "git --exec-path=/tmp/x ls-remote https://h/r"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-02-high", "tool": "Bash", "tool_input": {"command": "git --exec-path=/tmp/x ls-remote https://h/r"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-03-off", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/tmp/x git status"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-03-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/tmp/x git status"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-03-medium", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/tmp/x git status"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-03-high", "tool": "Bash", "tool_input": {"command": "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=/tmp/x git status"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-04-off", "tool": "Bash", "tool_input": {"command": "export GIT_CONFIG_PARAMETERS=\"'core.pager=/tmp/x'\" && git log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-04-relaxed", "tool": "Bash", "tool_input": {"command": "export GIT_CONFIG_PARAMETERS=\"'core.pager=/tmp/x'\" && git log"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-04-medium", "tool": "Bash", "tool_input": {"command": "export GIT_CONFIG_PARAMETERS=\"'core.pager=/tmp/x'\" && git log"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-04-high", "tool": "Bash", "tool_input": {"command": "export GIT_CONFIG_PARAMETERS=\"'core.pager=/tmp/x'\" && git log"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-05-off", "tool": "Bash", "tool_input": {"command": "GIT_EXEC_PATH=/tmp/x git status"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-05-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_EXEC_PATH=/tmp/x git status"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-05-medium", "tool": "Bash", "tool_input": {"command": "GIT_EXEC_PATH=/tmp/x git status"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-05-high", "tool": "Bash", "tool_input": {"command": "GIT_EXEC_PATH=/tmp/x git status"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-06-off", "tool": "Bash", "tool_input": {"command": "env GIT_CONFIG_KEY_0=alias.x git x"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-06-relaxed", "tool": "Bash", "tool_input": {"command": "env GIT_CONFIG_KEY_0=alias.x git x"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-06-medium", "tool": "Bash", "tool_input": {"command": "env GIT_CONFIG_KEY_0=alias.x git x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-06-high", "tool": "Bash", "tool_input": {"command": "env GIT_CONFIG_KEY_0=alias.x git x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-07-off", "tool": "Bash", "tool_input": {"command": "declare -x GIT_CONFIG_COUNT=2"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-07-relaxed", "tool": "Bash", "tool_input": {"command": "declare -x GIT_CONFIG_COUNT=2"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-07-medium", "tool": "Bash", "tool_input": {"command": "declare -x GIT_CONFIG_COUNT=2"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-07-high", "tool": "Bash", "tool_input": {"command": "declare -x GIT_CONFIG_COUNT=2"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-08-off", "tool": "Bash", "tool_input": {"command": "bash -c 'export GIT_EXEC_PATH=/tmp; git log'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-08-relaxed", "tool": "Bash", "tool_input": {"command": "bash -c 'export GIT_EXEC_PATH=/tmp; git log'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-08-medium", "tool": "Bash", "tool_input": {"command": "bash -c 'export GIT_EXEC_PATH=/tmp; git log'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-08-high", "tool": "Bash", "tool_input": {"command": "bash -c 'export GIT_EXEC_PATH=/tmp; git log'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-09-off", "tool": "Bash", "tool_input": {"command": "sudo -u me GIT_CONFIG_COUNT=1 git log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E10-09-relaxed", "tool": "Bash", "tool_input": {"command": "sudo -u me GIT_CONFIG_COUNT=1 git log"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E10-09-medium", "tool": "Bash", "tool_input": {"command": "sudo -u me GIT_CONFIG_COUNT=1 git log"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E10-09-high", "tool": "Bash", "tool_input": {"command": "sudo -u me GIT_CONFIG_COUNT=1 git log"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E10-bare-off", "tool": "Bash", "tool_input": {"command": "git --exec-path"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E10-bare-relaxed", "tool": "Bash", "tool_input": {"command": "git --exec-path"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E10-bare-medium", "tool": "Bash", "tool_input": {"command": "git --exec-path"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E10-bare-high", "tool": "Bash", "tool_input": {"command": "git --exec-path"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E11-00-off", "tool": "Bash", "tool_input": {"command": "GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy' git fetch"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E11-00-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy' git fetch"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E11-00-medium", "tool": "Bash", "tool_input": {"command": "GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy' git fetch"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E11-00-high", "tool": "Bash", "tool_input": {"command": "GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy' git fetch"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E11-01-off", "tool": "Bash", "tool_input": {"command": "GIT_SSH=/usr/bin/ssh git pull"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E11-01-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_SSH=/usr/bin/ssh git pull"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E11-01-medium", "tool": "Bash", "tool_input": {"command": "GIT_SSH=/usr/bin/ssh git pull"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E11-01-high", "tool": "Bash", "tool_input": {"command": "GIT_SSH=/usr/bin/ssh git pull"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E11-02-off", "tool": "Bash", "tool_input": {"command": "export GIT_ASKPASS=/tmp/a.sh"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E11-02-relaxed", "tool": "Bash", "tool_input": {"command": "export GIT_ASKPASS=/tmp/a.sh"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E11-02-medium", "tool": "Bash", "tool_input": {"command": "export GIT_ASKPASS=/tmp/a.sh"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E11-02-high", "tool": "Bash", "tool_input": {"command": "export GIT_ASKPASS=/tmp/a.sh"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E11-03-off", "tool": "Bash", "tool_input": {"command": "GIT_PROXY_COMMAND=/tmp/p git fetch"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E11-03-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_PROXY_COMMAND=/tmp/p git fetch"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E11-03-medium", "tool": "Bash", "tool_input": {"command": "GIT_PROXY_COMMAND=/tmp/p git fetch"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E11-03-high", "tool": "Bash", "tool_input": {"command": "GIT_PROXY_COMMAND=/tmp/p git fetch"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E11-04-off", "tool": "Bash", "tool_input": {"command": "GIT_EXTERNAL_DIFF=/tmp/d git diff"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E11-04-relaxed", "tool": "Bash", "tool_input": {"command": "GIT_EXTERNAL_DIFF=/tmp/d git diff"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E11-04-medium", "tool": "Bash", "tool_input": {"command": "GIT_EXTERNAL_DIFF=/tmp/d git diff"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E11-04-high", "tool": "Bash", "tool_input": {"command": "GIT_EXTERNAL_DIFF=/tmp/d git diff"}, "tier": "high", "headless": false, "want": "A"}
+{"id": "E11-hl", "tool": "Bash", "tool_input": {"command": "GIT_SSH_COMMAND=x git fetch"}, "tier": "high", "headless": true, "want": "D"}
+{"id": "E12-00-off", "tool": "Bash", "tool_input": {"command": "git fetch --upload-pack=/tmp/x.sh ."}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-00-relaxed", "tool": "Bash", "tool_input": {"command": "git fetch --upload-pack=/tmp/x.sh ."}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-00-medium", "tool": "Bash", "tool_input": {"command": "git fetch --upload-pack=/tmp/x.sh ."}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-00-high", "tool": "Bash", "tool_input": {"command": "git fetch --upload-pack=/tmp/x.sh ."}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-01-off", "tool": "Bash", "tool_input": {"command": "git pull --upload-pack /tmp/x origin"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-01-relaxed", "tool": "Bash", "tool_input": {"command": "git pull --upload-pack /tmp/x origin"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-01-medium", "tool": "Bash", "tool_input": {"command": "git pull --upload-pack /tmp/x origin"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-01-high", "tool": "Bash", "tool_input": {"command": "git pull --upload-pack /tmp/x origin"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-02-off", "tool": "Bash", "tool_input": {"command": "git clone --upload-pack=/tmp/x u"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-02-relaxed", "tool": "Bash", "tool_input": {"command": "git clone --upload-pack=/tmp/x u"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-02-medium", "tool": "Bash", "tool_input": {"command": "git clone --upload-pack=/tmp/x u"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-02-high", "tool": "Bash", "tool_input": {"command": "git clone --upload-pack=/tmp/x u"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-03-off", "tool": "Bash", "tool_input": {"command": "git clone -u /tmp/x u"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-03-relaxed", "tool": "Bash", "tool_input": {"command": "git clone -u /tmp/x u"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-03-medium", "tool": "Bash", "tool_input": {"command": "git clone -u /tmp/x u"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-03-high", "tool": "Bash", "tool_input": {"command": "git clone -u /tmp/x u"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-04-off", "tool": "Bash", "tool_input": {"command": "git ls-remote --upload-pack=/tmp/x ."}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-04-relaxed", "tool": "Bash", "tool_input": {"command": "git ls-remote --upload-pack=/tmp/x ."}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-04-medium", "tool": "Bash", "tool_input": {"command": "git ls-remote --upload-pack=/tmp/x ."}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-04-high", "tool": "Bash", "tool_input": {"command": "git ls-remote --upload-pack=/tmp/x ."}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-05-off", "tool": "Bash", "tool_input": {"command": "git push --receive-pack=/tmp/x origin"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-05-relaxed", "tool": "Bash", "tool_input": {"command": "git push --receive-pack=/tmp/x origin"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-05-medium", "tool": "Bash", "tool_input": {"command": "git push --receive-pack=/tmp/x origin"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-05-high", "tool": "Bash", "tool_input": {"command": "git push --receive-pack=/tmp/x origin"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-06-off", "tool": "Bash", "tool_input": {"command": "git push --exec=/tmp/x origin"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-06-relaxed", "tool": "Bash", "tool_input": {"command": "git push --exec=/tmp/x origin"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-06-medium", "tool": "Bash", "tool_input": {"command": "git push --exec=/tmp/x origin"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-06-high", "tool": "Bash", "tool_input": {"command": "git push --exec=/tmp/x origin"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E12-07-off", "tool": "Bash", "tool_input": {"command": "git archive --remote=r --exec=/tmp/x HEAD"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E12-07-relaxed", "tool": "Bash", "tool_input": {"command": "git archive --remote=r --exec=/tmp/x HEAD"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E12-07-medium", "tool": "Bash", "tool_input": {"command": "git archive --remote=r --exec=/tmp/x HEAD"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E12-07-high", "tool": "Bash", "tool_input": {"command": "git archive --remote=r --exec=/tmp/x HEAD"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-00-off", "tool": "Bash", "tool_input": {"command": "gh secret set API_KEY --body x"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-00-relaxed", "tool": "Bash", "tool_input": {"command": "gh secret set API_KEY --body x"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-00-medium", "tool": "Bash", "tool_input": {"command": "gh secret set API_KEY --body x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-00-high", "tool": "Bash", "tool_input": {"command": "gh secret set API_KEY --body x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-01-off", "tool": "Bash", "tool_input": {"command": "gh variable set X --body y"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-01-relaxed", "tool": "Bash", "tool_input": {"command": "gh variable set X --body y"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-01-medium", "tool": "Bash", "tool_input": {"command": "gh variable set X --body y"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-01-high", "tool": "Bash", "tool_input": {"command": "gh variable set X --body y"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-02-off", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/actions/secrets/T -f encrypted_value=e -f key_id=k"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-02-relaxed", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/actions/secrets/T -f encrypted_value=e -f key_id=k"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-02-medium", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/actions/secrets/T -f encrypted_value=e -f key_id=k"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-02-high", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/actions/secrets/T -f encrypted_value=e -f key_id=k"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-03-off", "tool": "Bash", "tool_input": {"command": "gh api --method PUT /repos/{owner}/{repo}/actions/variables/V"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-03-relaxed", "tool": "Bash", "tool_input": {"command": "gh api --method PUT /repos/{owner}/{repo}/actions/variables/V"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-03-medium", "tool": "Bash", "tool_input": {"command": "gh api --method PUT /repos/{owner}/{repo}/actions/variables/V"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-03-high", "tool": "Bash", "tool_input": {"command": "gh api --method PUT /repos/{owner}/{repo}/actions/variables/V"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-04-off", "tool": "Bash", "tool_input": {"command": "gh api orgs/o/actions/secrets/T -XPUT"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-04-relaxed", "tool": "Bash", "tool_input": {"command": "gh api orgs/o/actions/secrets/T -XPUT"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-04-medium", "tool": "Bash", "tool_input": {"command": "gh api orgs/o/actions/secrets/T -XPUT"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-04-high", "tool": "Bash", "tool_input": {"command": "gh api orgs/o/actions/secrets/T -XPUT"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-05-off", "tool": "Bash", "tool_input": {"command": "gh api repos/$GITHUB_REPOSITORY/environments/prod/secrets/T -X PUT"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-05-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/$GITHUB_REPOSITORY/environments/prod/secrets/T -X PUT"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-05-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/$GITHUB_REPOSITORY/environments/prod/secrets/T -X PUT"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-05-high", "tool": "Bash", "tool_input": {"command": "gh api repos/$GITHUB_REPOSITORY/environments/prod/secrets/T -X PUT"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-06-off", "tool": "Bash", "tool_input": {"command": "gh api user/codespaces/secrets/T --method=PUT"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E13-06-relaxed", "tool": "Bash", "tool_input": {"command": "gh api user/codespaces/secrets/T --method=PUT"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E13-06-medium", "tool": "Bash", "tool_input": {"command": "gh api user/codespaces/secrets/T --method=PUT"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-06-high", "tool": "Bash", "tool_input": {"command": "gh api user/codespaces/secrets/T --method=PUT"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-get-off", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/secrets"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E13-get-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/secrets"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E13-get-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/secrets"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E13-get-high", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/secrets"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E13-list-off", "tool": "Bash", "tool_input": {"command": "gh secret list"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E13-list-relaxed", "tool": "Bash", "tool_input": {"command": "gh secret list"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E13-list-medium", "tool": "Bash", "tool_input": {"command": "gh secret list"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E13-list-high", "tool": "Bash", "tool_input": {"command": "gh secret list"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E14-00-off", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/workflows/ci.yml/dispatches -f ref=main"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E14-00-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/workflows/ci.yml/dispatches -f ref=main"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E14-00-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/workflows/ci.yml/dispatches -f ref=main"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E14-00-high", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/workflows/ci.yml/dispatches -f ref=main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E14-01-off", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/dispatches -f event_type=x"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E14-01-relaxed", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/dispatches -f event_type=x"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E14-01-medium", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/dispatches -f event_type=x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E14-01-high", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/dispatches -f event_type=x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E14-02-off", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/deployments -f ref=main"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E14-02-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/deployments -f ref=main"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E14-02-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/deployments -f ref=main"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E14-02-high", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/deployments -f ref=main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E14-03-off", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/environments/prod"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E14-03-relaxed", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/environments/prod"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E14-03-medium", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/environments/prod"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E14-03-high", "tool": "Bash", "tool_input": {"command": "gh api -X PUT repos/o/r/environments/prod"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E14-04-off", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/pages/deployments"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E14-04-relaxed", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/pages/deployments"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E14-04-medium", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/pages/deployments"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E14-04-high", "tool": "Bash", "tool_input": {"command": "gh api -X POST repos/o/r/pages/deployments"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E14-hl", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/deployments -f ref=main"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "E15-get-off", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/pulls/1/comments"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E15-get-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/pulls/1/comments"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E15-get-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/pulls/1/comments"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-get-high", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/pulls/1/comments"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-comment-off", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/issues/1/comments -f body=hi"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E15-comment-relaxed", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/issues/1/comments -f body=hi"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E15-comment-medium", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/issues/1/comments -f body=hi"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-comment-high", "tool": "Bash", "tool_input": {"command": "gh api repos/o/r/issues/1/comments -f body=hi"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-graphql-off", "tool": "Bash", "tool_input": {"command": "gh api graphql -f query='{viewer{login}}'"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E15-graphql-relaxed", "tool": "Bash", "tool_input": {"command": "gh api graphql -f query='{viewer{login}}'"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E15-graphql-medium", "tool": "Bash", "tool_input": {"command": "gh api graphql -f query='{viewer{login}}'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-graphql-high", "tool": "Bash", "tool_input": {"command": "gh api graphql -f query='{viewer{login}}'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-00-off", "tool": "Bash", "tool_input": {"command": "gh repo delete o/r --yes"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-00-relaxed", "tool": "Bash", "tool_input": {"command": "gh repo delete o/r --yes"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-00-medium", "tool": "Bash", "tool_input": {"command": "gh repo delete o/r --yes"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-00-high", "tool": "Bash", "tool_input": {"command": "gh repo delete o/r --yes"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-01-off", "tool": "Bash", "tool_input": {"command": "gh repo delete"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-01-relaxed", "tool": "Bash", "tool_input": {"command": "gh repo delete"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-01-medium", "tool": "Bash", "tool_input": {"command": "gh repo delete"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-01-high", "tool": "Bash", "tool_input": {"command": "gh repo delete"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-02-off", "tool": "Bash", "tool_input": {"command": "gh issue delete 3 --yes"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-02-relaxed", "tool": "Bash", "tool_input": {"command": "gh issue delete 3 --yes"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-02-medium", "tool": "Bash", "tool_input": {"command": "gh issue delete 3 --yes"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-02-high", "tool": "Bash", "tool_input": {"command": "gh issue delete 3 --yes"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-03-off", "tool": "Bash", "tool_input": {"command": "gh alias set co 'pr checkout'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-03-relaxed", "tool": "Bash", "tool_input": {"command": "gh alias set co 'pr checkout'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-03-medium", "tool": "Bash", "tool_input": {"command": "gh alias set co 'pr checkout'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-03-high", "tool": "Bash", "tool_input": {"command": "gh alias set co 'pr checkout'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-04-off", "tool": "Bash", "tool_input": {"command": "gh alias list"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-04-relaxed", "tool": "Bash", "tool_input": {"command": "gh alias list"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-04-medium", "tool": "Bash", "tool_input": {"command": "gh alias list"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-04-high", "tool": "Bash", "tool_input": {"command": "gh alias list"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-05-off", "tool": "Bash", "tool_input": {"command": "gh api -X DELETE repos/o/r"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E15-05-relaxed", "tool": "Bash", "tool_input": {"command": "gh api -X DELETE repos/o/r"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E15-05-medium", "tool": "Bash", "tool_input": {"command": "gh api -X DELETE repos/o/r"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E15-05-high", "tool": "Bash", "tool_input": {"command": "gh api -X DELETE repos/o/r"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E15-delsecret-off", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E15-delsecret-relaxed", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E15-delsecret-medium", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E15-delsecret-high", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E7-00-off", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-00-relaxed", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-00-medium", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-00-high", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-01-off", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-01-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-01-medium", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-01-high", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-02-off", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-02-medium", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-02-high", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-03-off", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-03-medium", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-03-high", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-04-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-04-medium", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-04-high", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-05-off", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-05-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-05-medium", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-05-high", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-06-off", "tool": "Bash", "tool_input": {"command": "git config credential.helper store"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-06-relaxed", "tool": "Bash", "tool_input": {"command": "git config credential.helper store"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-06-medium", "tool": "Bash", "tool_input": {"command": "git config credential.helper store"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-06-high", "tool": "Bash", "tool_input": {"command": "git config credential.helper store"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-read-off", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "E7-read-relaxed", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "E7-read-medium", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "E7-read-high", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-00-off", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-00-relaxed", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-00-medium", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-00-high", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-01-off", "tool": "Bash", "tool_input": {"command": "git restore -S ."}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-01-relaxed", "tool": "Bash", "tool_input": {"command": "git restore -S ."}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-01-medium", "tool": "Bash", "tool_input": {"command": "git restore -S ."}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-01-high", "tool": "Bash", "tool_input": {"command": "git restore -S ."}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-02-off", "tool": "Bash", "tool_input": {"command": "git -C sub restore --staged --source=HEAD~1 f"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-02-relaxed", "tool": "Bash", "tool_input": {"command": "git -C sub restore --staged --source=HEAD~1 f"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-02-medium", "tool": "Bash", "tool_input": {"command": "git -C sub restore --staged --source=HEAD~1 f"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-02-high", "tool": "Bash", "tool_input": {"command": "git -C sub restore --staged --source=HEAD~1 f"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-03-off", "tool": "Bash", "tool_input": {"command": "git clean -n"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-03-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -n"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-03-medium", "tool": "Bash", "tool_input": {"command": "git clean -n"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-03-high", "tool": "Bash", "tool_input": {"command": "git clean -n"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-04-off", "tool": "Bash", "tool_input": {"command": "git clean --dry-run -d"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-04-relaxed", "tool": "Bash", "tool_input": {"command": "git clean --dry-run -d"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-04-medium", "tool": "Bash", "tool_input": {"command": "git clean --dry-run -d"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-04-high", "tool": "Bash", "tool_input": {"command": "git clean --dry-run -d"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-05-off", "tool": "Bash", "tool_input": {"command": "git clean -nd"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-05-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -nd"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-05-medium", "tool": "Bash", "tool_input": {"command": "git clean -nd"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-05-high", "tool": "Bash", "tool_input": {"command": "git clean -nd"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-06-off", "tool": "Bash", "tool_input": {"command": "git clean -dn -x"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-06-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -dn -x"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-06-medium", "tool": "Bash", "tool_input": {"command": "git clean -dn -x"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-06-high", "tool": "Bash", "tool_input": {"command": "git clean -dn -x"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-none-07-off", "tool": "Bash", "tool_input": {"command": "git clean -n -- -f"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "FL-none-07-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -n -- -f"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "FL-none-07-medium", "tool": "Bash", "tool_input": {"command": "git clean -n -- -f"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "FL-none-07-high", "tool": "Bash", "tool_input": {"command": "git clean -n -- -f"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "FL-deny-00-off", "tool": "Bash", "tool_input": {"command": "git restore --staged --worktree f"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-00-relaxed", "tool": "Bash", "tool_input": {"command": "git restore --staged --worktree f"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-00-medium", "tool": "Bash", "tool_input": {"command": "git restore --staged --worktree f"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-00-high", "tool": "Bash", "tool_input": {"command": "git restore --staged --worktree f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-01-off", "tool": "Bash", "tool_input": {"command": "git restore -SW f"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-01-relaxed", "tool": "Bash", "tool_input": {"command": "git restore -SW f"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-01-medium", "tool": "Bash", "tool_input": {"command": "git restore -SW f"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-01-high", "tool": "Bash", "tool_input": {"command": "git restore -SW f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-02-off", "tool": "Bash", "tool_input": {"command": "git restore -W f"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-02-relaxed", "tool": "Bash", "tool_input": {"command": "git restore -W f"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-02-medium", "tool": "Bash", "tool_input": {"command": "git restore -W f"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-02-high", "tool": "Bash", "tool_input": {"command": "git restore -W f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-03-off", "tool": "Bash", "tool_input": {"command": "git restore --worktree ."}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-03-relaxed", "tool": "Bash", "tool_input": {"command": "git restore --worktree ."}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-03-medium", "tool": "Bash", "tool_input": {"command": "git restore --worktree ."}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-03-high", "tool": "Bash", "tool_input": {"command": "git restore --worktree ."}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-04-off", "tool": "Bash", "tool_input": {"command": "git clean -f"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-04-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -f"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-04-medium", "tool": "Bash", "tool_input": {"command": "git clean -f"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-04-high", "tool": "Bash", "tool_input": {"command": "git clean -f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-05-off", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-05-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-05-medium", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-05-high", "tool": "Bash", "tool_input": {"command": "git clean -fdx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-06-off", "tool": "Bash", "tool_input": {"command": "git clean -d -- -n"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-06-relaxed", "tool": "Bash", "tool_input": {"command": "git clean -d -- -n"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-06-medium", "tool": "Bash", "tool_input": {"command": "git clean -d -- -n"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-06-high", "tool": "Bash", "tool_input": {"command": "git clean -d -- -n"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "FL-deny-07-off", "tool": "Bash", "tool_input": {"command": "git restore -s HEAD f"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "FL-deny-07-relaxed", "tool": "Bash", "tool_input": {"command": "git restore -s HEAD f"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "FL-deny-07-medium", "tool": "Bash", "tool_input": {"command": "git restore -s HEAD f"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "FL-deny-07-high", "tool": "Bash", "tool_input": {"command": "git restore -s HEAD f"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-00-off", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-00-relaxed", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-00-medium", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-00-high", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-01-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-01-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-01-medium", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-01-high", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-02-off", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-02-medium", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-02-high", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-03-off", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-03-medium", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-03-high", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-04-off", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-04-medium", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-04-high", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-05-off", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-05-relaxed", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-05-medium", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-05-high", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-06-off", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-06-relaxed", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-06-medium", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-06-high", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-07-off", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-07-relaxed", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-07-medium", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-07-high", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-08-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-08-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-08-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-08-high", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-09-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-09-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-09-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-09-high", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-10-off", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-10-relaxed", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-10-medium", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-10-high", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-11-off", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "P-cfg-11-relaxed", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-11-medium", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-cfg-11-high", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-00-off", "tool": "Bash", "tool_input": {"command": "xargs --max-lines git -P clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-00-relaxed", "tool": "Bash", "tool_input": {"command": "xargs --max-lines git -P clean -fdx"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-00-medium", "tool": "Bash", "tool_input": {"command": "xargs --max-lines git -P clean -fdx"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-00-high", "tool": "Bash", "tool_input": {"command": "xargs --max-lines git -P clean -fdx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-01-off", "tool": "Bash", "tool_input": {"command": "arch -x86_64 git clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-01-relaxed", "tool": "Bash", "tool_input": {"command": "arch -x86_64 git clean -fdx"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-01-medium", "tool": "Bash", "tool_input": {"command": "arch -x86_64 git clean -fdx"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-01-high", "tool": "Bash", "tool_input": {"command": "arch -x86_64 git clean -fdx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-02-off", "tool": "Bash", "tool_input": {"command": "chrt -f 1 git clean -fd"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-02-relaxed", "tool": "Bash", "tool_input": {"command": "chrt -f 1 git clean -fd"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-02-medium", "tool": "Bash", "tool_input": {"command": "chrt -f 1 git clean -fd"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-02-high", "tool": "Bash", "tool_input": {"command": "chrt -f 1 git clean -fd"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-03-off", "tool": "Bash", "tool_input": {"command": "numactl -N 0 git reset --hard"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-03-relaxed", "tool": "Bash", "tool_input": {"command": "numactl -N 0 git reset --hard"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-03-medium", "tool": "Bash", "tool_input": {"command": "numactl -N 0 git reset --hard"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-03-high", "tool": "Bash", "tool_input": {"command": "numactl -N 0 git reset --hard"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-04-off", "tool": "Bash", "tool_input": {"command": "chroot /mnt git clean -x"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-04-relaxed", "tool": "Bash", "tool_input": {"command": "chroot /mnt git clean -x"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-04-medium", "tool": "Bash", "tool_input": {"command": "chroot /mnt git clean -x"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-04-high", "tool": "Bash", "tool_input": {"command": "chroot /mnt git clean -x"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-05-off", "tool": "Bash", "tool_input": {"command": "strace -f -o /tmp/t git clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-05-relaxed", "tool": "Bash", "tool_input": {"command": "strace -f -o /tmp/t git clean -fdx"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-05-medium", "tool": "Bash", "tool_input": {"command": "strace -f -o /tmp/t git clean -fdx"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-05-high", "tool": "Bash", "tool_input": {"command": "strace -f -o /tmp/t git clean -fdx"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-06-off", "tool": "Bash", "tool_input": {"command": "prlimit --nofile=10 git clean -fd"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-06-relaxed", "tool": "Bash", "tool_input": {"command": "prlimit --nofile=10 git clean -fd"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-06-medium", "tool": "Bash", "tool_input": {"command": "prlimit --nofile=10 git clean -fd"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-06-high", "tool": "Bash", "tool_input": {"command": "prlimit --nofile=10 git clean -fd"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-07-off", "tool": "Bash", "tool_input": {"command": "sudo -u me env A=1 nice -n 5 git clean -fd"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-07-relaxed", "tool": "Bash", "tool_input": {"command": "sudo -u me env A=1 nice -n 5 git clean -fd"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-07-medium", "tool": "Bash", "tool_input": {"command": "sudo -u me env A=1 nice -n 5 git clean -fd"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-07-high", "tool": "Bash", "tool_input": {"command": "sudo -u me env A=1 nice -n 5 git clean -fd"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-08-off", "tool": "Bash", "tool_input": {"command": "firejail --quiet gh secret set X --body y"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-wrap-08-relaxed", "tool": "Bash", "tool_input": {"command": "firejail --quiet gh secret set X --body y"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "P-wrap-08-medium", "tool": "Bash", "tool_input": {"command": "firejail --quiet gh secret set X --body y"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "P-wrap-08-high", "tool": "Bash", "tool_input": {"command": "firejail --quiet gh secret set X --body y"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-wrap-force-off", "tool": "Bash", "tool_input": {"command": "systemd-run --user git push --force"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-wrap-force-relaxed", "tool": "Bash", "tool_input": {"command": "systemd-run --user git push --force"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-wrap-force-medium", "tool": "Bash", "tool_input": {"command": "systemd-run --user git push --force"}, "tier": "medium", "headless": false, "want": "A"}
+{"id": "P-wrap-force-high", "tool": "Bash", "tool_input": {"command": "systemd-run --user git push --force"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "P-cfg-hl", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": true, "want": "D"}
+{"id": "P-none-00-off", "tool": "Bash", "tool_input": {"command": "git --no-pager clean -n"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-00-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager clean -n"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-00-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager clean -n"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-00-high", "tool": "Bash", "tool_input": {"command": "git --no-pager clean -n"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-01-off", "tool": "Bash", "tool_input": {"command": "git --no-pager clean --dry-run"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-01-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager clean --dry-run"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-01-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager clean --dry-run"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-01-high", "tool": "Bash", "tool_input": {"command": "git --no-pager clean --dry-run"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-02-off", "tool": "Bash", "tool_input": {"command": "git --no-pager restore --staged src/lib.rs"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-02-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager restore --staged src/lib.rs"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-02-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager restore --staged src/lib.rs"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-02-high", "tool": "Bash", "tool_input": {"command": "git --no-pager restore --staged src/lib.rs"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-03-off", "tool": "Bash", "tool_input": {"command": "xargs grep -l git"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-03-relaxed", "tool": "Bash", "tool_input": {"command": "xargs grep -l git"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-03-medium", "tool": "Bash", "tool_input": {"command": "xargs grep -l git"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-03-high", "tool": "Bash", "tool_input": {"command": "xargs grep -l git"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-04-off", "tool": "Bash", "tool_input": {"command": "nice make clean"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-04-relaxed", "tool": "Bash", "tool_input": {"command": "nice make clean"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-04-medium", "tool": "Bash", "tool_input": {"command": "nice make clean"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-04-high", "tool": "Bash", "tool_input": {"command": "nice make clean"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-05-off", "tool": "Bash", "tool_input": {"command": "sudo apt install git"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-05-relaxed", "tool": "Bash", "tool_input": {"command": "sudo apt install git"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-05-medium", "tool": "Bash", "tool_input": {"command": "sudo apt install git"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-05-high", "tool": "Bash", "tool_input": {"command": "sudo apt install git"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-06-off", "tool": "Bash", "tool_input": {"command": "timeout 5 cargo test"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-06-relaxed", "tool": "Bash", "tool_input": {"command": "timeout 5 cargo test"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-06-medium", "tool": "Bash", "tool_input": {"command": "timeout 5 cargo test"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-06-high", "tool": "Bash", "tool_input": {"command": "timeout 5 cargo test"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "P-none-07-off", "tool": "Bash", "tool_input": {"command": "git config user.email a@b"}, "tier": "off", "headless": false, "want": "-"}
+{"id": "P-none-07-relaxed", "tool": "Bash", "tool_input": {"command": "git config user.email a@b"}, "tier": "relaxed", "headless": false, "want": "-"}
+{"id": "P-none-07-medium", "tool": "Bash", "tool_input": {"command": "git config user.email a@b"}, "tier": "medium", "headless": false, "want": "-"}
+{"id": "P-none-07-high", "tool": "Bash", "tool_input": {"command": "git config user.email a@b"}, "tier": "high", "headless": false, "want": "-"}
