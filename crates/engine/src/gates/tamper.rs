@@ -3154,9 +3154,13 @@ pub(crate) fn risky_git_key(key: &str, value: &str) -> bool {
     }
 }
 
-/// Whether `value` is a bare, well-known editor or pager (`vim`, `code --wait`, `delta`).
-fn is_known_editor_or_pager(value: &str) -> bool {
+/// Whether `value` is a bare, well-known editor or pager (`vim`, `code --wait`, `delta`), or
+/// a no-op (`true`, `:`, empty).
+pub(crate) fn is_known_editor_or_pager(value: &str) -> bool {
     const KNOWN: &[&str] = &[
+        "",
+        "true",
+        ":",
         "vim",
         "vi",
         "nvim",
