@@ -24,8 +24,9 @@
 //!   [`grep_exclusions`].
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::gate::Verdict;
 use crate::gates::secretpath;
@@ -70,6 +71,7 @@ enum Root {
 }
 
 /// One compiled `credentials.list` record.
+#[derive(Clone)]
 struct Entry {
     exception: bool,
     root: Root,
@@ -81,22 +83,212 @@ struct Entry {
     source: &'static str,
 }
 
-/// The compiled list, `None` when the embedded lists failed to parse.
-fn entries() -> Option<&'static [Entry]> {
+/// Stores the hooks deny that `credentials.list` does not carry (hook-only: the sandbox
+/// snippet comes from the list alone).
+const HOOK_STORES: &[&str] = &[
+    // Bitwarden desktop is Electron and unsandboxed: a plain directory nothing else gates
+    // (kit `DENY_CREDENTIALS`).
+    "~/Library/Application Support/Bitwarden/",
+    // git's XDG credential-store file, which `credential.helper store` uses when it exists.
+    "~/.config/git/credentials",
+];
+
+/// Environment variables that move a credential store, as the CLIs read them: each item is a
+/// path under the value (`""` the value itself; a trailing `/` a directory and everything
+/// below it). `XDG_CONFIG_HOME` moves every `~/.config/…` record ([`env_entries`]).
+const ENV_STORES: &[(&str, &[&str])] = &[
+    ("GH_CONFIG_DIR", &["hosts.yml"]),
+    ("DOCKER_CONFIG", &["config.json"]),
+    ("CARGO_HOME", &["credentials", "credentials.toml"]),
+    ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
+    ("AWS_CONFIG_FILE", &[""]),
+    ("KUBECONFIG", &[""]),
+    ("NPM_CONFIG_USERCONFIG", &[""]),
+    ("npm_config_userconfig", &[""]),
+    ("NETRC", &[""]),
+    ("GNUPGHOME", &["/"]),
+    ("PASSWORD_STORE_DIR", &["/"]),
+    ("CLOUDSDK_CONFIG", &["/"]),
+    ("AZURE_CONFIG_DIR", &["/"]),
+];
+
+/// The compiled list and [`HOOK_STORES`], `None` when the embedded lists failed to parse.
+fn list_entries() -> Option<&'static [Entry]> {
     static COMPILED: OnceLock<Option<Vec<Entry>>> = OnceLock::new();
     COMPILED
         .get_or_init(|| {
-            lists::credentials()
-                .ok()
-                .map(|c| c.iter().map(compile).collect())
+            lists::credentials().ok().map(|c| {
+                c.iter()
+                    .map(|c| compile(c.exception, c.glob.as_str()))
+                    .chain(HOOK_STORES.iter().map(|g| compile(false, g)))
+                    .collect()
+            })
         })
         .as_deref()
 }
 
+/// [`list_entries`] plus the stores the environment moves ([`env_entries`]), rebuilt only when
+/// one of those variables changes.
+fn entries() -> Option<Arc<Vec<Entry>>> {
+    type Cache = Mutex<Option<(OsString, Arc<Vec<Entry>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let base = list_entries()?;
+    let key = env_key();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let Ok(mut cache) = cache.lock() else {
+        return Some(Arc::new(with_env(base)));
+    };
+    if let Some((k, all)) = cache.as_ref() {
+        if *k == key {
+            return Some(Arc::clone(all));
+        }
+    }
+    let all = Arc::new(with_env(base));
+    *cache = Some((key, Arc::clone(&all)));
+    Some(all)
+}
+
+fn with_env(base: &[Entry]) -> Vec<Entry> {
+    let mut all = base.to_vec();
+    all.extend(env_entries(base));
+    all
+}
+
+/// The values [`env_entries`] depends on, as one cache key.
+fn env_key() -> OsString {
+    let mut key = OsString::new();
+    let names =
+        ENV_STORES
+            .iter()
+            .map(|(n, _)| *n)
+            .chain(["XDG_CONFIG_HOME", "HOME", "USERPROFILE"]);
+    let mut relative = false;
+    for name in names {
+        if let Some(v) = std::env::var_os(name) {
+            relative |= !Path::new(&v).is_absolute();
+            key.push(&v);
+        }
+        key.push("\0");
+    }
+    if relative {
+        if let Ok(cwd) = std::env::current_dir() {
+            key.push(cwd);
+        }
+    }
+    key
+}
+
+/// The records for stores an environment variable moves ([`ENV_STORES`], and every
+/// `~/.config/…` record, exceptions too, under `$XDG_CONFIG_HOME`), rooted at the value as
+/// given and at its canonical form. A directory store at or above a home or the working
+/// directory is left out: a variable set to `/` or `~` must not deny the whole tree.
+fn env_entries(base: &[Entry]) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    let cwd = std::env::current_dir().ok();
+    let mut push = |value: &Path, item: &str, exception: bool| {
+        let dir = item.ends_with('/');
+        let item = item.trim_end_matches('/');
+        let value = match (value.is_absolute(), &cwd) {
+            (false, Some(cwd)) => cwd.join(value),
+            (false, None) => return,
+            (true, _) => value.to_path_buf(),
+        };
+        let path = if item.is_empty() {
+            value
+        } else {
+            value.join(item)
+        };
+        let spelled = path.to_string_lossy().into_owned();
+        let forms: Vec<(String, Vec<String>)> = [Some(spelled.clone()), canonical(&spelled)]
+            .into_iter()
+            .flatten()
+            .map(|form| {
+                let folded = secretpath::fold(&form, None);
+                let segs = segments(&folded.to_ascii_lowercase());
+                (folded, segs)
+            })
+            .collect();
+        if dir
+            && forms
+                .iter()
+                .any(|(_, segs)| covers_home_or_cwd(segs, cwd.as_deref()))
+        {
+            return;
+        }
+        for (folded, segs) in forms {
+            if segs.is_empty() || segs.iter().any(|s| s == ".." || has_wild(s)) {
+                continue;
+            }
+            let source: &'static str = Box::leak(
+                format!(
+                    "/{}{}",
+                    folded.trim_start_matches('/'),
+                    if dir { "/" } else { "" }
+                )
+                .into_boxed_str(),
+            );
+            if out.iter().any(|e| e.source == source) {
+                continue;
+            }
+            out.push(Entry {
+                exception,
+                root: Root::Abs,
+                segs,
+                dir,
+                source,
+            });
+        }
+    };
+    for (name, items) in ENV_STORES {
+        let Some(value) = std::env::var_os(name).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let values: Vec<PathBuf> = if *name == "KUBECONFIG" {
+            std::env::split_paths(&value).collect()
+        } else {
+            vec![PathBuf::from(&value)]
+        };
+        for value in values.iter().filter(|v| !v.as_os_str().is_empty()) {
+            for item in *items {
+                push(value, item, false);
+            }
+        }
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        let xdg = PathBuf::from(xdg);
+        for entry in base.iter().filter(|e| e.root == Root::Home) {
+            let Some(rest) = entry.source.strip_prefix("~/.config/") else {
+                continue;
+            };
+            push(&xdg, rest, entry.exception);
+        }
+    }
+    out
+}
+
+/// Whether the directory `segs` is a home, the working directory, or above one of them.
+fn covers_home_or_cwd(segs: &[String], cwd: Option<&Path>) -> bool {
+    if segs.len() < 2 {
+        return true;
+    }
+    let cwd: Vec<Vec<String>> = cwd
+        .into_iter()
+        .flat_map(|c| {
+            let text = c.to_string_lossy().into_owned();
+            [canonical(&text), Some(text)]
+        })
+        .flatten()
+        .map(|c| segments(&secretpath::normalize(&c, None)))
+        .collect();
+    home_roots(true)
+        .into_iter()
+        .chain(cwd)
+        .any(|other| other.starts_with(segs))
+}
+
 const CONFIG_DIR_PREFIX: &str = "${CLAUDE_CONFIG_DIR:-~/.claude}/";
 
-fn compile(c: &'static Credential) -> Entry {
-    let glob = c.glob.as_str();
+fn compile(exception: bool, glob: &'static str) -> Entry {
     let (root, rest) = if let Some(rest) = glob.strip_prefix(CONFIG_DIR_PREFIX) {
         (Root::ConfigDir, rest)
     } else if let Some(rest) = glob.strip_prefix("~/") {
@@ -107,7 +299,7 @@ fn compile(c: &'static Credential) -> Entry {
         (Root::Anywhere, glob)
     };
     Entry {
-        exception: c.exception,
+        exception,
         root,
         segs: segments(&rest.to_ascii_lowercase()),
         dir: glob.ends_with('/'),
@@ -425,7 +617,7 @@ fn check(path: &Path, globbing: bool, unexpanded: bool) -> bool {
         })
     };
     let mut denied = false;
-    for entry in entries {
+    for entry in entries.iter() {
         if !hit(entry) {
             continue;
         }
@@ -470,18 +662,18 @@ pub fn reaches_store(dir: &Path) -> bool {
         return home_roots(true).iter().any(|root| {
             let mut full = root.clone();
             full.extend(segs[i + 1..].iter().cloned());
-            reaches_abs(entries, &full)
+            reaches_abs(&entries, &full)
         });
     }
     if !is_absolute(&text) {
         return false;
     }
-    if reaches_abs(entries, &segs) {
+    if reaches_abs(&entries, &segs) {
         return true;
     }
     if let Some(real) = canonical(&dir.to_string_lossy()) {
         segs = segments(&secretpath::normalize(&real, None));
-        return reaches_abs(entries, &segs);
+        return reaches_abs(&entries, &segs);
     }
     false
 }
@@ -532,10 +724,67 @@ pub fn grep_root(target: &Path, real: &Path, homes: &[String]) -> Option<Verdict
     in_data.then(|| hard_deny("search inside the safe-ai-skill data dir (its state key)"))
 }
 
+/// Whether `path` is a hard link to a single-file credential store (`~/.config/gh/hosts.yml`,
+/// `~/.npmrc`, …, and the files the environment moves there): the same device and inode, so
+/// no spelling or link hides it. A file with one link is answered without looking further.
+pub fn hard_link_to_store(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = crate::localfs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_file() || meta.nlink() < 2 {
+            return false;
+        }
+        let Some(entries) = entries() else {
+            return false;
+        };
+        store_files(&entries).iter().any(|file| {
+            crate::localfs::metadata(file)
+                .is_ok_and(|m| m.dev() == meta.dev() && m.ino() == meta.ino())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The concrete files of the single-file records (no wildcard, not a directory, not an
+/// exception), under every home and config dir.
+#[cfg(unix)]
+fn store_files(entries: &[Entry]) -> Vec<PathBuf> {
+    let homes = home_dirs();
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.exception || entry.dir || entry.segs.iter().any(|s| has_wild(s)) {
+            continue;
+        }
+        match entry.root {
+            Root::Anywhere => {}
+            Root::Abs => out.push(PathBuf::from(entry.source)),
+            Root::Home => {
+                let rest = entry.source.trim_start_matches("~/");
+                out.extend(homes.iter().map(|h| h.join(rest)));
+            }
+            Root::ConfigDir => {
+                let rest = entry.source.trim_start_matches(CONFIG_DIR_PREFIX);
+                out.extend(homes.iter().map(|h| h.join(".claude").join(rest)));
+                if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+                    out.push(PathBuf::from(dir).join(rest));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether the credential lists loaded; without them a directory Grep cannot be given its
 /// exclusions and asks.
 pub fn lists_available() -> bool {
-    entries().is_some()
+    list_entries().is_some()
 }
 
 /// The exclusion globs for the state key of every data dir a Grep over `dir` reaches
@@ -575,7 +824,8 @@ pub fn grep_exclusions(dir: &Path) -> Vec<String> {
 /// or another spelling): ripgrep prints paths under `given`.
 pub fn grep_exclusions_as(dir: &Path, given: &Path) -> Vec<String> {
     let mut globs: Vec<String> = GREP_EXCLUDED.iter().map(|g| g.to_string()).collect();
-    let all: &[Entry] = entries().unwrap_or_default();
+    let all = entries().unwrap_or_default();
+    let all: &[Entry] = &all;
     let push = |glob: String, globs: &mut Vec<String>| {
         if !globs.contains(&glob) {
             globs.push(glob);
@@ -599,6 +849,9 @@ pub fn grep_exclusions_as(dir: &Path, given: &Path) -> Vec<String> {
         }
     }
     for glob in config_dir_globs(dir, given, all) {
+        push(glob, &mut globs);
+    }
+    for glob in abs_globs(dir, given, all) {
         push(glob, &mut globs);
     }
     if !foreign && !touches_home(dir) {
@@ -687,6 +940,48 @@ fn config_dir_globs(dir: &Path, given: &Path, entries: &[Entry]) -> Vec<String> 
                 } else {
                     format!("{prefix}{item}").replace(' ', "?")
                 };
+                if !out.contains(&glob) {
+                    out.push(glob);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The exclusion globs for the absolute records (`/Library/Keychains/`, the stores the
+/// environment moves) below the Grep root `dir` (canonical) named `given`: each relative to the
+/// root and as `**/<that path>`, as ripgrep matches a glob against the path it prints.
+fn abs_globs(dir: &Path, given: &Path, entries: &[Entry]) -> Vec<String> {
+    let roots: Vec<Vec<String>> = [
+        Some(dir.to_string_lossy().into_owned()),
+        Some(given.to_string_lossy().into_owned()),
+        canonical(&given.to_string_lossy()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|d| segments(&secretpath::normalize(&d, None)))
+    .collect();
+    let mut out = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|e| !e.exception && e.root == Root::Abs)
+    {
+        let written: Vec<&str> = entry.source.split('/').filter(|s| !s.is_empty()).collect();
+        for root in &roots {
+            let under = entry.segs.len() > root.len()
+                && root.iter().zip(&entry.segs).all(|(r, e)| seg_match(e, r));
+            if !under || written.len() != entry.segs.len() {
+                continue;
+            }
+            let rest = written[root.len()..].join("/");
+            let rest = if entry.dir {
+                format!("{rest}/**")
+            } else {
+                rest
+            };
+            for glob in [rest.clone(), format!("**/{rest}")] {
+                let glob = glob.replace(' ', "?");
                 if !out.contains(&glob) {
                     out.push(glob);
                 }
@@ -963,6 +1258,32 @@ mod tests {
     }
 
     #[test]
+    fn hook_only_stores_are_credentials() {
+        assert!(cred(
+            "/users/u/library/application support/bitwarden/data.json"
+        ));
+        assert!(cred("/users/u/library/application support/bitwarden"));
+        assert!(cred("/home/u/.config/git/credentials"));
+        assert!(!cred(
+            "/users/u/library/application support/code/user/settings.json"
+        ));
+        assert!(!cred("/home/u/.config/git/config"));
+    }
+
+    #[test]
+    fn a_directory_variable_never_covers_a_home_or_the_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let segs = |p: &str| segments(&secretpath::normalize(p, None));
+        assert!(covers_home_or_cwd(&segs("/"), Some(&cwd)));
+        assert!(covers_home_or_cwd(&segs("/home"), Some(&cwd)));
+        assert!(covers_home_or_cwd(
+            &segs(&cwd.to_string_lossy()),
+            Some(&cwd)
+        ));
+        assert!(!covers_home_or_cwd(&segs("/opt/gnupg"), Some(&cwd)));
+    }
+
+    #[test]
     fn near_misses_are_not_credentials() {
         for p in [
             "/home/u/proj/.npmrc",
@@ -1007,7 +1328,7 @@ mod tests {
             .iter()
             .filter(|c| !c.exception)
         {
-            let want = exclusion_globs(&compile(c));
+            let want = exclusion_globs(&compile(c.exception, c.glob.as_str()));
             for glob in want {
                 assert!(home.contains(&glob), "{} -> {glob}", c.glob);
             }

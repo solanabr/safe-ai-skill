@@ -109,6 +109,9 @@ fn decide_path_with(path: &str, cwd: &Path, policy: &Policy, unknown: bool) -> D
     if let Some(Verdict::Hard(what)) = verdicts.iter().find(|v| matches!(v, Verdict::Hard(_))) {
         return hard_deny(what);
     }
+    if credpaths::hard_link_to_store(&raw) {
+        return hard_deny("a hard link to a credential store");
+    }
 
     // Content: keypairs and private keys are hard denies under any name.
     let file = resolved.as_deref().unwrap_or(&raw);
@@ -659,6 +662,16 @@ pub fn decide_mcp_args(input: Option<&Value>, cwd: &Path, policy: &Policy) -> De
             );
         }
     }
+    if let Some(value) = input {
+        let mut dirs = Vec::new();
+        complete &= collect_path_keys(value, 0, &mut dirs);
+        if dirs.iter().any(|d| dir_reaches_store(d, cwd)) {
+            return hard_deny(
+                "a directory at or above a credential store, or linking into one; an MCP \
+                 tool's directory search cannot be given exclusions",
+            );
+        }
+    }
     if complete {
         return Decision::Defer;
     }
@@ -712,6 +725,65 @@ fn holds_claude_state(arg: &str, cwd: &Path) -> bool {
             || secretpath::data_dir_reach(f, &homes).is_some()
             || secretpath::is_transcript_tree(f, &homes)
     })
+}
+
+/// Most entries of a `path` directory looked at for a symlink into a credential store.
+const MAX_DIR_ENTRIES: usize = 4096;
+
+/// Whether the MCP `path` directory `arg` would let a recursive reader (context-mode's
+/// `ctx_index`, a filesystem server's search) reach a credential store: it is at or above one
+/// ([`credpaths::reaches_store`]), or an immediate child is a symlink resolving into or above
+/// one (a stow-style `config/gh` link, which a symlink-following walk enters). A deeper link
+/// is a residual, as in the kit.
+fn dir_reaches_store(arg: &str, cwd: &Path) -> bool {
+    let homes = secretpath::homes_resolved();
+    let target = absolute(arg, cwd, &homes);
+    if !crate::localfs::is_dir(&target) {
+        return false;
+    }
+    if credpaths::reaches_store(&target) {
+        return true;
+    }
+    let Ok(children) = crate::localfs::read_dir(&target) else {
+        return false;
+    };
+    children
+        .take(MAX_DIR_ENTRIES)
+        .filter_map(Result::ok)
+        .filter(|c| c.file_type().is_ok_and(|t| t.is_symlink()))
+        .filter_map(|c| crate::localfs::canonicalize(c.path()).ok())
+        .any(|real| {
+            credpaths::is_credential(Path::new(&secretpath::normalize(
+                &real.to_string_lossy(),
+                None,
+            ))) || (crate::localfs::is_dir(&real) && credpaths::reaches_store(&real))
+                || credpaths::hard_link_to_store(&real)
+        })
+}
+
+/// Collect the string values of `path` keys at any depth into `out` (bounded like
+/// [`collect_path_strings`]); `false` when a limit cut the walk short.
+fn collect_path_keys<'a>(value: &'a Value, depth: usize, out: &mut Vec<&'a str>) -> bool {
+    if depth > MAX_MCP_DEPTH {
+        return false;
+    }
+    match value {
+        Value::Array(items) => items.iter().all(|v| collect_path_keys(v, depth + 1, out)),
+        Value::Object(map) => map.iter().all(|(k, v)| {
+            if let (true, Some(s)) = (k == "path", v.as_str()) {
+                if s.len() <= MAX_MCP_PATH_LEN && !s.contains(['\n', '\r']) && !s.trim().is_empty()
+                {
+                    if out.len() >= MAX_MCP_PATHS {
+                        return false;
+                    }
+                    out.push(s);
+                }
+                return true;
+            }
+            collect_path_keys(v, depth + 1, out)
+        }),
+        _ => true,
+    }
 }
 
 /// Deepest MCP argument nesting that is path-checked.

@@ -6,7 +6,8 @@
 //! 1. **Command-form readers** that print a stored credential: `gh auth token`,
 //!    `git credential fill`, `security find-generic-password -w`, `aws configure get *secret*`,
 //!    `npm config get *_authToken`, `docker-credential-* get`, `secret-tool lookup`,
-//!    `pass show`, `op read`, `bw get`, … (plugin-internal, not path globs).
+//!    `pass show`, `op read`, `bw get`, `gcloud auth print-access-token`,
+//!    `az account get-access-token`, … (plugin-internal, not path globs).
 //! 2. **Any word that names a credential path**, in any command, whatever the program: `vim
 //!    ~/.aws/credentials`, `gpg -d ~/.password-store/x.gpg`, `tar cz ~/.aws`, `python3 x.py
 //!    ~/.npmrc`, `ln ~/.aws/credentials k`. A word is a path candidate after `~`/`$HOME`/
@@ -2156,6 +2157,7 @@ fn literal_hit(path: &Path, exempt: Exempt) -> bool {
         return true;
     }
     crate::localfs::canonicalize(path).is_ok_and(|real| !exempt.allows(&real) && secret(&real))
+        || (exempt != Exempt::Solana && credpaths::hard_link_to_store(path))
 }
 
 fn candidate_hit(word: &str, cwds: &[PathBuf], exempt: Exempt) -> bool {
@@ -2439,6 +2441,24 @@ fn reader(cmd: &SimpleCommand) -> Option<&'static str> {
             (first == Some("get")).then_some("docker-credential-* get")
         }
         "secret-tool" => matches!(first, Some("lookup" | "search")).then_some("secret-tool lookup"),
+        "gcloud" => {
+            let token = |p: &str| matches!(p, "print-access-token" | "print-identity-token");
+            // Global flags may take values (`--account me`), so `auth` is found, not assumed.
+            let auth = args.pos.iter().position(|p| p == "auth");
+            let after = |n: usize| auth.and_then(|i| args.pos.get(i + n)).map(String::as_str);
+            if after(1).is_some_and(token)
+                || (after(1) == Some("application-default") && after(2).is_some_and(token))
+            {
+                Some("gcloud auth print-access-token")
+            } else if args.after("config") == Some("config-helper") {
+                Some("gcloud config config-helper")
+            } else {
+                None
+            }
+        }
+        "az" => args
+            .starts("account", "get-access-token")
+            .then_some("az account get-access-token"),
         "pass" => pass_reader(&args),
         "op" => {
             if matches!(first, Some("read" | "inject")) {
@@ -2512,6 +2532,27 @@ mod tests {
         for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
             let verdict = decide("gh auth token", Path::new("/tmp"), &policy, tier);
             assert!(matches!(verdict, Some(Verdict::Deny(_))), "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn cloud_token_printers_deny_and_their_neighbours_pass() {
+        for c in [
+            "gcloud auth print-access-token",
+            "gcloud auth print-identity-token",
+            "gcloud --account me auth application-default print-access-token",
+            "gcloud config config-helper --format=json",
+            "az account get-access-token",
+        ] {
+            assert!(decide_text(c), "{c}");
+        }
+        for c in [
+            "gcloud auth list",
+            "gcloud auth login",
+            "gcloud config list",
+            "az account show",
+        ] {
+            assert!(!decide_text(c), "{c}");
         }
     }
 
