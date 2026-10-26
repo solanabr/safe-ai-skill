@@ -163,6 +163,7 @@ passwd home and not inside the project or hook cwd (see `datadir` docs). Hooks r
 | `generations.json` | `statefile` | authenticated `{file: generation}` index; an envelope below its generation is tampered |
 | `pending.json` | `confirm` | pending requests: id, payload, code **hash** once announced, failure count (authenticated) |
 | `migrated.json` | `migrate` | authenticated marker: 1.0 state was converted |
+| `reports/<sid>.json`, `reports/<sid>.start.json`, `reports/last-<project hash>.json` | `report` | session report written at SessionEnd, start marker written at SessionStart (time, project hash, spend and grant-budget snapshot), and the per-project pointer the next recap reads. The project is stored as a hash, never a path. Newest 200 reports kept, markers pruned after 30 days. Informational: nothing reads them to decide |
 | `*.lock` | `statefile::FileLock` | `state.lock` (stores), `pending.lock`, `grants.lock` |
 
 ---
@@ -425,6 +426,12 @@ pub fn gates::configchange::decide(input: &Value) -> Option<Verdict>;      // Co
 pub fn gates::encoded::expand(command: &str) -> Vec<String>;      // decoded payload texts
 pub fn gates::encoded::decide(command: &str) -> Option<Verdict>;  // undecodable payload → Ask
 pub fn gates::envread::decide_bash(command: &str) -> Option<Verdict>;   // env dumps
+pub fn gates::containers::decide(command: &str, cwd: &Path, policy: &Policy, tier: Tier) -> Option<Verdict>; // container privilege guard, run by gate-bash-secrets
+pub fn gates::keyfiles::decide_bash(command: &str, cwd: &Path, tier: Tier) -> Option<Verdict>;         // git add / commit -a / stash of a key file, run by gate-bash-secrets
+pub fn gates::keyfiles::session_notice(cwd: &Path) -> Option<String>;                                  // SessionStart notice (bounded sweep)
+pub fn gates::permreq::decide(tool: &str, tool_input: Option<&Value>, permission_mode: Option<&str>, cwd: &Path, policy: &Policy, dir: &DataDir) -> Option<Value>; // PermissionRequest answer
+pub fn report::session_start(dir: &DataDir, session_id: &str, cwd: &Path, now: u64) -> Option<String>; // start marker + recap line
+pub fn report::session_end(dir: &DataDir, raw: &[u8], now: u64) -> Option<SessionReport>;              // writes reports/<sid>.json
 ```
 > `secrets`/`read` return only `Decision`; `main.rs` wraps them in a `GateMeta` with
 > `scope = SecretRead, hard_guard = true`.
@@ -440,6 +447,23 @@ pub fn gates::envread::decide_bash(command: &str) -> Option<Verdict>;   // env d
 > `Cargo.toml`/`Cargo.lock`, `go.mod` and the Python manifests for its High rules. `credpaths`
 > adds the stores that environment variables move (`ENV_STORES`, rebuilt only when one of
 > those variables changes) and a hard-link check by device and inode.
+> `containers` and `keyfiles::decide_bash` are two more entries of `gate-bash-secrets`' tier
+> verdict (`strictest([...])` in `main.rs`, also run on inner commands), so they inherit its
+> headless post-processor and its Codex and opencode reach. `containers` reads compose files
+> (512 KiB cap) and judges services as it judges flags. `keyfiles` never runs git: it reads the
+> index through `verify::gittracked`; its SessionStart sweep is capped at depth 8, 20,000
+> entries, 64 content sniffs and 250 ms, and `DOMAIN_PACKS` is the (empty) slot a domain pack
+> fills with its own key-file patterns.
+> `permreq` is the `PermissionRequest` gate (`gate-permission`, `onFailure: block`). It does not
+> go through `gate::decide` or `relax::apply`: it calls the PreToolUse gates' decision functions
+> itself, keeps only hard-guard results (a deny, or an ask whose `GateMeta` is not grantable),
+> and answers `hookSpecificOutput.decision.behavior = "deny"` when the session is unattended
+> (headless, `dontAsk`, unknown mode) or a gate denies in `auto`/`acceptEdits`/`bypassPermissions`,
+> else a `systemMessage` warning or nothing. It never emits `allow`. Its denies are audited as
+> `permission_request`.
+> `report` runs on the SessionStart and SessionEnd hooks only, never on a gate path. `session-end`
+> prints nothing (Claude Code discards SessionEnd output and allows it 1.5 s) and always exits 0;
+> the SessionStart recap travels in `systemMessage` only.
 > `tamper` is the self-grant tripwire: `secrets::decide` runs `decide_bash_within`
 > first (with the hook payload's `cwd` as the session directory), sharing one work `Budget`
 > (units plus a 2 s deadline) with its own scan; exhausting it asks ("command too complex to
@@ -620,7 +644,7 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 ## Subcommands (`main.rs`, complete)
 
 `gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-webfetch` · `gate-tamper` · `gate-skill` · `gate-config` ·
-`gate-prompt-expansion` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
+`gate-prompt-expansion` · `gate-permission` · `session-end` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
 `verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
 `install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
 `session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
