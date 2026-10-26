@@ -652,6 +652,7 @@ fn inner_text_verdict(text: &str, cwd: &Path, effective: &Policy) -> Option<Verd
         envread::decide_bash(text),
         gitguard::decide(text, cwd, effective, tier),
         safe_ai_skill::gates::containers::decide(text, cwd, effective, tier),
+        safe_ai_skill::gates::keyfiles::decide_bash(text, cwd, tier),
     ])
 }
 
@@ -711,6 +712,7 @@ fn cmd_gate_bash_secrets() -> ExitCode {
         encoded_bash_verdict(command, &cwd, &effective),
         git_verdict(command, &cwd, &effective),
         safe_ai_skill::gates::containers::decide(command, &cwd, &effective, tier),
+        safe_ai_skill::gates::keyfiles::decide_bash(command, &cwd, tier),
     ]);
     // Secret reads are always a hard guard. A solana command the bash gate's `if` filters miss
     // is decided here too, under the bash gate's own meta.
@@ -1567,20 +1569,25 @@ fn cmd_verify_session() -> ExitCode {
         platform::session_notices()
     };
     let codex_scope = adapt::is_codex().then(|| adapt::codex::SESSION_SCOPE.to_string());
-    let notices: Vec<String> = [effective.ignored_notice(), loosenings, codex_scope]
-        .into_iter()
-        .flatten()
-        .chain(platform_notices)
-        .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
-            format!(
-                "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
+    let notices: Vec<String> = [
+        effective.ignored_notice(),
+        loosenings,
+        codex_scope,
+        safe_ai_skill::gates::keyfiles::session_notice(&cwd),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(platform_notices)
+    .chain(datadir::other_state_dirs(&dir).into_iter().map(|d| {
+        format!(
+            "safe-ai-skill: another data dir holds state and is not in use: {} (in use: \
                  {}). Its tier, grants and spend ledger do not apply; copy it over the one in \
                  use (key included) or delete it.",
-                d.display(),
-                dir.path.display()
-            )
-        }))
-        .collect();
+            d.display(),
+            dir.path.display()
+        )
+    }))
+    .collect();
     // The tier line leads whenever there is anything to say, or the tier is not the plain
     // default; a clean default session stays silent.
     let plain_default = resolution.tier == Tier::Relaxed
