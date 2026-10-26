@@ -141,6 +141,19 @@ pub fn anchor_network(cwd: &Path, cli: impl FnOnce() -> Network) -> Network {
     }
 }
 
+/// [`SOLANA_CONFIG_TIMEOUT`]; test builds (`test-hooks`) may raise it with
+/// `SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS` so a loaded test machine doesn't read Unknown.
+fn solana_config_timeout() -> Duration {
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    SOLANA_CONFIG_TIMEOUT
+}
+
 /// The CLI config's cluster: `solana config get`, bounded at [`SOLANA_CONFIG_TIMEOUT`] (a
 /// timeout, a missing binary or any failure is [`Network::Unknown`]), cached for 60 s in the
 /// authenticated `netcache.json` of a trusted data dir.
@@ -155,7 +168,7 @@ pub fn cli_network(cwd: &Path) -> Network {
             return classify_url(&url);
         }
     }
-    let Some(url) = solana_config_rpc_url(SOLANA_CONFIG_TIMEOUT) else {
+    let Some(url) = solana_config_rpc_url(solana_config_timeout()) else {
         return Network::Unknown;
     };
     if let Some(dir) = &dir {
