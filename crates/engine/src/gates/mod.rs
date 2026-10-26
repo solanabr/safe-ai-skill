@@ -17,6 +17,7 @@ pub mod fetchexec;
 pub mod gitguard;
 pub mod mcp;
 pub mod mcpexec;
+pub mod permreq;
 pub mod read;
 pub mod secretpath;
 pub mod secrets;
