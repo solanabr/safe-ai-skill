@@ -547,6 +547,50 @@ fn scan_bash(
 /// `--print`, or a prompt fed on stdin (a pipe into it, `<`, `<<`, `<<<`), also behind
 /// wrappers (`env`, `timeout 5`, `xargs`, `npx`, `bash -c '…'`, `$(…)`).
 pub fn decide_nested_claude(command: &str) -> Decision {
+    let scan = scan_nested(command);
+    if !scan.found {
+        return Decision::Defer;
+    }
+    if scan.text.contains("safe-ai-skill") && scan.text.contains("confirm") {
+        return Decision::Deny {
+            reason: "safe-ai-skill tamper tripwire: a nested Claude Code session must not confirm \
+                     safe-ai-skill requests; only the user confirms, by typing the code in their \
+                     own prompt. Do not retry or work around this check."
+                .into(),
+        };
+    }
+    if scan.print {
+        return Decision::Ask {
+            reason: NESTED_CLAUDE_REASON.into(),
+        };
+    }
+    Decision::Defer
+}
+
+/// One nested Claude Code launch on a command line.
+#[derive(Debug, Default)]
+struct Invocation {
+    /// Spelled as the plain command word `claude` (behind wrappers the permission matcher
+    /// strips, not behind a package runner, a path or `$(which …)`): what the kit's static
+    /// `Bash(claude …)` deny rules match, at every tier.
+    plain: bool,
+    /// A `CLAUDE_CONFIG_DIR=` assignment precedes it in the same simple command.
+    config_dir: bool,
+    /// Its words, lowercase, quotes stripped.
+    args: Vec<String>,
+}
+
+/// What [`scan_nested`] found.
+struct NestedScan {
+    /// The command line, lowercase, quotes and backslashes stripped.
+    text: String,
+    found: bool,
+    print: bool,
+    invocations: Vec<Invocation>,
+}
+
+/// Find the nested Claude Code launches in `command`.
+fn scan_nested(command: &str) -> NestedScan {
     let text = command
         .to_lowercase()
         .replace("\\\n", "")
@@ -575,6 +619,7 @@ pub fn decide_nested_claude(command: &str) -> Decision {
         words.push((word, sep));
     }
     let (mut found, mut print) = (false, false);
+    let mut invocations: Vec<Invocation> = Vec::new();
     // Command position: after a separator, a wrapper, an assignment or a `-c`, so a mention in
     // an argument (`git commit -m "claude -p"`) is not an invocation.
     let mut cmd_pos = false;
@@ -588,6 +633,12 @@ pub fn decide_nested_claude(command: &str) -> Decision {
     let (mut resolver, mut resolved) = (false, false);
     // A wrapper flag's value (`exec -a NAME`, `env -u VAR`, `sudo -u USER`) is not a program.
     let mut skip_value = false;
+    // Behind a package runner or JS runtime (`npx`, `npm exec`, `node`): not the plain spelling.
+    let mut runner = false;
+    // `npm`/`pnpm`/`yarn`/`bun` at command position: `exec`, `x` or `dlx` may follow.
+    let mut pkg_runner = false;
+    // A `CLAUDE_CONFIG_DIR=` assignment in the current simple command.
+    let mut config_dir = false;
     for (w, before) in &words {
         if let Some(c) = before {
             if matches!(c, '<') && in_claude {
@@ -601,6 +652,9 @@ pub fn decide_nested_claude(command: &str) -> Decision {
             } else if !matches!(c, '<' | '>') {
                 in_claude = false;
                 after_wrapper = false;
+                runner = false;
+                pkg_runner = false;
+                config_dir = false;
                 piped = *c == '|';
                 cmd_pos = true;
             } else {
@@ -614,12 +668,23 @@ pub fn decide_nested_claude(command: &str) -> Decision {
         if std::mem::replace(&mut skip_value, false) && cmd_pos {
             continue;
         }
+        if in_claude {
+            if let Some(inv) = invocations.last_mut() {
+                inv.args.push(w.clone());
+            }
+        }
         let at_cmd = std::mem::replace(&mut cmd_pos, false);
         let was_resolver = std::mem::replace(&mut resolver, false);
+        let was_pkg_runner = std::mem::replace(&mut pkg_runner, false);
         if (at_cmd && (base == "claude" || base == "claude-code"))
             || w.contains("@anthropic-ai/claude-code")
         {
             found = true;
+            invocations.push(Invocation {
+                plain: at_cmd && w == "claude" && !runner && !was_resolver,
+                config_dir,
+                args: Vec::new(),
+            });
             in_claude = true;
             after_wrapper = false;
             resolved = was_resolver;
@@ -627,6 +692,12 @@ pub fn decide_nested_claude(command: &str) -> Decision {
         } else if at_cmd && matches!(base, "which" | "type" | "whence" | "where") {
             resolver = true;
             cmd_pos = true;
+        } else if at_cmd && matches!(base, "npm" | "pnpm" | "yarn" | "bun") {
+            pkg_runner = true;
+        } else if was_pkg_runner && matches!(w.as_str(), "exec" | "x" | "dlx") {
+            cmd_pos = true;
+            after_wrapper = true;
+            runner = true;
         } else if (w == "-c" && !in_claude)
             || (at_cmd
                 && (w.contains('=')
@@ -658,8 +729,19 @@ pub fn decide_nested_claude(command: &str) -> Decision {
                             | "chrt"
                             | "taskset"
                             | "eval"
+                            | "node"
+                            | "deno"
+                            | "tsx"
+                            | "ts-node"
                     )))
         {
+            if at_cmd {
+                runner |= matches!(
+                    base,
+                    "npx" | "bunx" | "pnpx" | "dlx" | "node" | "deno" | "tsx" | "ts-node"
+                );
+                config_dir |= w.starts_with("claude_config_dir=");
+            }
             cmd_pos = true;
             after_wrapper = w != "-c";
         } else if at_cmd && after_wrapper && (w.starts_with('-') || is_plain_value(w)) {
@@ -678,23 +760,135 @@ pub fn decide_nested_claude(command: &str) -> Decision {
             print = true;
         }
     }
-    if !found {
-        return Decision::Defer;
+    NestedScan {
+        text,
+        found,
+        print,
+        invocations,
     }
-    if text.contains("safe-ai-skill") && text.contains("confirm") {
-        return Decision::Deny {
-            reason: "safe-ai-skill tamper tripwire: a nested Claude Code session must not confirm \
-                     safe-ai-skill requests; only the user confirms, by typing the code in their \
-                     own prompt. Do not retry or work around this check."
-                .into(),
+}
+
+/// Policy-weakening flags the kit denies on a plain `claude` at every tier
+/// (`DENY_POLICY_ESCAPE`, matched as a substring like its `Bash(claude *--<flag>*)` rules).
+const WEAKEN_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--settings",
+    "--setting-sources",
+    "--allowedtools",
+    "--allowed-tools",
+    "--add-dir",
+    "--mcp-config",
+    "--plugin-dir",
+    "--plugin-url",
+];
+
+/// Flags only the kit's hook (`fetch-exec-guard`, `CLAUDEWEAKEN`) adds, below Off; plus
+/// `--allow-dangerously-skip-permissions`, which no kit pattern matches and which lets the
+/// session switch into bypass mode.
+const HOOK_WEAKEN_FLAGS: &[&str] = &[
+    "--disallowedtools",
+    "--strict-mcp-config",
+    "--allow-dangerously-skip-permissions",
+];
+
+/// Decide a nested Claude Code launch that escapes the policy (F3, F4): a weakening flag
+/// ([`WEAKEN_FLAGS`]), `claude mcp add…` or `claude setup-token` on the plain `claude` is a
+/// deny at every tier; through a package runner, a path, a JS runtime or `$(which claude)`,
+/// with the hook-only flags or a `CLAUDE_CONFIG_DIR=` assignment, a deny below Off, as the
+/// kit's hook has it. `claude plugin disable|uninstall` of safe-ai-skill is a deny at every
+/// tier (D1). `None` is no opinion.
+pub fn decide_nested_claude_flags(command: &str, tier: Tier) -> Option<Verdict> {
+    if !contains_ci(command, "claude") {
+        return None;
+    }
+    let scan = scan_nested(command);
+    let mut hook_deny: Option<String> = None;
+    for inv in &scan.invocations {
+        let positional: Vec<&str> = inv
+            .args
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !a.starts_with('-'))
+            .collect();
+        let flag = inv
+            .args
+            .iter()
+            .find_map(|a| WEAKEN_FLAGS.iter().find(|f| a.contains(**f)));
+        let subcommand = match positional.as_slice() {
+            ["mcp", add, ..] if add.starts_with("add") => Some(SubEscape::McpAdd),
+            [setup, ..] if setup.starts_with("setup-token") => Some(SubEscape::SetupToken),
+            ["plugin", verb, ..]
+                if matches!(*verb, "disable" | "uninstall" | "remove" | "rm")
+                    && inv.args.iter().any(|a| a.contains("safe-ai-skill")) =>
+            {
+                return Some(Verdict::Deny(
+                    "safe-ai-skill tamper tripwire: this turns the safe-ai-skill plugin off \
+                     through a nested `claude plugin` command, which turns off protection, so an \
+                     agent may never run it; only the user can turn safe-ai-skill down, with the \
+                     `safe-ai-skill` CLI and its confirmation code."
+                        .to_string(),
+                ));
+            }
+            _ => None,
         };
+        if inv.plain {
+            if let Some(flag) = flag {
+                return Some(Verdict::Deny(weaken_reason(flag)));
+            }
+            if let Some(sub) = subcommand {
+                return Some(Verdict::Deny(sub.reason()));
+            }
+        }
+        if hook_deny.is_none() {
+            let hook_flag = flag.copied().or_else(|| {
+                inv.args
+                    .iter()
+                    .find_map(|a| HOOK_WEAKEN_FLAGS.iter().find(|f| a.contains(**f)).copied())
+            });
+            let config_dir =
+                inv.config_dir || inv.args.iter().any(|a| a.starts_with("claude_config_dir="));
+            hook_deny = match (hook_flag, subcommand) {
+                (Some(flag), _) => Some(weaken_reason(flag)),
+                (None, Some(sub)) => Some(sub.reason()),
+                (None, None) if config_dir => Some(weaken_reason("CLAUDE_CONFIG_DIR")),
+                _ => None,
+            };
+        }
     }
-    if print {
-        return Decision::Ask {
-            reason: NESTED_CLAUDE_REASON.into(),
-        };
+    hook_deny.filter(|_| tier != Tier::Off).map(Verdict::Deny)
+}
+
+/// A `claude` subcommand the kit denies outright.
+#[derive(Clone, Copy)]
+enum SubEscape {
+    McpAdd,
+    SetupToken,
+}
+
+impl SubEscape {
+    fn reason(self) -> String {
+        match self {
+            SubEscape::McpAdd => "safe-ai-skill tamper tripwire: `claude mcp add` registers an \
+                 MCP server, a program the client starts with your permissions, so an agent may \
+                 not run it; ask the user to add the server themselves."
+                .to_string(),
+            SubEscape::SetupToken => "safe-ai-skill tamper tripwire: `claude setup-token` mints \
+                 a long-lived Claude Code credential, so an agent may not run it; ask the user to \
+                 run it themselves."
+                .to_string(),
+        }
     }
-    Decision::Defer
+}
+
+fn weaken_reason(flag: &str) -> String {
+    format!(
+        "safe-ai-skill tamper tripwire: this starts a nested Claude Code agent with `{flag}`, \
+         which re-rolls the permission policy in a child process with no firewall, so an agent \
+         may never run it; run a plain `claude` form, or ask the user to start that session \
+         themselves."
+    )
 }
 
 /// Wrapper flags that take a separate value (`exec -a NAME`, `env -u VAR`, `sudo -u USER`,
@@ -1890,6 +2084,18 @@ const BASH_NEEDLES: &[&str] = &[
     "safe_ai_skill",
     "pkg",
     "set-script",
+    ".cargo",
+    "/.config",
+    ".config/",
+    ".zsh",
+    ".zprofile",
+    ".zlogin",
+    ".bash",
+    ".profile",
+    "launchagents",
+    "launchdaemons",
+    "managed-settings",
+    "claude_config_dir",
 ];
 
 /// Where the user-level Claude Code settings live, taken from the hook environment.
@@ -2017,6 +2223,235 @@ fn classify_path(path: &Path, homes: &ConfigHomes) -> Option<Guarded> {
     })
 }
 
+/// A path the kit Edit-denies whatever the write makes it say: code that runs on the next
+/// ordinary command (P3, `DENY_CODE_ON_NEXT_BUILD`), an administrator's managed settings (P5)
+/// and, at High, Claude Code's user-scope policy surface (P8, `DENY_SELF_PROTECTION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    NextBuild,
+    Managed,
+    UserPolicy,
+}
+
+impl Surface {
+    /// Every tier for the first two, as the kit's static denies; High only for the third.
+    fn applies(self, tier: Tier) -> bool {
+        match self {
+            Surface::UserPolicy => tier == Tier::High,
+            Surface::NextBuild | Surface::Managed => true,
+        }
+    }
+
+    /// The reason for a write to it; `certain` when the command plainly writes it, not when
+    /// the path was only found quoted in interpreter code or is hard-linked.
+    fn reason(self, shown: &str, certain: bool) -> String {
+        let what = match self {
+            Surface::NextBuild => {
+                "runs code the next time an ordinary command (a shell, cargo, git or a login) \
+                 starts"
+            }
+            Surface::Managed => "is an administrator's managed settings file",
+            Surface::UserPolicy => {
+                "is Claude Code configuration it loads or runs (agents, commands, skills, \
+                 plugins, schedules, shell snapshots or the local install), locked at tier high"
+            }
+        };
+        let fix = match self {
+            Surface::Managed => "ask your administrator to make the change",
+            _ => "ask the user to make the change themselves",
+        };
+        if certain {
+            format!(
+                "safe-ai-skill tamper tripwire: `{shown}` {what}, so an agent may not write it; \
+                 {fix}."
+            )
+        } else {
+            format!(
+                "safe-ai-skill tamper tripwire: this command may write `{shown}`, which {what}; \
+                 {fix}."
+            )
+        }
+    }
+}
+
+/// Home-relative files that run code on the next shell, cargo, git or login (lowercase).
+const NEXT_BUILD_FILES: &[&str] = &[
+    ".cargo/config.toml",
+    ".cargo/config",
+    ".gitconfig",
+    ".config/git/config",
+    ".zshenv",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".profile",
+    ".config/fish/config.fish",
+];
+
+/// Home-relative directories whose contents run at login or on a shell start (lowercase).
+const NEXT_BUILD_DIRS: &[&str] = &[
+    ".config/fish/conf.d",
+    "library/launchagents",
+    ".config/autostart",
+];
+
+/// System-wide launchd directories.
+const SYSTEM_NEXT_BUILD_DIRS: &[&str] = &["/library/launchagents", "/library/launchdaemons"];
+
+/// User-scope Claude Code directories loaded as policy or run (under `~/.claude` or
+/// `$CLAUDE_CONFIG_DIR`).
+const USER_POLICY_DIRS: &[&str] = &[
+    "agents",
+    "commands",
+    "skills",
+    "rules",
+    "output-styles",
+    "plugins",
+    "cowork_plugins",
+    "workflows",
+    "routines",
+    "shell-snapshots",
+    "local",
+];
+
+/// User-scope Claude Code files loaded as policy.
+const USER_POLICY_FILES: &[&str] = &[
+    "scheduled_tasks.json",
+    "loop.md",
+    "daemon.json",
+    "launch.json",
+];
+
+/// `rel` is `dir` or below it.
+fn is_under(rel: &str, dir: &str) -> bool {
+    rel.strip_prefix(dir)
+        .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+}
+
+/// `norm` relative to `root` (both normalised), when below it.
+fn rel_to<'a>(norm: &'a str, root: &Path) -> Option<&'a str> {
+    let root = normalize_path(&root.to_string_lossy());
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    norm.strip_prefix(root)?.strip_prefix('/')
+}
+
+/// The surface a normalised absolute path is, if any.
+fn surface(norm: &str, homes: &ConfigHomes) -> Option<Surface> {
+    let name = norm.rsplit('/').next().unwrap_or("");
+    if name == "managed-settings.json" {
+        return Some(Surface::Managed);
+    }
+    if norm.ends_with("/.cargo/config.toml")
+        || SYSTEM_NEXT_BUILD_DIRS.iter().any(|d| is_under(norm, d))
+    {
+        return Some(Surface::NextBuild);
+    }
+    if let Some(rel) = homes.home.as_deref().and_then(|h| rel_to(norm, h)) {
+        if NEXT_BUILD_FILES.contains(&rel) || NEXT_BUILD_DIRS.iter().any(|d| is_under(rel, d)) {
+            return Some(Surface::NextBuild);
+        }
+    }
+    let roots = homes
+        .home
+        .iter()
+        .map(|h| h.join(".claude"))
+        .chain(homes.config_dir.clone());
+    for root in roots {
+        if let Some(rel) = rel_to(norm, &root) {
+            if USER_POLICY_FILES.contains(&rel) || USER_POLICY_DIRS.iter().any(|d| is_under(rel, d))
+            {
+                return Some(Surface::UserPolicy);
+            }
+        }
+    }
+    None
+}
+
+/// The surface `path` is, as given or with symlinks resolved.
+fn surface_of(path: &Path, homes: &ConfigHomes) -> Option<Surface> {
+    surface(&normalize_path(&path.to_string_lossy()), homes).or_else(|| {
+        let real = resolve_existing(path)?;
+        surface(&normalize_path(&real.to_string_lossy()), homes)
+    })
+}
+
+/// The surface paths a session may reach, for globs and for deletes of a directory holding one.
+fn surface_paths(cwd: &Path, homes: &ConfigHomes) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::iter::once(cwd)
+        .chain(homes.project_dir.as_deref())
+        .map(|root| root.join(".cargo/config.toml"))
+        .collect();
+    out.extend(["/Library/LaunchAgents", "/Library/LaunchDaemons"].map(PathBuf::from));
+    if let Some(home) = &homes.home {
+        out.extend(NEXT_BUILD_FILES.iter().map(|f| home.join(f)));
+        out.extend(NEXT_BUILD_DIRS.iter().map(|d| home.join(d)));
+        out.push(home.join("Library/LaunchAgents"));
+    }
+    let roots = homes
+        .home
+        .iter()
+        .map(|h| h.join(".claude"))
+        .chain(homes.config_dir.clone());
+    for root in roots {
+        out.extend(USER_POLICY_DIRS.iter().map(|d| root.join(d)));
+        out.extend(USER_POLICY_FILES.iter().map(|f| root.join(f)));
+    }
+    out
+}
+
+/// The surfaces `touch` reaches: its own paths, glob matches against `known`, and for a delete
+/// the existing surfaces below it.
+fn surface_targets(touch: &Touch, known: &[PathBuf], homes: &ConfigHomes) -> Vec<Surface> {
+    let mut out = Vec::new();
+    let delete = matches!(touch.op, Op::Delete | Op::Find(_));
+    for path in &touch.paths {
+        let key = normalize_path(&path.to_string_lossy());
+        if touch.glob {
+            for k in known {
+                let kk = normalize_path(&k.to_string_lossy());
+                let hit = crate::gates::bash::glob_match(&key, &kk)
+                    || (delete
+                        && kk
+                            .match_indices('/')
+                            .any(|(i, _)| crate::gates::bash::glob_match(&key, &kk[..i])));
+                if hit {
+                    out.extend(surface(&kk, homes));
+                }
+            }
+            continue;
+        }
+        out.extend(surface_of(path, homes));
+        if delete {
+            let prefix = format!("{}/", key.trim_end_matches('/'));
+            for k in known {
+                let kk = normalize_path(&k.to_string_lossy());
+                if kk.starts_with(&prefix) && crate::localfs::exists(k) {
+                    out.extend(surface(&kk, homes));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The verdict on a Bash `touch` of a surface at `tier`.
+fn surface_verdict(s: Surface, touch: &Touch, tier: Tier) -> Option<Verdict> {
+    if !s.applies(tier) {
+        return None;
+    }
+    let shown: String = touch.raw.chars().take(160).collect();
+    Some(if touch.inferred || matches!(touch.op, Op::Link) {
+        Verdict::Ask(s.reason(&shown, false))
+    } else {
+        Verdict::Deny(s.reason(&shown, true))
+    })
+}
+
 /// A file's current text: absent, readable, or present but unreadable (too large, not text).
 enum Old {
     Missing,
@@ -2110,8 +2545,33 @@ pub fn decide_file_content(
     policy: &Policy,
     tier: Tier,
 ) -> Option<Verdict> {
-    let _ = (policy, tier);
-    decide_file_content_in(tool_input, cwd, &ConfigHomes::from_env())
+    let _ = policy;
+    decide_file_content_at(tool_input, cwd, &ConfigHomes::from_env(), tier)
+}
+
+/// [`decide_file_content`] with the settings locations and the tier given: a write to a
+/// [`Surface`] the tier locks is a deny whatever it says; anything else goes on to
+/// [`decide_file_content_in`].
+pub fn decide_file_content_at(
+    tool_input: Option<&Value>,
+    cwd: &Path,
+    homes: &ConfigHomes,
+    tier: Tier,
+) -> Option<Verdict> {
+    let input = tool_input?;
+    for key in ["file_path", "notebook_path"] {
+        let Some(raw) = input.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = absolute_in(raw, cwd, homes) else {
+            continue;
+        };
+        if let Some(s) = surface_of(&path, homes).filter(|s| s.applies(tier)) {
+            let shown: String = raw.chars().take(160).collect();
+            return Some(Verdict::Deny(s.reason(&shown, true)));
+        }
+    }
+    decide_file_content_in(tool_input, cwd, homes)
 }
 
 /// [`decide_file_content`] with the settings locations given.
@@ -2483,6 +2943,14 @@ fn settings_change(before: &str, after: &str) -> Option<String> {
     None
 }
 
+/// How settings text, taken as a whole, turns protection off: a switch it sets (a
+/// `safe-ai-skill@…` plugin set to `false`, `disableAllHooks`, `allowManagedHooksOnly`,
+/// `env.SAFE_AI_SKILL_DISABLE`, `permissions.defaultMode: bypassPermissions`), as the D1 deny
+/// judges it. For [`crate::gates::configchange`], which sees only the file as it now is.
+pub fn settings_disable_reason(text: &str) -> Option<String> {
+    settings_change("", text)
+}
+
 /// Why a whole new settings text drops protection by not being JSON: the client ignores a
 /// settings file it cannot parse, so the protection `before` held goes with it.
 fn breaks_settings(before: &str, after: &str) -> Option<String> {
@@ -2849,6 +3317,8 @@ struct Touch {
     op: Op,
     glob: bool,
     paths: Vec<PathBuf>,
+    /// Found quoted in interpreter code, not shown to be written.
+    inferred: bool,
 }
 
 /// `raw` with `$NAME` / `${NAME}` replaced from `vars` (the last entry for a name wins); `None`
@@ -3022,12 +3492,27 @@ pub fn decide_bash_writes(
     policy: &Policy,
     tier: Tier,
 ) -> Option<Verdict> {
-    let _ = (policy, tier);
-    decide_bash_writes_in(command, cwd, &ConfigHomes::from_env())
+    let _ = policy;
+    let nested = decide_nested_claude_flags(command, tier);
+    if matches!(nested, Some(Verdict::Deny(_))) {
+        return nested;
+    }
+    decide_bash_writes_at(command, cwd, &ConfigHomes::from_env(), tier)
 }
 
-/// [`decide_bash_writes`] with the settings locations given.
+/// [`decide_bash_writes`] with the settings locations given, at tier relaxed.
 pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> Option<Verdict> {
+    decide_bash_writes_at(command, cwd, homes, Tier::Relaxed)
+}
+
+/// [`decide_bash_writes`] with the settings locations and the tier given (the nested-claude
+/// check, [`decide_nested_claude_flags`], is not included).
+pub fn decide_bash_writes_at(
+    command: &str,
+    cwd: &Path,
+    homes: &ConfigHomes,
+    tier: Tier,
+) -> Option<Verdict> {
     let git_cmd = contains_ci(command, "git")
         && (contains_ci(command, "config") || contains_ci(command, "core."));
     let env_cmd = contains_ci(command, "launchctl") || contains_ci(command, "set-environment");
@@ -3093,6 +3578,7 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
                 glob: word.splits && word.text.contains(['*', '?', '[']),
                 raw: word.text.clone(),
                 op,
+                inferred: false,
             });
         }
     }
@@ -3108,6 +3594,7 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
             glob: file.contains(['*', '?', '[']),
             raw: file.clone(),
             op: Op::Write(content),
+            inferred: false,
         });
     }
     for code in interpreter_code(&parsed) {
@@ -3143,6 +3630,7 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
                 glob: false,
                 raw: raw.to_string(),
                 op: Op::Write(Content::Unknown),
+                inferred: true,
             });
         }
     }
@@ -3186,6 +3674,17 @@ pub fn decide_bash_writes_in(command: &str, cwd: &Path, homes: &ConfigHomes) -> 
                 for path in places.resolve(file, homes) {
                     written.push((normalize_path(&path.to_string_lossy()), text.clone()));
                 }
+            }
+        }
+    }
+    let surfaces = surface_paths(cwd, homes);
+    for touch in &touches {
+        for s in surface_targets(touch, &surfaces, homes) {
+            if let Some(v) = surface_verdict(s, touch, tier) {
+                if matches!(v, Verdict::Deny(_)) {
+                    return Some(v);
+                }
+                strictest = stricter(strictest, v);
             }
         }
     }

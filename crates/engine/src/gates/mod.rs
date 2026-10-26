@@ -5,6 +5,7 @@
 //! each own one file and are reached through one call line in a shared file.
 
 pub mod bash;
+pub mod configchange;
 pub mod creddump;
 pub mod credpaths;
 pub mod encoded;
