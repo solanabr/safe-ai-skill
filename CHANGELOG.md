@@ -4,7 +4,9 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [Unreleased]
+## [1.3.0] — 2026-11-09
+
+The first release since 1.0.0. 1.0.1, 1.1.0 and 1.2.0 below were never released on their own: 1.3.0 ships their changes too, so read their behaviour changes before upgrading from 1.0.x.
 
 ### Added
 
@@ -62,7 +64,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **Long `cd` chains.** The directory sets the tamper and wallet gates keep while following `cd` are capped, so a command with hundreds of `cd`s no longer runs out of the gate's time and turns a denied secret read into an ask.
 - **CI.** The gate smoke test reads a credential store under an isolated home and state dir instead of a project `.env`, and its Windows quarantine is removed. The test jobs run with `--no-fail-fast`. The release vendor step sees new, untracked binaries. The npm install e2e skips on schedule while no release of the manifest version exists.
 
-## [1.2.0] — Unreleased
+## [1.2.0] — not released on its own (ships in 1.3.0)
 
 ### Behaviour changes (read before upgrading)
 
@@ -112,7 +114,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [1.1.0] — Unreleased
+## [1.1.0] — not released on its own (ships in 1.3.0)
 
 ### Behaviour changes (read before upgrading)
 
@@ -206,7 +208,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [1.0.1] — Unreleased
+## [1.0.1] — not released on its own (ships in 1.3.0)
 
 ### Summary
 

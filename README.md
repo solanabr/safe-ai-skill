@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml"><img src="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Rust-1.82+-orange?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-purple" alt="Claude Code plugin">
@@ -107,7 +107,7 @@ npx @stbr/safe-ai-skill add skill <name|url>  # or run without installing
 curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 ```
 
-Downloads the prebuilt binary for your platform and verifies its SHA-256 against the release's published `SHA256SUMS` before installing — checksum-pinned, not an opaque pipe. Set `SAFE_AI_SKILL_BIN_DIR` to override the install location (default `~/.local/bin`). From 1.2.0, on macOS and Linux, it also installs the plugin's shim as `safe-ai-skill`, with the binary beside it as `safe-ai-skill-<platform>`. The shim checks the binary's sha256, and it is the entry point the [Codex hooks](docs/adapters.md) need.
+Downloads the prebuilt binary for your platform and verifies its SHA-256 against the release's published `SHA256SUMS` before installing — checksum-pinned, not an opaque pipe. Set `SAFE_AI_SKILL_BIN_DIR` to override the install location (default `~/.local/bin`). From 1.3.0, on macOS and Linux, it also installs the plugin's shim as `safe-ai-skill`, with the binary beside it as `safe-ai-skill-<platform>`. The shim checks the binary's sha256, and it is the entry point the [Codex hooks](docs/adapters.md) need.
 
 **cargo** (any platform with a Rust toolchain)
 
@@ -235,6 +235,10 @@ safe-ai-skill protects against a careless model and prompt-injected instructions
 If the engine can't run on a platform (no prebuilt binary, wrong executable format, exit 126/127), the hooks fail open with a one-line notice and SessionStart reports the firewall INACTIVE with the reason (that SessionStart message is the only place you see it: Claude Code keeps an exit-0 hook's stderr in its debug log), but `solana`, `spl-token` and `anchor` commands still get `ask`. `SAFE_AI_SKILL_STRICT=1` blocks instead. `SAFE_AI_SKILL_DISABLE=1` switches the hooks off, and is ignored (the hooks keep running) in strict mode, or when the project's committed `.claude/settings.json` mentions it or can't be read. See [SECURITY.md](SECURITY.md) for details.
 
 **Verified-hash cache.** The shim checks the engine binary's sha256 before running it. After a full match it records the binary's fingerprint (device, inode, size, mtime and ctime, read with `stat` at a fixed system path) beside the stamped hash in `$CLAUDE_PLUGIN_DATA/shim-verified-<platform>` (mode 0600), and a later call skips the hash and the executable-format probe only when that file is a regular file (not a symlink) of mode 0600 owned by the binary's owner, and its line equals the shim's stamped hash plus the binary's current fingerprint. Anything else is a full check, and only a pass is ever cached. Replacing or modifying the binary in place changes its ctime, which a user process cannot set, so it forces a rehash; a binary whose ctime does not predate the check is never cached. A process that can rewrite both the binary and the cache file can already rewrite the shim and its stamped hashes, so the cache grants it nothing new. What the cache does add is a dependence on `stat` and on the filesystem's ctime: a process able to set ctime (root, or one that can change the system clock) could make a swapped binary match the cache, where hashing on every call would have caught it. The cache is off on Windows, where a user process can set ctime, and when `CLAUDE_PLUGIN_DATA` is unset, relative or not a writable directory. **`SAFE_AI_SKILL_SHIM_CACHE=0` turns it off**, from any source since it only makes the shim stricter; every hook call then hashes the binary again and is slower, by about 3 to 5 ms per call on macOS with the native `sha256sum` and about 20 to 25 ms where the shim falls back to Perl's `shasum` (figures taken on a loaded machine, not a benchmark).
+
+## Upgrading from 1.0.x to 1.3.0
+
+1.3.0 is the first release since 1.0.0. 1.0.1, 1.1.0 and 1.2.0 were never released on their own, so upgrading from 1.0.x brings the changes in both sections below. The full list is in the [CHANGELOG](CHANGELOG.md).
 
 ## Upgrading to 1.2.0 (read before upgrading)
 
