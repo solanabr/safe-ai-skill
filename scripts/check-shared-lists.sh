@@ -2,6 +2,8 @@
 # Lint policy/shared (shared contract §1.1-§1.4): records sorted (LC_ALL=C) and unique within
 # each [section], valid enums, lowercase hosts without scheme/port/trailing dot, no brace or
 # character-class globs, no tabs, LF only, and MANIFEST counts and hashes matching the bytes.
+# Also checks that the engine crate's embedded copy (crates/engine/policy/shared/) is
+# byte-identical to policy/shared.
 #
 #   sh scripts/check-shared-lists.sh
 set -eu
@@ -108,6 +110,28 @@ for f in credentials.list exfil-hosts.list onchain-verbs.list; do
 done
 lines=$(wc -l <"$manifest" | tr -d ' ')
 [ "$lines" = 4 ] || err "MANIFEST: expected 4 lines, found $lines"
+
+# The engine embeds its own copy so the published crate builds on its own; policy/shared stays
+# canonical and the copy must equal it byte for byte, with nothing else beside it.
+copy="$root/crates/engine/policy/shared"
+stale=0
+for f in credentials.list exfil-hosts.list onchain-verbs.list MANIFEST; do
+  if ! cmp -s "$dir/$f" "$copy/$f"; then
+    err "crates/engine/policy/shared/$f differs from policy/shared/$f (or is missing)"
+    stale=1
+  fi
+done
+for p in "$copy"/* "$copy"/.[!.]*; do
+  [ -e "$p" ] || continue
+  case ${p##*/} in
+    credentials.list | exfil-hosts.list | onchain-verbs.list | MANIFEST) ;;
+    *) err "crates/engine/policy/shared/${p##*/}: only the three lists and MANIFEST belong here" ;;
+  esac
+done
+if [ "$stale" = 1 ]; then
+  echo "check-shared-lists: resync the crate copy from the repo root with:" >&2
+  echo "  cp policy/shared/credentials.list policy/shared/exfil-hosts.list policy/shared/onchain-verbs.list policy/shared/MANIFEST crates/engine/policy/shared/" >&2
+fi
 
 if [ "$fail" = 0 ]; then
   echo "check-shared-lists: OK"

@@ -1,10 +1,12 @@
 //! The shared list files (shared contract §1), embedded at build time.
 //!
 //! `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` and `MANIFEST` are compiled in
-//! with `include_str!` (a test pins them byte-for-byte to the repo files). [`lists`] parses
-//! them once and checks every MANIFEST count and sha256; any failure makes the lists
-//! [`ListsUnavailable`], and the gates that depend on them answer a hard-guard `ask` (fail
-//! closed) instead of deciding on partial data.
+//! with `include_str!` from the crate's own copy in `crates/engine/policy/shared/`, so the
+//! published crate builds on its own. The repo root's `policy/shared/` stays canonical:
+//! `scripts/check-shared-lists.sh` (CI) fails unless the copy is byte-identical, and a test pins
+//! the embedded bytes to the root files. [`lists`] parses them once and checks every MANIFEST
+//! count and sha256; any failure makes the lists [`ListsUnavailable`], and the gates that
+//! depend on them answer a hard-guard `ask` (fail closed) instead of deciding on partial data.
 //!
 //! Formats (one record per line, whitespace-separated columns, `#` comments, blank lines and
 //! `[section]` headers ignored):
@@ -20,13 +22,13 @@ use sha2::{Digest, Sha256};
 use crate::policy::tier::Tier;
 
 /// `policy/shared/credentials.list`.
-pub const CREDENTIALS_LIST: &str = include_str!("../../../policy/shared/credentials.list");
+pub const CREDENTIALS_LIST: &str = include_str!("../policy/shared/credentials.list");
 /// `policy/shared/exfil-hosts.list`.
-pub const EXFIL_HOSTS_LIST: &str = include_str!("../../../policy/shared/exfil-hosts.list");
+pub const EXFIL_HOSTS_LIST: &str = include_str!("../policy/shared/exfil-hosts.list");
 /// `policy/shared/onchain-verbs.list`.
-pub const ONCHAIN_VERBS_LIST: &str = include_str!("../../../policy/shared/onchain-verbs.list");
+pub const ONCHAIN_VERBS_LIST: &str = include_str!("../policy/shared/onchain-verbs.list");
 /// `policy/shared/MANIFEST`.
-pub const MANIFEST: &str = include_str!("../../../policy/shared/MANIFEST");
+pub const MANIFEST: &str = include_str!("../policy/shared/MANIFEST");
 
 /// The lists could not be used; callers that depend on them ask.
 #[derive(Debug, Clone, PartialEq, Eq)]
