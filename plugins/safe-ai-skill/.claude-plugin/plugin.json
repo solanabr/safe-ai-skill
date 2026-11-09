@@ -1,19 +1,19 @@
 {
   "name": "safe-ai-skill",
   "version": "1.3.0",
-  "description": "Security firewall + supply-chain verifier for Solana AI dev — gates transactions/deploys/secrets and verifies skills/MCPs.",
+  "description": "Hook-based security firewall and supply-chain verifier for Claude Code skills, MCPs and agents. Gates destructive git, secret and credential reads, exfiltration, download-and-run, self-tampering and Solana on-chain actions; grades and pins skill packs.",
   "author": {
     "name": "Superteam Brazil"
   },
   "license": "MIT",
   "keywords": [
-    "solana",
     "security",
+    "claude-code",
     "firewall",
     "supply-chain",
+    "mcp",
     "ai",
-    "claude-code",
-    "mcp"
+    "solana"
   ],
   "hooks": "./hooks/hooks.json"
 }
