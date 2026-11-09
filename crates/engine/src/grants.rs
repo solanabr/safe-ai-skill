@@ -29,15 +29,24 @@ const GRANTS_LOCK: &str = "grants.lock";
 /// Longest a grant may run (30 days).
 const MAX_GRANT_SECS: u64 = 30 * 86_400;
 
-/// The scopes a grant may name. `other` is gone (spec D1.9) and `secret_read` is always a
-/// hard guard, so a grant could never apply to it.
-pub const GRANTABLE_SCOPES: [Scope; 5] = [
-    Scope::Transfer,
-    Scope::Swap,
-    Scope::Deploy,
-    Scope::Authority,
-    Scope::Destructive,
-];
+/// The scopes a grant may name. `other` is gone (spec D1.9); `authority`, `destructive` and
+/// `secret_read` are hard guards wherever a gate emits them, so a grant could never apply to
+/// them.
+pub const GRANTABLE_SCOPES: [Scope; 3] = [Scope::Transfer, Scope::Swap, Scope::Deploy];
+
+/// Why no grant can cover `scope`, when it is a hard guard. 1.3.0 accepted `authority` and
+/// `destructive` grants, which relaxed nothing; a `grants.json` or pending request from then
+/// can still name them.
+fn hard_guard_reason(scope: Scope) -> Option<&'static str> {
+    match scope {
+        Scope::Authority => Some("authority changes are a hard guard; no grant can relax them"),
+        Scope::Destructive => {
+            Some("destructive actions (burns, closes) are a hard guard; no grant can relax them")
+        }
+        Scope::SecretRead => Some("secret reads are a hard guard; no grant can relax them"),
+        Scope::Transfer | Scope::Swap | Scope::Deploy | Scope::Other => None,
+    }
+}
 
 /// A single scoped grant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +75,13 @@ impl Grant {
     /// Whether this grant has expired as of `now` (epoch seconds).
     pub fn is_expired(&self, now: u64) -> bool {
         now >= self.expires_at
+    }
+
+    /// Whether this grant can never match: its scope is outside [`GRANTABLE_SCOPES`] (an
+    /// `authority` or `destructive` grant stored by 1.3.0, or a forged scope). It stays in the
+    /// file until it expires or is revoked.
+    pub fn is_inert(&self) -> bool {
+        !GRANTABLE_SCOPES.contains(&self.scope)
     }
 
     /// SOL remaining in this grant's budget (never negative; guards `NaN`).
@@ -104,10 +120,10 @@ impl Grant {
         amount <= self.remaining_sol()
     }
 
-    /// Whether this grant matches `meta` ignoring expiry (caller checks expiry). A scope
-    /// outside [`GRANTABLE_SCOPES`] never matches, whatever the file says.
+    /// Whether this grant matches `meta` ignoring expiry (caller checks expiry). An inert
+    /// grant ([`Grant::is_inert`]) never matches, whatever the file says.
     fn matches(&self, meta: &GateMeta) -> bool {
-        if self.scope != meta.scope || !GRANTABLE_SCOPES.contains(&self.scope) {
+        if self.scope != meta.scope || self.is_inert() {
             return false;
         }
         // Program restriction (empty = any).
@@ -127,8 +143,18 @@ impl Grant {
         self.permits_amount(meta.amount_sol)
     }
 
-    /// One line for the user: what this grant permits and until when.
+    /// One line for the user: what this grant permits and until when. An inert grant says it
+    /// relaxes nothing, and why.
     pub fn describe(&self, now: u64) -> String {
+        if self.is_inert() {
+            return format!(
+                "grant {}: {}, relaxes nothing ({}), expires in {}",
+                self.id,
+                self.scope.label(),
+                hard_guard_reason(self.scope).unwrap_or("not a grant scope"),
+                human_secs(self.expires_at.saturating_sub(now)),
+            );
+        }
         format!(
             "grant {}: {}, {} of {} SOL left, at most {} SOL per tx, {}; {}, expires in {}{}",
             self.id,
@@ -224,8 +250,12 @@ impl GrantRequest {
     }
 
     /// The grant this request becomes when confirmed at `now`. Re-validates, because the
-    /// payload came back from disk.
+    /// payload came back from disk: a request for a hard-guard scope (parked by 1.3.0) fails
+    /// with the reason.
     pub fn activate(&self, now: u64, id: String) -> Result<Grant, String> {
+        if let Some(why) = hard_guard_reason(self.scope) {
+            return Err(format!("{why}, so this grant was not created"));
+        }
         if !GRANTABLE_SCOPES.contains(&self.scope)
             || self.for_secs == 0
             || self.for_secs > MAX_GRANT_SECS
@@ -261,7 +291,8 @@ pub struct Grants {
     pub grants: Vec<Grant>,
 }
 
-/// Parse a grant scope label: one of [`GRANTABLE_SCOPES`], else an error naming them.
+/// Parse a grant scope label: one of [`GRANTABLE_SCOPES`], else an error naming them (and,
+/// for a hard-guard scope, saying why no grant covers it).
 pub fn grantable_scope(label: &str) -> Result<Scope, String> {
     GRANTABLE_SCOPES
         .iter()
@@ -269,10 +300,9 @@ pub fn grantable_scope(label: &str) -> Result<Scope, String> {
         .find(|s| s.label() == label)
         .ok_or_else(|| {
             let known: Vec<&str> = GRANTABLE_SCOPES.iter().map(Scope::label).collect();
-            let why = if label == Scope::SecretRead.label() {
-                "secret reads are a hard guard; no grant covers them".to_string()
-            } else {
-                format!("unknown scope `{}`", printable(label))
+            let why = match hard_guard_reason(Scope::from_label(label)) {
+                Some(why) => why.to_string(),
+                None => format!("unknown scope `{}`", printable(label)),
             };
             format!("--scope: {why}; expected one of {}", known.join("|"))
         })
@@ -593,13 +623,14 @@ pub(crate) mod tests {
             ..transfer_meta(None)
         };
         assert!(find_match_at(&grants, &meta, 100).is_none());
-        let mut destructive = transfer_grant("g3", 10_000);
-        destructive.scope = Scope::Destructive;
+        // A scope that carries no amount matches without one.
+        let mut deploy = transfer_grant("g3", 10_000);
+        deploy.scope = Scope::Deploy;
         let grants = Grants {
-            grants: vec![destructive],
+            grants: vec![deploy],
         };
         let meta = GateMeta {
-            scope: Scope::Destructive,
+            scope: Scope::Deploy,
             ..transfer_meta(None)
         };
         assert!(find_match_at(&grants, &meta, 100).is_some());
@@ -609,9 +640,53 @@ pub(crate) mod tests {
     fn an_other_scope_grant_in_the_file_never_matches() {
         let mut g = transfer_grant("g1", 10_000);
         g.scope = Scope::Other;
+        assert!(g.is_inert());
+        assert!(g
+            .describe(100)
+            .contains("relaxes nothing (not a grant scope)"));
         let grants = Grants { grants: vec![g] };
         let meta = GateMeta::unknown();
         assert!(find_match_at(&grants, &meta, 100).is_none());
+    }
+
+    #[test]
+    fn a_stored_authority_or_destructive_grant_is_inert() {
+        // grants.json from 1.3.0 may hold these: it still loads, and they never match, not
+        // even a meta of their scope that is not marked a hard guard.
+        let dir = tmp_data("inert");
+        let stale = [Scope::Authority, Scope::Destructive]
+            .iter()
+            .map(|scope| Grant {
+                scope: *scope,
+                max_tx_sol: 1e9,
+                budget_sol: 1e9,
+                danger: true,
+                ..transfer_grant(scope.label(), u64::MAX)
+            })
+            .collect();
+        save(&dir, &Grants { grants: stale }).unwrap();
+        let stored = live(&dir);
+        assert_eq!(stored.grants.len(), 2);
+        for g in &stored.grants {
+            assert!(g.is_inert(), "{g:?}");
+            for hard_guard in [false, true] {
+                let meta = GateMeta {
+                    program: Some("spl-token".into()),
+                    ..GateMeta::new(g.scope, hard_guard)
+                };
+                assert!(find_match_at(&stored, &meta, 100).is_none(), "{meta:?}");
+            }
+            let line = g.describe(100);
+            let label = g.scope.label();
+            assert!(
+                line.starts_with(&format!("grant {label}: {label}, relaxes nothing ("))
+                    && line.contains("are a hard guard; no grant can relax them"),
+                "{line}"
+            );
+            assert!(!line.contains("SOL"), "{line}");
+        }
+        assert!(!transfer_grant("g", u64::MAX).is_inert());
+        let _ = std::fs::remove_dir_all(&dir.path);
     }
 
     #[test]
@@ -823,16 +898,31 @@ pub(crate) mod tests {
 
     #[test]
     fn scopes_are_validated() {
-        for ok in ["transfer", "swap", "deploy", "authority", "destructive"] {
+        for ok in ["transfer", "swap", "deploy"] {
             assert!(grantable_scope(ok).is_ok(), "{ok}");
         }
-        for bad in ["other", "", "Transfer", "secret_read", "all", "transfer "] {
+        for bad in ["other", "", "Transfer", "Authority", "all", "transfer "] {
             let err = grantable_scope(bad).unwrap_err();
-            assert!(err.contains("--scope"), "{bad}: {err}");
+            assert!(
+                err.starts_with("--scope: unknown scope `")
+                    && err.ends_with("; expected one of transfer|swap|deploy"),
+                "{bad}: {err}"
+            );
         }
-        assert!(grantable_scope("secret_read")
-            .unwrap_err()
-            .contains("hard guard"));
+        // The hard guards are refused with the reason, never as unknown.
+        for (hard, what) in [
+            ("authority", "authority changes"),
+            ("destructive", "destructive actions (burns, closes)"),
+            ("secret_read", "secret reads"),
+        ] {
+            assert_eq!(
+                grantable_scope(hard).unwrap_err(),
+                format!(
+                    "--scope: {what} are a hard guard; no grant can relax them; expected one \
+                     of transfer|swap|deploy"
+                )
+            );
+        }
     }
 
     #[test]
@@ -844,6 +934,8 @@ pub(crate) mod tests {
 
         let bad = [
             GrantRequest::from_args("other", "30m", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("authority", "30m", 1.0, 1.0, "", "", false),
+            GrantRequest::from_args("destructive", "30m", 1.0, 1.0, "", "", true),
             GrantRequest::from_args("transfer", "nope", 1.0, 1.0, "", "", false),
             GrantRequest::from_args("transfer", "0m", 1.0, 1.0, "", "", false),
             GrantRequest::from_args("transfer", "31d", 1.0, 1.0, "", "", false),
@@ -868,7 +960,21 @@ pub(crate) mod tests {
 
         let mut forged = r.clone();
         forged.scope = Scope::Other;
-        assert!(forged.activate(1_000, "g".into()).is_err());
+        assert_eq!(
+            forged.activate(1_000, "g".into()),
+            Err("the pending grant is invalid".to_string())
+        );
+        // A request parked by 1.3.0 for a scope that is now refused.
+        for scope in [Scope::Authority, Scope::Destructive, Scope::SecretRead] {
+            forged.scope = scope;
+            let err = forged.activate(1_000, "g".into()).unwrap_err();
+            assert!(
+                err.ends_with(
+                    "are a hard guard; no grant can relax them, so this grant was not created"
+                ),
+                "{scope:?}: {err}"
+            );
+        }
         forged = r.clone();
         forged.programs = vec!["evil\ntext".into()];
         assert!(forged.activate(1_000, "g".into()).is_err());

@@ -299,12 +299,31 @@ fn a_secret_in_a_confirm_prompt_is_still_blocked() {
 #[test]
 fn an_unknown_or_removed_scope_is_a_cli_error() {
     let sb = Sandbox::new("relax-scope");
-    for scope in ["other", "bogus", "secret_read", ""] {
+    for scope in [
+        "other",
+        "bogus",
+        "secret_read",
+        "authority",
+        "destructive",
+        "",
+    ] {
         let run = sb.cli(&["allow", "--scope", scope, "--for", "30m"]);
         assert_ne!(run.code, Some(0), "{scope}: {}", run.stdout);
         let v = run.json();
         assert_eq!(v["status"], "error", "{scope}: {v}");
-        assert!(v["error"].as_str().unwrap().contains("--scope"), "{v}");
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("--scope: ")
+                && error.ends_with("expected one of transfer|swap|deploy"),
+            "{v}"
+        );
+        // A hard guard is refused as one, with no grant to fall back on.
+        let hard = ["secret_read", "authority", "destructive"].contains(&scope);
+        assert_eq!(
+            error.contains("are a hard guard; no grant can relax them"),
+            hard,
+            "{v}"
+        );
     }
     let run = sb.cli(&[
         "allow", "--scope", "transfer", "--for", "30m", "--to", "x\ny",
@@ -830,5 +849,105 @@ fn an_unreadable_process_table_shows_and_confirms_nothing() {
         );
         assert!(v.get("hookSpecificOutput").is_none(), "{v}");
         assert_eq!(sb.state("pending.json"), pending);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Hard-guard scopes: a grant stored by 1.3.0 relaxes nothing
+// ---------------------------------------------------------------------------------------
+
+/// A `grants.json` written by 1.3.0 may hold `authority` or `destructive` grants. In a trusted
+/// data dir they still load and are listed, but every authority change, close and burn asks at
+/// every tier, nothing is debited, and the session notice says they relax nothing.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_stale_authority_or_destructive_grant_relaxes_nothing() {
+    use common::Tier;
+    use safe_ai_skill::datadir::{DataDir, TEST_TRUST_ENV};
+    use safe_ai_skill::gate::Scope;
+    use safe_ai_skill::grants::{self, Grant, Grants};
+
+    let sb = Sandbox::new("relax-stale-scope");
+    let dir = DataDir {
+        path: sb.data.path().to_path_buf(),
+        trusted: true,
+    };
+    let stale = [Scope::Authority, Scope::Destructive]
+        .iter()
+        .map(|scope| Grant {
+            id: format!("stale-{}", scope.label()),
+            scope: *scope,
+            programs: Vec::new(),
+            to: Vec::new(),
+            max_tx_sol: 1_000.0,
+            budget_sol: 1_000_000.0,
+            spent_sol: 0.0,
+            expires_at: u64::MAX,
+            danger: true,
+        })
+        .collect();
+    grants::save(&dir, &Grants { grants: stale }).unwrap();
+
+    let devnet = "--url https://api.devnet.solana.com";
+    let commands = [
+        format!("spl-token authorize {DEST} mint {DEST} {devnet}"),
+        format!("spl-token approve {DEST} 10 {DEST} {devnet}"),
+        format!("solana close {DEST} {devnet}"),
+        format!("spl-token close {DEST} {devnet}"),
+        format!("spl-token burn {DEST} 100 {devnet}"),
+    ];
+    let no_tools = TempDir::new("relax-stale-path");
+    for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+        for command in &commands {
+            let run = Invocation::new(&["gate-bash"])
+                .plugin_data(sb.data.path())
+                .home(sb.home.path())
+                .cwd(sb.proj.path())
+                .tier(tier)
+                .env("PATH", no_tools.path().to_str().unwrap())
+                .stdin(
+                    json!({"session_id":"it-relax","cwd": sb.proj.path(),
+                           "hook_event_name":"PreToolUse","tool_name":"Bash",
+                           "tool_input":{"command": command}})
+                    .to_string(),
+                )
+                .run();
+            assert_eq!(
+                decision_label(&run),
+                "ask",
+                "{tier:?}: {command}: {}",
+                run.stdout
+            );
+        }
+    }
+    let stored = grants::live(&dir);
+    assert_eq!(stored.grants.len(), 2);
+    assert!(
+        stored.grants.iter().all(|g| g.spent_sol == 0.0),
+        "{stored:?}"
+    );
+
+    // `status` lists them (no error); the session notice says they relax nothing.
+    let trust = [(TEST_TRUST_ENV, "1")];
+    let status = sb.cli_env(&["status"], &trust);
+    assert_eq!(status.code, Some(0), "{}", status.stderr);
+    let v = status.json();
+    assert_eq!(v["grants_state"], "valid", "{v}");
+    assert_eq!(v["grants"].as_array().map(Vec::len), Some(2), "{v}");
+    let run = sb.hook(
+        &["verify", "session"],
+        json!({"session_id":"it-relax","hook_event_name":"SessionStart","source":"startup",
+               "cwd": sb.proj.path()}),
+        &trust,
+    );
+    let v = run.json();
+    let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    for line in [
+        "grant stale-authority: authority, relaxes nothing (authority changes are a hard \
+         guard; no grant can relax them)",
+        "grant stale-destructive: destructive, relaxes nothing (destructive actions (burns, \
+         closes) are a hard guard; no grant can relax them)",
+    ] {
+        assert!(msg.contains(line), "{msg}");
     }
 }
