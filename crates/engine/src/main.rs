@@ -36,6 +36,8 @@ use safe_ai_skill::{
     registry, relax, sandbox, session, verify,
 };
 
+mod help;
+
 /// Exit status for an invocation error (unknown or missing subcommand), distinct from a verdict.
 const EXIT_USAGE: u8 = 3;
 
@@ -94,8 +96,8 @@ const PANIC_ASK_GATES: &[&str] = &[
 /// A subcommand handler: gets the arguments after the subcommand name.
 type Handler = fn(&[String]) -> ExitCode;
 
-/// The subcommand registry. A new subcommand is one line here. Names not listed exit 3
-/// ([`cmd_unknown`]).
+/// The subcommand registry. A new subcommand is one line here plus its entry in [`help`]. Names
+/// not listed exit 3 ([`cmd_unknown`]).
 const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("gate-bash", |_| cmd_gate_bash()),
     ("gate-bash-secrets", |_| cmd_gate_bash_secrets()),
@@ -127,6 +129,9 @@ const SUBCOMMANDS: &[(&str, Handler)] = &[
     ("env", safe_ai_skill::env::main),
     ("doctor", safe_ai_skill::doctor::main),
     ("--version", |_| cmd_version()),
+    ("help", help::main),
+    ("--help", help::main),
+    ("-h", help::main),
 ];
 
 fn main() -> ExitCode {
@@ -136,6 +141,10 @@ fn main() -> ExitCode {
 
     if PANIC_ASK_GATES.contains(&sub) {
         install_panic_ask();
+    }
+    // `<command> --help` prints the usage instead of running the command.
+    if let Some(code) = help::flag(sub, rest) {
+        return code;
     }
     match SUBCOMMANDS.iter().find(|(name, _)| *name == sub) {
         Some((name, handler)) if DEADLINE_GATES.contains(name) => {

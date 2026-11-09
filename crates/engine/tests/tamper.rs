@@ -287,6 +287,14 @@ fn bash_runs_plugin_binary_from_cache_path_read_only() {
         "cache binary status",
     );
     assert_deny(&sb.bash(&format!("{bin} revoke")), "cache binary revoke");
+    assert_no_opinion(
+        &sb.bash(&format!("true && {bin} --help")),
+        "cache binary help after &&",
+    );
+    assert_deny(
+        &sb.bash(&format!("echo x | tee {bin} status")),
+        "cache binary as tee's argument",
+    );
 }
 
 // ---------------------------------------------------------------------------------------
