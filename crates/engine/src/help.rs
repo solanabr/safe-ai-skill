@@ -129,11 +129,12 @@ const ADD: &str = "usage: safe-ai-skill add skill|mcp|repo <source> [--yes] [--f
 Checks a source before you install it and prints the install command in the \"run\" field; it
 never installs anything or writes .mcp.json. A local directory is graded like the session
 sweep, at your tier, for every kind. A GitHub repo or npm package gets a provenance check
-only: online, a moving ref or version is resolved to the exact commit or version, which is
-what gets graded (npm: looked up on osv.dev) and what \"run\" installs. The add is held until
---yes when it can't be pinned, when osv.dev can't answer, or when the source is not a GitHub
-repo, an npm package or a local directory. --offline skips every lookup. --force implies --yes
-and also takes a local pack the tier denies. Output is JSON.
+only; an exact npm version is also looked up on osv.dev. Only a full commit SHA or an exact
+x.y.z version you name yourself can pass. A moving ref or version is held until --yes; online
+it is resolved first, and \"run\" installs exactly that commit or version. The add is also held
+when osv.dev can't answer, or when the source is not a GitHub repo, an npm package or a local
+directory. --offline skips every lookup. --force implies --yes and also takes a local pack the
+tier denies. Output is JSON.
 ";
 
 const INSTALL: &str =
