@@ -158,11 +158,11 @@ pub fn decide(
     // tool name, possibly nested under `params`/`args` (depth ≤ 3). Classify from the tool
     // name AND the action together, using token-boundary matching so `display`/`design`/
     // `minted` do not match `pay`/`sign`/`mint`.
-    let action = payload.and_then(extract_action);
-    let action_tokens = action
-        .as_deref()
-        .map(|a| without_read_prefix(name_tokens(a)))
-        .unwrap_or_default();
+    let actions = payload.map(extract_actions).unwrap_or_default();
+    let action_tokens: Vec<String> = actions
+        .iter()
+        .flat_map(|a| without_read_prefix(name_tokens(a)))
+        .collect();
     let mut class_tokens = name_tokens(tool_name);
     class_tokens.extend(action_tokens.iter().cloned());
     let wallet_ctx = is_wallet_context(&class_tokens);
@@ -173,8 +173,10 @@ pub fn decide(
         wallet_ctx,
     );
     let signal = payload.and_then(payload_signal);
-    // Staking verbs gate even when a user-trimmed pattern lacks them.
-    let staking = is_staking(&class_tokens);
+    // Staking verbs gate even when a user-trimmed pattern lacks them; `undelegate` (also a DNS
+    // word) counts only on a call the pattern already gates.
+    let staking = is_staking(&class_tokens)
+        || (name_sensitive && class_tokens.iter().any(|t| t == "undelegate"));
 
     // An authority or destructive verb in the tool segment or the action is a hard guard
     // whatever transfer verb sits beside it (`transferMintAuthority`, `burnAndSend`). The
@@ -183,11 +185,11 @@ pub fn decide(
     // (`freezeAccount`, `approve`), unless it follows a read verb (`getFreezeStatus`).
     let tool_tokens = name_tokens(short_name(tool_name));
     let call_tokens: Vec<String> = tool_tokens.iter().chain(&action_tokens).cloned().collect();
-    let guard = guarded_scope(&call_tokens);
+    let guard = guarded_scope(&call_tokens, true);
     let guard_gates = wallet_ctx && guard.is_some() && {
         let mut unread = without_read_prefix(tool_tokens);
         unread.extend(action_tokens);
-        guarded_scope(&unread).is_some()
+        guarded_scope(&unread, false).is_some()
     };
 
     // Fast path: no sensitive verb, no staking or guarded verb, and no value-moving payload
@@ -249,7 +251,10 @@ pub fn decide(
         meta.hard_guard = true;
     }
 
-    let short_tool = action.as_deref().unwrap_or_else(|| short_name(tool_name));
+    let short_tool = actions
+        .first()
+        .map(String::as_str)
+        .unwrap_or_else(|| short_name(tool_name));
 
     let reason = match scope {
         Scope::Authority => format!(
@@ -259,6 +264,10 @@ pub fn decide(
         Scope::Destructive => format!(
             "MCP destructive action: {short_tool} (a close or burn; a hard guard, so no grant \
              relaxes it) — approve to proceed"
+        ),
+        Scope::Deploy => format!(
+            "MCP deploy or upgrade: {short_tool} (an MCP call names no cluster; a hard guard, \
+             so no grant relaxes it) — approve to proceed"
         ),
         Scope::Swap => {
             // Record the mint so main can route to the rugcheck/relaxation swap path.
@@ -467,14 +476,21 @@ fn collect_keys(payload: &Value, keys: &[&str], depth: usize, out: &mut Vec<Valu
     }
 }
 
-/// The routed `action` verb of an MCP payload (`tool_input.action`, or nested under
-/// [`NEST_KEYS`]); a one-element array (`["transferSol"]`) counts as its string.
-fn extract_action(payload: &Value) -> Option<String> {
-    find_all(payload, &["action"]).iter().find_map(|v| match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(items) => items.iter().find_map(|i| i.as_str().map(str::to_string)),
-        _ => None,
-    })
+/// The routed `action` verbs of an MCP payload (`tool_input.action`, and any nested under
+/// [`NEST_KEYS`]), shallowest first; an array (`["transferSol"]`) counts each string. Every one
+/// is classified, since which the server runs is its choice.
+fn extract_actions(payload: &Value) -> Vec<String> {
+    find_all(payload, &["action"])
+        .iter()
+        .flat_map(|v| match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Parse a JSON value as an `f64`, accepting numbers and numeric strings.
@@ -483,7 +499,8 @@ fn number(v: &Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-/// Fold a name for matching: drop zero-width and soft-hyphen characters, map fullwidth ASCII
+/// Fold a name for matching: drop zero-width, soft-hyphen and combining characters (U+034F, the
+/// grapheme joiner, among them), map fullwidth ASCII
 /// to ASCII, and map the common Cyrillic/Greek look-alikes of Latin letters (`trаnsfer` with
 /// a Cyrillic `а`). Not full NFKC; enough that a look-alike verb still matches.
 fn fold(s: &str) -> String {
@@ -491,12 +508,16 @@ fn fold(s: &str) -> String {
         .filter(|c| {
             !matches!(
                 c,
-                '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+                '\u{00AD}'
+                    | '\u{0300}'..='\u{036F}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{FEFF}'
             )
         })
         .map(|c| match c {
             '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            'а' | 'α' => 'a',
+            'а' | 'α' | 'ɑ' => 'a',
             'в' => 'b',
             'с' | 'ϲ' => 'c',
             'е' | 'ε' => 'e',
@@ -662,43 +683,57 @@ fn classify_scope(tokens: &[String]) -> Scope {
 }
 
 /// Whether the tokens indicate a staking / delegation action (no destination, but still
-/// value-moving): `stake`, `unstake`, `delegate`, `undelegate`, `deactivate`.
+/// value-moving): `stake`, `unstake`, `delegate`, `deactivate`.
 fn is_staking(tokens: &[String]) -> bool {
-    tokens.iter().any(|t| {
-        matches!(
-            t.as_str(),
-            "stake" | "unstake" | "delegate" | "undelegate" | "deactivate"
-        )
-    })
+    tokens
+        .iter()
+        .any(|t| matches!(t.as_str(), "stake" | "unstake" | "delegate" | "deactivate"))
 }
 
 /// Stems that mark an authority or ownership change wherever they appear in a token, so a
 /// run-together spelling (`TRANSFER_SETAUTHORITY`, `transferownership`) still counts. Each is
-/// specific: `authoritative` and `authorization` contain none of them.
-const AUTHORITY_STEMS: &[&str] = &[
-    "authority",
-    "authorities",
+/// specific: `authoritative` contains none of them.
+const AUTHORITY_STEMS: &[&str] = &["authority", "authorities", "ownership"];
+
+/// Verbs that use or hand out an authority: authorizing, approving or revoking a delegate,
+/// freezing or thawing an account. `authorized` / `unauthorized` are states, not these verbs.
+const AUTHORITY_VERBS: &[&str] = &[
     "authorize",
     "authorise",
-    "ownership",
+    "approve",
+    "revoke",
+    "freeze",
+    "unfreeze",
+    "thaw",
 ];
 
-/// Verbs that use or hand out an authority: approving or revoking a delegate, freezing or
-/// thawing an account.
-const AUTHORITY_VERBS: &[&str] = &["approve", "revoke", "freeze", "unfreeze", "thaw"];
+/// Authority words too common elsewhere to gate a call by themselves (`auth`, `assign`), and
+/// the holders a set/change/transfer verb hands over (`transferOwner`, `setAdmin`): on a call
+/// already gated they make it a hard guard (`transferMintAuth`, `transferAndAssign`).
+const WEAK_AUTHORITY_VERBS: &[&str] = &["auth", "assign"];
+const HOLDERS: &[&str] = &["owner", "owners", "admin", "admins", "manager"];
+const HANDOVER_VERBS: &[&str] = &["set", "change", "update", "transfer", "assign"];
 
 /// Verbs that destroy an account or tokens.
 const DESTRUCTIVE_VERBS: &[&str] = &["close", "burn"];
 
-/// What a guarded verb may be run together with and still count (`closeaccount`, `burnall`).
-/// Any other tail is another word: `closeout`, `closed`, `approved`, `burner`, `thawed`.
-const GUARD_OBJECTS: &[&str] = &["", "account", "accounts", "all", "mint", "token", "tokens"];
+/// Program deploys and upgrades: an MCP call names no cluster, so a deploy beside a transfer
+/// verb (`upgradeAndWithdraw`) is no transfer a grant may cover.
+const DEPLOY_VERBS: &[&str] = &["deploy", "redeploy", "upgrade"];
 
-/// The hard-guard scope of an MCP call whose tool-name / action tokens carry an authority
-/// verb ([`AUTHORITY_STEMS`], [`AUTHORITY_VERBS`]) or a destructive one
-/// ([`DESTRUCTIVE_VERBS`]), or `None`. A verb matches as a whole token or run together with a
-/// [`GUARD_OBJECTS`] word.
-fn guarded_scope(tokens: &[String]) -> Option<Scope> {
+/// What a guarded verb may be run together with and still count (`closeaccount`, `burnall`,
+/// `closeacct`). Any other tail is another word: `closeout`, `closed`, `approved`, `burner`,
+/// `thawed`.
+const GUARD_OBJECTS: &[&str] = &[
+    "", "account", "accounts", "acct", "accts", "ata", "atas", "all", "empty", "mint", "token",
+    "tokens",
+];
+
+/// The hard-guard scope of an MCP call whose tool-name / action tokens carry a destructive verb
+/// ([`DESTRUCTIVE_VERBS`]), an authority one ([`AUTHORITY_STEMS`], [`AUTHORITY_VERBS`]) or,
+/// with `weak`, a [`WEAK_AUTHORITY_VERBS`] / holder handover / [`DEPLOY_VERBS`] one; `None`
+/// otherwise. A verb matches as a whole token or run together with a [`GUARD_OBJECTS`] word.
+fn guarded_scope(tokens: &[String], weak: bool) -> Option<Scope> {
     let verb_in = |verbs: &[&str]| {
         tokens.iter().any(|t| {
             verbs.iter().any(|v| {
@@ -707,14 +742,22 @@ fn guarded_scope(tokens: &[String]) -> Option<Scope> {
             })
         })
     };
+    let handover = || {
+        tokens
+            .windows(2)
+            .any(|w| HANDOVER_VERBS.contains(&w[0].as_str()) && HOLDERS.contains(&w[1].as_str()))
+    };
     if verb_in(DESTRUCTIVE_VERBS) {
         Some(Scope::Destructive)
     } else if verb_in(AUTHORITY_VERBS)
         || tokens
             .iter()
             .any(|t| AUTHORITY_STEMS.iter().any(|s| t.contains(s)))
+        || (weak && (verb_in(WEAK_AUTHORITY_VERBS) || handover()))
     {
         Some(Scope::Authority)
+    } else if weak && verb_in(DEPLOY_VERBS) {
+        Some(Scope::Deploy)
     } else {
         None
     }
@@ -923,6 +966,9 @@ fn is_read_verb(token: &str) -> bool {
             | "status"
             | "simulate"
             | "estimate"
+            | "view"
+            | "check"
+            | "inspect"
     )
 }
 
@@ -1279,7 +1325,7 @@ mod tests {
 
     #[test]
     fn guarded_verbs_match_whole_words_and_their_object_compounds_only() {
-        let scope = |name: &str| guarded_scope(&name_tokens(name));
+        let scope = |name: &str| guarded_scope(&name_tokens(name), true);
         for name in [
             "setAuthority",
             "transferMintAuthority",
@@ -1427,6 +1473,61 @@ mod tests {
         }
         let kinds = payload_kinds(&deep);
         assert!(kinds.opaque, "{kinds:?}");
+    }
+
+    #[test]
+    fn abbreviated_authority_handover_and_deploy_words_guard_a_gated_call() {
+        for (tool, scope) in [
+            ("mcp__w__transferMintAuth", Scope::Authority),
+            ("mcp__w__transferUpdateAuth", Scope::Authority),
+            ("mcp__w__transferAdmin", Scope::Authority),
+            ("mcp__w__transferOwner", Scope::Authority),
+            ("mcp__w__transferAndAssign", Scope::Authority),
+            ("mcp__w__withdraw_closeacct", Scope::Destructive),
+            ("mcp__w__withdrawAndCloseata", Scope::Destructive),
+            ("mcp__w__upgradeAndWithdraw", Scope::Deploy),
+        ] {
+            let (d, m) = decide_with(tool, json!({ "to": TO, "amount": 0.01 }));
+            assert!(matches!(d, Decision::Ask { .. }), "{tool}: {d:?}");
+            assert_eq!(m.scope, scope, "{tool}");
+            assert!(m.hard_guard, "{tool}");
+        }
+        // Every routed action is read, and look-alike spellings fold.
+        for payload in [
+            json!({ "action": ["transferSol", "setAuthority"], "to": TO, "amount": 0.01 }),
+            json!({ "action": "transferSol", "params": { "action": "setAuthority" },
+                    "to": TO, "amount": 0.01 }),
+            json!({ "action": "transferMint\u{034F}Authority", "to": TO, "amount": 0.01 }),
+            json!({ "action": "transfer\u{0251}uthority", "to": TO, "amount": 0.01 }),
+        ] {
+            let (_, m) = decide_with("mcp__helius__heliusWrite", payload.clone());
+            assert_eq!(m.scope, Scope::Authority, "{payload}");
+            assert!(m.hard_guard, "{payload}");
+        }
+        let (_, m) = decide_with(
+            "mcp__w__withdrawWithheld",
+            json!({ "to": TO, "amount": 0.01 }),
+        );
+        assert!(m.hard_guard, "Token-2022 withheld fees are token units");
+        // `authorized` is a state, and a payment to the owner is a payment.
+        for tool in ["mcp__solana__payAuthorized", "mcp__w__transferToOwner"] {
+            let (_, m) = decide_with(tool, json!({ "to": TO, "amount": 0.01 }));
+            assert_eq!(m.scope, Scope::Transfer, "{tool}");
+            assert!(!m.hard_guard, "{tool}");
+        }
+    }
+
+    #[test]
+    fn weak_words_reads_and_undelegate_elsewhere_gate_nothing_new() {
+        for tool in [
+            "mcp__wallet__authLogin",
+            "mcp__solana__viewFreezeStatus",
+            "mcp__solana__checkTokenAuthorities",
+            "mcp__dns__undelegateZone",
+        ] {
+            let (d, _) = decide(tool, None, &ctx(), &Policy::default());
+            assert_eq!(d, Decision::Defer, "{tool}");
+        }
     }
 
     #[test]

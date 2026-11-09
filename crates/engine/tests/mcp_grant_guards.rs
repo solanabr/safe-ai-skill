@@ -132,7 +132,24 @@ fn guarded_calls() -> Vec<(&'static str, Value)> {
             "mcp__tokenkit__burnAndSend",
             json!({"to": DEST, "amount": 0.01}),
         ),
+        // Abbreviated, run-together and deploy spellings.
+        (
+            "mcp__tokenkit__transferMintAuth",
+            json!({"to": DEST, "amount": 0.01}),
+        ),
+        (
+            "mcp__tokenkit__withdraw_closeacct",
+            json!({"to": DEST, "amount": 0.01}),
+        ),
+        (
+            "mcp__tokenkit__upgradeAndWithdraw",
+            json!({"to": DEST, "amount": 0.01}),
+        ),
         // The verb in a routed tool's `action`.
+        (
+            "mcp__helius__heliusWrite",
+            json!({"action": ["transferSol", "setAuthority"], "to": DEST, "amount": 0.01}),
+        ),
         (
             "mcp__helius__heliusWrite",
             json!({"action": "transferMintAuthority", "to": DEST, "amount": 0.01}),
@@ -236,6 +253,10 @@ fn sol_transfers() -> Vec<(&'static str, Value)> {
         ),
         (
             "mcp__solana-tokens__transferSol",
+            json!({"to": DEST, "amount": 0.01}),
+        ),
+        (
+            "mcp__solana__payAuthorized",
             json!({"to": DEST, "amount": 0.01}),
         ),
     ]
