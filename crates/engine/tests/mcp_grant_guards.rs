@@ -162,6 +162,28 @@ fn guarded_calls() -> Vec<(&'static str, Value)> {
             "mcp__agentkit__transferSpl",
             json!({"to": DEST, "amount": 0.5}),
         ),
+        (
+            "mcp__wallet__transfer",
+            json!({"to": DEST, "amount": 0.9, "token": USDC}),
+        ),
+        (
+            "mcp__wallet__transfer",
+            json!({"to": DEST, "amount": 0.9, "options": {"tokenMintAddress": USDC}}),
+        ),
+        (
+            "mcp__agentkit__transferSPLToken",
+            json!({"to": DEST, "amount": 0.9}),
+        ),
+        ("mcp__goat__send_ETH", json!({"to": DEST, "amount": "0.9"})),
+        // A transfer that hands over an authority, or carries a pre-built transaction.
+        (
+            "mcp__wallet__transfer",
+            json!({"to": DEST, "amount": 0.01, "newOwner": DEST}),
+        ),
+        (
+            "mcp__solana__sendRawTransaction",
+            json!({"transaction": "AQAB", "to": DEST, "amount": 0.01}),
+        ),
         // A SOL amount the grant cannot read: a decoy key beside the real one, or send-max.
         (
             "mcp__helius__heliusWrite",
@@ -206,6 +228,14 @@ fn sol_transfers() -> Vec<(&'static str, Value)> {
         ),
         (
             "mcp__burn-tracker__sendSol",
+            json!({"to": DEST, "amount": 0.01}),
+        ),
+        (
+            "mcp__wallet__transfer",
+            json!({"to": DEST, "amount": 0.01, "mint": null, "currency": "SOL"}),
+        ),
+        (
+            "mcp__solana-tokens__transferSol",
             json!({"to": DEST, "amount": 0.01}),
         ),
     ]
