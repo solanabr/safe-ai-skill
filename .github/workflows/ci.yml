@@ -446,6 +446,19 @@ jobs:
       - name: opencode plugin (fail-closed tests, fake engines)
         run: node --test adapters/opencode/test/plugin.test.mjs
 
+      # `files` must name the wrapper's own files. A broad entry would publish a binary or
+      # SHA256SUMS left in npm/bin, and users' postinstall would then skip its download and check.
+      - name: npm pack contents (wrapper files only, stray npm/bin files left out)
+        working-directory: npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bin && touch bin/safe-ai-skill-linux-x64 bin/SHA256SUMS
+          got=$(npm pack --dry-run --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{console.log(JSON.parse(s)[0].files.map(f=>f.path).sort().join(" "))})')
+          rm -f bin/safe-ai-skill-linux-x64 bin/SHA256SUMS
+          want="README.md bin/cli.js package.json scripts/postinstall.js"
+          [ "$got" = "$want" ] || { echo "::error::npm pack would publish: $got (want: $want)"; exit 1; }
+
       - name: shellcheck (install.sh + scripts)
         run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh
 
@@ -468,6 +481,28 @@ jobs:
           sh -n scripts/shared-manifest.sh
           sh -n scripts/check-shared-lists.sh
           sh scripts/check-shared-lists.sh
+
+      - name: Install Rust (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/engine/target
+          key: cargo-package-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/engine/Cargo.lock') }}
+          restore-keys: |
+            cargo-package-${{ runner.os }}-${{ runner.arch }}-
+
+      # The crate stays publishable to crates.io: cargo package builds the tarball on its own,
+      # so an include_str! or file reaching outside crates/engine fails here. The "ignoring
+      # test" warnings are expected (tests/ is excluded from the package).
+      - name: cargo package --locked (crates.io publishability)
+        run: cargo package --manifest-path "$MANIFEST" --locked
 
       - name: Version consistency across manifests
         run: sh scripts/check-versions.sh
