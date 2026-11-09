@@ -52,6 +52,21 @@ string around a placeholder, stays WARN.
   `Gemfile.lock`, `composer.lock`, `Podfile.lock`, `pubspec.lock`, `mix.lock`, `flake.lock`,
   `packages.lock.json`) without an exec bit or shebang. Any other `*.lock` is scanned.
 
+## Registry-free verification model
+
+Trust rests on the artifact itself, not on a hash allowlist someone has to maintain:
+
+1. **Rule-based scan.** Every file of a pack is classified as code, documentation or pack metadata, and the detectors run in that context (strings and comments are data, interpolations are code). Findings in docs cap at WARN, a single code signal is HIGH (the pack is *unreviewed*: reported, not blocked), and only combinations of signals (an exfiltrating `` !`cmd` ``, padding plus a sink, `eval` plus a decoder, a symlink leaving the pack, and so on) BLOCK.
+2. **Per-pack pinning.** Each skill pack and `ext/` submodule is pinned on first sight by content (`ext/` submodules also by commit SHA). Later drift blocks the pack, in place, until you approve it with `safe-ai-skill verify approve <name>` and confirm the code safe-ai-skill shows you.
+3. **Catalog gating.** Entries in a project's `skill-registry.json` are classified by risk class (`wallet_signing`, `key_custody`, `installer_script`, `standard`). Installing a high-risk class needs explicit approval (`add ... --yes`). The three shipped classes all `ask`, and a repo cannot change catalog classes.
+4. **Provenance check.** `add` reads the source string; it fetches and pins nothing. A GitHub source passes only when it names a full 40-hex commit; any other ref, the default branch included, is a MEDIUM `unpinned_ref` finding and the add is held until you pass `--yes`. An npm source passes only when it names an exact version (`pkg@x.y.z`); otherwise it is a MEDIUM `unpinned_version` finding, and a name within edit distance 2 of a popular package is a HIGH `typosquat` finding that blocks. Any other source (a non-GitHub URL, the `owner/repo` shorthand, a tarball or remote MCP URL) gets no provenance check and passes with no finding. The printed install command is your original, unpinned source. `@latest` entries in `.mcp.json` are flagged as informational.
+5. **CVE lookup.** `add` queries osv.dev for an exact, non-local npm source (`pkg@x.y.z` as you wrote it; `add` resolves nothing). No API key is needed. This is the only network step: the session sweep and the gates make no network calls. A CVSS 7 or higher advisory (or a HIGH or CRITICAL label, or no severity) is HIGH and blocks; 4 to 7 is MEDIUM and holds the add until `--yes`. **The lookup fails open:** if osv.dev is unreachable or times out, `add` records a LOW `osv_unavailable` finding and still passes. `install` makes no CVE lookup.
+6. **Local state.** Per-pack state (`state.json`, authenticated) records the pin, grade and findings. A project may commit `.safe-ai-skill/packs.lock` to pin pack contents for everyone: a mismatch blocks, and a match can't clear a block.
+
+At SessionStart: block on a combination rule or drift, report a HIGH as unreviewed, warn on documentation findings, pin a clean pack. `add` blocks an exact npm version with a known high-severity advisory (see item 5); `install` does no CVE lookup.
+
+How `add` and `install` use the grade, and what `--yes` and `--force` let through, is in [docs/cli.md](cli.md#verify-add-and-install).
+
 ## Combination rules (the only BLOCKs)
 
 | Combo | Fires when |
@@ -64,7 +79,7 @@ string around a placeholder, stays WARN.
 | `native_binary` | A native ELF, Mach-O or PE file. BPF and SBF `.so` files (e_machine 247 and 263) are exempt. |
 | `masquerade_referenced` | Archive or executable bytes sit behind a text extension, and a `SKILL.md` names the file, its stem or its disguised inner extension (`.docx` in `x.docx.txt`). |
 | `bang_exfil` | A `` !`cmd` `` outside a closed fence touches the network, a secret path, the environment or a credential variable, directly or by running a pack script that does (`bash scripts/x.sh`, `./x.sh`, `${CLAUDE_SKILL_DIR}/x.sh`). A fence that never closes hides nothing. |
-| `description_injection` | A `SKILL.md` description carries shell syntax (`$(`, `\| sh`, `&&` …), a URL with an action verb or next to a credential (see [Description URLs](#description-urls-a-deliberate-deviation-from-d24)), an instruction aimed at every turn ("before responding …", "first, always run …"), or injection phrasing. The description is read as YAML (escapes, quoted keys, block scalars) and line by line, and tag characters are decoded first. |
+| `description_injection` | A `SKILL.md` description carries shell syntax (`$(`, `\| sh`, `&&` …), a URL with an action verb or next to a credential (see [Description URLs](#description-urls-a-deliberate-deviation-from-the-original-design)), an instruction aimed at every turn ("before responding …", "first, always run …"), or injection phrasing. The description is read as YAML (escapes, quoted keys, block scalars) and line by line, and tag characters are decoded first. |
 | `lifecycle_network` | An install-time npm script (`preinstall`, `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare`, `dependencies`, `prepack`, `postpack`, pnpm's `pnpm:devPreinstall`) reaches the network (curl, wget, npx, a URL …) or evaluates inline code (`node -e`, `python -c`, `eval`). Names are compared after JSON decoding. |
 | `harness_bypass` | A shipped `.claude/settings*.json` contains `bypassPermissions`, a `defaultMode` key or `dangerously*`, compared after JSON decoding (`\u0064efaultMode` counts). |
 | `registry_hijack` | Code writes package-manager registry config (`.npmrc`, `.yarnrc`, `pip.conf`, `npm config set registry`, git `insteadOf` …) and names a registry host other than npmjs, yarnpkg, PyPI, crates.io or rubygems in the same file. A git `insteadOf` that only adds credentials to the same host is not a hijack. |

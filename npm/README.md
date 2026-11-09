@@ -5,8 +5,9 @@ Code. Its hooks read Solana CLI, SPL Token and Anchor commands and value-moving
 MCP calls before they run: mainnet deploys, authority changes and over-cap
 transfers ask for your approval, and irreversible actions (`--final`,
 `program close` (program or buffer), `spl-token close|burn`, …) are denied on
-mainnet or any cluster not identified as localnet or devnet. Credential stores,
-keypairs and project `.env` files are read-denied. The firewall takes a tier
+mainnet or any cluster not identified as localnet or devnet. Credential stores
+and keypairs are read-denied at every tier; project `.env` reads follow the tier
+(denied at High; `.env.production` is denied from Relaxed). The firewall takes a tier
 (`off < relaxed < medium < high`) as an input. A supply-chain verifier runs at
 every session start: it scans skills and MCPs, flags telemetry preambles and
 plaintext JWTs, pins content hashes, and blocks a pack that drifted (in place,
@@ -45,12 +46,13 @@ The package is scoped (`@stbr/safe-ai-skill`); the installed CLI command is `saf
 ## Quick start
 
 ```bash
-# Gate installs before they run
-safe-ai-skill add skill <name|url>    # any GitHub skill URL or catalog entry
-safe-ai-skill add mcp <id|pkg|url>    # any MCP; pins exact version before writing .mcp.json
-safe-ai-skill add repo <url>          # any clonable repo; pins to commit SHA
+# Check a source before you install it: prints the install command, pins and
+# installs nothing (see the project README for what is and isn't checked)
+safe-ai-skill add skill <name|url|dir>
+safe-ai-skill add mcp <id|pkg|url>
+safe-ai-skill add repo <url|dir>
 
-# Audit what is already installed
+# Run the session sweep now: grade and pin the installed packs
 safe-ai-skill verify
 
 # Request approval of a blocked (drifted) pack after you reviewed it; confirm with
@@ -81,7 +83,7 @@ claude plugin install safe-ai-skill@safe-ai-skill
 Once installed, the hooks run in every session — no per-skill configuration
 required (see the warning above for what they cannot catch). solana-ai-kit users already have the plugin through the
 kit and should not add it again. If you installed `safe-ai-skill@stbr`, follow
-the migration steps in the [README](https://github.com/solanabr/safe-ai-skill/blob/main/README.md#install)
+the migration steps in [docs/upgrading.md](https://github.com/solanabr/safe-ai-skill/blob/main/docs/upgrading.md#moving-from-safe-ai-skillstbr)
 before removing anything: the solana-ai-kit marketplace is also named `stbr`.
 
 ## How this package works
@@ -96,9 +98,10 @@ Supported platforms: macOS arm64, macOS x64, Linux x64, Linux arm64, Windows x64
 (also used on ARM). The Linux binaries are static (musl), so they run on any
 distribution, Alpine included.
 
-For unsupported platforms or offline installs:
+For unsupported platforms or offline installs, build from the matching release tag (crates.io carries only 1.0.0):
 ```bash
-cargo install safe-ai-skill
+git clone --branch v1.3.0 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
+cargo install --locked --path crates/engine
 ```
 
 ## Further reading
