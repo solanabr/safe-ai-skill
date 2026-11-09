@@ -934,6 +934,9 @@ fn a_stale_authority_or_destructive_grant_relaxes_nothing() {
     let v = status.json();
     assert_eq!(v["grants_state"], "valid", "{v}");
     assert_eq!(v["grants"].as_array().map(Vec::len), Some(2), "{v}");
+    for g in v["grants"].as_array().unwrap() {
+        assert_eq!(g["inert"], true, "{v}");
+    }
     let run = sb.hook(
         &["verify", "session"],
         json!({"session_id":"it-relax","hook_event_name":"SessionStart","source":"startup",
@@ -943,9 +946,9 @@ fn a_stale_authority_or_destructive_grant_relaxes_nothing() {
     let v = run.json();
     let msg = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
     for line in [
-        "grant stale-authority: authority, relaxes nothing (authority changes are a hard \
+        "inert grant stale-authority: authority, relaxes nothing (authority changes are a hard \
          guard; no grant can relax them)",
-        "grant stale-destructive: destructive, relaxes nothing (destructive actions (burns, \
+        "inert grant stale-destructive: destructive, relaxes nothing (destructive actions (burns, \
          closes) are a hard guard; no grant can relax them)",
     ] {
         assert!(msg.contains(line), "{msg}");
