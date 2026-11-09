@@ -100,22 +100,21 @@ jobs:
         run: cargo build --manifest-path ${{ env.MANIFEST }} --verbose
 
       - uses: actions/setup-node@v4
-        if: runner.os != 'Windows'
         with:
           node-version: "22"
 
       - name: cargo test --verbose
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose --no-fail-fast
         env:
           # The opencode plugin's Node tests (real engine) must run, not skip.
-          SAFE_AI_SKILL_REQUIRE_NODE_TESTS: ${{ runner.os != 'Windows' && '1' || '' }}
+          SAFE_AI_SKILL_REQUIRE_NODE_TESTS: "1"
 
       # The test-only overrides (trusted data dir, sandbox state, crash trigger) exist only in
       # these builds: the tier matrix, the shared corpus plugin column and the Off /
       # `env_read: deny` / grant rows that drive the binary run here. A separate target dir
       # keeps the release-shaped debug binary for the steps below.
       - name: cargo test --features test-hooks
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --target-dir crates/engine/target/test-hooks
+        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --no-fail-fast --target-dir crates/engine/target/test-hooks
 
       # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
       # No network: we use the freshly built binary, not a release download.
@@ -348,7 +347,7 @@ jobs:
   windows:
     name: Windows / x86_64-pc-windows-msvc
     needs: lint
-    runs-on: windows-latest
+    runs-on: windows-2025
     defaults:
       run:
         shell: bash
@@ -379,17 +378,19 @@ jobs:
       - name: --version runs
         run: crates/engine/target/release/safe-ai-skill.exe --version
 
-      # Quarantined (#33): native Windows gate-read has no opinion where a deny is wanted. The
-      # step still runs and a failure is annotated; remove continue-on-error once #33 is fixed.
-      - name: Gate smoke (mainnet --final deploy, .env read)
-        id: gate_smoke
-        continue-on-error: true
+      - name: Gate smoke (mainnet --final deploy, credential-store read)
         run: sh scripts/gate-smoke.sh crates/engine/target/release/safe-ai-skill.exe
 
-      - name: Gate smoke quarantine notice
-        if: steps.gate_smoke.outcome == 'failure'
-        # Quoted: unquoted, YAML reads ` #33)"` as a comment and bash gets an open quote.
-        run: 'echo "::warning::Windows gate smoke failed (quarantined, see #33)"'
+      # The engine suite reports any state in the default standalone data dir as "another data
+      # dir holds state". Fail here, naming the culprit, instead of in 20 unrelated tests.
+      - name: No stray engine state before the suite
+        run: |
+          stray="$(cygpath -u "$LOCALAPPDATA")/safe-ai-skill-data"
+          if [ -e "$stray/key" ]; then
+            echo "::error::$stray holds state before the engine suite ran; an earlier step wrote outside its isolated data dir"
+            ls -la "$stray"
+            exit 1
+          fi
 
       - name: Engine suite (fails on any failure not in the known-failures list)
         run: python -I scripts/windows-test-gate.py

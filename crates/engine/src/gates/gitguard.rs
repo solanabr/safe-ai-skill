@@ -493,6 +493,42 @@ fn restore_index_only(rest: &[Word]) -> bool {
     staged && !worktree
 }
 
+/// Whether `t` is `full` or an abbreviation of it git accepts (at least `min` bytes).
+fn abbrev(t: &str, full: &str, min: usize) -> bool {
+    t.len() >= min && full.starts_with(t)
+}
+
+/// Whether a short-option cluster (`-qf`) holds `flag` before an option in `valued`, whose
+/// value is the rest of the cluster.
+fn cluster_has(t: &str, flag: char, valued: &str) -> bool {
+    if t.starts_with("--") || !t.starts_with('-') {
+        return false;
+    }
+    for c in t[1..].chars() {
+        if c == flag {
+            return true;
+        }
+        if valued.contains(c) {
+            return false;
+        }
+    }
+    false
+}
+
+/// `git checkout` forms that overwrite the working tree: a `--` path separator anywhere, a
+/// `.` pathspec, or `-f` / `--force`. `git checkout <branch>` and `-b <name>` do not.
+fn checkout_discards(rest: &[Word]) -> bool {
+    texts(rest).any(|t| t == "--" || t == ".")
+        || options(rest).any(|t| abbrev(t, "--force", 5) || cluster_has(t, 'f', "bB"))
+}
+
+/// `git switch -f` / `--force` / `--discard-changes`.
+fn forced_switch(rest: &[Word]) -> bool {
+    options(rest).any(|t| {
+        abbrev(t, "--force", 5) || abbrev(t, "--discard-changes", 4) || cluster_has(t, 'f', "cC")
+    })
+}
+
 fn git_findings(walk: &GitWalk<'_>, tier: Tier, out: &mut Vec<Finding>) {
     const FIX_RUN: &str = "if the user wants it, they run it themselves";
     if walk.config_env {
@@ -522,14 +558,24 @@ fn git_findings(walk: &GitWalk<'_>, tier: Tier, out: &mut Vec<Finding>) {
             "runs git restore, overwriting the working tree",
             FIX_RUN,
         )),
-        "checkout" if first == Some("--") => out.push(deny_every_tier(
-            "runs git checkout -- <path>, discarding uncommitted changes",
+        "checkout" if checkout_discards(rest) => out.push(deny_every_tier(
+            "runs git checkout over a path or with --force, discarding uncommitted changes",
+            FIX_RUN,
+        )),
+        "switch" if forced_switch(rest) => out.push(deny_every_tier(
+            "runs git switch --force or --discard-changes, discarding uncommitted changes",
             FIX_RUN,
         )),
         "reset" if any(&|t| t.starts_with("--ha")) => out.push(deny_every_tier(
             "runs git reset --hard, discarding uncommitted changes",
             FIX_RUN,
         )),
+        "reset" if any(&|t| abbrev(t, "--merge", 4) || abbrev(t, "--keep", 3)) => {
+            out.push(deny_every_tier(
+                "runs git reset --merge or --keep, which overwrites working-tree files",
+                FIX_RUN,
+            ))
+        }
         "prune" => out.push(deny_every_tier(
             "runs git prune, deleting the unreachable objects a dropped stash or branch is \
              recovered from",
@@ -594,9 +640,11 @@ fn git_findings(walk: &GitWalk<'_>, tier: Tier, out: &mut Vec<Finding>) {
     }
 }
 
-/// `git push`: mirror and transport overrides deny; a force push ladders (E5).
+/// `git push`: mirror and transport overrides deny; a force push or a remote branch deletion
+/// ladders (E5).
 fn push_findings(rest: &[Word], tier: Tier, out: &mut Vec<Finding>) {
     let mut forced = false;
+    let mut deleted = false;
     let mut dry_run = false;
     for t in texts(rest) {
         if t.starts_with("--mirror") {
@@ -621,14 +669,28 @@ fn push_findings(rest: &[Word], tier: Tier, out: &mut Vec<Finding>) {
                 forced = true
             }
             _ if t.starts_with('+') && t.len() > 1 => forced = true,
+            _ if t.starts_with(':') && t.len() > 1 => deleted = true,
+            _ if abbrev(t, "--delete", 4) => deleted = true,
             _ if t.starts_with("--") => {}
-            _ if t.starts_with('-') && t[1..].contains('f') => forced = true,
+            _ if t.starts_with('-') => {
+                forced |= cluster_has(t, 'f', "o");
+                deleted |= cluster_has(t, 'd', "o");
+            }
             _ => {}
         }
     }
-    if forced && !dry_run {
+    if dry_run {
+        return;
+    }
+    if forced {
         remote_ladder(
             "force-pushes, which discards commits on the remote branch",
+            tier,
+            out,
+        );
+    } else if deleted {
+        remote_ladder(
+            "deletes a branch or tag on the remote, which discards its commits there",
             tier,
             out,
         );
@@ -830,6 +892,13 @@ fn exec_key(key: &str, value: &str) -> bool {
     let k = key.to_ascii_lowercase();
     let first = k.split('.').next().unwrap_or("");
     let last = k.rsplit('.').next().unwrap_or("");
+    let tool_key = matches!(
+        (first, last),
+        ("core", "pager" | "editor") | ("sequence", "editor")
+    ) || first == "pager";
+    if tool_key && crate::gates::tamper::is_known_editor_or_pager(value) {
+        return false;
+    }
     let kit = k.contains('.')
         && (first == "alias"
             || matches!(
@@ -1575,7 +1644,7 @@ mod tests {
         for cmd in [
             "git config core.hooksPath .h",
             "git config --global alias.co checkout",
-            "git config set core.pager less",
+            "git config set core.pager /tmp/p",
             "git config --edit",
             "git -c core.fsmonitor=/tmp/x status",
             "git config --rename-section foo core",
@@ -1586,6 +1655,8 @@ mod tests {
         }
         for cmd in [
             "git config core.pager",
+            "git config set core.pager less",
+            "git -c core.editor=true rebase --continue",
             "git config user.name x",
             "git config -l",
         ] {

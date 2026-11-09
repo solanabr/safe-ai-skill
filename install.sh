@@ -6,7 +6,7 @@
 # verifies its SHA-256 against the release's published SHA256SUMS, and installs
 # it to $SAFE_AI_SKILL_BIN_DIR (default: ~/.local/bin).
 #
-# From 1.2.0 a release also ships the plugin's POSIX shim (safe-ai-skill-shim). On
+# From 1.3.0 a release also ships the plugin's POSIX shim (safe-ai-skill-shim). On
 # macOS and Linux it is installed as `safe-ai-skill`, with the binary beside it as
 # `safe-ai-skill-<platform>`: the shim checks the binary against the sha256 stamped in
 # it and is the entry point Codex hooks need (it turns an engine failure into a block).
@@ -20,13 +20,13 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 #   SAFE_AI_SKILL_BIN_DIR=/usr/local/bin sh install.sh
-#   SAFE_AI_SKILL_VERSION=1.2.0 sh install.sh
+#   SAFE_AI_SKILL_VERSION=1.3.0 sh install.sh
 
 set -eu
 
 REPO="solanabr/safe-ai-skill"
 # Default version — scripts/check-versions.sh keeps it equal to every manifest.
-VERSION="${SAFE_AI_SKILL_VERSION:-1.2.0}"
+VERSION="${SAFE_AI_SKILL_VERSION:-1.3.0}"
 TAG="v${VERSION}"
 RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 BIN_DIR="${SAFE_AI_SKILL_BIN_DIR:-${HOME}/.local/bin}"

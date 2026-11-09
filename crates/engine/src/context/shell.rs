@@ -15,6 +15,8 @@
 //! shell reading a pipe, `eval "$x"`, `python -c` naming `solana`) set [`Parsed::opaque`];
 //! unbalanced quotes or substitutions set [`Parsed::unparseable`]. Pure: no I/O.
 
+use std::cell::RefCell;
+
 /// Deepest nesting of substitutions and `-c` scripts followed; deeper is unparseable.
 const MAX_DEPTH: usize = 8;
 
@@ -55,9 +57,11 @@ const INTERPRETERS: &[&str] = &[
 
 /// Whether `program` (a base name, [`base_name`]) is one of [`INTERPRETERS`].
 pub fn is_interpreter(program: &str) -> bool {
-    INTERPRETERS
-        .iter()
-        .any(|i| program == *i || program.starts_with(&format!("{i}.")))
+    INTERPRETERS.iter().any(|i| {
+        program
+            .strip_prefix(i)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
 }
 
 /// Project runners that run their command in an environment: `(name, subcommand)`, where an
@@ -702,8 +706,33 @@ fn opaque(out: &mut Parsed, text: &str) {
     out.opaque_mention |= mentions_family(text);
 }
 
+/// Shortest command whose parse [`parse`] keeps for the next call.
+const MEMO_MIN: usize = 4096;
+
+thread_local! {
+    /// The last long command parsed on this thread and its parse. Every gate on a Bash command
+    /// parses it, so a long one would otherwise be parsed once per gate.
+    static LAST_PARSE: RefCell<Option<(String, Parsed)>> = const { RefCell::new(None) };
+}
+
 /// Parse `command` (see the module docs). Never panics.
 pub fn parse(command: &str) -> Parsed {
+    if command.len() < MEMO_MIN {
+        return parse_uncached(command);
+    }
+    let hit = LAST_PARSE.with(|last| match &*last.borrow() {
+        Some((text, parsed)) if text == command => Some(parsed.clone()),
+        _ => None,
+    });
+    if let Some(parsed) = hit {
+        return parsed;
+    }
+    let parsed = parse_uncached(command);
+    LAST_PARSE.with(|last| *last.borrow_mut() = Some((command.to_string(), parsed.clone())));
+    parsed
+}
+
+fn parse_uncached(command: &str) -> Parsed {
     let mut out = Parsed::default();
     parse_into(command, 0, false, &mut out);
     out

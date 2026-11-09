@@ -82,7 +82,7 @@
 //!   separators: a relative name with a trailing dot or space (`safe-ai-skill-stbr.`), 8.3 short
 //!   names, `%USERPROFILE%`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -140,6 +140,11 @@ impl Budget {
             left: units,
             deadline: now.checked_add(time).unwrap_or(now),
         }
+    }
+
+    /// Whether the units or the time have run out, so later work cannot be paid for.
+    pub fn is_spent(&self) -> bool {
+        self.left == 0
     }
 
     /// Spend `units`; `Err` once the units or the time have run out (and from then on).
@@ -596,6 +601,15 @@ fn scan_nested(command: &str) -> NestedScan {
         .to_lowercase()
         .replace("\\\n", "")
         .replace(['\'', '"', '\\'], "");
+    // Every launch below is a word naming `claude`; without one there is nothing to find.
+    if !text.contains("claude") {
+        return NestedScan {
+            text,
+            found: false,
+            print: false,
+            invocations: Vec::new(),
+        };
+    }
     // Words with the separator that ended the previous one (`None`: whitespace).
     let mut words: Vec<(String, Option<char>)> = Vec::new();
     let mut word = String::new();
@@ -1095,16 +1109,27 @@ struct CdScan {
     dirs: Vec<Dir>,
     /// Per token: the index in `dirs` of the directory it runs in.
     at: Vec<usize>,
+    /// Each directory's classification, `(data_parent, plugins, protected)`. A long chain of
+    /// relative `cd`s revisits the same few hundred paths (each grows to `MAX_DIR`, then starts
+    /// over), and classifying one costs far more than the budget charges for it.
+    seen: HashMap<String, (bool, bool, bool)>,
 }
 
 impl CdScan {
     fn add(&mut self, path: Option<String>, protected: &Protected) -> usize {
         let (data_parent, plugins, inside) = match path.as_deref() {
-            Some(dir) => (
-                is_data_parent(dir, protected),
-                is_plugins_dir(dir),
-                is_protected_dir(dir, protected),
-            ),
+            Some(dir) => match self.seen.get(dir) {
+                Some(&known) => known,
+                None => {
+                    let class = (
+                        is_data_parent(dir, protected),
+                        is_plugins_dir(dir),
+                        is_protected_dir(dir, protected),
+                    );
+                    self.seen.insert(dir.to_string(), class);
+                    class
+                }
+            },
             None => (false, false, false),
         };
         self.enters_plugins |= plugins || data_parent;
@@ -1131,6 +1156,7 @@ fn scan_cds(
         enters_plugins: false,
         dirs: Vec::new(),
         at: Vec::with_capacity(toks.len()),
+        seen: HashMap::new(),
     };
     // Per token, scanning forward through words: the first one that is not a flag, and the
     // last word before a boundary. One backward pass, so a run of flags is not rescanned by
@@ -1918,6 +1944,27 @@ fn expand_home(word: &str, home: &str) -> String {
 
 /// Resolve `.`, `..` and repeated `/` in a `/`-separated string.
 fn lexical(path: &str) -> String {
+    // No empty, `.` or `..` component past a leading `/`: already resolved (a `cd` chain joins
+    // one word at a time onto a resolved directory).
+    let resolved = !(path == "."
+        || path == ".."
+        || path.starts_with("./")
+        || path.starts_with("../")
+        || path.ends_with('/')
+        || path.ends_with("/.")
+        || path.ends_with("/..")
+        || path.contains("//")
+        || path.contains("/./")
+        || path.contains("/../"));
+    if resolved {
+        path.to_string()
+    } else {
+        resolve_components(path)
+    }
+}
+
+/// [`lexical`] without its shortcut.
+fn resolve_components(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for comp in path.split('/') {
@@ -2965,12 +3012,22 @@ fn settings_change(before: &str, after: &str) -> Option<String> {
     None
 }
 
-/// How settings text, taken as a whole, turns protection off: a switch it sets (a
-/// `safe-ai-skill@…` plugin set to `false`, `disableAllHooks`, `allowManagedHooksOnly`,
-/// `env.SAFE_AI_SKILL_DISABLE`, `permissions.defaultMode: bypassPermissions`), as the D1 deny
-/// judges it. For [`crate::gates::configchange`], which sees only the file as it now is.
-pub fn settings_disable_reason(text: &str) -> Option<String> {
-    settings_change("", text)
+/// The switches in settings text, taken as a whole, that turn protection off, for
+/// [`crate::gates::configchange`]: `disableAllHooks`, `allowManagedHooksOnly`,
+/// `env.SAFE_AI_SKILL_DISABLE`; a `safe-ai-skill@…` plugin set to `false` only when no other
+/// `safe-ai-skill@…` entry is `true` (an install under another marketplace stays on); and
+/// `permissions.defaultMode: bypassPermissions` only outside project scope, since Claude Code
+/// does not honor it from `.claude/settings.json` or `.claude/settings.local.json`
+/// (<https://code.claude.com/docs/en/permission-modes>, "Which mode a session starts in").
+pub fn settings_disable_reasons(text: &str, project_scope: bool) -> BTreeSet<String> {
+    let facts = settings_facts(text);
+    let plugin_on = facts.protecting.iter().any(|p| p.starts_with("plugin:"));
+    facts
+        .disabling
+        .into_iter()
+        .filter(|what| !(plugin_on && what.starts_with("turns off the `safe-ai-skill@")))
+        .filter(|what| !(project_scope && what.contains("`bypassPermissions`")))
+        .collect()
 }
 
 /// Why a whole new settings text drops protection by not being JSON: the client ignores a
@@ -3154,9 +3211,13 @@ pub(crate) fn risky_git_key(key: &str, value: &str) -> bool {
     }
 }
 
-/// Whether `value` is a bare, well-known editor or pager (`vim`, `code --wait`, `delta`).
-fn is_known_editor_or_pager(value: &str) -> bool {
+/// Whether `value` is a bare, well-known editor or pager (`vim`, `code --wait`, `delta`), or
+/// a no-op (`true`, `:`, empty).
+pub(crate) fn is_known_editor_or_pager(value: &str) -> bool {
     const KNOWN: &[&str] = &[
+        "",
+        "true",
+        ":",
         "vim",
         "vi",
         "nvim",
@@ -3282,6 +3343,9 @@ struct Places {
     vars: Vec<(String, String)>,
 }
 
+/// Most directories [`Places`] follows through a chain of `cd`s (see [`Places::cd`]).
+const MAX_PLACES: usize = 64;
+
 impl Places {
     /// Every absolute spelling of `raw` (none when it holds an expansion); after a directory
     /// change the gate cannot follow, a relative path is also placed under a stand-in dir so
@@ -3304,6 +3368,12 @@ impl Places {
     }
 
     fn cd(&mut self, cmd: &SimpleCommand, homes: &ConfigHomes) {
+        // Every relative `cd` maps each known dir again, so the set grows with the chain; past
+        // the cap the location is unknown, which keeps relative paths classified (`/?`).
+        if self.known.len() >= MAX_PLACES {
+            self.unknown = true;
+            return;
+        }
         let target = cmd.words.iter().skip(1).find(|w| !w.text.starts_with('-'));
         match target {
             Some(w) if !w.splits => {
@@ -3535,10 +3605,12 @@ pub fn decide_bash_writes_at(
     homes: &ConfigHomes,
     tier: Tier,
 ) -> Option<Verdict> {
-    let git_cmd = contains_ci(command, "git")
-        && (contains_ci(command, "config") || contains_ci(command, "core."));
-    let env_cmd = contains_ci(command, "launchctl") || contains_ci(command, "set-environment");
-    if !git_cmd && !env_cmd && !BASH_NEEDLES.iter().any(|n| contains_ci(command, n)) {
+    // Lowercased once: each needle is then one std substring search, not a windowed compare.
+    let lower = command.to_ascii_lowercase();
+    let names = |needle: &str| lower.contains(needle);
+    let git_cmd = names("git") && (names("config") || names("core."));
+    let env_cmd = names("launchctl") || names("set-environment");
+    if !git_cmd && !env_cmd && !BASH_NEEDLES.iter().any(|n| names(n)) {
         return None;
     }
     let mut strictest: Option<Verdict> = exported_switch(command).map(Verdict::Ask);
@@ -3662,7 +3734,7 @@ pub fn decide_bash_writes_at(
             && matches!(t.op, Op::Write(_) | Op::Delete | Op::Find(_))
             && t.raw.contains(['$', '`'])
     });
-    if computed && contains_ci(command, ".claude") {
+    if computed && names(".claude") {
         strictest = stricter(
             strictest,
             Verdict::Ask(
@@ -5002,6 +5074,18 @@ mod tests {
         assert_eq!(lexical("/.."), "/");
         assert_eq!(lexical("../a/../../b"), "../../b");
         assert_eq!(lexical(".safe-ai-skill/"), ".safe-ai-skill");
+        // The shortcut agrees with the full resolution on every short path over `a . /`.
+        let mut paths = vec![String::new()];
+        for _ in 0..7 {
+            let longer: Vec<String> = paths
+                .iter()
+                .flat_map(|p| ["a", ".", "/"].map(|c| format!("{p}{c}")))
+                .collect();
+            for p in &longer {
+                assert_eq!(lexical(p), resolve_components(p), "{p:?}");
+            }
+            paths = longer;
+        }
         assert_eq!(
             ifs_as_space("a${ifs}b$ifs c$ifsx${ifs:0:1}d"),
             "a b  c$ifsx d"

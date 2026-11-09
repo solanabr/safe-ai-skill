@@ -18,9 +18,10 @@
 //! [`session_notice`] sweeps the project (bounded: depth, entry, sniff and time caps; skips
 //! `.git`, `node_modules`, `target` and other dependency or build trees) and reports in one line
 //! each key file that is tracked by git or not covered by `.gitignore`, and each private key
-//! (not env-style files, which are routinely `0644`) that is group/world-readable.
-//! [`decide_bash`] gates `git add`, `git commit -a` / `git commit <paths>` and `git stash` that
-//! would stage such a file:
+//! (not env-style files, which are routinely `0644`) that is group/world-readable, once per
+//! project and finding set. [`decide_bash`] gates `git add`, `git commit -a` /
+//! `git commit <paths>` that would stage such a file, and `git stash -u` / `--all` that would
+//! sweep an untracked one into a stash (a plain stash of tracked files stays local):
 //!
 //! | Tier | Off | Relaxed | Medium | High |
 //! |---|---|---|---|---|
@@ -237,6 +238,25 @@ fn key_kind(full: &Path, name: &str, exists: bool) -> Option<Kind> {
     None
 }
 
+/// [`key_kind`] from the bare name alone, for when a sweep's budget is spent: no file read and
+/// no full-path classification (which consults the credential-path lists and costs far more
+/// per call). Names that need their content to decide (`*.pem`, `*.key`, `id_rsa`, `*.p8`)
+/// do not count.
+fn name_kind(name: &str) -> Option<Kind> {
+    if !name_candidate(name) {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    let content_only = lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || patterns().all(|p| !p.name.matches(&lower) || p.evidence != Evidence::Name)
+            && patterns().any(|p| p.name.matches(&lower));
+    if content_only {
+        return None;
+    }
+    key_kind(Path::new(name), name, false)
+}
+
 fn has_key_block(path: &Path) -> bool {
     matches!(
         secretpath::sniff(path, CONTENT_BYTES),
@@ -394,11 +414,22 @@ impl Repo {
 }
 
 fn same_path(a: &str, b: &str) -> bool {
+    same_bytes(a.as_bytes(), b.as_bytes())
+}
+
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
     if FOLDS_CASE {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
     }
+}
+
+/// Whether `path` lies below the directory `dir` (both repository-relative). Compared as bytes:
+/// `dir.len()` need not fall on a character boundary of `path`.
+fn inside(path: &str, dir: &str) -> bool {
+    let (path, dir) = (path.as_bytes(), dir.as_bytes());
+    path.get(dir.len()) == Some(&b'/') && path.get(..dir.len()).is_some_and(|p| same_bytes(p, dir))
 }
 
 /// Whether the work-tree file differs from its index entry (size or modification second).
@@ -745,7 +776,8 @@ fn group_or_world_readable(_path: &Path) -> bool {
     false
 }
 
-fn walk(repo: &Repo, from: &str, caps: Caps, into_ignored: bool) -> (Vec<Found>, bool) {
+/// The key files below `from`, and how many files' content the walk read.
+fn walk(repo: &Repo, from: &str, caps: Caps, into_ignored: bool) -> (Vec<Found>, usize) {
     let mut w = Walk {
         repo,
         caps,
@@ -769,7 +801,7 @@ fn walk(repo: &Repo, from: &str, caps: Caps, into_ignored: bool) -> (Vec<Found>,
                 format!("{dir}/{part}")
             };
             if !into_ignored && is_ignored(&rules, &dir, true) {
-                return (Vec::new(), false);
+                return (Vec::new(), 0);
             }
             if dir != from {
                 load_rules(&repo.root.join(&dir).join(".gitignore"), &dir, &mut rules);
@@ -777,7 +809,7 @@ fn walk(repo: &Repo, from: &str, caps: Caps, into_ignored: bool) -> (Vec<Found>,
         }
         w.dir(from, 0, &mut rules);
     }
-    (w.out, w.capped)
+    (w.out, w.sniffs)
 }
 
 // ---- SessionStart ------------------------------------------------------------------------
@@ -787,6 +819,12 @@ const NOTICE_NAMES: usize = 5;
 
 /// The sweep of the project at `cwd`: every key file found, with what is wrong with it.
 pub fn sweep(cwd: &Path, caps: Caps) -> Vec<Found> {
+    sweep_project(cwd, caps).map_or_else(Vec::new, |(_, found)| found)
+}
+
+/// [`sweep`], with the project's root (the repository's, or `cwd` outside one).
+fn sweep_project(cwd: &Path, caps: Caps) -> Option<(PathBuf, Vec<Found>)> {
+    let start = Instant::now();
     let base = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let root = find_root(&base);
     let in_repo = root.is_some();
@@ -794,25 +832,33 @@ pub fn sweep(cwd: &Path, caps: Caps) -> Vec<Found> {
     // Outside a repository, the home directory or `/` is not a project.
     let home = std::env::var_os("HOME").map(PathBuf::from);
     if !in_repo && (root.parent().is_none() || home.as_deref() == Some(root.as_path())) {
-        return Vec::new();
+        return None;
     }
     let repo = Repo::open(&root);
-    let (mut found, _) = walk(&repo, "", caps, false);
+    let (mut found, mut sniffs) = walk(&repo, "", caps, false);
     if !in_repo {
         for f in &mut found {
             f.ignored = true;
         }
     }
     // Tracked key files the walk did not reach (removed from the work tree, or past a cap).
+    // Full checks share the walk's sniff and time budget; once it is spent, only the bare name
+    // decides (env names and key stores count, a `.pem` that needs its content does not).
     if let Some(tracked) = &repo.tracked {
         for t in tracked {
             if found.iter().any(|f| same_path(&f.rel, &t.path)) {
                 continue;
             }
             let full = root.join(&t.path);
-            let exists = full.is_file();
             let name = t.path.rsplit('/').next().unwrap_or(&t.path);
-            if let Some((what, private_key)) = key_kind(&full, name, exists) {
+            let (kind, exists) = if sniffs < caps.sniffs && start.elapsed() <= caps.time {
+                sniffs += 1;
+                let exists = full.is_file();
+                (key_kind(&full, name, exists), exists)
+            } else {
+                (name_kind(name), false)
+            };
+            if let Some((what, private_key)) = kind {
                 found.push(Found {
                     rel: t.path.clone(),
                     what,
@@ -824,16 +870,54 @@ pub fn sweep(cwd: &Path, caps: Caps) -> Vec<Found> {
         }
     }
     found.retain(|f| f.readable || f.tracked || !f.ignored);
-    found
+    Some((root, found))
 }
 
-/// The one-line SessionStart notice for the project at `cwd`, `None` when nothing needs
-/// attention. Names files, never their contents.
-pub fn session_notice(cwd: &Path) -> Option<String> {
-    let found = sweep(cwd, SESSION_CAPS);
+/// The SessionStart key-hygiene notice, in two forms of one line each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNotice {
+    /// For the user (`systemMessage`): the files, what is wrong, and the remedy commands.
+    pub user: String,
+    /// For the model (`additionalContext`): the files and what is wrong, with no remedy to
+    /// carry out (untracking or deleting a deliberately committed file is the user's call).
+    pub model: String,
+}
+
+/// The SessionStart notice for the project at `cwd`, `None` when nothing needs attention or
+/// this project's finding set was already reported. Names files, never their contents.
+///
+/// Once per project and finding set: `<plugin_data>/tips/keyfiles-<project hash>` holds the
+/// hash of the last reported set, so an intentionally committed file (a debug keystore, a
+/// committed `.env.development`) is reported once, and again only when the set changes. When
+/// the marker cannot be written the notice is still returned (a security notice that repeats
+/// beats one that is lost).
+pub fn session_notice(cwd: &Path, plugin_data: &Path) -> Option<SessionNotice> {
+    let (root, found) = sweep_project(cwd, SESSION_CAPS)?;
     if found.is_empty() {
         return None;
     }
+    let mut set: Vec<String> = found
+        .iter()
+        .map(|f| {
+            format!(
+                "{}\0{}\0{}{}{}",
+                f.rel, f.what, f.tracked as u8, f.ignored as u8, f.readable as u8
+            )
+        })
+        .collect();
+    set.sort();
+    let digest = crate::audit::sha256_hex(set.join("\n").as_bytes());
+    let mut project = crate::audit::sha256_hex(root.to_string_lossy().as_bytes());
+    project.truncate(16);
+    let marker = plugin_data.join("tips").join(format!("keyfiles-{project}"));
+    if read_capped(&marker, 256).is_some_and(|seen| seen == digest.as_bytes()) {
+        return None;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, &digest);
+
     let listed: Vec<String> = found
         .iter()
         .take(NOTICE_NAMES)
@@ -857,14 +941,24 @@ pub fn session_notice(cwd: &Path) -> Option<String> {
     } else {
         String::new()
     };
-    Some(format!(
-        "safe-ai-skill key hygiene: {} key or secret file{} need{} attention: {}{more}; run chmod \
-         600 on them, list them in .gitignore, and untrack tracked ones with git rm --cached.",
+    let head = format!(
+        "safe-ai-skill key hygiene: {} key or secret file{} need{} attention: {}{more}",
         found.len(),
         if found.len() == 1 { "" } else { "s" },
         if found.len() == 1 { "s" } else { "" },
         listed.join("; ")
-    ))
+    );
+    Some(SessionNotice {
+        user: format!(
+            "{head}; unless committed on purpose, run chmod 600 on them, list them in \
+             .gitignore, and untrack tracked ones with git rm --cached (shown once until \
+             this list changes)."
+        ),
+        model: format!(
+            "{head}; the user has been told, so leave these files as they are unless the \
+             user asks, and do not print their contents."
+        ),
+    })
 }
 
 /// A path safe to put in a one-line message: control characters replaced, length capped.
@@ -902,6 +996,8 @@ struct Stage {
     paths: Vec<String>,
     /// No pathspec limits it (`add -A`, `commit -a`, `stash`).
     whole: bool,
+    /// Modified tracked files are taken (not by `stash`: a stash stays in the local repository).
+    tracked: bool,
     /// Untracked files are staged.
     untracked: bool,
     /// Ignored files are staged too (`add -f`, `stash --all`).
@@ -1033,9 +1129,9 @@ fn split_args<'a>(
             opts.push(format!("--{name}"));
             continue;
         }
-        for (k, c) in t.bytes().enumerate().skip(1) {
-            opts.push(format!("-{}", c as char));
-            if value_short.contains(&c) {
+        for (k, c) in t.char_indices().skip(1) {
+            opts.push(format!("-{c}"));
+            if c.is_ascii() && value_short.contains(&(c as u8)) {
                 if k + 1 == t.len() {
                     i += 1;
                 }
@@ -1073,6 +1169,7 @@ fn stage_add(rest: &[Word]) -> Option<Stage> {
     Some(Stage {
         whole: paths.is_empty(),
         paths,
+        tracked: true,
         untracked: !update,
         ignored: has(&opts, &["-f", "--force"]),
         verb: "add",
@@ -1109,6 +1206,7 @@ fn stage_commit(rest: &[Word]) -> Option<Stage> {
     Some(Stage {
         whole: paths.is_empty(),
         paths,
+        tracked: true,
         untracked: false,
         ignored: false,
         verb: "commit",
@@ -1130,6 +1228,7 @@ fn stage_stash(rest: &[Word]) -> Option<Stage> {
     Some(Stage {
         whole: paths.is_empty(),
         paths,
+        tracked: false,
         untracked: all || has(&opts, &["-u", "--include-untracked"]),
         ignored: all,
         verb: "stash",
@@ -1190,7 +1289,10 @@ fn staged_keys(stage: &Stage, dir: &Path) -> Vec<(String, &'static str)> {
         }
         let glob_at = p.find(['*', '?', '[']);
         let literal = match glob_at {
-            Some(g) => p[..g].rsplit_once('/').map_or("", |(d, _)| d),
+            Some(g) => p
+                .get(..g)
+                .and_then(|h| h.rsplit_once('/'))
+                .map_or("", |(d, _)| d),
             None => p.as_str(),
         };
         let literal = if literal.is_empty() { "." } else { literal };
@@ -1209,17 +1311,11 @@ fn staged_keys(stage: &Stage, dir: &Path) -> Vec<(String, &'static str)> {
         scopes.push((rel, pattern));
     }
     // Tracked files: staged when modified (a staging run of an unchanged file is a no-op).
-    if let Some(tracked) = &repo.tracked {
+    if let Some(tracked) = repo.tracked.as_ref().filter(|_| stage.tracked) {
         for t in tracked {
             let in_scope = scopes.iter().any(|(rel, pattern)| match pattern {
                 Some(g) => glob(g.as_bytes(), t.path.as_bytes(), false),
-                None => {
-                    rel.is_empty()
-                        || same_path(&t.path, rel)
-                        || t.path.len() > rel.len()
-                            && same_path(&t.path[..rel.len()], rel)
-                            && t.path.as_bytes()[rel.len()] == b'/'
-                }
+                None => rel.is_empty() || same_path(&t.path, rel) || inside(&t.path, rel),
             });
             if !in_scope {
                 continue;

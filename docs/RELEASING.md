@@ -99,10 +99,11 @@ prints the plugin tag name and checks that `plugin.json` and the marketplace ent
 
 Both point at the same commit, and that commit contains the binaries.
 
-## 1.0.1 one-off steps
+## Still outstanding from 1.0.x
 
-- **Retro-tag 1.0.0.** a8d20f8 is `v1.0.0` plus its vendored binaries and nothing else, and those
-  binaries match the release assets. Tag it so version ranges can resolve 1.0.0:
+- **Retro-tag 1.0.0 (not done).** a8d20f8 is `v1.0.0` plus its vendored binaries and nothing
+  else, and those binaries match the release assets. `safe-ai-skill--v1.0.0` does not exist, so
+  version ranges cannot resolve 1.0.0. Tag it:
 
   ```sh
   git tag -a safe-ai-skill--v1.0.0 -m "safe-ai-skill 1.0.0" a8d20f8
@@ -110,11 +111,30 @@ Both point at the same commit, and that commit contains the binaries.
   ```
 
   Leave `v1.0.0` where it is. Moving a published tag breaks every cached checkout and checksum.
-- **1.0.1 is the first release built this way.** Create `release/v1.0.1` from the hotfix branch
-  and follow steps 2–7. The vendor commit replaces all four 1.0.0 binaries, and the two Linux ones
-  become static. Until then the hotfix branch fails CI's `binary-versions` and
-  `verify-attestations` checks, because it carries 1.0.0 binaries: that is the guard working, not
-  something to waive.
+- **The release branch flow has not been used yet.** As of 2026-10-26 the only tag and GitHub
+  Release is `v1.0.0`, there is no `release/v*` branch, and the manifests are at 1.2.0. The first
+  release cut this way vendors binaries for every version since 1.0.0 in one commit, so expect
+  `binary-versions` and `verify-attestations` to fail on any branch that bumps a manifest before
+  that vendor commit exists: that is the guard working, not something to waive.
+
+## Before the next release, check
+
+Observed on 2026-10-26 (re-check; the settings drift):
+
+- `main` has no branch protection (the API answers 404), so the required checks listed under
+  one-time setup are not enforced and `binary-versions` can be bypassed by a direct merge.
+- There is no tag ruleset. `v*` and `safe-ai-skill--v*` can be created, moved and deleted by
+  anyone with write access.
+- The only ruleset is `release branches` (`release/v*`: creation, update, deletion and
+  non-fast-forward rules, active). It lists two bypass actors with mode `always`: repository
+  roles 2 and 5 (maintain and admin). Confirm that is who should be able to push there, because
+  release.yml's attestations name the branch.
+- No `RELEASE_PAT` is visible at repository level (no repository secrets and no environments).
+  An organisation-level secret could not be listed with the available token; if there is none,
+  the vendor commit is pushed with `GITHUB_TOKEN` and CI does not run on it until the PR to `main`.
+- Immutable releases cannot be read without administration access: check the setting by hand.
+- npm-e2e.yml's scheduled run skips while the manifest version has no GitHub Release; it only
+  proves the install path again once the release is published.
 
 ## Bumping the toolchain
 

@@ -201,3 +201,30 @@ fn other_fixtures_denials_stay_denied_when_unattended() {
     eprintln!("checked {checked} denied rows");
     assert!(missed.is_empty(), "{}", missed.join("\n"));
 }
+
+/// The gates' state (the spend ledger) goes to the data dir the hook hands in, never to one
+/// resolved again from the environment (which in a test is the real home's standalone dir).
+#[test]
+fn state_goes_to_the_given_data_dir() {
+    let tmp = common::TempDir::outside_home("ex-g7-dir");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let dir = datadir::DataDir {
+        path: tmp.join("data"),
+        trusted: true,
+    };
+    let command =
+        "solana transfer 9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin 1 --url mainnet-beta";
+    permreq::decide(
+        "Bash",
+        Some(&serde_json::json!({ "command": command })),
+        Some("dontAsk"),
+        &proj,
+        &policy(Tier::Medium, false),
+        &dir,
+    );
+    assert!(
+        dir.path.join("spend.json").is_file(),
+        "the spend ledger was not read from the given dir"
+    );
+}

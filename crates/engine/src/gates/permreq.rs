@@ -35,8 +35,7 @@ use crate::context::Context;
 use crate::datadir::DataDir;
 use crate::gate::{GateMeta, Scope, Verdict};
 use crate::gates::{
-    bash, creddump, encoded, envread, envwrite, exfil, fetchexec, gitguard, mcp, mcpexec, read,
-    secrets, tamper, wallet,
+    bash, encoded, envwrite, exfil, gitguard, mcp, mcpexec, read, secrets, shellcmd, tamper, wallet,
 };
 use crate::io::Decision;
 use crate::policy::tier::Tier;
@@ -122,7 +121,7 @@ pub fn classify(
             }
             found.hard(read::decide_mcp_args(tool_input, cwd, policy));
             found.tier(exfil::decide_mcp(t, tool_input, cwd, policy, tier));
-            let (d, meta) = mcp::decide(t, tool_input, &Context::build("", cwd), policy);
+            let (d, meta) = mcp::decide(t, tool_input, &Context::build_in("", cwd, dir), policy);
             // `gate-mcp` denies a value-moving MCP ask at High (no cluster is named).
             match d {
                 Decision::Ask { reason } if tier == Tier::High => {
@@ -130,7 +129,7 @@ pub fn classify(
                 }
                 d => found.meta(d, &meta),
             }
-            let (d, meta) = mcpexec::decide(tool_input, cwd, policy);
+            let (d, meta) = mcpexec::decide(tool_input, cwd, policy, dir);
             found.meta(d, &meta);
         }
         _ => {
@@ -158,22 +157,11 @@ fn bash_call(
     if command.is_empty() {
         return;
     }
-    let tier = policy.tier();
     found.verdict(verify::enforce::bash_verdict(dir, command, cwd));
     found.hard(tamper::decide_nested_claude(command));
-    for v in [
-        wallet::decide_bash(command, cwd, policy, tier),
-        creddump::decide(command, cwd, policy, tier),
-        envwrite::decide_cli(command, cwd, policy, tier),
-        exfil::decide_bash(command, cwd, policy, tier),
-        fetchexec::decide(command, cwd, policy, tier),
-        tamper::decide_bash_writes(command, cwd, policy, tier),
-        envread::decide_bash(command),
-        encoded::decide(command),
-        gitguard::decide(command, cwd, policy, tier),
-    ] {
-        found.tier(v);
-    }
+    // Every Bash-command tier gate, from the list `gate-bash-secrets` uses; nested commands
+    // are walked below with the rest of this function.
+    found.tier(shellcmd::flat_verdict(command, cwd, policy, dir));
     let (d, meta) = bash::with_indirection_prefilter(
         secrets::decide(command, cwd, policy),
         GateMeta::new(Scope::SecretRead, true),
@@ -186,7 +174,7 @@ fn bash_call(
         let (d, meta) = bash::over_cap(policy);
         found.meta(d, &meta);
     } else if bash::may_concern(command) {
-        let (d, meta) = bash::decide(command, &Context::build(command, cwd), policy);
+        let (d, meta) = bash::decide(command, &Context::build_in(command, cwd, dir), policy);
         // A command found inside another one joins as a tier verdict (no grant lifts it).
         if nested {
             found.hard(d);

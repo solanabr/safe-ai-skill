@@ -18,7 +18,7 @@ on:
     types: [labeled, synchronize]
 
 env:
-  RUST_TOOLCHAIN: stable
+  RUST_TOOLCHAIN: "1.98.1"   # same pin as ci.yml and release.yml
   MANIFEST: crates/engine/Cargo.toml
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

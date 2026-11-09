@@ -361,7 +361,8 @@ jobs:
       - name: Commit and push to release/v${{ inputs.version }}
         run: |
           set -euo pipefail
-          if git diff --quiet -- plugins/safe-ai-skill/bin; then
+          # status, not diff: `git diff` ignores untracked files (a binary not yet committed).
+          if [ -z "$(git status --porcelain -- plugins/safe-ai-skill/bin)" ]; then
             echo "::notice::$GITHUB_SHA already contains these binaries; tag it directly (docs/RELEASING.md)."
             exit 0
           fi

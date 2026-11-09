@@ -300,6 +300,19 @@ expect_ask() {
     and d["hookSpecificOutput"]["permissionDecision"] == "ask"
     and "inactive" in d["hookSpecificOutput"]["permissionDecisionReason"]'
 }
+# expect_permission_deny <needle>: a PermissionRequest deny whose message contains <needle>.
+expect_permission_deny() {
+  expect_json 'list(d) == ["hookSpecificOutput"]
+    and d["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    and d["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    and "'"$1"'" in d["hookSpecificOutput"]["decision"]["message"]'
+}
+# expect_config_block <needle>: a ConfigChange block whose reason contains <needle>.
+expect_config_block() {
+  expect_json 'list(d) == ["decision", "reason"]
+    and d["decision"] == "block"
+    and "'"$1"'" in d["reason"]'
+}
 # expect_notice <needle>: a SessionStart notice whose two texts both contain <needle>.
 expect_notice() {
   expect_json "'$1' in d['systemMessage']
@@ -746,6 +759,21 @@ matrix() {
     expect_rc 0
     expect_ask
     expect_err_lines 1
+    t "$sc: gate-permission leaves the prompt to Claude Code"
+    run_solana gate-permission
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
+    t "$sc: session-end continues with one stderr line"
+    run session-end
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
+    t "$sc: gate-config lets the settings change through with one stderr line"
+    run gate-config
+    expect_rc 0
+    expect_no_out
+    expect_err_lines 1
     t "$sc: SessionStart reports the firewall INACTIVE"
     run verify session
     expect_rc 0
@@ -764,12 +792,16 @@ matrix() {
     expect_err_has 'firewall inactive'
     t "$sc: SAFE_AI_SKILL_STRICT=1 fails closed"
     e_strict=1
-    for args in gate-read gate-bash gate-mcp 'verify session'; do
+    for args in gate-read gate-bash gate-mcp gate-config 'verify session'; do
       # shellcheck disable=SC2086 # 'verify session' is two arguments
       run $args
       expect_rc 2
       expect_no_out
     done
+    t "$sc: SAFE_AI_SKILL_STRICT=1 denies a PermissionRequest (exit 2 is not honoured there)"
+    run gate-permission
+    expect_rc 0
+    expect_permission_deny STRICT
     t "$sc: SAFE_AI_SKILL_STRICT=1 makes a CLI command exit 2"
     run status
     expect_rc 2
@@ -799,6 +831,21 @@ matrix() {
     t "crash $sc: gate-skill blocks"
     run gate-skill
     expect_rc 2
+    expect_no_out
+    expect_err_has crashed
+    t "crash $sc: gate-permission denies with exit 0"
+    run gate-permission
+    expect_rc 0
+    expect_permission_deny crashed
+    expect_err_has 'denied this request'
+    t "crash $sc: gate-config blocks the settings change with exit 0"
+    run gate-config
+    expect_rc 0
+    expect_config_block crashed
+    expect_err_has 'blocked this settings change'
+    t "crash $sc: session-end continues"
+    run session-end
+    expect_rc 0
     expect_no_out
     expect_err_has crashed
     t "crash $sc: gate-read continues and drops the engine's stdout"
@@ -1012,6 +1059,14 @@ matrix() {
   run gate-skill
   expect_rc 2
   expect_no_out
+  t "tamper: gate-permission denies with exit 0"
+  run gate-permission
+  expect_rc 0
+  expect_permission_deny sha256
+  t "tamper: gate-config blocks the settings change with exit 0"
+  run gate-config
+  expect_rc 0
+  expect_config_block sha256
   t "tamper: the other PreToolUse gates ask"
   for args in gate-read gate-bash-secrets; do
     run "$args"
@@ -1019,7 +1074,7 @@ matrix() {
     expect_tamper_ask
   done
   t "tamper: non-PreToolUse hooks continue with one stderr line"
-  for args in redact prompt-guard gate-prompt-expansion; do
+  for args in redact prompt-guard gate-prompt-expansion session-end; do
     run "$args"
     expect_rc 0
     expect_no_out
@@ -1274,7 +1329,7 @@ matrix() {
 }
 
 sh_name=hooks.json
-t "hooks.json wires onFailure: block on the Bash gate-bash entry and the Skill gate, continue elsewhere"
+t "hooks.json wires onFailure: block on the Bash gate-bash entry, the Skill gate and gate-permission, continue elsewhere"
 check
 "$py" -I - "$hooks_json" "$work/hook-commands" <<'EOF' || fail "see above"
 import json, re, sys
@@ -1298,7 +1353,16 @@ for event, groups in cfg["hooks"].items():
             # gate-bash runs for every Bash call (an `if` filter misses wrapped, quoted,
             # path-qualified, expansion and solana-keygen commands) and fails closed.
             solana_entry = sub == "gate-bash"
-            want = "block" if solana_entry or skill else "continue"
+            # The PermissionRequest gate fails closed: a failure denies the request.
+            permission = event == "PermissionRequest"
+            if permission and sub != "gate-permission":
+                problems.append(f"{event}: must run gate-permission, runs {cmd!r}")
+            if sub == "gate-permission" and not permission:
+                problems.append(f"{event}: gate-permission belongs on PermissionRequest only")
+            # The shim answers gate-config with ConfigChange's own block (decision: block).
+            if (sub == "gate-config") != (event == "ConfigChange"):
+                problems.append(f"{event}: gate-config belongs on ConfigChange, and only it there")
+            want = "block" if solana_entry or skill or permission else "continue"
             blocking += solana_entry
             if solana_entry and (group.get("matcher") != "Bash" or "if" in hook):
                 problems.append(f"{event}: gate-bash must be an unconditional Bash entry")

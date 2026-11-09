@@ -22,7 +22,15 @@ use crate::policy::tier::Tier;
 /// way an existing install needs; SessionStart re-applies a record below it (T6).
 ///
 /// - 1: first rule set (X1–X9, P14, P21 from kit rule set 10).
-pub const RULE_SET_VERSION: u32 = 1;
+/// - 2: the repository's `.git` write carve-out is absolute ([`MachineInputs::git_dir`]), and
+///   the project root is added absolute ([`MachineInputs::project_root`]) beside `"."` in
+///   `allowWrite` and High's `allowRead`: relative entries anchor at the session's working
+///   directory, not the repository root.
+pub const RULE_SET_VERSION: u32 = 2;
+
+/// Entries an earlier rule set wrote that no tier writes now, per list: still owned, so a
+/// record naming one removes it on the next apply.
+const RETIRED: &[(&str, &str)] = &[("sandbox.filesystem.allowWrite", ".git")];
 
 /// `DENY_BASH_C` (l.1032–1034), written at High only (the kit: Medium and High, l.1747): a
 /// skill's set-up line reaches Claude Code's permission rules only, never a hook (P14).
@@ -243,6 +251,13 @@ impl Block {
 pub struct MachineInputs {
     /// The git common dir's real path when it lies outside the project (a linked worktree).
     pub git_common_outside: Option<String>,
+    /// The repository's `.git` directory, absolute (a relative sandbox path anchors at the
+    /// session's working directory, which may be a subdirectory of the repository).
+    pub git_dir: Option<String>,
+    /// The directory holding the settings file (the repository root), absolute. `"."` stays
+    /// beside it: it is the session's own working directory, which for a linked worktree
+    /// outside the main checkout is not under this root.
+    pub project_root: Option<String>,
 }
 
 /// The index of `path` in [`LISTS`] (and so in [`Block::lists`]).
@@ -296,11 +311,15 @@ pub fn plan(tier: Tier, domains: &[&str], machine: &MachineInputs) -> Block {
         push_all(&mut lists[i].1, group);
     }
 
+    let root: Vec<&str> = machine.project_root.iter().map(String::as_str).collect();
     let i = idx("sandbox.filesystem.allowWrite");
     push_all(&mut lists[i].1, &["."]);
+    push_all(&mut lists[i].1, &root);
     push_all(&mut lists[i].1, SB_TEMP);
     push_all(&mut lists[i].1, SB_TOOLCHAIN_WRITE);
-    push_all(&mut lists[i].1, &[".git"]);
+    if let Some(git_dir) = &machine.git_dir {
+        push_all(&mut lists[i].1, &[git_dir.as_str()]);
+    }
     if let Some(common) = &machine.git_common_outside {
         push_all(&mut lists[i].1, &[common.as_str()]);
     }
@@ -322,6 +341,7 @@ pub fn plan(tier: Tier, domains: &[&str], machine: &MachineInputs) -> Block {
         push_all(&mut lists[i].1, HIGH_FENCE);
         let j = idx("sandbox.filesystem.allowRead");
         push_all(&mut lists[j].1, &["."]);
+        push_all(&mut lists[j].1, &root);
         push_all(&mut lists[j].1, SB_TEMP);
         push_all(&mut lists[j].1, SB_TOOLCHAIN_READ);
     }
@@ -342,6 +362,11 @@ pub fn emittable(path: &str, domains_high: &[&str], machine: &MachineInputs) -> 
             if !out.contains(e) {
                 out.push(e.clone());
             }
+        }
+    }
+    for (p, e) in RETIRED {
+        if *p == path && !out.iter().any(|o| o == e) {
+            out.push((*e).to_string());
         }
     }
     out
@@ -401,9 +426,34 @@ mod tests {
     }
 
     #[test]
+    fn repo_git_dir_is_absolute_and_relative_git_is_retired() {
+        let m = MachineInputs {
+            git_common_outside: None,
+            git_dir: Some("/repo/.git".into()),
+            project_root: Some("/repo".into()),
+        };
+        let h = plan(Tier::High, D, &m);
+        for list in [
+            "sandbox.filesystem.allowWrite",
+            "sandbox.filesystem.allowRead",
+        ] {
+            assert!(h.list(list).contains(&"/repo".to_string()), "{list}");
+            assert!(h.list(list).contains(&".".to_string()), "{list}");
+        }
+        let w = plan(Tier::Relaxed, D, &m);
+        let w = w.list("sandbox.filesystem.allowWrite");
+        assert!(w.contains(&"/repo/.git".to_string()));
+        assert!(!w.contains(&".git".to_string()));
+        assert!(emittable("sandbox.filesystem.allowWrite", D, &m).contains(&".git".to_string()));
+        assert!(!emittable("sandbox.filesystem.denyWrite", D, &m).contains(&".git".to_string()));
+    }
+
+    #[test]
     fn git_common_dir_is_writable_when_outside() {
         let m = MachineInputs {
             git_common_outside: Some("/repo/.git".into()),
+            git_dir: None,
+            project_root: None,
         };
         let b = plan(Tier::Relaxed, D, &m);
         assert!(b
