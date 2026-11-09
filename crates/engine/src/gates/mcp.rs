@@ -302,8 +302,9 @@ struct PayloadSignal {
     amount_sol: Option<f64>,
     destination: Option<String>,
     mint: Option<String>,
-    /// The amount appears more than once (e.g. top level and `args`) with different values,
-    /// so which one the server uses is unknown: no grant covers it.
+    /// Which amount the server uses is unknown: two differ (under different keys, or at the
+    /// top level and in `args`), one has unknown units, or a send-everything flag is set. No
+    /// grant covers it.
     ambiguous: bool,
 }
 
@@ -326,7 +327,8 @@ const MAX_NESTED_JSON: usize = 64 * 1024;
 /// ≤ [`MAX_NEST`]). Returns `Some` only when BOTH an amount-like key AND a destination-like key
 /// (or a mint) are present — the signature of a transfer-style call. Only `sol`/`amountSol`/
 /// `solAmount`, `lamports` (÷1e9) and a bare `amount` yield a SOL amount; `inputAmount`,
-/// `tokenAmount` and `value` count as an amount of unknown units.
+/// `tokenAmount` and `value` count as an amount of unknown units. The amount is ambiguous
+/// ([`PayloadSignal::ambiguous`]) when those disagree or a [`SEND_ALL_KEYS`] flag is set.
 fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
     let sol = find_all(payload, &["sol", "amountSol", "solAmount"]);
     let lamports = find_all(payload, &["lamports"]);
@@ -335,7 +337,9 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
     let has_amount =
         !(sol.is_empty() && lamports.is_empty() && bare.is_empty() && unknown_units.is_empty());
 
-    let sol_values: Vec<f64> = sol
+    // Every SOL-denominated value, whichever key holds it: the server may read any of them, so
+    // two that differ (`amount: 50` beside a decoy `lamports: 1`) leave the amount unknown.
+    let values: Vec<f64> = sol
         .iter()
         .filter_map(number)
         .chain(
@@ -344,15 +348,13 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
                 .filter_map(number)
                 .map(|n| n / 1_000_000_000.0),
         )
+        .chain(bare.iter().filter_map(number))
         .collect();
-    let bare_values: Vec<f64> = bare.iter().filter_map(number).collect();
-    let values = if sol_values.is_empty() {
-        bare_values
-    } else {
-        sol_values
-    };
     let amount_sol = values.iter().copied().reduce(f64::max);
-    let ambiguous = values.windows(2).any(|w| w[0] != w[1]);
+    // So does an amount of unknown units beside a SOL one, or a send-everything flag.
+    let ambiguous = values.windows(2).any(|w| w[0] != w[1])
+        || (amount_sol.is_some() && !unknown_units.is_empty())
+        || find_all(payload, SEND_ALL_KEYS).iter().any(truthy);
 
     let destination = find_all(
         payload,
@@ -380,6 +382,32 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
         })
     } else {
         None
+    }
+}
+
+/// Flags that make a transfer send the whole balance whatever its amount says.
+const SEND_ALL_KEYS: &[&str] = &[
+    "sendMax",
+    "sendAll",
+    "transferAll",
+    "withdrawAll",
+    "useMax",
+    "max",
+    "all",
+];
+
+/// Whether a flag value is set: `true`, a non-zero number, or a string other than
+/// `false`/`0`/`no`/empty.
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "" | "false" | "0" | "no"
+        ),
+        Value::Null => false,
+        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -1171,6 +1199,36 @@ mod tests {
             assert!(m.hard_guard, "{tool}: no grant may cover it");
             assert_eq!(m.amount_sol, None, "{tool}");
             assert!(d.reason().contains("hard guard"), "{}", d.reason());
+        }
+    }
+
+    #[test]
+    fn a_decoy_amount_key_or_a_send_max_flag_is_a_hard_guard() {
+        for payload in [
+            json!({ "action": "transferSol", "destination": TO, "amount": 50, "lamports": 1 }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 50, "sol": 0.5 }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 50,
+                    "args": "{\"lamports\":1}" }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 0.01, "value": 50 }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 0.01, "sendMax": true }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 0.01, "all": "true" }),
+        ] {
+            let (d, m) = decide_with("mcp__helius__heliusWrite", payload.clone());
+            assert!(matches!(d, Decision::Ask { .. }), "{payload}: {d:?}");
+            assert!(
+                m.hard_guard,
+                "{payload}: which amount the server sends is unknown"
+            );
+        }
+        // The same amount under two keys is one amount.
+        for payload in [
+            json!({ "action": "transferSol", "destination": TO, "amount": 0.01,
+                    "lamports": 10_000_000u64 }),
+            json!({ "action": "transferSol", "destination": TO, "amount": 0.01, "sendMax": false }),
+        ] {
+            let (_, m) = decide_with("mcp__helius__heliusWrite", payload.clone());
+            assert!(!m.hard_guard, "{payload}");
+            assert_eq!(m.amount_sol, Some(0.01), "{payload}");
         }
     }
 

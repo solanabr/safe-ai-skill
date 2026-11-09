@@ -162,6 +162,16 @@ fn guarded_calls() -> Vec<(&'static str, Value)> {
             "mcp__agentkit__transferSpl",
             json!({"to": DEST, "amount": 0.5}),
         ),
+        // A SOL amount the grant cannot read: a decoy key beside the real one, or send-max.
+        (
+            "mcp__helius__heliusWrite",
+            json!({"action": "transferSol", "destination": DEST, "amount": 50, "lamports": 1}),
+        ),
+        (
+            "mcp__helius__heliusWrite",
+            json!({"action": "transferSol", "destination": DEST, "amount": 0.01,
+                   "sendMax": true}),
+        ),
         // The same shapes without a transfer verb.
         (
             "mcp__tokenkit__setAuthority",
