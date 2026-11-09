@@ -622,13 +622,14 @@ pub fn verify::pipeline_add(kind: AddKind, source: &str, online: bool) -> (prove
 pub fn verify::install_command(kind: AddKind, resolved: &provenance::Resolved, source: &str) -> InstallCommand; // pure
 pub enum verify::provenance::SourceKind { GitHub, Npm, Local, Other }
 pub fn verify::provenance::classify_source(source: &str) -> SourceKind;   // by structure: exact host, shorthand, npm name
+pub fn verify::provenance::identity(source: &str) -> Option<String>;      // npm:<name> | github:<owner>/<repo> | other:<source>, lowercased; None for a local path
 pub fn verify::provenance::pin_github(r: &mut Resolved) -> bool;          // moving ref → commit (api.github.com)
 pub fn verify::provenance::pin_npm(r: &mut Resolved) -> bool;             // no version / dist-tag → exact version (registry)
-pub fn verify::osv::query(pkg: &str, version: &str) -> Report;            // unreachable/HTTP error/unreadable → MEDIUM osv_unavailable
+pub fn verify::osv::query(pkg: &str, version: &str) -> Report;            // follows next_page_token ≤ 5 pages; unreachable/HTTP error/malformed/unfinished → MEDIUM osv_unavailable
 pub fn verify::osv::skipped(pkg: &str) -> Finding;                        // LOW osv_skipped (--offline)
 ```
 
-`pipeline_add` runs the network-free provenance check, then (online) the GitHub or npm lookup, then osv.dev for the exact npm version graded. The unpinned finding drops to LOW only when the lookup pinned the source and `install_command` can carry the pin; an `other` source is a MEDIUM `unrecognised_source`. The network helpers read a loopback URL from `SAFE_AI_SKILL_TEST_NPM_REGISTRY`, `SAFE_AI_SKILL_TEST_GITHUB_API` and `SAFE_AI_SKILL_TEST_OSV_URL` only in `test-hooks` builds; their tests (`verify::testnet`, `tests/add_cmd.rs`) run against a loopback server.
+Before any of it, `main.rs` (`catalog_match`) matches the source against the project catalog by id, literal source or `provenance::identity`, offline; a high-risk match gates the add, and a catalog id is graded as its entry's source. `pipeline_add` runs the network-free provenance check, then (online) the GitHub or npm lookup, then osv.dev for the exact npm version graded. Only a source the user pinned exactly passes: a resolved moving source keeps its MEDIUM `unpinned_*` finding (the detail names what it resolved to), while `pin` and the pinned `run` let `--yes` install exactly what was graded. An `other` source is a MEDIUM `unrecognised_source`. `install_command`'s skills forms follow `skills@1.7.6`'s `parseSource`: `owner/repo#<sha>[@<skill>]`, or a `tree/<sha>/<path>` URL with `--skill`. The network helpers read a loopback URL from `SAFE_AI_SKILL_TEST_NPM_REGISTRY`, `SAFE_AI_SKILL_TEST_GITHUB_API` and `SAFE_AI_SKILL_TEST_OSV_URL` only in `test-hooks` builds; their tests (`verify::testnet`, `tests/add_cmd.rs`) run against a loopback server.
 
 **`verify session` (state v2).** `run_session` sweeps each root in
 `supply_chain.verify_skills_dirs` (project `.claude/skills`; `~/.claude/skills` only when a
