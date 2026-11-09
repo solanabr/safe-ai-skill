@@ -10,6 +10,10 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 - **README restructured.** Quick start, installation and everyday commands come first; per-gate detail lives in [docs/tiers.md](docs/tiers.md), every command, flag, hook and environment variable in the new [docs/cli.md](docs/cli.md), and upgrade notes plus the `@stbr` migration in the new [docs/upgrading.md](docs/upgrading.md). README, SECURITY.md and npm/README.md statements that no longer matched the code are corrected, notably: `add` reads the source string only, pins and installs nothing, passes a source it doesn't recognise (a GitLab URL, `owner/repo`, a tarball or remote MCP URL) with no finding, and its osv.dev lookup fails open; `add mcp` does not scan a directory; `status` lists no pins; `claude -p` alone does not turn headless on; `.env.production` is denied from Relaxed; `cargo install safe-ai-skill` gives 1.0.0. `tests/readme_tier_table.rs` now checks the per-gate table in `docs/tiers.md`.
 
+### Tooling & CI
+
+- **Repository clean-up.** Removed a committed Python bytecode file, the unneeded `plugins/safe-ai-skill/bin/.gitkeep`, and four ai-kit fixture variants no test read. `.gitignore` now also covers keypairs (`*-keypair.json`, `id.json`), `.npmrc`, the Codex and opencode adapters' project files (`AGENTS.md`, `.codex/`, `.opencode/`, `opencode.json[c]`), Python caches, logs, coverage and profiling output, and more editor leftovers.
+
 ## [1.3.0] — 2026-11-09
 
 The first release since 1.0.0. 1.0.1, 1.1.0 and 1.2.0 below were never released on their own: 1.3.0 ships their changes too, so read their behaviour changes before upgrading from 1.0.x.
