@@ -33,10 +33,11 @@ const exe = process.platform === "win32" ? ".exe" : "";
 const binaryPath = plat ? path.join(ACTUAL_BIN_DIR, `safe-ai-skill-${plat}${exe}`) : null;
 
 if (!binaryPath || !fs.existsSync(binaryPath)) {
+  const version = require("../package.json").version;
   process.stderr.write(
     `safe-ai-skill: no binary found for platform ${process.platform}/${process.arch}.\n` +
     `Run: npm install -g @stbr/safe-ai-skill  (to trigger postinstall)\n` +
-    `Or:  cargo install safe-ai-skill\n`
+    `Or:  cargo install safe-ai-skill --version ${version} --locked\n`
   );
   process.exit(2);
 }
