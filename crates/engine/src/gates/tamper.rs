@@ -211,7 +211,8 @@ const HOOK_SUBCOMMANDS: &[&str] = &[
 ];
 
 /// Real subcommands: a cache-path word followed by one of these is the binary being run, not a
-/// path being written. Mutating ones are denied before this list is consulted.
+/// path being written. Mutating ones are denied before this list is consulted. `-h` is left out:
+/// it is also another program's flag (`rsync -a x/ <plugin dir> -h` writes the plugin dir).
 const SUBCOMMANDS: &[&str] = &[
     "gate-bash",
     "gate-bash-secrets",
@@ -238,6 +239,8 @@ const SUBCOMMANDS: &[&str] = &[
     "env",
     "adapt",
     "--version",
+    "help",
+    "--help",
 ];
 
 /// Entries of a `.safe-ai-skill/` dir that hold state; a literal name also matches by stem
@@ -4887,6 +4890,46 @@ mod tests {
         assert_defer("\"${CLAUDE_PLUGIN_ROOT}/bin/safe-ai-skill\" env keys .env");
         assert_deny(&format!("{bin} revoke"));
         assert_deny(&format!("cp {bin} {bin}.bak && echo x > {bin}"));
+    }
+
+    #[test]
+    fn help_is_read_only_but_never_unlocks_a_denied_subcommand() {
+        let bin = "~/.claude/plugins/cache/stbr/safe-ai-skill/1.0.1/bin/safe-ai-skill";
+        for cmd in [
+            "safe-ai-skill --help".to_string(),
+            "safe-ai-skill -h".into(),
+            "safe-ai-skill help".into(),
+            "safe-ai-skill help tier".into(),
+            "safe-ai-skill help add".into(),
+            "safe-ai-skill help revoke".into(),
+            "safe-ai-skill tier --help".into(),
+            "safe-ai-skill verify --help".into(),
+            "npx @stbr/safe-ai-skill --help".into(),
+            format!("{bin} --help"),
+            format!("{bin} help"),
+            format!("\"{bin}\" help install"),
+        ] {
+            assert_defer(&cmd);
+        }
+        for cmd in [
+            "safe-ai-skill add --help".to_string(),
+            "safe-ai-skill add -h".into(),
+            "safe-ai-skill install --help".into(),
+            "safe-ai-skill install -h".into(),
+            "safe-ai-skill revoke --help".into(),
+            "safe-ai-skill confirm --help".into(),
+            "safe-ai-skill verify session --help".into(),
+            "safe-ai-skill gate-bash --help".into(),
+            "safe-ai-skill adapt --help".into(),
+            format!("{bin} add --help"),
+            format!("{bin} install -h"),
+            // `-h` after a cache path is not read as the binary's: it can be another program's
+            // flag, with the plugin as the destination.
+            format!("{bin} -h"),
+            "rsync -a evil/ ~/.claude/plugins/cache/stbr/safe-ai-skill -h".into(),
+        ] {
+            assert_deny(&cmd);
+        }
     }
 
     #[test]
