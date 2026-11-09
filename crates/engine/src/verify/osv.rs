@@ -2,32 +2,63 @@
 //!
 //! [`query`] POSTs to the free, Google-maintained osv.dev API and maps each returned
 //! advisory to a [`Finding`]. The network call is isolated in [`fetch`]; the pure response
-//! parser [`parse_response`] is what the unit tests drive against fixture JSON. On any
-//! network failure [`query`] returns a single LOW "unavailable" finding — it never panics
-//! and never blocks-by-crash.
+//! parser [`parse_response`] is what the unit tests drive against fixture JSON. When osv.dev
+//! cannot answer (network error, timeout, HTTP error, unparseable reply) [`query`] returns a
+//! MEDIUM `osv_unavailable` finding, so `add` holds until `--yes` rather than passing a package
+//! nobody looked up; it never panics. An explicit `--offline` is the user's choice: a LOW
+//! [`skipped`] finding.
 
 use super::{Finding, Report, Severity};
 
 /// osv.dev query endpoint.
 const OSV_URL: &str = "https://api.osv.dev/v1/query";
 
+/// Test-only override of [`OSV_URL`], read only in `test-hooks` builds.
+pub const TEST_URL_ENV: &str = "SAFE_AI_SKILL_TEST_OSV_URL";
+
 /// Query osv.dev for known vulnerabilities in `pkg`@`version` (npm ecosystem).
 ///
-/// Network is isolated: a request/parse failure yields a LOW informational
-/// `osv_unavailable` finding so the orchestrator can degrade to `ask` rather than block.
+/// Network is isolated: a request/parse failure yields a MEDIUM `osv_unavailable` finding.
 pub fn query(pkg: &str, version: &str) -> Report {
-    match fetch(pkg, version) {
-        Some(body) => parse_response(&body),
-        None => {
-            let mut report = Report::default();
-            report.findings.push(Finding::new(
-                Severity::Low,
-                "osv_unavailable",
-                format!("osv.dev lookup for {pkg}@{version} was unavailable (network)"),
-            ));
-            report
-        }
+    query_at(&osv_url(), pkg, version)
+}
+
+/// [`query`] against the endpoint at `url`.
+pub fn query_at(url: &str, pkg: &str, version: &str) -> Report {
+    match fetch_at(url, pkg, version) {
+        Ok(body) => parse_response(&body),
+        Err(why) => unavailable(&format!(
+            "osv.dev could not be asked about known vulnerabilities in {pkg}@{version} ({why}), so \
+             no CVE check ran; re-run when it is reachable, or pass --yes to take it unchecked"
+        )),
     }
+}
+
+/// The LOW finding for a lookup the user turned off with `--offline`.
+pub fn skipped(pkg: &str) -> Finding {
+    Finding::new(
+        Severity::Low,
+        "osv_skipped",
+        format!("the osv.dev CVE lookup for {pkg} was skipped (--offline)"),
+    )
+}
+
+/// A report holding one MEDIUM `osv_unavailable` finding.
+fn unavailable(detail: &str) -> Report {
+    let mut report = Report::default();
+    report
+        .findings
+        .push(Finding::new(Severity::Medium, "osv_unavailable", detail));
+    report
+}
+
+/// [`OSV_URL`], or in a `test-hooks` build the URL in [`TEST_URL_ENV`] when it is set.
+fn osv_url() -> String {
+    #[cfg(feature = "test-hooks")]
+    if let Ok(url) = std::env::var(TEST_URL_ENV) {
+        return url;
+    }
+    OSV_URL.to_string()
 }
 
 /// Build the osv.dev request body for `pkg`@`version`. Pure — unit-testable.
@@ -41,35 +72,44 @@ pub fn request_body(pkg: &str, version: &str) -> String {
 
 /// POST to osv.dev and return the raw response body.
 ///
-/// Isolated and optional: `None` on any network/IO error. NEVER called from unit tests.
-pub fn fetch(pkg: &str, version: &str) -> Option<String> {
+/// Isolated and optional: `Err` with a short reason on any network/HTTP/IO error. Unit tests
+/// drive [`fetch_at`] against a loopback server only.
+pub fn fetch(pkg: &str, version: &str) -> Result<String, String> {
+    fetch_at(&osv_url(), pkg, version)
+}
+
+/// [`fetch`] against the endpoint at `url`.
+pub fn fetch_at(url: &str, pkg: &str, version: &str) -> Result<String, String> {
     let body = request_body(pkg, version);
     let resp = ureq::agent()
-        .post(OSV_URL)
+        .post(url)
         .timeout(std::time::Duration::from_secs(4))
         .set("Content-Type", "application/json")
         .set("User-Agent", "safe-ai-skill")
         .send_string(&body)
-        .ok()?;
-    resp.into_string().ok()
+        .map_err(|e| match e {
+            ureq::Error::Status(code, _) => format!("HTTP {code}"),
+            ureq::Error::Transport(_) => "unreachable or timed out".to_string(),
+        })?;
+    resp.into_string()
+        .map_err(|_| "the reply could not be read".to_string())
 }
 
 /// Parse an osv.dev response body into a [`Report`]. Pure — unit-testable with fixtures.
 ///
-/// An empty object (`{}`) or an empty/absent `vulns` array → no findings. Each vuln becomes
+/// An empty object (`{}`) or an empty/absent `vulns` array → no findings; a body that is not
+/// a JSON object → a MEDIUM `osv_unavailable` finding. Each vuln becomes
 /// a [`Finding`]; severity is derived from the advisory's `severity`/`database_specific`
 /// CVSS when present, otherwise defaults to High.
 pub fn parse_response(body: &str) -> Report {
     let mut report = Report::default();
     let value: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => {
-            report.findings.push(Finding::new(
-                Severity::Low,
-                "osv_unavailable",
-                "osv.dev response was not valid JSON",
-            ));
-            return report;
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => {
+            return unavailable(
+                "osv.dev's reply was not a JSON object, so no CVE check ran; re-run when it \
+                 answers, or pass --yes to take it unchecked",
+            )
         }
     };
 
@@ -221,10 +261,56 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_is_unavailable_low() {
-        let report = parse_response("not json");
-        assert_eq!(report.max_severity(), Some(Severity::Low));
-        assert!(kinds(&report).contains(&"osv_unavailable".to_string()));
+    fn invalid_json_is_unavailable_medium() {
+        for body in ["not json", "[]", "\"x\"", ""] {
+            let report = parse_response(body);
+            assert_eq!(report.max_severity(), Some(Severity::Medium), "{body}");
+            assert_eq!(
+                kinds(&report),
+                vec!["osv_unavailable".to_string()],
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreachable_osv_holds() {
+        let base = crate::verify::testnet::serve(|method, _, body| match method {
+            "POST" if body.contains("\"bad\"") => (503, "{}".into()),
+            "POST" if body.contains("\"html\"") => (200, "<html>".into()),
+            "POST" if body.contains("\"vuln\"") => (
+                200,
+                r#"{"vulns":[{"id":"GHSA-1","severity":[{"type":"CVSS_V3","score":"9.1"}]}]}"#
+                    .into(),
+            ),
+            _ => (200, "{}".into()),
+        });
+        let closed = crate::verify::testnet::closed();
+        for (url, pkg, why) in [
+            (base.as_str(), "bad", "HTTP 503"),
+            (closed.as_str(), "x", "unreachable or timed out"),
+        ] {
+            let report = query_at(url, pkg, "1.0.0");
+            assert_eq!(kinds(&report), vec!["osv_unavailable".to_string()], "{pkg}");
+            assert_eq!(report.max_severity(), Some(Severity::Medium), "{pkg}");
+            assert!(report.findings[0].detail.contains(why), "{report:?}");
+        }
+        let report = query_at(&base, "html", "1.0.0");
+        assert_eq!(report.max_severity(), Some(Severity::Medium));
+        assert!(query_at(&base, "clean", "1.0.0").findings.is_empty());
+        let report = query_at(&base, "vuln", "1.0.0");
+        assert_eq!(kinds(&report), vec!["cve".to_string()]);
+        assert_eq!(report.max_severity(), Some(Severity::High));
+    }
+
+    #[test]
+    fn offline_is_a_low_skip() {
+        let f = skipped("left-pad");
+        assert_eq!(
+            (f.severity, f.kind.as_str()),
+            (Severity::Low, "osv_skipped")
+        );
+        assert!(f.detail.contains("--offline"));
     }
 
     #[test]

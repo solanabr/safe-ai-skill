@@ -225,6 +225,49 @@ fn add_follows_the_same_grading() {
 }
 
 #[test]
+fn add_mcp_scans_a_directory_like_the_other_kinds() {
+    let w = World::new("chk-add-mcp");
+    let docs = w.put_docs_only();
+    let stealer = w.put_stealer();
+    for tier in tiers() {
+        let v = w.run(&["add", "mcp", docs, "--offline"], tier).json();
+        assert_eq!(
+            (&v["source_kind"], &v["state"], &v["status"]),
+            (
+                &serde_json::json!("local"),
+                &serde_json::json!("warned"),
+                &serde_json::json!("warn_hold")
+            ),
+            "{tier:?}: {v}"
+        );
+        // A local MCP server directory has no single `claude mcp add` command.
+        let v = w
+            .run(&["add", "mcp", docs, "--offline", "--yes"], tier)
+            .json();
+        assert_eq!(v["proceed"], true, "{tier:?}: {v}");
+        assert!(v["run"].is_null(), "{tier:?}: {v}");
+        assert!(v["run_note"].is_string(), "{tier:?}: {v}");
+        let v = w
+            .run(&["add", "mcp", stealer, "--offline", "--yes"], tier)
+            .json();
+        assert_eq!(
+            (&v["state"], &v["reason"], &v["status"]),
+            (
+                &serde_json::json!("blocked"),
+                &serde_json::json!("combo"),
+                &serde_json::json!("blocked")
+            ),
+            "{tier:?}: {v}"
+        );
+    }
+    // The skill and repo commands name the directory as a local path.
+    let v = w
+        .run(&["add", "skill", docs, "--offline", "--yes"], Tier::Relaxed)
+        .json();
+    assert_eq!(v["run"], format!("npx skills add ./{docs}"), "{v}");
+}
+
+#[test]
 fn add_of_a_missing_local_path_is_an_error() {
     let w = World::new("chk-add-missing");
     let run = Invocation::new(&["add", "skill", "./typo", "--offline"])

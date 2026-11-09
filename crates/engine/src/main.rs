@@ -1677,23 +1677,21 @@ fn cmd_verify_request(action: &str, target: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `add`'s usage line.
+const ADD_USAGE: &str = "usage: add skill|mcp|repo <source> [--yes] [--force] [--offline]";
+
 fn cmd_add(rest: &[String]) -> ExitCode {
-    let kind = rest.first().map(String::as_str).unwrap_or("");
-    let source = rest.get(1).map(String::as_str).unwrap_or("");
+    let (kind, source) = match add_args(rest) {
+        Ok(parsed) => parsed,
+        Err(problem) => return add_usage_error(&problem),
+    };
+    let kind_label = kind.label();
     // `add` is a user-invoked install, so the (otherwise isolated) network steps are allowed:
-    // an `--online` flag (default on for `add`) lets provenance hit the npm/osv registries.
+    // npm / GitHub lookups pin a moving source and osv.dev grades the version; `--offline`
+    // turns them off.
     let online = !rest.iter().any(|a| a == "--offline");
     let confirm = Confirm::from_args(rest);
     let force = confirm.yes;
-
-    if source.is_empty() {
-        print_json(&serde_json::json!({
-            "command": "add",
-            "status": "error",
-            "error": "usage: add skill|mcp|repo <source>",
-        }));
-        return ExitCode::SUCCESS;
-    }
 
     let Some(plugin_data) = cli_data_dir("add") else {
         return ExitCode::FAILURE;
@@ -1715,7 +1713,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
             );
             print_json(&serde_json::json!({
                 "command": "add",
-                "kind": kind,
+                "kind": kind_label,
                 "source": source,
                 "verdict": "high_risk",
                 "status": if decision == "deny" { "high_risk_deny" } else { "high_risk_ask" },
@@ -1737,39 +1735,40 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         );
     }
 
-    // mcp → npm package provenance (+ osv); a local skill/repo dir → the sweep's rule engine at
-    // the current tier, plus the provenance of its source; any other source → provenance only.
+    // A local directory (a path, or a name that is a directory here), whatever the kind → the
+    // sweep's rule engine at the current tier; any other source → its provenance (+ osv).
     let local = verify::expand_home(source);
     let add_error = |e: String| {
         print_json(&serde_json::json!({
             "command": "add",
-            "kind": kind,
+            "kind": kind_label,
             "source": source,
             "status": "error",
             "error": e,
         }));
         ExitCode::FAILURE
     };
-    let looks_local = ["./", "../", "/", "~"]
-        .iter()
-        .any(|p| source.starts_with(p))
-        || source == "."
-        || source == "..";
-    if kind != "mcp" && looks_local && !local.is_dir() {
-        return add_error(format!("{source}: no such local directory"));
+    let is_local = local.is_dir()
+        || verify::provenance::classify_source(source) == verify::provenance::SourceKind::Local;
+    if is_local && !local.is_dir() {
+        return add_error(if local.exists() {
+            format!("{source}: not a directory")
+        } else {
+            format!("{source}: no such local directory")
+        });
     }
     let mut checked: Option<verify::check::Check> = None;
-    let report = match kind {
-        "mcp" => verify::pipeline_npm(source, online),
-        _ if local.is_dir() => {
-            let ctx = check_context().for_install();
-            match verify::check::check_dir(&local, source, &ctx) {
-                Ok(check) => checked = Some(check),
-                Err(e) => return add_error(e),
-            }
-            verify::provenance::resolve(source)
+    let (resolved, report, install) = if is_local {
+        let ctx = check_context().for_install();
+        match verify::check::check_dir(&local, source, &ctx) {
+            Ok(check) => checked = Some(check),
+            Err(e) => return add_error(e),
         }
-        _ => verify::pipeline_npm(source, online),
+        let resolved = verify::provenance::Resolved::local(source);
+        let install = verify::install_command(kind, &resolved, source);
+        (resolved, verify::Report::default(), install)
+    } else {
+        verify::pipeline_add(kind, source, online)
     };
 
     let verdict = match &checked {
@@ -1787,9 +1786,6 @@ fn cmd_add(rest: &[String]) -> ExitCode {
             })
         })
         .collect();
-
-    // The underlying install command emitted on pass (or warn + confirm).
-    let install_cmd = underlying_install_cmd(kind, source);
 
     // A pack the tier denies, or a combination BLOCK at any tier, proceeds only with `--force`.
     let pack_blocked = checked
@@ -1822,20 +1818,31 @@ fn cmd_add(rest: &[String]) -> ExitCode {
             &plugin_data,
             "add_approve",
             "add",
-            &format!("kind={kind} source={source} verdict={}", verdict.label()),
+            &format!(
+                "kind={kind_label} source={source} verdict={} pin={}",
+                verdict.label(),
+                resolved.pin
+            ),
         );
     }
 
+    let run = install.run.as_deref().filter(|_| proceed);
+    let pin = (!resolved.pin.is_empty()).then_some(resolved.pin.as_str());
     let mut out = serde_json::json!({
         "command": "add",
-        "kind": kind,
+        "kind": kind_label,
         "source": source,
+        "source_kind": resolved.kind,
+        "pin": pin,
         "verdict": verdict.label(),
         "status": status,
         "proceed": proceed,
-        "run": if proceed { serde_json::Value::String(install_cmd) } else { serde_json::Value::Null },
+        "run": run,
     });
     if let Some(map) = out.as_object_mut() {
+        if let Some(note) = &install.note {
+            map.insert("run_note".into(), serde_json::json!(note));
+        }
         match &checked {
             // The pack: the sweep's state, findings and report; the source: its provenance.
             Some(check) => {
@@ -1852,6 +1859,46 @@ fn cmd_add(rest: &[String]) -> ExitCode {
     }
     print_json(&out);
     ExitCode::SUCCESS
+}
+
+/// `add`'s kind and source: the first two arguments that are not flags. Flags (`--yes`,
+/// `--force`, `--offline`) may come anywhere; anything else is a usage problem.
+fn add_args(rest: &[String]) -> Result<(verify::AddKind, &str), String> {
+    let mut words = Vec::new();
+    for arg in rest {
+        match arg.as_str() {
+            "--yes" | "--force" | "--offline" => {}
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            word => words.push(word),
+        }
+    }
+    let Some((&kind, rest)) = words.split_first() else {
+        return Err("missing kind and source".to_string());
+    };
+    let Some(kind) = verify::AddKind::parse(kind) else {
+        return Err(format!("unknown kind `{kind}`"));
+    };
+    match rest {
+        [source] if source.trim().starts_with('-') => {
+            Err(format!("a source cannot start with `-`: `{source}`"))
+        }
+        [source] if !source.trim().is_empty() => Ok((kind, source)),
+        [] | [_] => Err("missing source".to_string()),
+        [_, extra, ..] => Err(format!("unexpected argument `{extra}`")),
+    }
+}
+
+/// A malformed `add` command line: the problem and [`ADD_USAGE`] on stderr and in the JSON
+/// error, exit 3 like an unknown subcommand.
+fn add_usage_error(problem: &str) -> ExitCode {
+    let error = format!("{problem}; {ADD_USAGE}");
+    let _ = writeln!(std::io::stderr(), "safe-ai-skill: add: {error}");
+    print_json(&serde_json::json!({
+        "command": "add",
+        "status": "error",
+        "error": error,
+    }));
+    ExitCode::from(EXIT_USAGE)
 }
 
 /// Resolve an `add <source>` target against the project catalog and classify it.
@@ -1917,16 +1964,6 @@ fn high_risk_add_reason(kind: &str, entry_id: &str) -> String {
         other => format!(
             "`{entry_id}` is a high-risk catalog entry ({other}) — re-run with --yes to confirm"
         ),
-    }
-}
-
-/// The underlying installer command `add` emits on a pass (the user runs it to install).
-fn underlying_install_cmd(kind: &str, source: &str) -> String {
-    match kind {
-        "skill" => format!("npx skills add {source}"),
-        "repo" => format!("git clone {source}"),
-        "mcp" => format!("claude mcp add {source}"),
-        _ => format!("install {source}"),
     }
 }
 
