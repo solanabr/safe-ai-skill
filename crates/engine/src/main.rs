@@ -2672,6 +2672,7 @@ fn cmd_status() -> ExitCode {
                 "time_left_secs": time_left,
                 "expired": g.is_expired(now),
                 "danger": g.danger,
+                "inert": g.is_inert(),
             })
         })
         .collect();

@@ -35,6 +35,7 @@ use std::sync::Mutex;
 
 use common::{EnvRead, Invocation, SandboxMode, TempDir, Tier, TEST_HOOKS};
 use safe_ai_skill::datadir::DataDir;
+use safe_ai_skill::gate::Scope;
 use safe_ai_skill::grants::{self, Grant, Grants};
 use serde_json::Value;
 
@@ -347,8 +348,10 @@ fn parse_ctx(v: &Value, what: &str) -> Result<Ctx, String> {
             &format!("{what} grant"),
         )?;
         let scope = str_field(go, "scope", what)?.to_string();
-        if grants::grantable_scope(&scope).is_err() {
-            return Err(format!("{what}: grant scope `{scope}` is not grantable"));
+        // A grant already in the data dir may carry a scope `allow` now refuses (`authority`,
+        // `destructive`, stored by 1.3.0); it must relax nothing.
+        if Scope::from_label(&scope) == Scope::Other {
+            return Err(format!("{what}: grant scope `{scope}` is not a scope"));
         }
         grants.push(GrantSpec {
             scope,
@@ -959,7 +962,7 @@ fn materialise(row: &Row) -> Result<Paths, String> {
         };
         let mut list = Vec::new();
         for (n, spec) in row.ctx.grants.iter().enumerate() {
-            let scope = grants::grantable_scope(&spec.scope)?;
+            let scope = Scope::from_label(&spec.scope);
             list.push(Grant {
                 id: format!("g-corpus-{n}"),
                 scope,

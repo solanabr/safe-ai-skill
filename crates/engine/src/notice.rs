@@ -93,7 +93,10 @@ pub fn loosenings(inputs: &Inputs<'_>) -> Option<String> {
                 .grants
                 .iter()
                 .filter(|g| !g.is_expired(inputs.now))
-                .map(|g| format!("live {}", g.describe(inputs.now)))
+                .map(|g| {
+                    let state = if g.is_inert() { "inert" } else { "live" };
+                    format!("{state} {}", g.describe(inputs.now))
+                })
                 .collect();
             if dir.trusted {
                 lines.extend(live);
