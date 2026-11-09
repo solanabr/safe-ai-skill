@@ -21,6 +21,64 @@ pub mod rules;
 pub mod state;
 pub mod trust;
 
+/// A loopback HTTP server for the network helpers' unit tests: no test reaches the internet.
+#[cfg(test)]
+pub(crate) mod testnet {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve `route(method, path, body) -> (status, reply)` on `127.0.0.1` from a background
+    /// thread; returns the base URL (`http://127.0.0.1:<port>`).
+    pub fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let (status, reply) = route(&method, &path, &String::from_utf8_lossy(&body));
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        base
+    }
+
+    /// A loopback base URL nothing listens on (connection refused).
+    pub fn closed() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        base
+    }
+}
+
 use serde::Serialize;
 
 /// Severity of a supply-chain finding.
