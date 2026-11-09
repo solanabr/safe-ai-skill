@@ -13,6 +13,11 @@ use super::{Finding, Report, Severity};
 /// osv.dev query endpoint.
 const OSV_URL: &str = "https://api.osv.dev/v1/query";
 
+/// Most result pages followed for one package version (osv.dev pages a large or slow answer
+/// with `next_page_token`, and may send only the token). An answer still unfinished after them
+/// is incomplete, so it holds like an unreachable osv.dev.
+const MAX_PAGES: usize = 5;
+
 /// Test-only override of [`OSV_URL`], read only in `test-hooks` builds.
 pub const TEST_URL_ENV: &str = "SAFE_AI_SKILL_TEST_OSV_URL";
 
@@ -23,15 +28,37 @@ pub fn query(pkg: &str, version: &str) -> Report {
     query_at(&osv_url(), pkg, version)
 }
 
-/// [`query`] against the endpoint at `url`.
+/// [`query`] against the endpoint at `url`, following `next_page_token` up to [`MAX_PAGES`].
 pub fn query_at(url: &str, pkg: &str, version: &str) -> Report {
-    match fetch_at(url, pkg, version) {
-        Ok(body) => parse_response(&body),
-        Err(why) => unavailable(&format!(
-            "osv.dev could not be asked about known vulnerabilities in {pkg}@{version} ({why}), so \
-             no CVE check ran; re-run when it is reachable, or pass --yes to take it unchecked"
-        )),
+    let mut report = Report::default();
+    let mut token: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let page = fetch_at(url, pkg, version, token.as_deref())
+            .and_then(|body| parse_page(&body).ok_or_else(|| "a malformed reply".to_string()));
+        match page {
+            Ok((found, None)) => {
+                report.merge(found);
+                return report;
+            }
+            Ok((found, next)) => {
+                report.merge(found);
+                token = next;
+            }
+            Err(why) => {
+                report.merge(unavailable(&format!(
+                    "osv.dev gave no usable answer about known vulnerabilities in \
+                     {pkg}@{version} ({why}), so no CVE check ran; re-run when it is reachable, \
+                     or pass --yes to take it unchecked"
+                )));
+                return report;
+            }
+        }
     }
+    report.merge(unavailable(&format!(
+        "osv.dev's answer about {pkg}@{version} was still incomplete after {MAX_PAGES} pages, so \
+         the CVE check did not finish; re-run later, or pass --yes to take it unchecked"
+    )));
+    report
 }
 
 /// The LOW finding for a lookup the user turned off with `--offline`.
@@ -63,10 +90,18 @@ fn osv_url() -> String {
 
 /// Build the osv.dev request body for `pkg`@`version`. Pure — unit-testable.
 pub fn request_body(pkg: &str, version: &str) -> String {
-    let v = serde_json::json!({
+    page_request_body(pkg, version, None)
+}
+
+/// [`request_body`] for the result page `page_token` names (none: the first page).
+pub fn page_request_body(pkg: &str, version: &str, page_token: Option<&str>) -> String {
+    let mut v = serde_json::json!({
         "version": version,
         "package": { "ecosystem": "npm", "name": pkg }
     });
+    if let (Some(token), Some(map)) = (page_token, v.as_object_mut()) {
+        map.insert("page_token".into(), serde_json::json!(token));
+    }
     v.to_string()
 }
 
@@ -75,12 +110,17 @@ pub fn request_body(pkg: &str, version: &str) -> String {
 /// Isolated and optional: `Err` with a short reason on any network/HTTP/IO error. Unit tests
 /// drive [`fetch_at`] against a loopback server only.
 pub fn fetch(pkg: &str, version: &str) -> Result<String, String> {
-    fetch_at(&osv_url(), pkg, version)
+    fetch_at(&osv_url(), pkg, version, None)
 }
 
-/// [`fetch`] against the endpoint at `url`.
-pub fn fetch_at(url: &str, pkg: &str, version: &str) -> Result<String, String> {
-    let body = request_body(pkg, version);
+/// [`fetch`] of the result page `page_token` names, against the endpoint at `url`.
+pub fn fetch_at(
+    url: &str,
+    pkg: &str,
+    version: &str,
+    page_token: Option<&str>,
+) -> Result<String, String> {
+    let body = page_request_body(pkg, version, page_token);
     let resp = ureq::agent()
         .post(url)
         .timeout(std::time::Duration::from_secs(4))
@@ -95,29 +135,51 @@ pub fn fetch_at(url: &str, pkg: &str, version: &str) -> Result<String, String> {
         .map_err(|_| "the reply could not be read".to_string())
 }
 
-/// Parse an osv.dev response body into a [`Report`]. Pure — unit-testable with fixtures.
+/// Parse one osv.dev response body into a [`Report`]. Pure — unit-testable with fixtures.
 ///
-/// An empty object (`{}`) or an empty/absent `vulns` array → no findings; a body that is not
-/// a JSON object → a MEDIUM `osv_unavailable` finding. Each vuln becomes
-/// a [`Finding`]; severity is derived from the advisory's `severity`/`database_specific`
-/// CVSS when present, otherwise defaults to High.
+/// `{}` or an empty `vulns` array → no findings. A body that is not a well-formed reply (see
+/// [`parse_page`]), or one that says more pages follow (`next_page_token`, which this single
+/// page cannot follow), → a MEDIUM `osv_unavailable` finding besides any advisories on it.
 pub fn parse_response(body: &str) -> Report {
-    let mut report = Report::default();
-    let value: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v @ serde_json::Value::Object(_)) => v,
-        _ => {
-            return unavailable(
-                "osv.dev's reply was not a JSON object, so no CVE check ran; re-run when it \
-                 answers, or pass --yes to take it unchecked",
-            )
+    match parse_page(body) {
+        Some((report, None)) => report,
+        Some((mut report, Some(_))) => {
+            report.merge(unavailable(
+                "osv.dev's reply said more results follow, so the CVE check did not finish; \
+                 re-run later, or pass --yes to take it unchecked",
+            ));
+            report
         }
+        None => unavailable(
+            "osv.dev's reply was not a well-formed answer, so no CVE check ran; re-run when it \
+             answers, or pass --yes to take it unchecked",
+        ),
+    }
+}
+
+/// One result page: its advisories and the `next_page_token`, if more pages follow. `None`
+/// unless the body is a JSON object that is `{}`, carries a `vulns` array, or carries only a
+/// `next_page_token` (a page osv.dev cut short); a non-array `vulns`, a non-string token or any
+/// other object (an error envelope) is not an answer.
+///
+/// Each vuln becomes a [`Finding`]; severity is derived from the advisory's
+/// `severity`/`database_specific` CVSS when present, otherwise defaults to High.
+pub fn parse_page(body: &str) -> Option<(Report, Option<String>)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let map = value.as_object()?;
+    let token = match map.get("next_page_token") {
+        None => None,
+        Some(serde_json::Value::String(t)) if !t.is_empty() => Some(t.clone()),
+        Some(_) => return None,
+    };
+    let vulns = match map.get("vulns") {
+        Some(serde_json::Value::Array(arr)) => arr.as_slice(),
+        Some(_) => return None,
+        None if map.keys().all(|k| k == "next_page_token") => &[],
+        None => return None,
     };
 
-    let vulns = match value.get("vulns").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return report, // `{}` or no vulns → clean
-    };
-
+    let mut report = Report::default();
     for vuln in vulns {
         let id = vuln
             .get("id")
@@ -138,7 +200,7 @@ pub fn parse_response(body: &str) -> Report {
         ));
     }
 
-    report
+    Some((report, token))
 }
 
 /// Derive a [`Severity`] from a vuln object. Uses a CVSS score when parseable, else High.
@@ -301,6 +363,60 @@ mod tests {
         let report = query_at(&base, "vuln", "1.0.0");
         assert_eq!(kinds(&report), vec!["cve".to_string()]);
         assert_eq!(report.max_severity(), Some(Severity::High));
+    }
+
+    #[test]
+    fn pages_are_followed_and_an_unfinished_answer_holds() {
+        // Page 1 holds one advisory and a token; page 2 (asked with that token) the other.
+        let base = crate::verify::testnet::serve(|_, _, body| {
+            if body.contains("\"page_token\":\"p2\"") {
+                (
+                    200,
+                    r#"{"vulns":[{"id":"B","database_specific":{"severity":"LOW"}}]}"#.into(),
+                )
+            } else if body.contains("\"two\"") {
+                (200, r#"{"vulns":[{"id":"A","database_specific":{"severity":"LOW"}}],"next_page_token":"p2"}"#.into())
+            } else {
+                // A token and nothing else, forever (osv.dev ran out of time on every page).
+                (200, r#"{"next_page_token":"again"}"#.into())
+            }
+        });
+        let report = query_at(&base, "two", "1.0.0");
+        let ids: Vec<&str> = report.findings.iter().map(|f| &f.detail[..1]).collect();
+        assert_eq!(ids, vec!["A", "B"], "{report:?}");
+        assert_eq!(report.max_severity(), Some(Severity::Low));
+
+        let report = query_at(&base, "slow", "1.0.0");
+        assert_eq!(kinds(&report), vec!["osv_unavailable".to_string()]);
+        assert_eq!(report.max_severity(), Some(Severity::Medium));
+        assert!(
+            report.findings[0].detail.contains("incomplete"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_well_formed_reply_counts() {
+        for body in [
+            r#"{"vulns":"x"}"#,
+            r#"{"vulns":{}}"#,
+            r#"{"code":3,"message":"bad request"}"#,
+            r#"{"next_page_token":5}"#,
+            r#"{"next_page_token":""}"#,
+        ] {
+            let report = parse_response(body);
+            assert_eq!(
+                kinds(&report),
+                vec!["osv_unavailable".to_string()],
+                "{body}"
+            );
+            assert_eq!(report.max_severity(), Some(Severity::Medium), "{body}");
+        }
+        // One page that says more follow is not clean either.
+        let report = parse_response(r#"{"next_page_token":"tok"}"#);
+        assert_eq!(report.max_severity(), Some(Severity::Medium));
+        assert!(page_request_body("p", "1.0.0", Some("tok")).contains("\"page_token\":\"tok\""));
+        assert!(!request_body("p", "1.0.0").contains("page_token"));
     }
 
     #[test]
