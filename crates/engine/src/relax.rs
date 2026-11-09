@@ -366,10 +366,14 @@ mod tests {
         })
     }
 
-    fn high_policy() -> Policy {
+    fn policy_at(tier: Tier) -> Policy {
         let mut p = Policy::from_sources(crate::policy::DEFAULT_POLICY_YAML, None);
-        p.runtime.tier = Tier::High;
+        p.runtime.tier = tier;
         p
+    }
+
+    fn high_policy() -> Policy {
+        policy_at(Tier::High)
     }
 
     fn transfer_meta(amount: f64, hard_guard: bool) -> GateMeta {
@@ -646,6 +650,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
+    #[test]
+    fn a_stale_authority_or_destructive_grant_relaxes_nothing_at_any_tier() {
+        // grants.json from 1.3.0 may hold these scopes, unrestricted and with a large budget.
+        let dir = tmp_data("relax_stale_scope");
+        let stale = [Scope::Authority, Scope::Destructive]
+            .iter()
+            .map(|scope| grants::Grant {
+                scope: *scope,
+                max_tx_sol: 1e9,
+                budget_sol: 1e9,
+                danger: true,
+                ..transfer_grant(scope.label(), u64::MAX)
+            })
+            .collect();
+        grants::save(&dir, &Grants { grants: stale }).unwrap();
+        for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+            let policy = policy_at(tier);
+            for scope in [Scope::Authority, Scope::Destructive] {
+                // Every gate marks these a hard guard; the grant is inert even if one did not.
+                for hard_guard in [true, false] {
+                    let meta = GateMeta {
+                        program: Some("spl-token".into()),
+                        ..GateMeta::new(scope, hard_guard)
+                    };
+                    let natural = Decision::Ask {
+                        reason: format!("{} — approve to proceed", scope.label()),
+                    };
+                    assert_eq!(
+                        apply(natural.clone(), &meta, &policy, &dir),
+                        natural,
+                        "{tier:?} {scope:?} hard_guard={hard_guard}"
+                    );
+                }
+            }
+        }
+        let stored = grants::live(&dir);
+        assert_eq!(stored.grants.len(), 2);
+        assert!(stored.grants.iter().all(|g| g.spent_sol == 0.0));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
     // -----------------------------------------------------------------------------------
     // Prompt-nonce confirmation
     // -----------------------------------------------------------------------------------
@@ -839,6 +884,41 @@ mod tests {
         );
         assert!(grants::live(&dir).grants.is_empty());
         let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_pending_authority_or_destructive_grant_fails_closed_with_the_reason() {
+        // A request 1.3.0 parked, confirmed after the upgrade: consumed, nothing stored.
+        for (scope, what) in [
+            ("authority", "authority changes"),
+            ("destructive", "destructive actions (burns, closes)"),
+        ] {
+            let dir = tmp_data(&format!("confirm_stale_{scope}"));
+            let nonce = pending(
+                &dir,
+                PendingKind::Grant,
+                json!({"scope":scope,"for_secs":1800,"max_tx_sol":1.0,"budget_sol":5.0,
+                       "programs":[],"to":[],"danger":false}),
+            );
+            let line = format!("safe-ai-skill confirm {nonce}");
+            let out = confirm_prompt(&dir, &line, now()).unwrap();
+            assert_eq!(
+                out.system_message,
+                format!(
+                    "safe-ai-skill: confirmation failed: {what} are a hard guard; no grant can \
+                     relax them, so this grant was not created."
+                )
+            );
+            assert!(!dir.path.join(grants::GRANTS_FILE).exists());
+            let audit = std::fs::read_to_string(dir.path.join("audit.jsonl")).unwrap();
+            assert!(audit.contains("confirm_failed"), "{audit}");
+            let again = confirm_prompt(&dir, &line, now()).unwrap();
+            assert!(
+                again.system_message.contains("nothing confirmed"),
+                "{again:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir.path);
+        }
     }
 
     #[test]
