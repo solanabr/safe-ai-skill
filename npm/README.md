@@ -113,7 +113,7 @@ cargo install safe-ai-skill --version <version> --locked
 
 Or build from the matching release tag:
 ```bash
-git clone --branch v1.3.0 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
+git clone --branch v1.3.1 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
 cargo install --locked --path crates/engine
 ```
 

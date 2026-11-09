@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "safe-ai-skill",
-      "version": "1.3.0",
+      "version": "1.3.1",
       "source": "./plugins/safe-ai-skill",
       "description": "Hook-based security firewall and supply-chain verifier for Claude Code skills, MCPs and agents. Gates destructive git, secret and credential reads, exfiltration, download-and-run, self-tampering and Solana on-chain actions; grades and pins skill packs."
     }

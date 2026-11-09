@@ -85,8 +85,9 @@ commit, pushes the tags and merges.
    commit**. Squash or rebase would give the tagged commit a new SHA, so `main` wouldn't contain
    it. This is the first time `main` sees the new version, and it gets the source and the
    binaries together.
-6. **Publish to npm** once the GitHub Release exists, because `postinstall` downloads from it:
-   `cd npm && npm publish`.
+6. **Publish to npm** from the tagged commit, once the GitHub Release exists, because
+   `postinstall` downloads from it: `git switch --detach vX.Y.Z && cd npm && npm publish`. The
+   package's README and fallback messages are the ones at the tag.
 7. **Publish to crates.io** from the tagged commit, also once the GitHub Release exists. The
    fallbacks in `install.sh` and the npm wrapper tell users to run
    `cargo install safe-ai-skill --version X.Y.Z --locked`, so every release is published. On a

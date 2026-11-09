@@ -4,7 +4,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [Unreleased]
+## [1.3.1] — 2026-11-09
 
 ### Behaviour changes (read before upgrading)
 
@@ -15,6 +15,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **`owner/repo@<x>` names a skill, never a ref**, as the skills CLI (`skills@1.7.6`) reads it, so it pins nothing and holds. Pin a GitHub source with `owner/repo#<sha>` (`#<sha>@<skill>` for one skill), or a `tree/<sha>` or `commit/<sha>` URL.
 - **`add mcp <dir>` scans the directory** with the session sweep's rules at your tier, as `add skill` and `add repo` do. Before, it ran only the source-string check on the path.
 - **The npm package's `files` list is narrowed** to `bin/cli.js`, `scripts/postinstall.js` and `README.md` (npm adds `package.json`). An install from npm works as before; see Security for why.
+- **MCP wallet calls ask more often.** On a wallet or Solana MCP server, a tool that freezes, thaws, approves, revokes or authorizes token accounts, mints or delegates now asks (the gate had no opinion before). A transfer or swap whose SOL amount is unclear (amount fields that disagree, a non-numeric amount, a send-all flag, a pre-built transaction) always asks, and an MCP transfer of SPL tokens (wrapped SOL included), NFTs or another chain's coin always asks, whatever the tool is called. Upgrading from 1.0 now says that dropped `authority` and `destructive` grants are hard guards that are no longer grantable.
 
 ### Added
 
@@ -43,6 +44,8 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 - **A catalog id was checked as an npm package of the same name.** `add mcp <id> --yes` graded whatever npm package carried the entry's id as its name, and printed the id as the source to install, not the entry's own source. A catalog id is now graded and printed as its entry's source.
 - **osv.dev replies that were not answers counted as clean.** A reply without a `vulns` array (a reply carrying only `next_page_token`, a wrong-typed `vulns`, an error object sent with status 200) passed a package that may have known advisories. `add` now follows `next_page_token` for up to 5 pages; anything but `{}` or an object with a `vulns` array, or an answer still unfinished after 5 pages, is a MEDIUM `osv_unavailable` that holds.
 - **`add` no longer passes what it did not check:** an unrecognised source and a failed or incomplete osv.dev lookup hold until `--yes` (see Behaviour changes).
+- **A `transfer` grant relaxed MCP calls that are hard guards.** The MCP gate read any tool name with a transfer word (transfer, send, withdraw, pay, drain) as a SOL transfer, so a confirmed `transfer` grant let through calls whose names also said they change an authority, close or burn, and token transfers whose tool name lacked the word `token` (their token units were debited as SOL). These calls now always ask.
+- **A `transfer` grant debited a different amount than the one sent.** With several amount fields in one MCP call, the grant was charged from one of them while the server could read another. Every amount field is now read, and a disagreement always asks.
 
 ### Documentation
 
