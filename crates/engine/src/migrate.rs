@@ -6,7 +6,8 @@
 //!
 //! - each unexpired 1.0 grant in a grantable scope with valid addresses becomes a *pending*
 //!   grant request for its remaining time and budget. The user sees their confirmation codes
-//!   in that SessionStart's `systemMessage` and keeps what they confirm;
+//!   in that SessionStart's `systemMessage` and keeps what they confirm. An authority or
+//!   destructive grant is dropped, and the notice says those scopes are hard guards now;
 //! - a 1.0 mode becomes a tier (D8 v2 spec §9), never below `relaxed`: `strict` and
 //!   `autopilot` are `relaxed` (the notice names what changed, and `allow --scope transfer`
 //!   for autopilot users), `paranoid` is `tier.json` `high`;
@@ -30,6 +31,7 @@ use std::path::Path;
 use crate::audit::{self, AuditEntry};
 use crate::confirm::{self, PendingKind, PENDING_FILE};
 use crate::datadir::DataDir;
+use crate::gate::Scope;
 use crate::grants::{self, GrantRequest, Grants, GRANTABLE_SCOPES, GRANTS_FILE};
 use crate::mode::{self, ModeRecord, MODE_FILE};
 use crate::policy::tier::Tier;
@@ -133,7 +135,12 @@ fn migrate_grants(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
     };
     rename_to(&path, "v1-migrated");
     let mut dropped = 0usize;
+    let mut hard_guarded = 0usize;
     for g in &old.grants {
+        if matches!(g.scope, Scope::Authority | Scope::Destructive) {
+            hard_guarded += 1;
+            continue;
+        }
         let Some(request) = as_request(g, now) else {
             dropped += 1;
             continue;
@@ -148,6 +155,13 @@ fn migrate_grants(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
                 g.id
             ));
         }
+    }
+    if hard_guarded > 0 {
+        lines.push(format!(
+            "grants.json from 1.0: {hard_guarded} authority or destructive grant(s) dropped: \
+             authority changes, closes and burns are hard guards, so these scopes are no longer \
+             grantable"
+        ));
     }
     if dropped > 0 {
         lines.push(format!(
@@ -411,6 +425,54 @@ mod tests {
         assert!(std::fs::read_to_string(dir.path.join("audit.jsonl"))
             .unwrap()
             .contains("state_migrate"));
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn v1_authority_and_destructive_grants_are_dropped_as_no_longer_grantable() {
+        let dir = tmp_data("migrate_hard_guard");
+        let mut authority = transfer_grant("auth", NOW + 3_600);
+        authority.scope = Scope::Authority;
+        let mut destructive = transfer_grant("burn", NOW + 3_600);
+        destructive.scope = Scope::Destructive;
+        let body = serde_json::to_string(&Grants {
+            grants: vec![
+                authority,
+                destructive,
+                transfer_grant("live", NOW + 3_600),
+                transfer_grant("expired", NOW - 1),
+            ],
+        })
+        .unwrap();
+        write(&dir, GRANTS_FILE, &body);
+
+        let lines = run(&dir, NOW);
+        assert!(
+            lines.iter().any(|l| l
+                == "grants.json from 1.0: 2 authority or destructive grant(s) dropped: authority \
+                    changes, closes and burns are hard guards, so these scopes are no longer \
+                    grantable"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains(": 1 expired or invalid")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1.0 grant live kept as pending")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("grant auth ") || l.contains("grant burn ")),
+            "{lines:?}"
+        );
+        let shown = confirm::announce_pending(&dir, real_now());
+        assert_eq!(shown.len(), 1, "only the transfer grant becomes a request");
+        assert!(grants::live(&dir).grants.is_empty());
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 
