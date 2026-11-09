@@ -2,16 +2,18 @@
 
 The `safe-ai-skill` binary is both the engine the hooks call and a CLI you run yourself. This page lists every subcommand and flag in `crates/engine/src/main.rs` and the modules it dispatches to. For what the firewall decides at each tier, see [docs/tiers.md](tiers.md).
 
-- **There is no `--help`.** `safe-ai-skill --help`, `-h` and `help` print `unknown subcommand` and exit 3. `safe-ai-skill env --help` does print usage for `env`.
-- **Output:** `status`, `tier`, `firewall`, `add`, `install`, `verify`, `registry`, `allow` and `session` print JSON on stdout. `doctor` and `env` print text. A request that is parked for your confirmation prints a "Pending request …" line on stderr and JSON on stdout.
-- **Exit codes vary by command.** An unknown top-level subcommand exits 3, as do usage errors from `env` and `adapt`. Other usage and argument errors print a JSON error and exit 0 or 1 depending on the command (`tier`, `allow` and `firewall` exit 1; `add`, `install`, `registry` and `verify` with a bad argument can exit 0), so check the JSON, not just the exit code. `doctor` always exits 0, `doctor --codex` exits 1 on a failure, `firewall check` exits non-zero on drift, and `env keys --require` exits 3 when a key is missing.
+- **Help:** `safe-ai-skill --help`, `-h` and `help` print the list of commands. `safe-ai-skill help <command>`, and `safe-ai-skill <command> --help` or `-h` as the first argument after the command, print that command's usage and do not run it. They exit 0. `help` with a name that is not a command exits 3, `help confirm` included (see [Which commands need the CLI](#which-commands-need-the-cli)). `help <hook subcommand>` says the hooks run it; a hook subcommand given `--help` still runs as the hook.
+- **Output:** `status`, `tier`, `firewall`, `add`, `install`, `verify`, `registry`, `allow` and `session` print JSON on stdout. `doctor`, `env` and the help print text. A request that is parked for your confirmation prints a "Pending request …" line on stderr and JSON on stdout.
+- **Exit codes vary by command.** An unknown top-level subcommand exits 3, as do usage errors from `add`, `env` and `adapt`. Other usage and argument errors print a JSON error and exit 0 or 1 depending on the command (`tier`, `allow`, `firewall` and `verify check` exit 1; `install`, `registry` and other `verify` errors can exit 0), so check the JSON, not just the exit code. `add` exits 0 whatever its verdict (read `status` and `proceed`), and 1 when a local path is not a directory. `doctor` always exits 0, `doctor --codex` exits 1 on a failure, `firewall check` exits non-zero on drift, and `env keys --require` exits 3 when a key is missing.
 - **Version:** `safe-ai-skill --version`.
 
 ## Which commands need the CLI
 
-The plugin runs the hooks by itself. Install the CLI (see [Install](../README.md#install)) to run `tier`, `allow`, `revoke`, `status`, `doctor`, `firewall`, `env`, `add`, `install`, `verify`, `registry` and `adapt`.
+The plugin runs the hooks by itself. Install the CLI (see [Install](../README.md#install)) to run `tier`, `allow`, `revoke`, `status`, `session`, `doctor`, `firewall`, `env`, `add`, `install`, `verify`, `registry` and `adapt`.
 
-Some commands change what the firewall trusts, so the agent cannot run them: the tamper tripwire denies `confirm`, `revoke`, `verify approve`, `verify trust`, `install`, `add`, bare `verify` and `verify session`, `adapt`, and every hook subcommand. Run those in your own terminal. `tier`, `allow`, `status`, `registry`, `doctor`, `firewall`, `env keys` and `verify check <dir>` stay open to the agent: `tier` can only raise the tier or create a request the agent cannot confirm, and `allow` only records a request. See [SECURITY.md](../SECURITY.md#design-guarantees).
+`safe-ai-skill confirm <code>` is not a terminal command: it works only as your entire next prompt in Claude Code (see [Confirming a relaxation](#confirming-a-relaxation)). Typed in a terminal it is an unknown subcommand.
+
+Some commands change what the firewall trusts, so the agent cannot run them: the tamper tripwire denies a Bash command that runs `confirm`, `revoke`, `verify approve`, `verify trust`, `install`, `add`, bare `verify` and `verify session`, `adapt`, or any hook subcommand, also with `--help` after it. Run those in your own terminal. `tier`, `allow`, `status`, `registry`, `doctor`, `firewall`, `env keys`, `verify check <dir>`, `verify --help`, `--help`, `-h` and `help [<command>]` stay open to the agent: `tier` can only raise the tier or create a request the agent cannot confirm, and `allow` only records a request. See [SECURITY.md](../SECURITY.md#design-guarantees).
 
 ## Where the CLI keeps state
 
@@ -34,7 +36,7 @@ safe-ai-skill tier --env-read deny|tier [--project]      # project .env reads: d
 safe-ai-skill tier --clear [--project]                   # drop your stored choice
 ```
 
-Raising the tier, or tightening `--env-read` to `deny`, applies at once. Lowering it, or loosening `--env-read` back to `tier`, records a pending request that you confirm (see [Confirming a relaxation](#confirming-a-relaxation)). `--env-read ask` was removed in 1.2.0 and is refused. `mode` is a deprecated alias of `tier` that prints a warning.
+A tier and `--env-read` can be given in one call (`tier high --env-read deny`). Raising the tier, or tightening `--env-read` to `deny`, applies at once. Lowering it, or loosening `--env-read` back to `tier`, records a pending request that you confirm (see [Confirming a relaxation](#confirming-a-relaxation)). `--env-read ask` was removed in 1.2.0 and is refused. `mode` is a deprecated alias of `tier` that prints a warning.
 
 ### `allow`
 
@@ -47,7 +49,7 @@ Requests a time-boxed grant. Nothing takes effect until you confirm it.
 
 | Flag | Meaning |
 |---|---|
-| `--scope` | `transfer`, `swap`, `deploy`, `authority` or `destructive`. Anything else is an error. `authority` and `destructive` are accepted, but every authority or destructive verdict is a hard guard, so these grants relax nothing |
+| `--scope` | `transfer`, `swap` or `deploy`. Anything else is an error (exit 1). `authority`, `destructive` and `secret_read` are refused with the reason: every authority, destructive or secret-read verdict is a hard guard, which no grant relaxes |
 | `--for` | Duration such as `30m`, `2h` or `1d`; at most 30 days |
 | `--max-tx`, `--budget` | Per-transaction and total SOL limits. Both default to 0, which covers no positive SOL amount, so give both for a `transfer` or `swap` grant. They never cover `spl-token` or MCP token transfers, which are token units |
 | `--programs`, `--to` | Comma-separated base58 addresses the grant is limited to |
@@ -55,17 +57,19 @@ Requests a time-boxed grant. Nothing takes effect until you confirm it.
 
 A command line that chains two or more gated on-chain actions, or holds any hard-guard ask, is never covered by a grant.
 
+1.3.0 accepted `authority` and `destructive` grants, which relaxed nothing. One it stored stays in `grants.json` until it expires or you run `revoke`, and still relaxes nothing: the session notice prints it as `inert grant …, relaxes nothing (…)` and `status` marks it `"inert": true`. A pending request for one fails at confirmation with the reason, and no grant is stored.
+
 ### `revoke`
 
 `safe-ai-skill revoke` drops every grant at once and applies immediately. The agent cannot run it; run it in your terminal.
 
 ### `status`
 
-`safe-ai-skill status` prints JSON: the tier and its source, the `tier_line`, the sandbox state, live grants, pending requests (id, kind, created, lapses; never the code), the spend ledger and caps (`per_tx_sol_max`, `hard_tx_sol_max`, `daily_sol_max`, `today_sol`), the `env_read` setting, recent audit entries, and the data dir it used. It does not list pins; use `verify` for those.
+`safe-ai-skill status` prints JSON: the tier and its source, the `tier_line`, the sandbox state, live grants (each with `inert`, true for a grant that relaxes nothing), pending requests (id, kind, created, lapses; never the code), the spend ledger and caps (`per_tx_sol_max`, `hard_tx_sol_max`, `daily_sol_max`, `today_sol`), the `env_read` setting, recent audit entries, and the data dir it used. It does not list pins; use `verify` for those.
 
 ### `session`
 
-`safe-ai-skill session` shows session state. `session init --cap <SOL>` generates a session keypair, writes it in plain Solana-keypair format (mode 0600) under `session/<id>.json` in the data dir, and prints how to fund it. No gate reads this state, so it relaxes nothing.
+`safe-ai-skill session` shows session state, as does `session` with any action other than `init`. `session init --cap <SOL>` generates a session keypair, writes it in plain Solana-keypair format (mode 0600) under `session/<id>.json` in the data dir, and prints how to fund it; a missing or unreadable `--cap` is 0. No gate reads this state, so it relaxes nothing.
 
 ## Confirming a relaxation
 
@@ -79,7 +83,7 @@ safe-ai-skill firewall show     # what safe-ai-skill owns in the settings file
 safe-ai-skill firewall check    # drift between the declared tier and the live file (exit non-zero on drift)
 ```
 
-`apply` writes a safe-ai-skill-owned block of sandbox restrictions into the project's `.claude/settings.local.json`; at High it also adds a permission deny and `permissions.blockReadsOutsideWorkingDirectories`. It writes nothing at Off except removing what it added earlier. **Naming a tier also sets the plugin tier**, as `safe-ai-skill tier <t>` does: for every project, or for this repository only with `--project` (`--project` needs a tier name). Without a tier name, `apply` uses the tier already in effect and records no tier. Raising applies at once; lowering needs the confirmation code. Details and caveats: [docs/tiers.md](tiers.md#settings-manager).
+`apply` writes a safe-ai-skill-owned block of sandbox restrictions into the project's `.claude/settings.local.json`; at High it also adds a permission deny and `permissions.blockReadsOutsideWorkingDirectories`. It writes nothing at Off except removing what it added earlier. **Naming a tier also sets the plugin tier**, as `safe-ai-skill tier <t>` does: for every project, or for this repository only with `--project` (`--project` needs a tier name). Without a tier name, `apply` uses the tier already in effect and records no tier. `--dry-run` (or `-n`) reports what it would write and writes nothing. Raising applies at once; lowering needs the confirmation code. Details and caveats: [docs/tiers.md](tiers.md#settings-manager).
 
 ## Environment files
 
@@ -118,15 +122,41 @@ safe-ai-skill registry list|verify
 
 ### What `add` does
 
-- **A local directory** (`./x`, `../x`, `/x`, `~/x`) given to `add skill` or `add repo` is graded by the same rule engine as the SessionStart sweep, at your tier, plus the provenance of its source. `add mcp` does not scan a directory.
-- **A URL or package name** gets a provenance check only. The content is not fetched, scanned or pinned, and nothing is resolved or hashed. The check reads the source string:
-  - A GitHub source passes only when it names a full 40-hex commit (`…/commit/<sha>`, `#<sha>` or `tree/<sha>`). Any other ref, the default branch included, is a MEDIUM `unpinned_ref` finding, and the add is held (`warn_hold`) until you pass `--yes`.
-  - An npm source passes only when it names an exact version (`pkg@x.y.z`). `pkg`, `pkg@latest` or a range is a MEDIUM `unpinned_version` finding, held until `--yes`. A name within edit distance 2 of a popular package is a HIGH `typosquat` finding, which blocks, and `--yes` and `--force` do not override it for a remote source.
-  - **Any other source passes with no finding:** a URL that isn't GitHub (GitLab, a tarball URL, a remote MCP endpoint) or the `owner/repo` shorthand gets no provenance check at all.
-  - The `run` command it prints is your original source, unpinned.
-- **An npm source with an exact version** is also looked up on osv.dev, unless `--offline`. This is the only network step, and it is skipped for an unpinned version. A known advisory is graded by its severity (a numeric CVSS score of 7 or more, or a HIGH or CRITICAL label, is HIGH and blocks; 4 to 7 or MODERATE is MEDIUM and is held until `--yes`; below 4 is LOW; an advisory with no severity counts as HIGH). **The lookup fails open:** when osv.dev is unreachable or times out (4 s), `add` records a LOW `osv_unavailable` finding and still returns `pass` with `proceed: true`. Rerun it when osv.dev is reachable if you need the CVE check.
-- **A catalog entry** in the high-risk classes (`wallet_signing`, `key_custody`, `installer_script`) is held until you pass `--yes` (the three shipped classes all `ask`; a repo cannot change catalog classes, so no shipped path reaches `high_risk_deny`), and the verify pipeline does not run until then.
-- `add` never runs the install and never writes `.mcp.json`. When the result is `pass` (or you passed the flag that lets a held result through), it prints the install command in the `"run"` field for you to run: `npx skills add <source>`, `claude mcp add <source>` or `git clone <source>`.
+`add` checks a source before you install it and prints the command that installs it, for you to run. It never runs that command, never writes `.mcp.json` and writes no pin or lockfile entry: `install` and `verify approve` are what pin packs.
+
+**Arguments.** The kind and the source are the first two arguments that are not flags; `--yes`, `--force` and `--offline` may come anywhere. A missing kind or source, a kind other than `skill`, `mcp` or `repo`, an unknown flag, an extra argument and a source that starts with `-` are usage errors: the problem and the usage line go to stderr, the JSON has `"status": "error"`, and `add` exits 3. A local path that is not a directory is an error with exit 1 (`no such local directory`, or `not a directory` for a file), for every kind.
+
+**What kind of source it is.** The JSON's `source_kind` is one of:
+
+| `source_kind` | Sources |
+|---|---|
+| `local` | `.`, `..`, `~`, `~/x`, `./x`, `../x`, an absolute path, a Windows drive or UNC path, and any other name that is a directory here |
+| `github` | A URL whose host is exactly `github.com` or `www.github.com` (`https`, `http`, `git+https`, `git://`, `ssh://`, `git+ssh`, a schemeless `github.com/o/r` or `git@github.com:o/r`), with an optional `/tree/<ref>[/<path>]`, `/commit/<sha>` or `#<ref>`; the shorthand `owner/repo[/<path>]` or `github:owner/repo`, with `#<ref>`, or with `@<ref>` when the ref is a version tag (`v1.2.0`) or a full commit SHA. Any other `@<name>` names a skill in the repository, as in the skills CLI |
+| `npm` | A valid package name, optionally scoped (`@scope/pkg`), prefixed `npm:` or given as an `npmjs.com/package/…` URL, with an optional `@<version>` |
+| `other` | Anything else: a URL on another host (GitLab, a tarball, a remote MCP server), including one that only mentions `github.com` in its path or host name |
+
+**What it checks.**
+
+- **A local directory**, for every kind (`add mcp` included), is graded by the same rule engine as the SessionStart sweep, at your tier (see [Install grading](#install-grading---yes-and---force)).
+- **A GitHub source** passes when it names a full 40-hex commit. Any other ref, the default branch included, is a MEDIUM `unpinned_ref` finding. `add` then asks the GitHub API (`api.github.com`, unauthenticated, so GitHub allows about 60 lookups an hour) for the commit the ref names now. When the printed command can carry that commit, the finding drops to LOW and the add passes. It stays MEDIUM, and the add is held (`warn_hold`) until you pass `--yes`, when no command can carry it (`add mcp`), when the lookup fails or is rate-limited, and under `--offline`.
+- **An npm source** passes when it names an exact `major.minor.patch` version (`pkg@1.2.3`; `pkg@1` and `pkg@1.2` are not exact). No version or a dist-tag (`latest`, `next`) is a MEDIUM `unpinned_version` finding, and `add` asks the npm registry for the exact version it serves now; the finding drops to LOW when the command can carry that version (`add mcp`). A range (`^1.0.0`, `1.x`) is not resolved: it stays MEDIUM and gets no CVE lookup. A name within edit distance 2 of a popular package is a HIGH `typosquat` finding, which blocks; `--yes` and `--force` do not override it.
+- **The exact npm version**, the one you named or the one the registry resolved, is looked up on osv.dev, and that is the version `run` installs. A known advisory is graded by its severity (a numeric CVSS score of 7 or more, or a HIGH or CRITICAL label, is HIGH and blocks; 4 to 7 or MODERATE is MEDIUM and is held until `--yes`; below 4 is LOW; an advisory with no severity counts as HIGH). When osv.dev cannot answer (an HTTP error, unreachable or timed out after 4 s, a reply it cannot read), `add` records a MEDIUM `osv_unavailable` finding and holds until `--yes`.
+- **Any other source** is a MEDIUM `unrecognised_source` finding, held until `--yes`: nothing about it was checked. A remote `http(s)` MCP server gets its own message, since its code runs on someone else's machine.
+- **A catalog entry** in the high-risk classes (`wallet_signing`, `key_custody`, `installer_script`) is held until you pass `--yes` (the three shipped classes all `ask`; a repo cannot change catalog classes, so no shipped path reaches `high_risk_deny`), and none of the checks above run until then.
+
+`--offline` turns off every network step: the GitHub and npm lookups and osv.dev. A full commit or an exact npm version still passes (npm with a LOW `osv_skipped` finding); a moving source stays held.
+
+**The install command.** When the add proceeds, `"run"` holds the command; `"pin"` is the commit or version it installs (null when there is none), and `"run_note"` says why `run` is null, or that the command is not pinned. Parts that come from your source are single-quoted when the shell would read them specially.
+
+| Kind | GitHub | npm | Local directory | Other |
+|---|---|---|---|---|
+| `skill` | `npx skills add o/r@<sha>`; a sub-directory as `npx skills add https://github.com/o/r/tree/<sha>/<path>`; `--skill <name>` kept | none: the skills CLI does not install npm packages | `npx skills add ./<path>` | `npx skills add <source>` |
+| `mcp` | none: clone it, then `claude mcp add <name> -- <the command that starts it>` | `claude mcp add <name> -- npx -y <pkg>@<version>` | none, for the same reason | `claude mcp add --transport http <name> <url>` for an `http(s)` URL; otherwise none |
+| `repo` | `git clone <url> <repo> && git -C <repo> checkout --detach <sha>` | none | `git clone <path>` | `git clone <source>` |
+
+The server `<name>` is the package name without its scope, or the URL's host without `www.` and with dots turned into dashes.
+
+A GitHub or npm source that could not be pinned, taken with `--yes`, prints your source as given (for example `npx skills add o/r`, `git clone --branch main https://github.com/o/r.git` or `claude mcp add <name> -- npx -y <pkg>`), with a `run_note` saying it installs whatever the source points to when you run it.
 
 The `status` field of the result is `pass`, `warn_hold`, `warn_proceed`, `blocked`, `force_proceed`, `high_risk_ask` or `high_risk_deny`.
 
@@ -146,7 +176,7 @@ The `status` field of the result is `pass`, `warn_hold`, `warn_proceed`, `blocke
 
 ### `registry`
 
-`registry list` shows the project's `skill-registry.json` catalog (path from `catalog.registry_path`) with risk classes flagged. `registry verify` audits installed entries against it. A missing registry file is an empty catalog.
+`registry list` (or `registry` alone) shows the project's `skill-registry.json` catalog (path from `catalog.registry_path`) with risk classes flagged. `registry verify` audits installed entries against it. A missing registry file is an empty catalog.
 
 ## Health checks and adapters
 
