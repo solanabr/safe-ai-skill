@@ -122,9 +122,10 @@ fn server_is(seg: &str, name: &str) -> bool {
 /// immediately — this is the overwhelming majority of MCP calls (reads).
 ///
 /// Sensitive path: when the name matches OR the payload carries an amount + destination
-/// signal, the call is classified (Transfer / Swap / Other), the SOL amount is parsed
-/// where derivable (lamports are divided by 1e9), and the program / destination / mint
-/// are recorded in [`GateMeta`]. The decision is [`Decision::Ask`]; value-moving MCP
+/// signal, the call is classified (Authority / Destructive / Transfer / Swap / Other), the SOL
+/// amount is parsed where derivable (lamports are divided by 1e9), and the program /
+/// destination / mint are recorded in [`GateMeta`]. Authority and destructive calls, token
+/// transfers and staking are hard guards. The decision is [`Decision::Ask`]; value-moving MCP
 /// calls are never hard-allowed here. Swap routing (rugcheck) is owned by the relaxation
 /// path — this gate only classifies `Scope::Swap` and records the mint so `main.rs` can
 /// route it.
@@ -163,7 +164,7 @@ pub fn decide(
         .map(|a| without_read_prefix(name_tokens(a)))
         .unwrap_or_default();
     let mut class_tokens = name_tokens(tool_name);
-    class_tokens.extend(action_tokens);
+    class_tokens.extend(action_tokens.iter().cloned());
     let wallet_ctx = is_wallet_context(&class_tokens);
 
     let name_sensitive = tokens_match_sensitive(
@@ -175,28 +176,48 @@ pub fn decide(
     // Staking verbs gate even when a user-trimmed pattern lacks them.
     let staking = is_staking(&class_tokens);
 
-    // Fast path: no sensitive verb, no staking verb, and no value-moving payload signal.
-    if !name_sensitive && !staking && signal.is_none() {
+    // An authority or destructive verb in the tool segment or the action is a hard guard
+    // whatever transfer verb sits beside it (`transferMintAuthority`, `burnAndSend`). The
+    // server segment names the server, not the action, so `mcp__burn-tracker__sendSol` is a
+    // SOL send. On a wallet surface such a verb gates even when the sensitive pattern lacks it
+    // (`freezeAccount`, `approve`), unless it follows a read verb (`getFreezeStatus`).
+    let tool_tokens = name_tokens(short_name(tool_name));
+    let call_tokens: Vec<String> = tool_tokens.iter().chain(&action_tokens).cloned().collect();
+    let guard = guarded_scope(&call_tokens);
+    let guard_gates = wallet_ctx && guard.is_some() && {
+        let mut unread = without_read_prefix(tool_tokens);
+        unread.extend(action_tokens);
+        guarded_scope(&unread).is_some()
+    };
+
+    // Fast path: no sensitive verb, no staking or guarded verb, and no value-moving payload
+    // signal.
+    if !name_sensitive && !staking && !guard_gates && signal.is_none() {
         return (Decision::Defer, GateMeta::unknown());
     }
 
-    // A token transfer moves value in TOKEN units, never SOL: no SOL grant or cap covers it
-    // (D3), so it is never relaxed and carries no SOL amount.
-    let token_units = is_token_transfer(&class_tokens);
     // Staking / delegation has no destination but still moves value out of liquid control; its
     // scope stays `Other`, with a stake-specific reason.
-    let scope = if staking {
-        Scope::Other
-    } else {
-        classify_scope(&class_tokens)
+    let scope = match guard {
+        Some(guarded) => guarded,
+        None if staking => Scope::Other,
+        None => classify_scope(&class_tokens),
     };
+    // A token transfer moves value in TOKEN units, never SOL: no SOL grant or cap covers it
+    // (D3), so it is never relaxed and carries no SOL amount. A transfer whose tool or action
+    // names a token (`transferSpl`), or whose payload names a mint (the wSOL mint too: an SPL
+    // transfer of wrapped SOL is still a token transfer) or a token amount, is one whatever
+    // its tool is called.
+    let token_units = is_token_transfer(&class_tokens)
+        || (scope == Scope::Transfer
+            && (has_token_word(&call_tokens) || payload.is_some_and(carries_token)));
 
     let mut meta = GateMeta::new(scope, false);
     let dest = signal.as_ref().and_then(|s| s.destination.clone());
     let mint = signal.as_ref().and_then(|s| s.mint.clone());
-    // A SOL transfer's amount is grantable; a token transfer's is not (token units), so it is
-    // dropped so no SOL grant can be matched against it.
-    let amount = if token_units {
+    // A SOL transfer's amount is grantable; a token transfer's is not (token units), nor is an
+    // authority or destructive call's, so it is dropped so no SOL grant can be matched to it.
+    let amount = if token_units || guard.is_some() {
         None
     } else {
         signal.as_ref().and_then(|s| s.amount_sol)
@@ -204,10 +225,12 @@ pub fn decide(
 
     meta.amount_sol = amount;
     meta.destination = dest.clone();
-    // Never relaxable: staking/delegation and token transfers (D3), and any value-moving call
-    // whose SOL amount cannot be read (an unknown field, `transfer_all`, a non-numeric value)
-    // or is given twice with different values at different nesting levels.
-    if staking
+    // Never relaxable: authority changes, approvals, freezes, closes and burns; staking and
+    // delegation; token transfers (D3); and any value-moving call whose SOL amount cannot be
+    // read (an unknown field, `transfer_all`, a non-numeric value) or is given twice with
+    // different values at different nesting levels.
+    if guard.is_some()
+        || staking
         || token_units
         || signal.as_ref().is_some_and(|s| s.ambiguous)
         || (amount.is_none() && matches!(scope, Scope::Transfer | Scope::Swap))
@@ -218,6 +241,14 @@ pub fn decide(
     let short_tool = action.as_deref().unwrap_or_else(|| short_name(tool_name));
 
     let reason = match scope {
+        Scope::Authority => format!(
+            "MCP authority action: {short_tool} (an authority or ownership change, approval, \
+             revocation or freeze; a hard guard, so no grant relaxes it) — approve to proceed"
+        ),
+        Scope::Destructive => format!(
+            "MCP destructive action: {short_tool} (a close or burn; a hard guard, so no grant \
+             relaxes it) — approve to proceed"
+        ),
         Scope::Swap => {
             // Record the mint so main can route to the rugcheck/relaxation swap path.
             if let Some(m) = mint.clone() {
@@ -578,20 +609,102 @@ fn classify_scope(tokens: &[String]) -> Scope {
 }
 
 /// Whether the tokens indicate a staking / delegation action (no destination, but still
-/// value-moving): `stake`, `unstake`, `delegate`, `deactivate`.
+/// value-moving): `stake`, `unstake`, `delegate`, `undelegate`, `deactivate`.
 fn is_staking(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "stake" | "unstake" | "delegate" | "undelegate" | "deactivate"
+        )
+    })
+}
+
+/// Stems that mark an authority or ownership change wherever they appear in a token, so a
+/// run-together spelling (`TRANSFER_SETAUTHORITY`, `transferownership`) still counts. Each is
+/// specific: `authoritative` and `authorization` contain none of them.
+const AUTHORITY_STEMS: &[&str] = &[
+    "authority",
+    "authorities",
+    "authorize",
+    "authorise",
+    "ownership",
+];
+
+/// Verbs that use or hand out an authority: approving or revoking a delegate, freezing or
+/// thawing an account.
+const AUTHORITY_VERBS: &[&str] = &["approve", "revoke", "freeze", "unfreeze", "thaw"];
+
+/// Verbs that destroy an account or tokens.
+const DESTRUCTIVE_VERBS: &[&str] = &["close", "burn"];
+
+/// What a guarded verb may be run together with and still count (`closeaccount`, `burnall`).
+/// Any other tail is another word: `closeout`, `closed`, `approved`, `burner`, `thawed`.
+const GUARD_OBJECTS: &[&str] = &["", "account", "accounts", "all", "mint", "token", "tokens"];
+
+/// The hard-guard scope of an MCP call whose tool-name / action tokens carry an authority
+/// verb ([`AUTHORITY_STEMS`], [`AUTHORITY_VERBS`]) or a destructive one
+/// ([`DESTRUCTIVE_VERBS`]), or `None`. A verb matches as a whole token or run together with a
+/// [`GUARD_OBJECTS`] word.
+fn guarded_scope(tokens: &[String]) -> Option<Scope> {
+    let verb_in = |verbs: &[&str]| {
+        tokens.iter().any(|t| {
+            verbs.iter().any(|v| {
+                t.strip_prefix(v)
+                    .is_some_and(|rest| GUARD_OBJECTS.contains(&rest))
+            })
+        })
+    };
+    if verb_in(DESTRUCTIVE_VERBS) {
+        Some(Scope::Destructive)
+    } else if verb_in(AUTHORITY_VERBS)
+        || tokens
+            .iter()
+            .any(|t| AUTHORITY_STEMS.iter().any(|s| t.contains(s)))
+    {
+        Some(Scope::Authority)
+    } else {
+        None
+    }
+}
+
+/// Whether the tokens name a token rather than SOL: `token`, `tokens`, `spl`, `nft`, `nfts`.
+fn has_token_word(tokens: &[String]) -> bool {
     tokens
         .iter()
-        .any(|t| matches!(t.as_str(), "stake" | "unstake" | "delegate" | "deactivate"))
+        .any(|t| matches!(t.as_str(), "token" | "tokens" | "spl" | "nft" | "nfts"))
 }
 
 /// Whether the tokens indicate a TOKEN (SPL) transfer: a `token` token alongside a
-/// transfer/send verb (`transferToken`, `sendToken`). Token amounts are not SOL (D3).
+/// transfer/send verb (`transferToken`, `sendToken`), whatever else the call is (a swap too).
+/// Token amounts are not SOL (D3).
 fn is_token_transfer(tokens: &[String]) -> bool {
     tokens.iter().any(|t| t == "token")
         && tokens
             .iter()
             .any(|t| matches!(t.as_str(), "transfer" | "send"))
+}
+
+/// Payload keys that make a transfer an SPL token transfer: a mint, or an amount or decimals
+/// in token units.
+const TOKEN_KEYS: &[&str] = &[
+    "mint",
+    "mintAddress",
+    "mint_address",
+    "tokenMint",
+    "token_mint",
+    "tokenAddress",
+    "token_address",
+    "inputMint",
+    "outputMint",
+    "tokenAmount",
+    "token_amount",
+    "decimals",
+];
+
+/// Whether the payload (or a nested [`NEST_KEYS`] object) carries a [`TOKEN_KEYS`] key with a
+/// value.
+fn carries_token(payload: &Value) -> bool {
+    find_all(payload, TOKEN_KEYS).iter().any(|v| !v.is_null())
 }
 
 /// An action's tokens with a leading read clause removed: `getStakeAccounts` and
@@ -976,6 +1089,173 @@ mod tests {
         assert_eq!(m.scope, Scope::Transfer);
         assert!(m.hard_guard, "token transfer is never grant-covered (D3)");
         assert_eq!(m.amount_sol, None, "token units are not SOL");
+    }
+
+    const TO: &str = "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin";
+
+    fn decide_with(tool: &str, payload: Value) -> (Decision, GateMeta) {
+        decide(tool, Some(&payload), &ctx(), &Policy::default())
+    }
+
+    #[test]
+    fn guarded_verbs_match_whole_words_and_their_object_compounds_only() {
+        let scope = |name: &str| guarded_scope(&name_tokens(name));
+        for name in [
+            "setAuthority",
+            "transferMintAuthority",
+            "TRANSFER_SETAUTHORITY",
+            "authorize",
+            "transferOwnership",
+            "approveAndTransfer",
+            "revoke-and-send",
+            "freezeAccount",
+            "unfreeze",
+            "thaw_then_send",
+        ] {
+            assert_eq!(scope(name), Some(Scope::Authority), "{name}");
+        }
+        for name in [
+            "closeAccountAndWithdraw",
+            "transfer_closeaccount",
+            "CLOSE_EMPTY_TOKEN_ACCOUNTS",
+            "burnAndSend",
+            "burnall",
+        ] {
+            assert_eq!(scope(name), Some(Scope::Destructive), "{name}");
+        }
+        // Other words that start with or contain a guarded one.
+        for name in [
+            "sendCloseoutPayment",
+            "closest",
+            "listClosed",
+            "enclosed",
+            "transferApproved",
+            "burnerWallet",
+            "antifreeze",
+            "thawed",
+            "authoritative",
+            "authorization",
+            "transferSol",
+        ] {
+            assert_eq!(scope(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_authority_or_destructive_verb_beside_a_transfer_verb_is_a_hard_guard() {
+        for (tool, payload, scope) in [
+            (
+                "mcp__tokenkit__transferMintAuthority",
+                json!({ "newAuthority": TO, "mint": TO, "amount": 0.01 }),
+                Scope::Authority,
+            ),
+            (
+                "mcp__tokenkit__closeAccountAndWithdraw",
+                json!({ "destination": TO, "amount": 0.01 }),
+                Scope::Destructive,
+            ),
+            (
+                "mcp__tokenkit__burnAndSend",
+                json!({ "to": TO, "amount": 0.01 }),
+                Scope::Destructive,
+            ),
+            (
+                "mcp__helius__heliusWrite",
+                json!({ "action": "transferMintAuthority", "to": TO, "amount": 0.01 }),
+                Scope::Authority,
+            ),
+        ] {
+            let (d, m) = decide_with(tool, payload);
+            assert!(matches!(d, Decision::Ask { .. }), "{tool}: {d:?}");
+            assert_eq!(m.scope, scope, "{tool}");
+            assert!(m.hard_guard, "{tool}: no grant may cover it");
+            assert_eq!(m.amount_sol, None, "{tool}");
+            assert!(d.reason().contains("hard guard"), "{}", d.reason());
+        }
+    }
+
+    #[test]
+    fn a_guarded_word_in_the_server_segment_does_not_guard_a_sol_send() {
+        let (d, m) = decide_with(
+            "mcp__burn-tracker__sendSol",
+            json!({ "to": TO, "amount": 0.01 }),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert_eq!(m.scope, Scope::Transfer);
+        assert!(!m.hard_guard);
+        assert_eq!(m.amount_sol, Some(0.01));
+    }
+
+    #[test]
+    fn a_transfer_naming_a_mint_or_token_amount_is_a_token_transfer() {
+        let usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let wsol = "So11111111111111111111111111111111111111112";
+        for (tool, payload) in [
+            (
+                "mcp__w__transfer",
+                json!({ "to": TO, "amount": 0.9, "mint": usdc }),
+            ),
+            (
+                "mcp__w__transfer",
+                json!({ "to": TO, "amount": 0.9, "mint": wsol }),
+            ),
+            (
+                "mcp__w__send",
+                json!({ "args": { "to": TO, "amount": 0.5, "tokenMint": usdc } }),
+            ),
+            (
+                "mcp__w__transfer",
+                json!({ "to": TO, "amount": 0.5, "tokenAmount": 500 }),
+            ),
+            ("mcp__w__transferSpl", json!({ "to": TO, "amount": 0.5 })),
+        ] {
+            let (d, m) = decide_with(tool, payload.clone());
+            assert!(matches!(d, Decision::Ask { .. }), "{tool} {payload}: {d:?}");
+            assert_eq!(m.scope, Scope::Transfer);
+            assert!(m.hard_guard, "{tool} {payload}");
+            assert_eq!(
+                m.amount_sol, None,
+                "{tool} {payload}: token units are not SOL"
+            );
+        }
+        // A swap still carries its mint into the swap path.
+        let (_, m) = decide_with("mcp__jupiter__swap", json!({ "amount": 5, "mint": usdc }));
+        assert_eq!(m.scope, Scope::Swap);
+        assert!(!m.hard_guard);
+    }
+
+    #[test]
+    fn a_guarded_verb_gates_on_a_wallet_surface_unless_it_is_read() {
+        for tool in [
+            "mcp__solana__freezeAccount",
+            "mcp__solana__approve",
+            "mcp__solana__revokeDelegate",
+            "mcp__wallet__setOwnership",
+        ] {
+            let (d, m) = decide(tool, None, &ctx(), &Policy::default());
+            assert!(matches!(d, Decision::Ask { .. }), "{tool}: {d:?}");
+            assert_eq!(m.scope, Scope::Authority, "{tool}");
+            assert!(m.hard_guard, "{tool}");
+        }
+        for tool in [
+            "mcp__solana__getFreezeStatus",
+            "mcp__github__approvePullRequest",
+            "mcp__oauth__revokeSession",
+        ] {
+            let (d, _) = decide(tool, None, &ctx(), &Policy::default());
+            assert_eq!(d, Decision::Defer, "{tool}");
+        }
+    }
+
+    #[test]
+    fn undelegate_with_a_transfer_verb_is_staking() {
+        let (d, m) = decide_with(
+            "mcp__w__undelegateAndWithdraw",
+            json!({ "to": TO, "amount": 0.01 }),
+        );
+        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
+        assert!(m.hard_guard);
+        assert!(d.reason().contains("staking"), "{}", d.reason());
     }
 
     #[test]
