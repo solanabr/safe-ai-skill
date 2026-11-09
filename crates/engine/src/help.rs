@@ -67,8 +67,8 @@ const ALLOW: &str = "usage:
                       [--programs <addr,addr>] [--to <addr,addr>] [--danger]
 
 Requests a time-boxed grant. Nothing takes effect until you confirm it.
-  --scope     transfer, swap, deploy, authority or destructive (authority and destructive
-              grants relax nothing: those verdicts are hard guards)
+  --scope     transfer, swap or deploy (authority changes, destructive actions and secret
+              reads are hard guards: no grant can relax them)
   --for       a duration such as 30m, 2h or 1d; at most 30 days
   --max-tx    per-transaction SOL limit (default 0)
   --budget    total SOL limit (default 0); give both for a transfer or swap grant
@@ -127,11 +127,13 @@ pack dir; both record a pending request that you confirm. Output is JSON.
 const ADD: &str = "usage: safe-ai-skill add skill|mcp|repo <source> [--yes] [--force] [--offline]
 
 Checks a source before you install it and prints the install command in the \"run\" field; it
-never installs anything or writes .mcp.json. A local directory given to `add skill` or
-`add repo` is graded like the session sweep, at your tier. A URL or package name gets a
-provenance check only: a GitHub ref that is not a full commit, or an npm version that is not
-exact, is held until --yes; an exact npm version is looked up on osv.dev unless --offline.
---force implies --yes and also takes a local pack the tier denies. Output is JSON.
+never installs anything or writes .mcp.json. A local directory is graded like the session
+sweep, at your tier, for every kind. A GitHub repo or npm package gets a provenance check
+only: online, a moving ref or version is resolved to the exact commit or version, which is
+what gets graded (npm: looked up on osv.dev) and what \"run\" installs. The add is held until
+--yes when it can't be pinned, when osv.dev can't answer, or when the source is not a GitHub
+repo, an npm package or a local directory. --offline skips every lookup. --force implies --yes
+and also takes a local pack the tier denies. Output is JSON.
 ";
 
 const INSTALL: &str =
