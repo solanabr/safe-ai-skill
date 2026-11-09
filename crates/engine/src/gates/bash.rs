@@ -1281,7 +1281,9 @@ fn classify_spl_token(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision
             "authority removal (--disable)",
         ),
         "authorize" | "approve" => authority_decision("spl-token", &sub, ctx, argv),
-        "burn" => destructive_decision("spl-token", ctx, false),
+        // `burn` is Class U, decided before this (shared list); a hard guard here too in case
+        // the list row goes.
+        "burn" => irreversible_decision("spl-token", ctx, argv, Scope::Destructive, "token burn"),
         "close" => irreversible_decision(
             "spl-token",
             ctx,
@@ -2010,6 +2012,25 @@ mod tests {
         let ctx = ctx_with(Network::Mainnet, "burn_main");
         let (d, _) = decide(&format!("spl-token burn {DEST} 100"), &ctx, &policy());
         assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn spl_burn_is_a_hard_guard_without_its_list_row() {
+        // The classifier behind the shared list: should the `spl-token burn` row go, a burn is
+        // still an ask no grant relaxes, on every cluster.
+        let parsed = shell::parse(&format!("spl-token burn {DEST} 100"));
+        let argv = Argv::from_shell(&parsed.commands[0].words);
+        for network in [Network::Devnet, Network::Mainnet, Network::Unknown] {
+            let ctx = ctx_with(network, "burn_fallback");
+            let (d, meta) = classify("spl-token", &argv, &ctx, &policy());
+            assert!(
+                d.reason().starts_with("Irreversible ") && d.reason().contains("token burn"),
+                "{network:?}: {d:?}"
+            );
+            assert!(matches!(d, Decision::Ask { .. }), "{network:?}: {d:?}");
+            assert!(meta.hard_guard, "{network:?}");
+            assert_eq!(meta.scope, Scope::Destructive);
+        }
     }
 
     #[test]
