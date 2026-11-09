@@ -182,14 +182,15 @@ pub fn decide(
     // whatever transfer verb sits beside it (`transferMintAuthority`, `burnAndSend`). The
     // server segment names the server, not the action, so `mcp__burn-tracker__sendSol` is a
     // SOL send. On a wallet surface such a verb gates even when the sensitive pattern lacks it
-    // (`freezeAccount`, `approve`), unless it follows a read verb (`getFreezeStatus`).
+    // (`freezeAccount`, `approve`), unless it follows a read verb (`getFreezeStatus`) or acts
+    // on something that is no Solana object (`approveFinding`, `revokeCertificate`).
     let tool_tokens = name_tokens(short_name(tool_name));
     let call_tokens: Vec<String> = tool_tokens.iter().chain(&action_tokens).cloned().collect();
     let guard = guarded_scope(&call_tokens, true);
     let guard_gates = wallet_ctx && guard.is_some() && {
         let mut unread = without_read_prefix(tool_tokens);
         unread.extend(action_tokens);
-        guarded_scope(&unread, false).is_some()
+        guarded_scope(&unread, false).is_some() && on_solana_objects(&unread)
     };
 
     // Fast path: no sensitive verb, no staking or guarded verb, and no value-moving payload
@@ -221,7 +222,11 @@ pub fn decide(
     let token_units = is_token_transfer(&class_tokens)
         || (scope == Scope::Transfer
             && (has_token_word(&call_tokens)
-                || (has_token_word(&server_tokens) && !names_sol(&call_tokens))
+                || ((has_token_word(&server_tokens)
+                    || server_tokens
+                        .iter()
+                        .any(|t| OTHER_CHAINS.contains(&t.as_str())))
+                    && !names_sol(&call_tokens))
                 || kinds.token));
 
     let mut meta = GateMeta::new(scope, false);
@@ -245,6 +250,7 @@ pub fn decide(
         || staking
         || token_units
         || kinds.opaque
+        || kinds.send_all
         || signal.as_ref().is_some_and(|s| s.ambiguous)
         || (amount.is_none() && matches!(scope, Scope::Transfer | Scope::Swap))
     {
@@ -323,8 +329,8 @@ struct PayloadSignal {
     destination: Option<String>,
     mint: Option<String>,
     /// Which amount the server uses is unknown: two differ (under different keys, or at the
-    /// top level and in `args`), one has unknown units, or a send-everything flag is set. No
-    /// grant covers it.
+    /// top level and in `args`), one is not a number, or one has unknown units. No grant
+    /// covers it.
     ambiguous: bool,
 }
 
@@ -348,10 +354,18 @@ const MAX_NESTED_JSON: usize = 64 * 1024;
 /// (or a mint) are present — the signature of a transfer-style call. Only `sol`/`amountSol`/
 /// `solAmount`, `lamports` (÷1e9) and a bare `amount` yield a SOL amount; `inputAmount`,
 /// `tokenAmount` and `value` count as an amount of unknown units. The amount is ambiguous
-/// ([`PayloadSignal::ambiguous`]) when those disagree or a [`SEND_ALL_KEYS`] flag is set.
+/// ([`PayloadSignal::ambiguous`]) when those disagree or one is not a number.
 fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
     let sol = find_all(payload, &["sol", "amountSol", "solAmount"]);
-    let lamports = find_all(payload, &["lamports"]);
+    let lamports = find_all(
+        payload,
+        &[
+            "lamports",
+            "amountLamports",
+            "lamportsAmount",
+            "amountInLamports",
+        ],
+    );
     let bare = find_all(payload, &["amount"]);
     let unknown_units = find_all(payload, &["tokenAmount", "inputAmount", "value"]);
     let has_amount =
@@ -371,10 +385,12 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
         .chain(bare.iter().filter_map(number))
         .collect();
     let amount_sol = values.iter().copied().reduce(f64::max);
-    // So does an amount of unknown units beside a SOL one, or a send-everything flag.
+    // So does an amount key that is not a number (`"amount": "max"` beside a decoy `sol`), or
+    // an amount of unknown units beside a SOL one.
+    let unreadable = values.len() != sol.len() + lamports.len() + bare.len();
     let ambiguous = values.windows(2).any(|w| w[0] != w[1])
-        || (amount_sol.is_some() && !unknown_units.is_empty())
-        || find_all(payload, SEND_ALL_KEYS).iter().any(truthy);
+        || unreadable
+        || (amount_sol.is_some() && !unknown_units.is_empty());
 
     let destination = find_all(
         payload,
@@ -404,17 +420,6 @@ fn payload_signal(payload: &Value) -> Option<PayloadSignal> {
         None
     }
 }
-
-/// Flags that make a transfer send the whole balance whatever its amount says.
-const SEND_ALL_KEYS: &[&str] = &[
-    "sendMax",
-    "sendAll",
-    "transferAll",
-    "withdrawAll",
-    "useMax",
-    "max",
-    "all",
-];
 
 /// Whether a flag value is set: `true`, a non-zero number, or a string other than
 /// `false`/`0`/`no`/empty.
@@ -522,7 +527,7 @@ fn fold(s: &str) -> String {
             'с' | 'ϲ' => 'c',
             'е' | 'ε' => 'e',
             'һ' | 'н' => 'h',
-            'і' | 'ι' => 'i',
+            'і' | 'ι' | 'ı' => 'i',
             'ј' => 'j',
             'к' | 'κ' => 'k',
             'м' => 'm',
@@ -711,7 +716,13 @@ const AUTHORITY_VERBS: &[&str] = &[
 /// the holders a set/change/transfer verb hands over (`transferOwner`, `setAdmin`): on a call
 /// already gated they make it a hard guard (`transferMintAuth`, `transferAndAssign`).
 const WEAK_AUTHORITY_VERBS: &[&str] = &["auth", "assign"];
-const HOLDERS: &[&str] = &["owner", "owners", "admin", "admins", "manager"];
+const HOLDERS: &[&str] = &[
+    "owner", "owners", "admin", "admins", "manager", "control", "role", "roles",
+];
+
+/// A destructive word too common elsewhere to gate a call by itself: reclaiming rent closes
+/// accounts (`reclaimRentAndWithdraw`).
+const WEAK_DESTRUCTIVE_VERBS: &[&str] = &["reclaim"];
 const HANDOVER_VERBS: &[&str] = &["set", "change", "update", "transfer", "assign"];
 
 /// Verbs that destroy an account or tokens.
@@ -747,7 +758,7 @@ fn guarded_scope(tokens: &[String], weak: bool) -> Option<Scope> {
             .windows(2)
             .any(|w| HANDOVER_VERBS.contains(&w[0].as_str()) && HOLDERS.contains(&w[1].as_str()))
     };
-    if verb_in(DESTRUCTIVE_VERBS) {
+    if verb_in(DESTRUCTIVE_VERBS) || (weak && verb_in(WEAK_DESTRUCTIVE_VERBS)) {
         Some(Scope::Destructive)
     } else if verb_in(AUTHORITY_VERBS)
         || tokens
@@ -766,13 +777,117 @@ fn guarded_scope(tokens: &[String], weak: bool) -> Option<Scope> {
 /// Words that name a token or another chain's asset rather than SOL (`transferSpl`,
 /// `transferChecked`, `sendUsdc`, `send_ETH`).
 const TOKEN_WORDS: &[&str] = &[
-    "token", "tokens", "spl", "nft", "nfts", "cnft", "cnfts", "asset", "assets", "mint", "checked",
-    "withheld", "usdc", "usdt", "pyusd", "eth", "ether", "weth", "btc", "wbtc", "erc20",
+    "token",
+    "tokens",
+    "spltoken",
+    "spltokens",
+    "spl",
+    "nft",
+    "nfts",
+    "cnft",
+    "cnfts",
+    "asset",
+    "assets",
+    "mint",
+    "checked",
+    "withheld",
+    "usdc",
+    "usdt",
+    "pyusd",
+    "eth",
+    "ether",
+    "weth",
+    "btc",
+    "wbtc",
+    "erc20",
+    "jito",
+    "jitosol",
+    "msol",
+    "bsol",
+    "stsol",
+    "bonk",
+    "wif",
+    "jup",
 ];
 
-/// Whether the tokens name a token rather than SOL ([`TOKEN_WORDS`]).
+/// Other chains a server may be named after (`mcp__evm__transfer_native`, `mcp__base__send`):
+/// its native coin is not SOL.
+const OTHER_CHAINS: &[&str] = &[
+    "evm",
+    "ethereum",
+    "eth",
+    "base",
+    "bitcoin",
+    "btc",
+    "polygon",
+    "arbitrum",
+    "optimism",
+    "avalanche",
+    "avax",
+    "bsc",
+    "bnb",
+    "tron",
+    "sui",
+    "aptos",
+];
+
+/// Words a guarded verb on a wallet surface may act on and still gate by itself
+/// (`freezeTokenAccount`, `revokeDelegate`, `setOwnership`).
+const SOLANA_OBJECTS: &[&str] = &[
+    "account",
+    "accounts",
+    "acct",
+    "accts",
+    "ata",
+    "atas",
+    "token",
+    "tokens",
+    "mint",
+    "mints",
+    "spl",
+    "nft",
+    "nfts",
+    "delegate",
+    "delegation",
+    "owner",
+    "authority",
+    "authorities",
+    "ownership",
+    "all",
+    "empty",
+    "stake",
+    "vote",
+    "nonce",
+    "program",
+    "buffer",
+    "set",
+    "update",
+    "change",
+    "new",
+    "and",
+    "then",
+    "or",
+    "to",
+    "from",
+    "for",
+];
+
+/// Whether every token is a guarded verb, a [`SOLANA_OBJECTS`] word or a [`WALLET_CONTEXT`]
+/// word: the call acts on Solana state, not on a finding, certificate or pass.
+fn on_solana_objects(tokens: &[String]) -> bool {
+    tokens.iter().all(|t| {
+        SOLANA_OBJECTS.contains(&t.as_str())
+            || WALLET_CONTEXT.contains(&t.as_str())
+            || guarded_scope(std::slice::from_ref(t), false).is_some()
+    })
+}
+
+/// Whether the tokens name a token rather than SOL: a [`TOKEN_WORDS`] word, or `token` run
+/// into another (`transferSPLtoken` splits as `sp`, `ltoken`).
 fn has_token_word(tokens: &[String]) -> bool {
-    tokens.iter().any(|t| TOKEN_WORDS.contains(&t.as_str()))
+    tokens
+        .iter()
+        .any(|t| TOKEN_WORDS.contains(&t.as_str()) || t.contains("token"))
 }
 
 /// Whether the tokens name SOL itself (`transferSol`, `sendLamports`).
@@ -798,11 +913,44 @@ const TOKEN_PROGRAMS: &[&str] = &[
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBkDLXV",
 ];
 
-/// Key words that name a token (`mint`, `tokenMintAddress`, `splToken`, `assetId`,
-/// `sourceTokenAccount`, `currency`): a transfer whose payload has one moves token units.
+/// Key words that name a token or another chain's asset (`mint`, `splToken`, `assetId`,
+/// `currency`, `contractAddress`): a transfer whose payload has one moves no SOL. `token` /
+/// `tokens` count too, unless the key is a credential ([`CREDENTIAL_WORDS`]).
 const TOKEN_KEY_WORDS: &[&str] = &[
-    "mint", "token", "tokens", "spl", "nft", "nfts", "cnft", "asset", "assets", "ata", "symbol",
-    "currency", "ticker", "coin",
+    "mint", "spl", "nft", "nfts", "cnft", "asset", "assets", "ata", "symbol", "currency", "ticker",
+    "coin", "contract", "erc20",
+];
+
+/// Key words that name a chain: a value other than Solana's makes a transfer another chain's.
+const CHAIN_KEY_WORDS: &[&str] = &["chain", "network", "blockchain"];
+
+/// Key words of a send-everything flag (`sendMax`, `send_max`, `useMax`, `entireBalance`).
+const SEND_ALL_WORDS: &[&str] = &["all", "max", "entire", "whole", "everything"];
+
+/// Key words that, beside a transaction word, describe a transaction rather than carry one
+/// (`txSignature`, `maxSupportedTransactionVersion`, `transactionId`).
+const TX_META_WORDS: &[&str] = &[
+    "id",
+    "ids",
+    "signature",
+    "signatures",
+    "sig",
+    "hash",
+    "fee",
+    "fees",
+    "memo",
+    "type",
+    "count",
+    "limit",
+    "priority",
+    "version",
+    "max",
+    "retries",
+    "status",
+    "url",
+    "link",
+    "history",
+    "commitment",
 ];
 
 /// Words beside `token` in a credential key (`accessToken`, `apiToken`), which names no token.
@@ -811,25 +959,19 @@ const CREDENTIAL_WORDS: &[&str] = &[
     "device",
 ];
 
-/// Keys that carry a pre-built transaction or instruction list: what it does is opaque to
-/// this gate, so no grant covers it (compared lowercased).
-const OPAQUE_KEYS: &[&str] = &[
+/// Key words of a pre-built transaction or instruction list (`transaction`,
+/// `encodedTransaction`, `base64Tx`, `txn`, `instructions`, `serialized`): what it does is
+/// opaque to this gate, so no grant covers it.
+const OPAQUE_WORDS: &[&str] = &[
     "transaction",
     "transactions",
     "tx",
     "txs",
-    "rawtransaction",
-    "serializedtransaction",
-    "signedtransaction",
-    "versionedtransaction",
-    "serializedtx",
-    "rawtx",
-    "signedtx",
-    "txbase64",
-    "base64transaction",
+    "txn",
     "instruction",
     "instructions",
     "ixs",
+    "serialized",
 ];
 
 /// Deepest payload level, and most values, [`payload_kinds`] reads; past either the payload
@@ -844,8 +986,10 @@ struct PayloadKinds {
     token: bool,
     /// A key names an authority or a new owner, admin or delegate (`newAuthority`, `newOwner`).
     authority: bool,
-    /// A pre-built transaction ([`OPAQUE_KEYS`]), or a payload too deep or large to read.
+    /// A pre-built transaction ([`OPAQUE_WORDS`]), or a payload too deep or large to read.
     opaque: bool,
+    /// A send-everything flag is set ([`SEND_ALL_WORDS`]): the amount says nothing.
+    send_all: bool,
 }
 
 /// Read every key and value of `payload`, nested objects and arrays and string-encoded JSON
@@ -903,28 +1047,59 @@ fn note_key(key: &str, val: &Value, kinds: &mut PayloadKinds) {
     if !has_value {
         return;
     }
-    if OPAQUE_KEYS.contains(&key.to_ascii_lowercase().as_str()) {
-        kinds.opaque = true;
-    }
     let words = name_tokens(key);
     let has = |set: &[&str]| words.iter().any(|w| set.contains(&w.as_str()));
-    let is_sol = val.as_str().is_some_and(|s| {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "sol" | "solana" | "native" | "lamports" | "lamport"
-        )
-    });
-    if has(TOKEN_KEY_WORDS) && !has(CREDENTIAL_WORDS) && !is_sol {
+    if has(OPAQUE_WORDS) && !has(TX_META_WORDS) {
+        kinds.opaque = true;
+    }
+    let text = val.as_str().map(|s| s.trim().to_ascii_lowercase());
+    let is_sol = text
+        .as_deref()
+        .is_some_and(|s| matches!(s, "sol" | "solana" | "native" | "lamports" | "lamport"));
+    let token_word = has(TOKEN_KEY_WORDS) || (has(&["token", "tokens"]) && !has(CREDENTIAL_WORDS));
+    if token_word && !is_sol {
         kinds.token = true;
     }
+    // A chain other than Solana (`"network": "ethereum"`, an EVM `chainId: 8453`).
+    let solana_net = text.as_deref().is_some_and(|s| {
+        s.contains("solana")
+            || matches!(
+                s,
+                "sol"
+                    | "mainnet"
+                    | "mainnet-beta"
+                    | "devnet"
+                    | "testnet"
+                    | "localnet"
+                    | "localhost"
+            )
+    });
+    if has(CHAIN_KEY_WORDS) && !solana_net {
+        kinds.token = true;
+    }
+    let send_all = has(SEND_ALL_WORDS)
+        && (words.len() == 1
+            || has(&[
+                "send", "use", "transfer", "withdraw", "drain", "pay", "is", "balance",
+            ]));
+    if send_all && truthy(val) {
+        kinds.send_all = true;
+    }
+    // A key that hands over an authority (`newAuthority`, `mintAuthority`, `newOwner`,
+    // `delegate`); a bare `authority` is the signer.
     let new_holder = words.windows(2).any(|w| {
-        w[0] == "new" && matches!(w[1].as_str(), "owner" | "admin" | "delegate" | "manager")
+        w[0] == "new"
+            && matches!(
+                w[1].as_str(),
+                "owner" | "admin" | "delegate" | "manager" | "auth"
+            )
     });
     if new_holder
-        || has(&["delegate"])
-        || words
-            .iter()
-            .any(|w| AUTHORITY_STEMS.iter().any(|s| w.contains(s)))
+        || has(&["delegate", "ownership"])
+        || (words.len() > 1
+            && words
+                .iter()
+                .any(|w| AUTHORITY_STEMS.iter().any(|s| w.contains(s))))
     {
         kinds.authority = true;
     }
@@ -969,6 +1144,8 @@ fn is_read_verb(token: &str) -> bool {
             | "view"
             | "check"
             | "inspect"
+            | "analyze"
+            | "analyse"
     )
 }
 
@@ -1524,6 +1701,134 @@ mod tests {
             "mcp__solana__viewFreezeStatus",
             "mcp__solana__checkTokenAuthorities",
             "mcp__dns__undelegateZone",
+        ] {
+            let (d, _) = decide(tool, None, &ctx(), &Policy::default());
+            assert_eq!(d, Decision::Defer, "{tool}");
+        }
+    }
+
+    #[test]
+    fn other_chains_raw_transactions_tickers_and_send_all_are_hard_guards() {
+        for (tool, payload) in [
+            (
+                "mcp__evm__transfer_native",
+                json!({ "to": TO, "amount": "0.9", "network": "ethereum" }),
+            ),
+            ("mcp__base__transfer", json!({ "to": TO, "amount": 0.9 })),
+            ("mcp__bitcoin__send", json!({ "to": TO, "amount": 0.9 })),
+            (
+                "mcp__wallet__transfer",
+                json!({ "to": TO, "amount": 0.9, "chain": "ethereum" }),
+            ),
+            (
+                "mcp__wallet__transfer",
+                json!({ "to": TO, "amount": 0.9, "chainId": 8453 }),
+            ),
+            (
+                "mcp__wallet__transfer",
+                json!({ "to": TO, "amount": 0.9, "contractAddress": TO }),
+            ),
+            (
+                "mcp__wallet__transfer",
+                json!({ "to": TO, "amount": 0.9, "apiTokenMint": TO }),
+            ),
+            (
+                "mcp__solana__sendTransaction",
+                json!({ "transactionBase64": "AQ", "to": TO, "amount": 0.01 }),
+            ),
+            (
+                "mcp__solana__sendTransaction",
+                json!({ "encodedTransaction": "AQ", "to": TO, "amount": 0.01 }),
+            ),
+            (
+                "mcp__solana__sendTransaction",
+                json!({ "txn": "AQ", "to": TO, "amount": 0.01 }),
+            ),
+            (
+                "mcp__solana__sendTransaction",
+                json!({ "serialized": "AQ", "to": TO, "amount": 0.01 }),
+            ),
+            (
+                "mcp__solana__sendRawTransaction",
+                json!({ "base64Tx": "AQ", "to": TO, "amount": 0.01 }),
+            ),
+            (
+                "mcp__w__transferJitoSOL",
+                json!({ "to": TO, "amount": 0.9 }),
+            ),
+            ("mcp__w__sendMSOL", json!({ "to": TO, "amount": 0.9 })),
+            ("mcp__w__sendBONK", json!({ "to": TO, "amount": 0.9 })),
+            (
+                "mcp__w__transferSPLtoken",
+                json!({ "to": TO, "amount": 0.9 }),
+            ),
+            (
+                "mcp__w__transferSol",
+                json!({ "to": TO, "amount": "max", "sol": 0.01 }),
+            ),
+            (
+                "mcp__w__transferSol",
+                json!({ "to": TO, "amount": 50, "amountLamports": 1 }),
+            ),
+            (
+                "mcp__w__transferSol",
+                json!({ "to": TO, "amount": 0.01, "send_max": true }),
+            ),
+            (
+                "mcp__w__transferSol",
+                json!({ "to": TO, "amount": 0.01, "entireBalance": true }),
+            ),
+            (
+                "mcp__w__transferSol",
+                json!({ "to": TO, "amount": 0.01, "options": { "sendMax": 1 } }),
+            ),
+        ] {
+            let (_, m) = decide_with(tool, payload.clone());
+            assert!(m.hard_guard, "{tool} {payload}");
+        }
+        for (tool, scope) in [
+            ("mcp__w__transferControl", Scope::Authority),
+            ("mcp__w__transferRole", Scope::Authority),
+            ("mcp__w__reclaimRentAndWithdraw", Scope::Destructive),
+        ] {
+            let (_, m) = decide_with(tool, json!({ "to": TO, "amount": 0.01 }));
+            assert_eq!(m.scope, scope, "{tool}");
+            assert!(m.hard_guard, "{tool}");
+        }
+        for payload in [
+            json!({ "action": "transferSol", "to": TO, "amount": 0.01, "newAuth": TO }),
+            json!({ "action": "transferAuthor\u{0131}ty", "to": TO, "amount": 0.01 }),
+        ] {
+            let (_, m) = decide_with("mcp__helius__heliusWrite", payload.clone());
+            assert_eq!(m.scope, Scope::Authority, "{payload}");
+        }
+        // A signer named `authority`, transaction metadata, Solana networks and an unset flag
+        // leave a SOL transfer a SOL transfer.
+        for payload in [
+            json!({ "to": TO, "amount": 0.5, "authority": TO }),
+            json!({ "to": TO, "amount": 0.5, "transactionId": "abc", "txSignature": "s" }),
+            json!({ "to": TO, "amount": 0.5, "maxSupportedTransactionVersion": 0, "maxRetries": 3 }),
+            json!({ "to": TO, "amount": 0.5, "network": "devnet", "chain": "solana" }),
+            json!({ "to": TO, "amount": 0.5, "sendMax": false }),
+        ] {
+            let (_, m) = decide_with("mcp__wallet__transferSol", payload.clone());
+            assert_eq!(m.scope, Scope::Transfer, "{payload}");
+            assert!(!m.hard_guard, "{payload}");
+            assert_eq!(m.amount_sol, Some(0.5), "{payload}");
+        }
+    }
+
+    #[test]
+    fn a_guarded_verb_on_a_non_solana_object_gates_nothing_new() {
+        for tool in [
+            "mcp__crypto__revokeCertificate",
+            "mcp__crypto__approveCsr",
+            "mcp__crypto__thawKey",
+            "mcp__google-wallet__revokePass",
+            "mcp__wallet__approveExpense",
+            "mcp__orca__approveFinding",
+            "mcp__drift__approveConversation",
+            "mcp__solana__analyzeTokenAuthorities",
         ] {
             let (d, _) = decide(tool, None, &ctx(), &Policy::default());
             assert_eq!(d, Decision::Defer, "{tool}");

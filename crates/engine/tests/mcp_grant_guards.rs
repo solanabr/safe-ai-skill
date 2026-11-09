@@ -192,6 +192,14 @@ fn guarded_calls() -> Vec<(&'static str, Value)> {
             json!({"to": DEST, "amount": 0.9}),
         ),
         ("mcp__goat__send_ETH", json!({"to": DEST, "amount": "0.9"})),
+        (
+            "mcp__evm__transfer_native",
+            json!({"to": DEST, "amount": "0.9", "network": "ethereum"}),
+        ),
+        (
+            "mcp__solana__sendTransaction",
+            json!({"encodedTransaction": "AQAB", "to": DEST, "amount": 0.01}),
+        ),
         // A transfer that hands over an authority, or carries a pre-built transaction.
         (
             "mcp__wallet__transfer",
@@ -258,6 +266,11 @@ fn sol_transfers() -> Vec<(&'static str, Value)> {
         (
             "mcp__solana__payAuthorized",
             json!({"to": DEST, "amount": 0.01}),
+        ),
+        (
+            "mcp__wallet__transferSol",
+            json!({"to": DEST, "amount": 0.01, "authority": DEST, "network": "devnet",
+                   "maxRetries": 3, "sendMax": false}),
         ),
     ]
 }
