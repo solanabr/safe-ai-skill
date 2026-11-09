@@ -5,9 +5,9 @@
 //!   never packages.
 //! * **GitHub**: a URL whose host is exactly `github.com` / `www.github.com` (`https://`,
 //!   `http://`, `git+https://`, `git://`, `ssh://`, `git@github.com:owner/repo`), or the
-//!   `owner/repo` / `github:owner/repo` shorthand with an optional `#ref` / `@ref`. A moving ref
-//!   (a branch, a tag, the default branch) is a MEDIUM "unpinned ref" finding; a 40-hex commit
-//!   SHA is immutable. Resolving a ref to its current SHA needs the GitHub API: isolated in
+//!   `owner/repo` / `github:owner/repo` shorthand with an optional `#ref` (`@skill` names a
+//!   skill, as in the skills CLI, never a ref). A moving ref (a branch, a tag, the default
+//!   branch) is a MEDIUM "unpinned ref" finding; a 40-hex commit SHA is immutable. Resolving a ref to its current SHA needs the GitHub API: isolated in
 //!   [`github_resolve_sha`].
 //! * **npm** packages (`pkg`, `@scope/pkg`, `npm:pkg`, an npmjs.com package URL) require an exact
 //!   version (a range / `@latest` is a finding); a Levenshtein-near match to a popular package
@@ -175,10 +175,39 @@ pub fn url_host(url: &str) -> Option<String> {
     if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
         return None;
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    if authority.contains('%') {
+        return None;
+    }
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = host.split(':').next().unwrap_or("").to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
+}
+
+/// What `source` names, independent of how it is spelled, for matching it against another
+/// source (the catalog gate): `npm:<name>` for an npm package (any version, `npm:` prefix or
+/// npmjs.com URL), `github:<owner>/<repo>` for a GitHub repository (any URL form, ref, path or
+/// skill), lowercased; `other:<source>` (lowercased, no trailing `/` or `.git`) for anything
+/// else; `None` for a local path.
+pub fn identity(source: &str) -> Option<String> {
+    let s = source.trim();
+    match classify_source(s) {
+        SourceKind::Local => None,
+        SourceKind::GitHub => match parse_github_source(s) {
+            Some(g) => Some(format!("github:{}/{}", g.owner, g.repo).to_ascii_lowercase()),
+            None => Some(format!("other:{}", s.to_ascii_lowercase())),
+        },
+        SourceKind::Npm => {
+            let (name, _) = npm_spec(s)?;
+            Some(format!("npm:{}", name.to_ascii_lowercase()))
+        }
+        SourceKind::Other => {
+            let lower = s.to_ascii_lowercase();
+            let trimmed = lower.trim_end_matches('/');
+            let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+            Some(format!("other:{trimmed}"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -213,27 +242,37 @@ pub fn parse_github(url: &str) -> Option<(String, String, String)> {
 ///
 /// URLs whose host is exactly `github.com` / `www.github.com` (`https`, `http`, `git+https`,
 /// `git`, `ssh`, `git+ssh`, schemeless `github.com/…`, scp-style `git@github.com:owner/repo`)
-/// with an optional `.git`, `tree/<ref>[/<path>]`, `commit/<sha>`, `blob/<ref>/…` or `#<ref>`;
-/// and the `owner/repo[/<path>]` / `github:owner/repo` shorthand with an optional `#<ref>`, or
-/// `@<ref>` where `<ref>` is a version tag or a full commit SHA (anything else after `@` names a
-/// skill, as in the skills CLI). Owner, repo and ref must be well-formed GitHub names.
+/// with an optional `.git`, `tree/<ref>[/<path>]`, `commit/<sha>` or `blob/<ref>/…`; and the
+/// `owner/repo[/<path>]` / `github:owner/repo` shorthand. The rest follows the skills CLI
+/// (`skills@1.7.6`, `parseSource` / `parseFragmentRef` in its `dist/cli.mjs`): `#<ref>` or
+/// `#<ref>@<skill>` names a ref (a `tree/<ref>` in the URL wins over it), and `@<skill>` straight
+/// after `owner/repo` always names a skill, never a ref. Owner, repo, ref, path and skill must be
+/// well-formed names.
 pub fn parse_github_source(source: &str) -> Option<GitHubSource> {
     let s = source.trim();
     let (base, fragment) = match s.split_once('#') {
         Some((b, f)) => (b, Some(f)),
         None => (s, None),
     };
-    if let Some(f) = fragment {
-        if !is_ref_name(f) {
-            return None;
-        }
-    }
+    let (fragment_ref, fragment_skill) =
+        match fragment.map(|f| f.split_once('@').unwrap_or((f, ""))) {
+            Some((r, k)) => {
+                if (!r.is_empty() && !is_ref_name(r)) || (!k.is_empty() && !is_plain_name(k)) {
+                    return None;
+                }
+                (r, k)
+            }
+            None => ("", ""),
+        };
     let mut parsed = match github_path(base) {
         Some((path, ssh)) => parse_github_url_path(path, ssh)?,
         None => parse_github_shorthand(base.strip_prefix("github:").unwrap_or(base))?,
     };
-    if let Some(f) = fragment {
-        parsed.reference = f.to_string();
+    if parsed.reference.is_empty() {
+        parsed.reference = fragment_ref.to_string();
+    }
+    if !fragment_skill.is_empty() {
+        parsed.skill = fragment_skill.to_string();
     }
     Some(parsed)
 }
@@ -254,7 +293,13 @@ fn github_path(s: &str) -> Option<(&str, bool)> {
         Some("ssh" | "git+ssh") => true,
         Some(_) => return None,
     };
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    // The authority ends at the first `/`, `?`, `#` or `\`, so `https://evil.example?@github.com/`
+    // is evil.example, as a browser reads it.
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    let (authority, path) = (&rest[..end], rest[end..].strip_prefix('/').unwrap_or(""));
+    if authority.contains('%') {
+        return None;
+    }
     let host = match authority.rsplit_once('@') {
         // `github.com/…` with no scheme takes no userinfo.
         Some(_) if scheme.is_none() => return None,
@@ -294,7 +339,7 @@ fn parse_github_url_path(path: &str, ssh: bool) -> Option<GitHubSource> {
     })
 }
 
-/// `owner/repo[/<path>]`, then an optional `@<tag | sha | skill>` straight after `owner/repo`.
+/// `owner/repo[/<path>]`, or `owner/repo@<skill>` (a skill, never a ref, as in the skills CLI).
 fn parse_github_shorthand(s: &str) -> Option<GitHubSource> {
     if s.contains(':') || s.contains('\\') {
         return None;
@@ -314,16 +359,15 @@ fn parse_github_shorthand(s: &str) -> Option<GitHubSource> {
     if !is_subpath(&subpath) || (at.is_some() && !subpath.is_empty()) {
         return None;
     }
-    let (reference, skill) = match at {
-        Some(a) if is_commit_sha(a) || is_version_tag(a) => (a.to_string(), String::new()),
-        Some(a) if is_plain_name(a) => (String::new(), a.to_string()),
+    let skill = match at {
+        Some(a) if is_plain_name(a) => a.to_string(),
         Some(_) => return None,
-        None => (String::new(), String::new()),
+        None => String::new(),
     };
     Some(GitHubSource {
         owner: owner.to_string(),
         repo: repo.to_string(),
-        reference,
+        reference: String::new(),
         subpath,
         skill,
         ssh: false,
@@ -338,9 +382,14 @@ fn is_owner_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A GitHub repository name: 1-100 of `[A-Za-z0-9._-]`, not `.`/`..`, not starting with `-`.
+/// A GitHub repository name: 1-100 of `[A-Za-z0-9._-]`, not `.`/`..`/`.git` (any case), not
+/// starting with `-`. (`.git` would make `git clone … .git` write a repository's control dir.)
 fn is_repo_name(s: &str) -> bool {
-    (1..=100).contains(&s.len()) && s != "." && s != ".." && is_plain_name(s)
+    (1..=100).contains(&s.len())
+        && s != "."
+        && s != ".."
+        && !s.eq_ignore_ascii_case(".git")
+        && is_plain_name(s)
 }
 
 /// `[A-Za-z0-9._-]+`, not starting with `-` (a flag) or `.`/`..` alone.
@@ -366,23 +415,6 @@ fn is_ref_name(s: &str) -> bool {
 /// Empty, or `/`-separated [`is_plain_name`] segments (no `.`/`..` segment).
 fn is_subpath(s: &str) -> bool {
     s.is_empty() || s.split('/').all(is_plain_name)
-}
-
-/// A version tag the skills CLI treats as a ref after `@`: `v1.2`, `1.2.3`, `1.2.3-rc.1+b`.
-fn is_version_tag(s: &str) -> bool {
-    let core = s.strip_prefix('v').unwrap_or(s);
-    let (core, suffix) = match core.find(['-', '+']) {
-        Some(i) => (&core[..i], &core[i..]),
-        None => (core, ""),
-    };
-    let numeric: Vec<&str> = core.split('.').collect();
-    numeric.len() >= 2
-        && numeric
-            .iter()
-            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        && suffix
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
 /// True if `r` is a moving ref (branch / `HEAD`) rather than an immutable one.
@@ -545,9 +577,10 @@ fn is_npm_name_part(s: &str) -> bool {
 }
 
 /// True if `version` is an exact pin (a concrete `major.minor.patch` semver, optionally with a
-/// pre-release / build suffix), not a range, a partial version (`1`, `1.2`), a tag or `latest`.
+/// pre-release / build suffix, nothing around it), not a range, a partial version (`1`, `1.2`),
+/// a tag or `latest`.
 pub fn is_exact_version(version: &str) -> bool {
-    let v = version.trim();
+    let v = version;
     let core = v.strip_prefix('v').unwrap_or(v);
     let (core, suffix) = match core.find(['-', '+']) {
         Some(i) => (&core[..i], Some(&core[i + 1..])),
@@ -888,7 +921,7 @@ mod tests {
         ] {
             assert_eq!(classify_source(&s), SourceKind::GitHub, "{s}");
         }
-        let (resolved, report) = resolve_with_identity(&pin("owner/repo", &sha));
+        let (resolved, report) = resolve_with_identity(&format!("owner/repo#{sha}"));
         assert!(
             resolved.immutable && report.findings.is_empty(),
             "{report:?}"
@@ -897,6 +930,13 @@ mod tests {
             (resolved.owner.as_str(), resolved.pin.as_str()),
             ("owner", sha.as_str())
         );
+        // As in the skills CLI (skills@1.7.6), `@<x>` after owner/repo names a skill, even a
+        // SHA or a version: it pins nothing, so it holds.
+        for at in [sha.as_str(), "v1.2.3"] {
+            let (resolved, report) = resolve_with_identity(&pin("owner/repo", at));
+            assert_eq!((resolved.skill.as_str(), resolved.pin.as_str()), (at, ""));
+            assert_eq!(kinds(&report), vec!["unpinned_ref".to_string()], "{at}");
+        }
         // Not owner/repo: a bad owner, a dot-led name, an option-like name.
         for s in [".claude/skills", "-x/y", "a b/c", "owner/repo/../x"] {
             assert_ne!(classify_source(s), SourceKind::GitHub, "{s}");
@@ -923,7 +963,15 @@ mod tests {
         let g = parse_github_source(&pin("o/r", "my-skill")).unwrap();
         assert_eq!((g.reference.as_str(), g.skill.as_str()), ("", "my-skill"));
         let g = parse_github_source(&pin("o/r", "v2.1.0")).unwrap();
-        assert_eq!((g.reference.as_str(), g.skill.as_str()), ("v2.1.0", ""));
+        assert_eq!((g.reference.as_str(), g.skill.as_str()), ("", "v2.1.0"));
+        // `#<ref>@<skill>` (the skills CLI's parseFragmentRef); a fragment skill wins over `@`.
+        let g = parse_github_source(&format!("o/r{}a#dev{}b", '@', '@')).unwrap();
+        assert_eq!((g.reference.as_str(), g.skill.as_str()), ("dev", "b"));
+        let g = parse_github_source(&format!("https://github.com/o/r#v1{}s", '@')).unwrap();
+        assert_eq!((g.reference.as_str(), g.skill.as_str()), ("v1", "s"));
+        // A `tree/<ref>` in the URL wins over a fragment, as in the CLI.
+        let g = parse_github_source("https://github.com/o/r/tree/main/x#dev").unwrap();
+        assert_eq!(g.reference, "main");
         let g = parse_github_source(&format!("git{}github.com:o/r.git", '@')).unwrap();
         assert!(g.ssh && g.repo == "r");
         // A ref or path a shell or git would read as something else is not a GitHub source.
@@ -936,6 +984,67 @@ mod tests {
         // An unparseable github.com URL is still GitHub, and holds.
         let report = resolve("https://github.com/only-owner");
         assert_eq!(kinds(&report), vec!["unparseable_source".to_string()]);
+    }
+
+    #[test]
+    fn the_url_authority_ends_before_query_fragment_or_backslash() {
+        for s in [
+            format!("https://evil.example?{}github.com/o/r", '@'),
+            format!("https://evil.example#{}github.com/o/r", '@'),
+            format!("https://evil.example\\{}github.com/o/r", '@'),
+            "https://git%68ub.com/o/r".to_string(),
+        ] {
+            assert_eq!(classify_source(&s), SourceKind::Other, "{s}");
+        }
+        assert_eq!(url_host("https://a.example\\b/c"), Some("a.example".into()));
+        assert_eq!(url_host("https://a%2eexample/c"), None);
+    }
+
+    #[test]
+    fn a_dot_git_repository_name_is_refused() {
+        for s in ["o/.git", "o/.GIT", "github:o/.git"] {
+            assert_eq!(parse_github_source(s), None, "{s}");
+            assert_ne!(classify_source(s), SourceKind::GitHub, "{s}");
+        }
+        // A github.com URL naming `.git` is still GitHub, unparseable, and holds.
+        assert_eq!(parse_github_source("https://github.com/o/.git.git"), None);
+        let report = resolve("https://github.com/o/.git.git");
+        assert_eq!(kinds(&report), vec!["unparseable_source".to_string()]);
+        assert!(parse_github_source("o/.github").is_some());
+    }
+
+    #[test]
+    fn identity_is_the_same_for_every_spelling() {
+        let npm = Some("npm:@phantom/mcp-server".to_string());
+        for s in [
+            "@phantom/mcp-server".to_string(),
+            pin("@phantom/mcp-server", "1.2.9"),
+            pin("@Phantom/MCP-Server", "latest"),
+            "npm:@phantom/mcp-server".to_string(),
+            "https://www.npmjs.com/package/@phantom/mcp-server".to_string(),
+            "https://npmjs.com/package/@phantom/mcp-server/v/1.2.9".to_string(),
+        ] {
+            assert_eq!(identity(&s), npm, "{s}");
+        }
+        let gh = Some("github:owner/repo".to_string());
+        for s in [
+            "owner/repo".to_string(),
+            "Owner/Repo#main".to_string(),
+            pin("owner/repo", "skill"),
+            "github:owner/repo".to_string(),
+            "https://github.com/owner/repo".to_string(),
+            "https://www.github.com/owner/repo.git".to_string(),
+            "https://github.com/owner/repo/tree/main/skills/x".to_string(),
+            format!("git{}github.com:owner/repo.git", '@'),
+        ] {
+            assert_eq!(identity(&s), gh, "{s}");
+        }
+        assert_eq!(identity("./x"), None);
+        assert_eq!(
+            identity("https://MCP.example.com/mcp/"),
+            Some("other:https://mcp.example.com/mcp".into())
+        );
+        assert_ne!(identity("phantom-mcp"), npm);
     }
 
     #[test]
@@ -1021,6 +1130,10 @@ mod tests {
             None
         );
         assert_eq!(parse_npm_version("not json", "a"), None);
+        assert_eq!(
+            parse_npm_version(r#"{"name":"a","version":" 4.17.15"}"#, "a"),
+            None
+        );
     }
 
     #[test]
@@ -1155,6 +1268,8 @@ mod tests {
         assert!(!is_exact_version("1.2.3-"));
         assert!(!is_exact_version("1.2.3 || 2.0.0"));
         assert!(!is_exact_version("1.2.x"));
+        assert!(!is_exact_version(" 1.2.3"));
+        assert!(!is_exact_version("1.2.3\n"));
         assert!(!is_exact_version("^1.0.0"));
         assert!(!is_exact_version("~1.0.0"));
         assert!(!is_exact_version("latest"));

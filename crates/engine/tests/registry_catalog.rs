@@ -309,3 +309,162 @@ fn registry_list_graceful_when_catalog_absent() {
     );
     assert!(v["entries"].as_array().unwrap().is_empty());
 }
+
+/// `name` and `version` joined with `@`, built at runtime (avoids fixture mangling).
+fn at(name: &str, version: &str) -> String {
+    format!("{name}{}{version}", '@')
+}
+
+/// Every spelling of a high-risk entry's package, not only its id or literal source.
+fn high_risk_spellings() -> Vec<(String, &'static str)> {
+    vec![
+        ("@phantom/mcp-server".into(), "phantom-mcp"),
+        (at("@phantom/mcp-server", "1.2.9"), "phantom-mcp"),
+        (at("@Phantom/MCP-Server", "latest"), "phantom-mcp"),
+        ("npm:@phantom/mcp-server".into(), "phantom-mcp"),
+        (
+            "https://npmjs.com/package/@phantom/mcp-server".into(),
+            "phantom-mcp",
+        ),
+        (
+            "https://www.npmjs.com/package/@phantom/mcp-server/v/1.2.9".into(),
+            "phantom-mcp",
+        ),
+        ("x402-proxy".into(), "x402-proxy-mcp"),
+        (at("x402-proxy", "0.1.0"), "x402-proxy-mcp"),
+    ]
+}
+
+#[test]
+fn add_high_risk_is_gated_under_every_spelling() {
+    let project = TempDir::new("add-spell-proj");
+    let data = TempDir::new("add-spell-data");
+    let home = TempDir::new("add-spell-home");
+    build_project(project.path());
+    for (source, id) in high_risk_spellings() {
+        let v = run_in_project(
+            project.path(),
+            data.path(),
+            home.path(),
+            &["add", "mcp", &source, "--offline"],
+        );
+        assert_eq!(
+            (&v["status"], &v["entry_id"]),
+            (&serde_json::json!("high_risk_ask"), &serde_json::json!(id)),
+            "{source}: {v}"
+        );
+        assert!(v["run"].is_null(), "{source}: {v}");
+    }
+}
+
+/// Online too: the gate needs no network and answers before any lookup (the lookups point at
+/// a closed loopback port, so a gate that let a source through would still not reach out).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn add_high_risk_is_gated_under_every_spelling_online() {
+    use safe_ai_skill::verify::{osv, provenance};
+    let project = TempDir::new("add-spell-on-proj");
+    let data = TempDir::new("add-spell-on-data");
+    let home = TempDir::new("add-spell-on-home");
+    build_project(project.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    for (source, id) in high_risk_spellings() {
+        let run = Invocation::new(&["add", "mcp", &source])
+            .plugin_data(data.path())
+            .home(home.path())
+            .cwd(project.path())
+            .env(provenance::TEST_NPM_REGISTRY_ENV, &closed)
+            .env(provenance::TEST_GITHUB_API_ENV, &closed)
+            .env(osv::TEST_URL_ENV, &closed)
+            .run();
+        let v = run.json();
+        assert_eq!(
+            (&v["status"], &v["entry_id"]),
+            (&serde_json::json!("high_risk_ask"), &serde_json::json!(id)),
+            "{source}: {v}"
+        );
+    }
+}
+
+#[test]
+fn add_a_confirmed_high_risk_id_grades_the_entry_source_not_a_package_of_that_name() {
+    let project = TempDir::new("add-h3-proj");
+    let data = TempDir::new("add-h3-data");
+    let home = TempDir::new("add-h3-home");
+    build_project(project.path());
+    for (id, package, server) in [
+        ("phantom-mcp", "@phantom/mcp-server", "mcp-server"),
+        ("x402-proxy-mcp", "x402-proxy", "x402-proxy"),
+    ] {
+        let v = run_in_project(
+            project.path(),
+            data.path(),
+            home.path(),
+            &["add", "mcp", id, "--offline", "--yes"],
+        );
+        assert_eq!(
+            (&v["source"], &v["catalog_entry"], &v["source_kind"]),
+            (
+                &serde_json::json!(id),
+                &serde_json::json!(id),
+                &serde_json::json!("npm")
+            ),
+            "{v}"
+        );
+        assert!(
+            v["catalog_source"]
+                .as_str()
+                .is_some_and(|s| s.ends_with(package)),
+            "{v}"
+        );
+        assert_eq!(
+            v["run"],
+            format!("claude mcp add {server} -- npx -y {package}"),
+            "{v}"
+        );
+        let text = v.to_string();
+        assert!(!text.contains(&format!("npx -y {id}")), "{v}");
+    }
+}
+
+#[test]
+fn add_an_ordinary_catalog_id_grades_its_source() {
+    let project = TempDir::new("add-ord-id-proj");
+    let data = TempDir::new("add-ord-id-data");
+    let home = TempDir::new("add-ord-id-home");
+    build_project(project.path());
+    let v = run_in_project(
+        project.path(),
+        data.path(),
+        home.path(),
+        &["add", "skill", "ux-writing-skill", "--offline", "--yes"],
+    );
+    assert_eq!(
+        (&v["source_kind"], &v["catalog_entry"], &v["status"]),
+        (
+            &serde_json::json!("github"),
+            &serde_json::json!("ux-writing-skill"),
+            &serde_json::json!("warn_proceed")
+        ),
+        "{v}"
+    );
+    assert_eq!(
+        v["run"], "npx skills add https://github.com/content-designer/ux-writing-skill",
+        "{v}"
+    );
+    // Another spelling of the same repository names the entry too.
+    let v = run_in_project(
+        project.path(),
+        data.path(),
+        home.path(),
+        &[
+            "add",
+            "skill",
+            "content-designer/ux-writing-skill",
+            "--offline",
+        ],
+    );
+    assert_eq!(v["catalog_entry"], "ux-writing-skill", "{v}");
+}

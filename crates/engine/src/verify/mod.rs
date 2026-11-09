@@ -249,9 +249,9 @@ pub struct InstallCommand {
 ///
 /// Network-free provenance first ([`provenance::resolve_with_identity`]). Online, a moving npm
 /// version (none or a dist-tag) is pinned to the exact version the registry serves now and a
-/// moving GitHub ref to the commit it names now; the unpinned finding then drops to LOW, but
-/// only when the kind's install command can carry the pin (it stays MEDIUM, and holds, when it
-/// cannot or the lookup failed). The exact npm version graded is looked up on osv.dev:
+/// moving GitHub ref to the commit it names now, so `run` installs exactly what was graded; the
+/// unpinned finding stays MEDIUM all the same (only a source the user pinned exactly can pass),
+/// and says what it resolved to. The exact npm version graded is looked up on osv.dev:
 /// unreachable is a MEDIUM `osv_unavailable`; offline (`online == false`, the user's
 /// `--offline`) is a LOW `osv_skipped`. Tests pass `online == false` to stay hermetic.
 pub fn pipeline_add(
@@ -272,9 +272,8 @@ pub fn pipeline_add(
             "unrecognised_source",
             Severity::Medium,
             format!(
-                "`{}` is a remote MCP server: its code runs on someone else's machine, so \
-                 safe-ai-skill cannot check it",
-                source.trim()
+                "`{source}` is a remote MCP server: its code runs on someone else's machine, \
+                 so safe-ai-skill cannot check it"
             ),
         );
     }
@@ -290,8 +289,9 @@ pub fn pipeline_add(
     (resolved, report, install)
 }
 
-/// Reword the `unpinned_version` / `unpinned_ref` finding of a moving npm / GitHub source: LOW
-/// once a lookup pinned it and `run` carries the pin, else MEDIUM saying why it stays unpinned.
+/// Reword the MEDIUM `unpinned_version` / `unpinned_ref` finding of a moving npm / GitHub source
+/// once online: what a lookup resolved it to and whether `run` carries that, or why it stayed
+/// unresolved. It stays MEDIUM either way: the user did not name that version or commit.
 fn restate_unpinned(
     report: &mut Report,
     resolved: &provenance::Resolved,
@@ -326,43 +326,32 @@ fn restate_unpinned(
         ),
         _ => return,
     };
-    let (severity, detail) = if looked_up && install.pinned {
-        (
-            Severity::Low,
-            format!(
-                "{moving}; it resolves to {what} {} now, {installs}",
-                resolved.pin
-            ),
+    let detail = if looked_up && install.pinned {
+        format!(
+            "{moving}; it resolves to {what} {} now, {installs}: pass --yes to take it, or name \
+             that {what} yourself",
+            resolved.pin
         )
     } else if looked_up {
-        (
-            Severity::Medium,
-            format!(
-                "{moving}; it resolves to {what} {} now, but there is no install command that \
-                 pins it",
-                resolved.pin
-            ),
+        format!(
+            "{moving}; it resolves to {what} {} now, but there is no install command that pins \
+             it",
+            resolved.pin
         )
     } else if !online {
         return;
     } else if npm && !provenance::is_dist_tag(&resolved.reference) {
-        (
-            Severity::Medium,
-            format!(
-                "{moving}: safe-ai-skill does not resolve a range, so no CVE lookup ran; use \
-                 `name@x.y.z`"
-            ),
+        format!(
+            "{moving}: safe-ai-skill does not resolve a range, so no CVE lookup ran; use \
+             `name@x.y.z`"
         )
     } else {
-        (
-            Severity::Medium,
-            format!(
-                "{moving}, and the lookup of the exact {what} it names failed ({failed}); pin it \
-                 yourself"
-            ),
+        format!(
+            "{moving}, and the lookup of the exact {what} it names failed ({failed}); pin it \
+             yourself"
         )
     };
-    restate(report, finding, severity, detail);
+    restate(report, finding, Severity::Medium, detail);
 }
 
 /// Give the first finding of kind `kind` a new severity and detail.
@@ -376,8 +365,10 @@ fn restate(report: &mut Report, kind: &str, severity: Severity, detail: String) 
 /// The command `add` prints for `resolved` (from `source`), in the form the target tool accepts:
 /// `npx skills add` for a skill, `claude mcp add` for an MCP server, `git clone` for a repo.
 ///
-/// A pinned source prints its pin: `npx skills add owner/repo@<sha>` (a sub-directory as
-/// `…/tree/<sha>/<path>`), `claude mcp add <name> -- npx -y <pkg>@<version>`,
+/// A pinned source prints its pin: `npx skills add owner/repo#<sha>[@<skill>]` (a sub-directory
+/// as `https://github.com/owner/repo/tree/<sha>/<path>`; forms checked against the skills CLI
+/// `skills@1.7.6`, whose `@<x>` after `owner/repo` selects a skill and never pins),
+/// `claude mcp add <name> -- npx -y <pkg>@<version>`,
 /// `git clone <url> <dir> && git -C <dir> checkout --detach <sha>`. An unpinned one prints the
 /// source as given. Pure.
 pub fn install_command(
@@ -385,7 +376,7 @@ pub fn install_command(
     resolved: &provenance::Resolved,
     source: &str,
 ) -> InstallCommand {
-    let given = source.trim();
+    let given = source;
     let pin = resolved.pin.as_str();
     let unpinned = |run: String| InstallCommand {
         run: Some(run),
@@ -450,29 +441,23 @@ pub fn install_command(
              it, then register it with `claude mcp add <name> -- <the command that starts it>`",
         ),
         ("github", AddKind::Skill) if !resolved.owner.is_empty() => {
-            let skill = if resolved.skill.is_empty() {
-                String::new()
-            } else {
-                format!(" --skill {}", resolved.skill)
+            let (owner, name, skill) = (&resolved.owner, &resolved.name, &resolved.skill);
+            let run = match (pin, resolved.subpath.as_str(), skill.as_str()) {
+                ("", _, _) => return unpinned(format!("npx skills add {}", shell_word(given))),
+                (pin, "", "") => format!("npx skills add {owner}/{name}#{pin}"),
+                (pin, "", skill) => format!("npx skills add {owner}/{name}#{pin}@{skill}"),
+                (pin, sub, "") => {
+                    format!("npx skills add https://github.com/{owner}/{name}/tree/{pin}/{sub}")
+                }
+                (pin, sub, skill) => format!(
+                    "npx skills add https://github.com/{owner}/{name}/tree/{pin}/{sub} --skill \
+                     {skill}"
+                ),
             };
-            match (pin, resolved.subpath.as_str()) {
-                ("", _) => unpinned(format!("npx skills add {}{skill}", shell_word(given))),
-                (pin, "") => InstallCommand {
-                    run: Some(format!(
-                        "npx skills add {}/{}@{pin}{skill}",
-                        resolved.owner, resolved.name
-                    )),
-                    pinned: true,
-                    note: None,
-                },
-                (pin, sub) => InstallCommand {
-                    run: Some(format!(
-                        "npx skills add https://github.com/{}/{}/tree/{pin}/{sub}{skill}",
-                        resolved.owner, resolved.name
-                    )),
-                    pinned: true,
-                    note: None,
-                },
+            InstallCommand {
+                run: Some(run),
+                pinned: true,
+                note: None,
             }
         }
         ("github", AddKind::Repo) if !resolved.owner.is_empty() => {
@@ -484,7 +469,7 @@ pub fn install_command(
                     resolved.owner, resolved.name
                 )
             };
-            let dir = &resolved.name;
+            let dir = &clone_dir(&resolved.name);
             let reference = resolved.reference.as_str();
             if !pin.is_empty() {
                 InstallCommand {
@@ -520,6 +505,16 @@ pub fn install_command(
         )),
         (_, AddKind::Skill) => unpinned(format!("npx skills add {}", shell_word(given))),
         (_, AddKind::Repo) => unpinned(format!("git clone {}", shell_word(given))),
+    }
+}
+
+/// The directory `git clone` writes `repo` into: the repository name, unless it could be read
+/// as an option or is `.git` (a clone there would be a repository's control dir), then `repo`.
+fn clone_dir(repo: &str) -> String {
+    if repo.starts_with('-') || repo.eq_ignore_ascii_case(".git") {
+        "repo".to_string()
+    } else {
+        repo.to_string()
     }
 }
 
@@ -6640,10 +6635,10 @@ mod add_tests {
     fn pinned_github_commands() {
         let sha = "a".repeat(40);
         let commit = format!("https://github.com/o/r/commit/{sha}");
-        assert_eq!(
-            run(AddKind::Skill, &commit),
-            Some(format!("npx skills add {}", at("o/r", &sha)))
-        );
+        let pinned = format!("npx skills add o/r#{sha}");
+        assert_eq!(run(AddKind::Skill, &commit), Some(pinned.clone()));
+        // The user's own `#<sha>` form is printed as typed.
+        assert_eq!(run(AddKind::Skill, &format!("o/r#{sha}")), Some(pinned));
         assert_eq!(
             run(
                 AddKind::Skill,
@@ -6654,8 +6649,8 @@ mod add_tests {
             ))
         );
         assert_eq!(
-            run(AddKind::Skill, &format!("o/r#{sha}")),
-            Some(format!("npx skills add {}", at("o/r", &sha)))
+            run(AddKind::Skill, &format!("o/r#{sha}{}my-skill", '@')),
+            Some(format!("npx skills add o/r#{sha}{}my-skill", '@'))
         );
         assert_eq!(
             run(AddKind::Repo, &commit),
@@ -6671,16 +6666,108 @@ mod add_tests {
                 '@'
             ))
         );
-        // `owner/repo@<skill>` keeps the skill selection when pinned.
+        // `owner/repo@<skill>` resolved online keeps the skill selection, in the `#` form.
         let mut resolved = provenance::resolve_with_identity(&at("o/r", "my-skill")).0;
         resolved.pin = sha.clone();
         assert_eq!(
             install_command(AddKind::Skill, &resolved, "").run,
+            Some(format!("npx skills add o/r#{sha}{}my-skill", '@'))
+        );
+        // A sub-directory and a skill: the tree URL and `--skill`.
+        let mut resolved =
+            provenance::resolve_with_identity(&format!("o/r/skills#main{}my-skill", '@')).0;
+        resolved.pin = sha.clone();
+        assert_eq!(
+            install_command(AddKind::Skill, &resolved, "").run,
             Some(format!(
-                "npx skills add {} --skill my-skill",
-                at("o/r", &sha)
+                "npx skills add https://github.com/o/r/tree/{sha}/skills --skill my-skill"
             ))
         );
+    }
+
+    /// The GitHub branches of `parseSource` in the skills CLI as published (`skills@1.7.6`,
+    /// `dist/cli.mjs`: `parseFragmentRef`, `githubTreeWithPathMatch`, `githubTreeMatch`,
+    /// `githubRepoMatch`, `atSkillMatch`, `shorthandMatch`), for the shapes `add` prints:
+    /// `(owner, repo, ref, subpath, skill)`.
+    fn skills_cli_1_7_6(input: &str) -> (String, String, String, String, String) {
+        let (input, frag_ref, frag_skill) = match input.split_once('#') {
+            Some((base, frag)) => match frag.split_once('@') {
+                Some((r, k)) => (base, r.to_string(), k.to_string()),
+                None => (base, frag.to_string(), String::new()),
+            },
+            None => (input, String::new(), String::new()),
+        };
+        let none = String::new;
+        if let Some(i) = input.find("github.com/") {
+            let parts: Vec<&str> = input[i + "github.com/".len()..].split('/').collect();
+            let (owner, repo) = (
+                parts[0].to_string(),
+                parts[1].trim_end_matches(".git").to_string(),
+            );
+            return match parts.get(2..) {
+                Some(["tree", r, sub @ ..]) if !sub.is_empty() => {
+                    (owner, repo, r.to_string(), sub.join("/"), none())
+                }
+                Some(["tree", r]) => (owner, repo, r.to_string(), none(), none()),
+                // A `commit/<sha>` path is dropped: only the fragment ref is used.
+                _ => (owner, repo, frag_ref, none(), none()),
+            };
+        }
+        if let Some((path, skill)) = input.split_once('@') {
+            let (owner, repo) = path.split_once('/').unwrap();
+            let skill = if frag_skill.is_empty() {
+                skill.to_string()
+            } else {
+                frag_skill
+            };
+            return (owner.into(), repo.into(), frag_ref, none(), skill);
+        }
+        let mut parts = input.splitn(3, '/');
+        let (owner, repo) = (parts.next().unwrap(), parts.next().unwrap());
+        let sub = parts.next().unwrap_or("").to_string();
+        (owner.into(), repo.into(), frag_ref, sub, frag_skill)
+    }
+
+    /// The source argument and `--skill` of a printed `npx skills add` command.
+    fn skills_args(run: &str) -> (String, Option<String>) {
+        let rest = run.strip_prefix("npx skills add ").unwrap();
+        match rest.split_once(" --skill ") {
+            Some((source, skill)) => (source.to_string(), Some(skill.to_string())),
+            None => (rest.to_string(), None),
+        }
+    }
+
+    #[test]
+    fn printed_skills_commands_pin_under_the_published_cli_grammar() {
+        let sha = "e".repeat(40);
+        let commit = format!("https://github.com/o/r/commit/{sha}");
+        let skill_at = format!("o/r#{sha}{}one", '@');
+        let tree = format!("https://github.com/o/r/tree/{sha}/skills/x");
+        for (source, want_sub, want_skill) in [
+            (commit.as_str(), "", ""),
+            (skill_at.as_str(), "", "one"),
+            (tree.as_str(), "skills/x", ""),
+        ] {
+            let printed = run(AddKind::Skill, source).unwrap();
+            let (arg, skill_flag) = skills_args(&printed);
+            let (owner, repo, reference, sub, skill) = skills_cli_1_7_6(&arg);
+            assert_eq!((owner.as_str(), repo.as_str()), ("o", "r"), "{printed}");
+            assert_eq!(reference, sha, "{printed} does not pin under skills@1.7.6");
+            assert_eq!(sub, want_sub, "{printed}");
+            assert_eq!(skill_flag.unwrap_or(skill), want_skill, "{printed}");
+        }
+        // Why not `owner/repo@<sha>`: that CLI reads it as a skill named <sha>, no ref.
+        let (_, _, reference, _, skill) = skills_cli_1_7_6(&at("o/r", &sha));
+        assert_eq!((reference.as_str(), skill.as_str()), ("", sha.as_str()));
+    }
+
+    #[test]
+    fn a_clone_never_writes_a_dot_git_or_option_like_directory() {
+        assert_eq!(clone_dir("r"), "r");
+        assert_eq!(clone_dir(".github"), ".github");
+        assert_eq!(clone_dir(".git"), "repo");
+        assert_eq!(clone_dir(".GIT"), "repo");
+        assert_eq!(clone_dir("-x"), "repo");
     }
 
     #[test]
@@ -6791,14 +6878,15 @@ mod add_tests {
     }
 
     #[test]
-    fn a_lookup_pin_drops_the_unpinned_finding_to_low_only_when_run_carries_it() {
+    fn a_lookup_pin_keeps_the_hold_and_prints_the_pin() {
         let (mut resolved, mut report) = provenance::resolve_with_identity("left-pad");
         let install = restate_with(&mut resolved, &mut report, AddKind::Mcp, "1.3.0");
         assert!(install.pinned);
-        assert_eq!(report.findings[0].severity, Severity::Low);
+        assert_eq!(report.findings[0].severity, Severity::Medium);
         assert!(report.findings[0]
             .detail
-            .contains("resolves to version 1.3.0"));
+            .contains("resolves to version 1.3.0 now"));
+        assert!(report.findings[0].detail.contains("--yes"));
         assert_eq!(
             install.run,
             Some(format!(
@@ -6817,11 +6905,9 @@ mod add_tests {
         let sha = "d".repeat(40);
         let (mut resolved, mut report) = provenance::resolve_with_identity("o/r");
         let install = restate_with(&mut resolved, &mut report, AddKind::Skill, &sha);
-        assert_eq!(report.findings[0].severity, Severity::Low);
-        assert_eq!(
-            install.run,
-            Some(format!("npx skills add {}", at("o/r", &sha)))
-        );
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+        assert!(report.findings[0].detail.contains(&sha));
+        assert_eq!(install.run, Some(format!("npx skills add o/r#{sha}")));
 
         let (mut resolved, mut report) = provenance::resolve_with_identity("o/r");
         restate_with(&mut resolved, &mut report, AddKind::Mcp, &sha);

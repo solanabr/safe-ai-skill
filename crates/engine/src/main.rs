@@ -1697,12 +1697,20 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // The project catalog entry the source names: by its id, or by what the source resolves to
+    // (any spelling of the entry's npm package or GitHub repository), online or offline.
+    let catalog = catalog_match(source);
+
     // Catalog high-risk gate (runs BEFORE the verify/install pipeline). If the target resolves
     // to a known high-risk registry entry (`phantom-mcp` wallet signing, `x402-proxy-mcp` key
     // custody, …), force the class decision (`ask`/`deny`) and refuse to emit the install
     // command — the verify pipeline never even runs. A `deny` blocks outright; an `ask` holds
     // unless `--yes`.
-    if let Some((entry_id, risk_class, decision)) = resolve_high_risk_target(source) {
+    if let Some((entry, (risk_class, decision))) = catalog
+        .as_ref()
+        .and_then(|m| m.high_risk.map(|class| (m, class)))
+    {
+        let entry_id = &entry.id;
         let blocked = decision == "deny" || (decision == "ask" && !force);
         if blocked {
             audit_event(
@@ -1720,7 +1728,8 @@ fn cmd_add(rest: &[String]) -> ExitCode {
                 "risk_class": risk_class,
                 "decision": decision,
                 "entry_id": entry_id,
-                "reason": high_risk_add_reason(risk_class, &entry_id),
+                "catalog_source": entry.source,
+                "reason": high_risk_add_reason(risk_class, entry_id),
                 "proceed": false,
                 "run": serde_json::Value::Null,
             }));
@@ -1735,9 +1744,16 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         );
     }
 
+    // A catalog id is graded and installed as its entry's own source, never as a package that
+    // happens to carry the id as its name.
+    let graded: &str = match &catalog {
+        Some(entry) if entry.by_id => &entry.source,
+        _ => source,
+    };
+
     // A local directory (a path, or a name that is a directory here), whatever the kind → the
     // sweep's rule engine at the current tier; any other source → its provenance (+ osv).
-    let local = verify::expand_home(source);
+    let local = verify::expand_home(graded);
     let add_error = |e: String| {
         print_json(&serde_json::json!({
             "command": "add",
@@ -1748,27 +1764,36 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         }));
         ExitCode::FAILURE
     };
-    let is_local = local.is_dir()
-        || verify::provenance::classify_source(source) == verify::provenance::SourceKind::Local;
+    let path_shaped =
+        verify::provenance::classify_source(graded) == verify::provenance::SourceKind::Local;
+    let is_local = path_shaped || local.is_dir();
     if is_local && !local.is_dir() {
         return add_error(if local.exists() {
-            format!("{source}: not a directory")
+            format!("{graded}: not a directory")
         } else {
-            format!("{source}: no such local directory")
+            format!("{graded}: no such local directory")
         });
     }
+    // A bare name that is also a directory here is graded as that directory.
+    let source_note = (is_local && !path_shaped).then(|| {
+        format!(
+            "`{graded}` is a directory here, so it was graded as that local directory, not as a \
+             package or repository; write `./{graded}` to say so, or run add from another \
+             directory to check the package or repository"
+        )
+    });
     let mut checked: Option<verify::check::Check> = None;
     let (resolved, report, install) = if is_local {
         let ctx = check_context().for_install();
-        match verify::check::check_dir(&local, source, &ctx) {
+        match verify::check::check_dir(&local, graded, &ctx) {
             Ok(check) => checked = Some(check),
             Err(e) => return add_error(e),
         }
-        let resolved = verify::provenance::Resolved::local(source);
-        let install = verify::install_command(kind, &resolved, source);
+        let resolved = verify::provenance::Resolved::local(graded);
+        let install = verify::install_command(kind, &resolved, graded);
         (resolved, verify::Report::default(), install)
     } else {
-        verify::pipeline_add(kind, source, online)
+        verify::pipeline_add(kind, graded, online)
     };
 
     let verdict = match &checked {
@@ -1819,7 +1844,7 @@ fn cmd_add(rest: &[String]) -> ExitCode {
             "add_approve",
             "add",
             &format!(
-                "kind={kind_label} source={source} verdict={} pin={}",
+                "kind={kind_label} source={graded} verdict={} pin={}",
                 verdict.label(),
                 resolved.pin
             ),
@@ -1843,6 +1868,13 @@ fn cmd_add(rest: &[String]) -> ExitCode {
         if let Some(note) = &install.note {
             map.insert("run_note".into(), serde_json::json!(note));
         }
+        if let Some(note) = &source_note {
+            map.insert("source_note".into(), serde_json::json!(note));
+        }
+        if let Some(entry) = &catalog {
+            map.insert("catalog_entry".into(), serde_json::json!(entry.id));
+            map.insert("catalog_source".into(), serde_json::json!(entry.source));
+        }
         match &checked {
             // The pack: the sweep's state, findings and report; the source: its provenance.
             Some(check) => {
@@ -1862,7 +1894,9 @@ fn cmd_add(rest: &[String]) -> ExitCode {
 }
 
 /// `add`'s kind and source: the first two arguments that are not flags. Flags (`--yes`,
-/// `--force`, `--offline`) may come anywhere; anything else is a usage problem.
+/// `--force`, `--offline`) may come anywhere; anything else is a usage problem, and so is a
+/// source with whitespace or control characters around it (or whitespace inside anything but a
+/// local path), or starting with `-`.
 fn add_args(rest: &[String]) -> Result<(verify::AddKind, &str), String> {
     let mut words = Vec::new();
     for arg in rest {
@@ -1878,14 +1912,30 @@ fn add_args(rest: &[String]) -> Result<(verify::AddKind, &str), String> {
     let Some(kind) = verify::AddKind::parse(kind) else {
         return Err(format!("unknown kind `{kind}`"));
     };
-    match rest {
-        [source] if source.trim().starts_with('-') => {
-            Err(format!("a source cannot start with `-`: `{source}`"))
-        }
-        [source] if !source.trim().is_empty() => Ok((kind, source)),
-        [] | [_] => Err("missing source".to_string()),
-        [_, extra, ..] => Err(format!("unexpected argument `{extra}`")),
+    let source = match rest {
+        [source] if !source.trim().is_empty() => *source,
+        [] | [_] => return Err("missing source".to_string()),
+        [_, extra, ..] => return Err(format!("unexpected argument `{extra}`")),
+    };
+    // One exact string is graded and printed, so nothing around it may be trimmed away.
+    if source.trim() != source || source.chars().any(char::is_control) {
+        return Err(format!(
+            "a source cannot start or end with whitespace or hold control characters: {source:?}"
+        ));
     }
+    if source.starts_with('-') {
+        return Err(format!("a source cannot start with `-`: `{source}`"));
+    }
+    // Only a local path may hold a space (`./My Skills`); a package, URL or `owner/repo` never.
+    let path_shaped =
+        verify::provenance::classify_source(source) == verify::provenance::SourceKind::Local;
+    if !path_shaped && source.contains(char::is_whitespace) {
+        return Err(format!(
+            "a package, URL or repository cannot contain whitespace (for a local directory, \
+             write ./{source}): {source:?}"
+        ));
+    }
+    Ok((kind, source))
 }
 
 /// A malformed `add` command line: the problem and [`ADD_USAGE`] on stderr and in the JSON
@@ -1901,34 +1951,61 @@ fn add_usage_error(problem: &str) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// Resolve an `add <source>` target against the project catalog and classify it.
+/// The project catalog entry an `add` source names.
+struct CatalogMatch {
+    /// The entry's catalog id.
+    id: String,
+    /// The entry's own `source` (trimmed).
+    source: String,
+    /// Named by its id, so the source to grade and install is [`CatalogMatch::source`].
+    by_id: bool,
+    /// `(class kind, forced decision)` when the entry is high-risk.
+    high_risk: Option<(&'static str, &'static str)>,
+}
+
+/// Match an `add <source>` target against the project catalog and classify it.
 ///
-/// Loads the project `skill-registry.json` (path from `policy.catalog.registry_path`) and tries
-/// to match `source` to a [`registry::RegistryEntry`] — first by exact `id`, then by exact
-/// `source` URL. If the matched entry is high-risk (per [`registry::Registry::high_risk`]),
-/// returns `(entry_id, class_kind, forced_decision)` where `forced_decision` is `ask`/`deny`
-/// from [`registry::Registry::decision_for_kind`]. Returns `None` when there is no catalog, no
-/// matching entry, or the entry is not high-risk — in which case `add` proceeds to its normal
-/// verify pipeline. Never panics; a missing/unparseable catalog yields `None`.
-fn resolve_high_risk_target(source: &str) -> Option<(String, &'static str, &'static str)> {
+/// Loads the project `skill-registry.json` (path from `policy.catalog.registry_path`) and finds
+/// the entries `source` names: by exact `id`, by exact `source`, or by resolved identity
+/// ([`verify::provenance::identity`]: the same npm package or GitHub repository however it is
+/// spelled — bare name, `name@version`, `npm:`, an npmjs.com URL, any GitHub URL form or the
+/// `owner/repo` shorthand). A high-risk match (per [`registry::Registry::high_risk`]) wins over
+/// an ordinary one and carries its forced `ask`/`deny` from
+/// [`registry::Registry::decision_for_kind`]. `None` when there is no catalog or no match.
+/// Network-free; never panics; a missing/unparseable catalog yields `None`.
+fn catalog_match(source: &str) -> Option<CatalogMatch> {
     let cwd = process_cwd();
     let policy = load_effective_policy(&cwd, &state_dir(&cwd));
     let reg_path = cwd.join(&policy.catalog.registry_path);
     let reg = registry::Registry::load(&reg_path).ok()?;
 
-    let entry = reg
-        .entry_by_id(source)
-        .or_else(|| reg.entries.iter().find(|e| e.source == source))?;
-
-    let kind = registry::Registry::high_risk(entry, &policy)?;
-    let decision = registry::Registry::decision_for_kind(&policy, &kind).unwrap_or("ask");
-    // Intern the dynamic strings to &'static via a small known set so the caller can pass them
-    // into JSON without lifetime juggling.
-    Some((
-        entry.id.clone(),
-        intern_class(&kind),
-        intern_decision(decision),
-    ))
+    let wanted = verify::provenance::identity(source);
+    let mut first = None;
+    for entry in &reg.entries {
+        let entry_source = entry.source.trim();
+        let by_id = entry.id == source;
+        let named = by_id
+            || entry_source == source
+            || (wanted.is_some() && verify::provenance::identity(entry_source) == wanted);
+        if !named {
+            continue;
+        }
+        let high_risk = registry::Registry::high_risk(entry, &policy).map(|kind| {
+            let decision = registry::Registry::decision_for_kind(&policy, &kind).unwrap_or("ask");
+            (intern_class(&kind), intern_decision(decision))
+        });
+        let found = CatalogMatch {
+            id: entry.id.clone(),
+            source: entry_source.to_string(),
+            by_id,
+            high_risk,
+        };
+        if found.high_risk.is_some() {
+            return Some(found);
+        }
+        first.get_or_insert(found);
+    }
+    first
 }
 
 /// Map a class kind string to a stable `&'static str` (falls back to a generic label).

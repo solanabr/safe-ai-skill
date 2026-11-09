@@ -8,6 +8,19 @@
 mod common;
 
 use common::{Invocation, Run, TempDir};
+use std::path::Path;
+
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap().flatten() {
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else if entry.file_name() != "shape.json" {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
 
 /// `name` and `version` joined with `@`, built at runtime (avoids fixture mangling).
 fn at(name: &str, version: &str) -> String {
@@ -132,7 +145,7 @@ fn owner_repo_is_github() {
     assert_eq!(v["run"], "npx skills add owner/repo", "{v}");
 
     let sha = "b".repeat(40);
-    let pinned = at("owner/repo", &sha);
+    let pinned = format!("owner/repo#{sha}");
     let v = w.add(&["skill", &pinned, "--offline"]);
     assert_eq!(
         (&v["status"], &v["pin"]),
@@ -140,6 +153,16 @@ fn owner_repo_is_github() {
         "{v}"
     );
     assert_eq!(v["run"], format!("npx skills add {pinned}"), "{v}");
+
+    // `owner/repo@<x>` selects skill <x> in the skills CLI (skills@1.7.6), even a SHA: it pins
+    // nothing, so it holds.
+    let v = w.add(&["skill", &at("owner/repo", &sha), "--offline"]);
+    assert_eq!(
+        (&v["status"], &v["pin"]),
+        (&serde_json::json!("warn_hold"), &serde_json::Value::Null),
+        "{v}"
+    );
+    assert_eq!(findings(&v), vec![pair("unpinned_ref", "medium")], "{v}");
 }
 
 #[test]
@@ -149,11 +172,7 @@ fn a_github_commit_url_prints_the_commit_not_the_url() {
     let url = format!("https://github.com/o/r/commit/{sha}");
     let v = w.add(&["skill", &url]);
     assert_eq!(v["status"], "pass", "{v}");
-    assert_eq!(
-        v["run"],
-        format!("npx skills add {}", at("o/r", &sha)),
-        "{v}"
-    );
+    assert_eq!(v["run"], format!("npx skills add o/r#{sha}"), "{v}");
     let v = w.add(&["repo", &url]);
     assert_eq!(
         v["run"],
@@ -247,6 +266,12 @@ fn a_usage_error_exits_3() {
         vec!["skill", "owner/repo", "--bogus"],
         vec!["skill", ""],
         vec!["skill", " -x"],
+        vec!["skill", "x "],
+        vec!["skill", " x"],
+        vec!["skill", "x\n"],
+        vec!["mcp", "left-pad@ 1.3.0"],
+        vec!["mcp", "left-pad@1.3.0 "],
+        vec!["skill", "owner/repo name"],
     ] {
         let run: Run = w.invoke(&args).run();
         assert_eq!(
@@ -269,6 +294,71 @@ fn a_usage_error_exits_3() {
                 .is_some_and(|e| e.contains("usage: add")),
             "{v}"
         );
+    }
+}
+
+#[test]
+fn a_padded_source_never_grades_one_directory_and_prints_another() {
+    let w = World::new("add-pad");
+    let stealer =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/corpus/shapes/issue10-stealer");
+    copy_tree(&stealer, &w.root.join("x"));
+    // A benign `x ` beside it (Windows drops a trailing space from a name, so not there).
+    if !cfg!(windows) {
+        std::fs::create_dir_all(w.root.join("x ")).unwrap();
+        std::fs::write(w.root.join("x ").join("SKILL.md"), "# fine\n").unwrap();
+    }
+    let v = w.add(&["skill", "x", "--offline"]);
+    assert_eq!(v["status"], "blocked", "{v}");
+    let run = w.invoke(&["skill", "x ", "--offline"]).run();
+    assert_eq!(run.code, Some(3), "{}", run.stdout);
+    // A local path may hold a space inside it when it is written as a path.
+    std::fs::create_dir_all(w.root.join("a b")).unwrap();
+    std::fs::write(w.root.join("a b").join("SKILL.md"), "# fine\n").unwrap();
+    let v = w.add(&["skill", "./a b", "--offline"]);
+    assert_eq!(
+        (&v["status"], &v["run"]),
+        (
+            &serde_json::json!("pass"),
+            &serde_json::json!("npx skills add './a b'")
+        ),
+        "{v}"
+    );
+    let run = w.invoke(&["skill", "a b", "--offline"]).run();
+    assert_eq!(run.code, Some(3), "{}", run.stdout);
+}
+
+#[test]
+fn a_bare_name_that_is_a_directory_here_says_so() {
+    let w = World::new("add-shadow");
+    std::fs::create_dir_all(w.root.join("left-pad")).unwrap();
+    std::fs::write(w.root.join("left-pad/SKILL.md"), "# fine\n").unwrap();
+    let v = w.add(&["mcp", "left-pad", "--offline"]);
+    assert_eq!(v["source_kind"], "local", "{v}");
+    assert!(
+        v["source_note"].as_str().is_some_and(
+            |n| n.contains("graded as that local directory") && n.contains("./left-pad")
+        ),
+        "{v}"
+    );
+    let v = w.add(&["mcp", "./left-pad", "--offline"]);
+    assert!(v["source_note"].is_null(), "{v}");
+}
+
+#[test]
+fn a_dot_git_repository_is_never_a_clone_directory() {
+    let w = World::new("add-dotgit");
+    let sha = "f".repeat(40);
+    for source in [format!("o/.git#{sha}"), format!("o/.GIT#{sha}")] {
+        let v = w.add(&["repo", &source, "--offline"]);
+        assert_eq!(
+            (&v["status"], &v["source_kind"]),
+            (&serde_json::json!("warn_hold"), &serde_json::json!("other")),
+            "{v}"
+        );
+        let v = w.add(&["repo", &source, "--offline", "--yes"]);
+        let run = v["run"].as_str().unwrap_or_default();
+        assert!(!run.contains(" .git ") && !run.contains("-C .git"), "{v}");
     }
 }
 
@@ -417,13 +507,25 @@ mod online {
     }
 
     #[test]
-    fn an_unpinned_npm_source_is_pinned_graded_and_printed_pinned() {
+    fn an_unpinned_npm_source_holds_but_is_graded_and_printed_pinned() {
         let w = World::new("add-on-npm");
         let base = healthy();
+        // Resolved and graded, but the user did not name 1.3.0: it holds until --yes.
         let v = healthy_run(&w, &base, &["mcp", "left-pad"]);
-        assert_eq!(v["status"], "pass", "{v}");
+        assert_eq!(
+            (&v["status"], &v["pin"]),
+            (&serde_json::json!("warn_hold"), &serde_json::json!("1.3.0")),
+            "{v}"
+        );
+        assert!(v["run"].is_null(), "{v}");
+        let v = healthy_run(&w, &base, &["mcp", "left-pad", "--yes"]);
+        assert_eq!(v["status"], "warn_proceed", "{v}");
         assert_eq!(v["pin"], "1.3.0", "{v}");
-        assert_eq!(findings(&v), vec![pair("unpinned_version", "low")], "{v}");
+        assert_eq!(
+            findings(&v),
+            vec![pair("unpinned_version", "medium")],
+            "{v}"
+        );
         assert!(
             v["findings"][0]["detail"]
                 .as_str()
@@ -441,32 +543,41 @@ mod online {
     }
 
     #[test]
-    fn a_moving_github_ref_is_pinned_to_its_commit() {
+    fn a_moving_github_ref_holds_but_prints_its_commit() {
         let w = World::new("add-on-gh");
         let base = healthy();
         let v = healthy_run(&w, &base, &["skill", "o/r"]);
         assert_eq!(
             (&v["status"], &v["pin"]),
-            (&serde_json::json!("pass"), &serde_json::json!(SHA)),
+            (&serde_json::json!("warn_hold"), &serde_json::json!(SHA)),
             "{v}"
         );
-        assert_eq!(findings(&v), vec![pair("unpinned_ref", "low")], "{v}");
+        assert_eq!(findings(&v), vec![pair("unpinned_ref", "medium")], "{v}");
+        let v = healthy_run(&w, &base, &["skill", "o/r", "--yes"]);
+        assert_eq!(v["status"], "warn_proceed", "{v}");
+        assert_eq!(v["run"], format!("npx skills add o/r#{SHA}"), "{v}");
+        // `@<skill>` keeps the skill selection, in the form the CLI pins: `#<sha>@<skill>`.
+        let v = healthy_run(&w, &base, &["skill", &at("o/r", "one"), "--yes"]);
         assert_eq!(
             v["run"],
-            format!("npx skills add {}", at("o/r", SHA)),
+            format!("npx skills add o/r#{SHA}{}one", '@'),
             "{v}"
         );
         let v = healthy_run(
             &w,
             &base,
-            &["skill", "https://github.com/o/r/tree/main/skills/x"],
+            &[
+                "skill",
+                "https://github.com/o/r/tree/main/skills/x",
+                "--yes",
+            ],
         );
         assert_eq!(
             v["run"],
             format!("npx skills add https://github.com/o/r/tree/{SHA}/skills/x"),
             "{v}"
         );
-        let v = healthy_run(&w, &base, &["repo", "https://github.com/o/r"]);
+        let v = healthy_run(&w, &base, &["repo", "https://github.com/o/r", "--yes"]);
         assert_eq!(
             v["run"],
             format!("git clone https://github.com/o/r.git r && git -C r checkout --detach {SHA}"),
@@ -513,6 +624,22 @@ mod online {
         let v = healthy_run(&w, &base, &["mcp", &spec]);
         assert_eq!(v["status"], "pass", "{v}");
         assert_eq!(v["findings"], serde_json::json!([]), "{v}");
+    }
+
+    #[test]
+    fn an_unfinished_osv_answer_holds() {
+        let w = World::new("add-on-osv-page");
+        let base = healthy();
+        let tokens = serve(|_, _, _| (200, r#"{"next_page_token":"tok"}"#.into()));
+        let v = online(
+            &w,
+            &["mcp", &at("left-pad", "1.3.0")],
+            &format!("{base}/npm"),
+            &format!("{base}/gh"),
+            &tokens,
+        );
+        assert_eq!(v["status"], "warn_hold", "{v}");
+        assert_eq!(findings(&v), vec![pair("osv_unavailable", "medium")], "{v}");
     }
 
     #[test]
