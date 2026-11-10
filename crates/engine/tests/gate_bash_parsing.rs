@@ -867,7 +867,10 @@ fn e2e_deadline_does_not_turn_a_deny_into_an_ask() {
     assert_eq!(label(&run).as_deref(), Some("deny"), "{}", run.stdout);
 }
 
-#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
+// The `solana` stub is a #!/bin/sh script, which Windows cannot exec. `test-hooks` only: the
+// probe has to outlast the deadline, and its 2 s bound equals the deadline floor, so in a
+// default build whichever timer fires first decides the answer.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn e2e_permission_request_answers_by_the_deadline() {
     // `gate-permission` runs the same slow CLI probe; past its deadline it answers the
@@ -896,6 +899,8 @@ fn e2e_permission_request_answers_by_the_deadline() {
             .home(home.path())
             .env("PATH", &format!("{}:/usr/bin:/bin", bin.path().display()))
             .env("SAFE_AI_SKILL_DEADLINE_MS", "200")
+            // Past the 2 s deadline floor, so the deadline answers, not the probe's timeout.
+            .env("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS", "10000")
             .headless(headless)
             .stdin(payload)
             .run();
