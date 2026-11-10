@@ -250,7 +250,7 @@ The first release since 1.0.0. 1.0.1, 1.1.0 and 1.2.0 below were never released 
 
 ### Documentation
 
-- README and SECURITY.md open with a disclaimer: what the plugin cannot protect on its own, which holes the kit's sandbox and permission rules close, and the recommended setup. `docs/tiers.md` explains the tiers, selection and confirmation, the sandbox-conditioned `.env` opt-in (disabled in release builds), migration, the shared lists and the headless rule. A test pins the README tier table's verdicts to the engine's table. `docs/drafts/aikit-firewall-split.md` drafts the proposed kit-side changes ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264), [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265)); nothing in it is posted.
+- README and SECURITY.md open with a disclaimer: what the plugin cannot protect on its own, which holes the kit's sandbox and permission rules close, and the recommended setup. `docs/tiers.md` explains the tiers, selection and confirmation, the sandbox-conditioned `.env` opt-in (disabled in release builds), migration, the shared lists and the headless rule. A test pins the README tier table's verdicts to the engine's table. The proposed kit-side changes are tracked in [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265).
 
 ### Release process
 

@@ -6,10 +6,7 @@
 //! `phantom-mcp` wallet signing, `x402-proxy-mcp` BIP-39 key custody, `curl … | bash`
 //! installer scripts).
 //!
-//! # Round-2 ownership
-//! **Agent A** fills the stub bodies (parse + classify + load) and the `#[cfg(test)]` tests.
-//! The public signatures below are FROZEN — consume them, do not change them. The on-disk
-//! registry shape is `{ "version": …, "updated": …, "entries": [ … ] }` where each entry
+//! The on-disk registry shape is `{ "version": …, "updated": …, "entries": [ … ] }` where each entry
 //! carries `id`, `name`, `type`, `domain`, `description`, `source`, `install`, `license`,
 //! `maintainer`, `signal`, `default_installed`, `safety`, `tags`. The fields kept on
 //! [`RegistryEntry`] are the subset safe-ai-skill gates on; unknown fields are tolerated.

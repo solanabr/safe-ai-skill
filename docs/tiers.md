@@ -63,7 +63,7 @@ safe-ai-skill tier --clear [--project]
   A code never works in another session. **Native Windows:** confirmations (lowering the tier, loosening `env_read`, grants, `verify trust`/`approve`) are unavailable, because the engine cannot read the process table there; raising the tier and everything else work. Use WSL for those actions.
 - **Residuals.** Processes are recognised by their argument words, which a nested session's launcher chooses (`exec -a bash claude -p …` looks like a shell), and a nested run started with the owner's session id (`claude --resume <id> -p`, `--session-id <id>`, `-c`) passes the session binding. Both are what the Bash gates' ask is for: `gate-bash` and `gate-bash-secrets` ask about (deny at High or headless) any nested `claude` they can see with `-p`/`--print`, `-c`/`--continue`, `-r`/`--resume`, `--session-id`, or a prompt piped or redirected into it, also behind wrappers (`exec -a NAME`, `env -u VAR`, `timeout 5`, `xargs`, `npx`) or `$(which claude)`. A renamed or linked `claude` binary, or one reached through an expansion, is not seen.
 - `mode` is a deprecated alias for `tier`.
-- solana-ai-kit's `/firewall` reaches this only by running `safe-ai-skill tier <t> --project` (a proposed kit change, see [the kit draft](drafts/aikit-firewall-split.md)); there is no other handoff file. Until the kit change lands, `/firewall` does not run it; run `safe-ai-skill tier <t> --project` yourself.
+- solana-ai-kit's `/firewall` reaches this only by running `safe-ai-skill tier <t> --project` (a proposed kit change); there is no other handoff file. Until the kit change lands, `/firewall` does not run it; run `safe-ai-skill tier <t> --project` yourself.
 
 ### Sandbox detection
 
@@ -533,5 +533,4 @@ Three line-oriented files at the root of this repository in `policy/shared/`, pl
 - [docs/cli.md](cli.md): every command and flag, and the hook table
 - [docs/upgrading.md](upgrading.md): moving from 1.0.x
 - [SECURITY.md](../SECURITY.md#recommended-setup): recommended setup, known holes by layer
-- [docs/drafts/aikit-firewall-split.md](drafts/aikit-firewall-split.md): the proposed kit-side changes
 - [ai-kit#264](https://github.com/solanabr/ai-kit/issues/264) (firewall scope) and [ai-kit#265](https://github.com/solanabr/ai-kit/issues/265) (docs)

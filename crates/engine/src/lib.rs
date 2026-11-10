@@ -5,7 +5,7 @@
 //! (`safe-ai-skill`) whose `main.rs` is a thin dispatcher over these modules.
 //!
 //! # Module map
-//! - Foundation (FROZEN — owned by the foundation pass): [`io`], [`policy`], [`context`],
+//! - Foundation: [`io`], [`policy`], [`context`],
 //!   [`audit`], [`error`], [`gate`].
 //! - Runtime gates: [`gates`].
 //! - Output / prompt guards: [`redact`], [`promptguard`].
@@ -22,8 +22,6 @@
 //!   [`gate::Verdict`].
 //! - Platform (1.1.0): [`platform`] (SessionStart install and platform notices), [`localfs`]
 //!   (filesystem lookups for tool-input paths, never on a foreign Windows network share).
-//!
-//! See `ARCHITECTURE.md` for the round-2 editing contract and ownership table.
 
 pub mod adapt;
 pub mod adapt_opencode;
