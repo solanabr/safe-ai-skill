@@ -195,7 +195,9 @@ const GATED_PROGRAMS: &[&str] = &[
 const CARGO_GIT_ORGS: &[&str] = &["solana-labs", "anza-xyz", "coral-xyz", "solana-foundation"];
 
 /// Shells. Their stdin forms are the secrets gate's; here they only run fetched files or code.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish"];
+const SHELLS: &[&str] = &[
+    "sh", "bash", "rbash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "csh", "tcsh",
+];
 
 /// Interpreters that read their program from standard input when given none (or `-`).
 const STDIN_INTERPRETERS: &[&str] = &[
