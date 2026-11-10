@@ -6,6 +6,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Changed
+
+- **Shell code a command hands a shell gets every Bash gate.** A producer's output that a shell or `source` runs, and a dynamic `-c`, `eval`, here-string, launcher or `su -c` script, now go through the full gate list, as a decoded payload does. That holds in `gate-bash-secrets`, `gate-bash`, `gate-mcp` and `PermissionRequest`.
+  - Scripts inside such scripts are followed 4 levels down.
+  - More than 64 of them in one command, or more text than the parser reads, asks like a command too large to check.
+
 ### Fixed
 
 - **Anchor and Solana CLI dev-loop commands no longer ask on a test cluster.** Each of these asked at every tier, so CI denied it.

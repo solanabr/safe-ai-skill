@@ -599,12 +599,19 @@ fn cmd_gate_bash() -> ExitCode {
     let (decision, meta) = safe_ai_skill::gates::bash::decide(command, &ctx, &effective);
     // Default-wallet destruction is joined here too, so the commands the fast path passes on
     // (keygen, file-clobbering programs, redirections) get it from this `onFailure: block`
-    // entry as well as from `gate-bash-secrets`.
+    // entry as well as from `gate-bash-secrets`. So is every gate's verdict on the shell code
+    // the command hands a shell, as on a decoded payload.
     let wallet_verdict = wallet::decide_bash(command, &cwd, &effective, effective.tier());
     let nested_verdict = shellcmd::nested_claude_verdict(nested, effective.tier());
     let encoded_verdict = shellcmd::encoded_verdict(command, &cwd, &effective, &dir);
+    let recovered_verdict = shellcmd::recovered_verdict(command, &cwd, &effective, &dir);
     let (decision, meta) = join_tier(
-        strictest([wallet_verdict, nested_verdict, encoded_verdict]),
+        strictest([
+            wallet_verdict,
+            nested_verdict,
+            encoded_verdict,
+            recovered_verdict,
+        ]),
         decision,
         meta,
     );

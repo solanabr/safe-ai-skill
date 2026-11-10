@@ -7,9 +7,10 @@
 //! opinion. Tier gates only tighten, so an `allow` from one is dropped.
 //! Gate state (the CLI cluster cache, pack state) is in the data dir the caller resolved.
 
+use std::collections::HashSet;
 use std::path::Path;
 
-use crate::context::Context;
+use crate::context::{shell, Context};
 use crate::datadir::DataDir;
 use crate::gate::Verdict;
 use crate::gates::{
@@ -36,8 +37,9 @@ enum Level {
 }
 
 /// Every Bash-command tier gate on `command` (the set `gate-bash-secrets` joins with its
-/// secret-read decision), decoded payloads and `git submodule foreach` / `rebase --exec`
-/// strings judged by [`inner_verdict`]. The strictest wins; on a tie the later one.
+/// secret-read decision), decoded payloads, the shell code it hands a shell
+/// ([`recovered_verdict`]) and `git submodule foreach` / `rebase --exec` strings judged by
+/// [`inner_verdict`]. The strictest wins; on a tie the later one.
 pub fn tier_verdict(command: &str, cwd: &Path, policy: &Policy, dir: &DataDir) -> Option<Verdict> {
     verdicts(command, cwd, policy, dir, Level::Top)
 }
@@ -66,6 +68,73 @@ pub fn encoded_verdict(
         all.push(inner_verdict(&decoded, cwd, policy, dir));
     }
     strictest(all)
+}
+
+/// Deepest nesting of recovered scripts followed, the secrets gate's own re-parse depth (it
+/// asks past it).
+const MAX_RECOVERED_DEPTH: usize = 4;
+
+/// Most recovered scripts judged for one command; more asks like a command too large to check.
+const MAX_RECOVERED: usize = 64;
+
+/// The shell code `command` hands a shell without the parse listing it as commands, then the
+/// same inside each, [`MAX_RECOVERED_DEPTH`] levels down: a producer's output a shell or
+/// `source` runs, a dynamic here-string, launcher or `su -c` script
+/// ([`shell::Parsed::opaque_shell_scripts`]), and a dynamic `-c` or `eval` script
+/// ([`bash::dynamic_script`]). `None` past [`MAX_RECOVERED`] scripts or
+/// [`bash::MAX_PARSE_BYTES`] of their text.
+pub fn recovered_scripts(command: &str) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    let mut bytes = 0usize;
+    let mut level = vec![command.to_string()];
+    for _ in 0..MAX_RECOVERED_DEPTH {
+        let mut next = Vec::new();
+        for text in &level {
+            let parsed = shell::parse(text);
+            let scripts = parsed
+                .commands
+                .iter()
+                .filter_map(bash::dynamic_script)
+                .chain(parsed.opaque_shell_scripts);
+            for script in scripts {
+                if !seen.insert(script.clone()) {
+                    continue;
+                }
+                bytes = bytes.saturating_add(script.len());
+                if found.len() >= MAX_RECOVERED || bytes > bash::MAX_PARSE_BYTES {
+                    return None;
+                }
+                found.push(script.clone());
+                next.push(script);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    Some(found)
+}
+
+/// Every script [`recovered_scripts`] finds in `command`, judged by [`inner_verdict`] and, for
+/// an encoded payload it runs, [`encoded_verdict`]: the verdict the code earns run directly.
+/// More scripts or text than that asks like a command too large to check ([`bash::over_cap`]).
+pub fn recovered_verdict(
+    command: &str,
+    cwd: &Path,
+    policy: &Policy,
+    dir: &DataDir,
+) -> Option<Verdict> {
+    let Some(scripts) = recovered_scripts(command) else {
+        return decision_verdict(bash::over_cap(policy).0);
+    };
+    strictest(scripts.iter().flat_map(|script| {
+        [
+            inner_verdict(script, cwd, policy, dir),
+            encoded_verdict(script, cwd, policy, dir),
+        ]
+    }))
 }
 
 /// A [`tamper::decide_nested_claude`] decision as a tier verdict: its `ask` is a deny at High.
@@ -137,7 +206,10 @@ fn verdicts(
         envread::decide_bash(command),
     ]);
     match level {
-        Level::Top => all.push(encoded_verdict(command, cwd, policy, dir)),
+        Level::Top => {
+            all.push(encoded_verdict(command, cwd, policy, dir));
+            all.push(recovered_verdict(command, cwd, policy, dir));
+        }
         Level::Flat => all.push(encoded_at_tier(command, tier)),
         Level::Inner => {}
     }
@@ -169,5 +241,73 @@ fn decision_verdict(d: Decision) -> Option<Verdict> {
         Decision::Deny { reason } => Some(Verdict::Deny(reason)),
         Decision::Ask { reason } => Some(Verdict::Ask(reason)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scripts(command: &str) -> Vec<String> {
+        recovered_scripts(command).expect("under the caps")
+    }
+
+    #[test]
+    fn every_kind_of_handed_script_is_recovered() {
+        for (command, script) in [
+            ("echo 'ls -la' | sh", "ls -la"),
+            ("bash <(echo 'ls -la')", "ls -la"),
+            ("source <(printf 'ls -la')", "ls -la"),
+            ("sh -c \"ls $DIR\"", "ls $DIR"),
+            ("eval \"ls $DIR\"", "ls $DIR"),
+            ("sh <<< \"ls $DIR\"", "ls $DIR"),
+            ("watch \"ls $DIR\"", "ls $DIR"),
+            ("su -c \"ls $DIR\" root", "ls $DIR"),
+        ] {
+            assert_eq!(scripts(command), [script], "{command}");
+        }
+        // Code the parse lists as commands is not recovered: the gates already read it.
+        for command in ["ls -la", "sh -c 'ls -la'", "sh <<< 'ls -la'", "bash ./x.sh"] {
+            assert!(scripts(command).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn scripts_inside_scripts_are_followed_to_the_depth_cap() {
+        assert_eq!(
+            scripts("echo \"echo 'ls -la' | sh\" | sh"),
+            ["echo 'ls -la' | sh", "ls -la"]
+        );
+        // Each level wraps the one below in a dynamic `-c` script.
+        let mut command = "ls $DIR".to_string();
+        for _ in 0..MAX_RECOVERED_DEPTH + 2 {
+            command = format!("sh -c {}", shell_quote(&command));
+        }
+        assert_eq!(scripts(&command).len(), MAX_RECOVERED_DEPTH);
+    }
+
+    #[test]
+    fn repeated_scripts_count_once_and_too_many_are_none() {
+        let same = "echo 'ls' | sh; ".repeat(MAX_RECOVERED * 2);
+        assert_eq!(scripts(&same), ["ls"]);
+        let distinct =
+            |n: usize| -> String { (0..n).map(|i| format!("echo 'ls {i}' | sh; ")).collect() };
+        assert_eq!(scripts(&distinct(MAX_RECOVERED)).len(), MAX_RECOVERED);
+        assert_eq!(recovered_scripts(&distinct(MAX_RECOVERED + 1)), None);
+        let long = format!("echo '{}' | sh", "x ".repeat(bash::MAX_PARSE_BYTES / 2 + 1));
+        assert_eq!(recovered_scripts(&long), None);
+    }
+
+    /// Double quotes around `text`, escaping what a double-quoted string expands.
+    fn shell_quote(text: &str) -> String {
+        let mut out = String::from("\"");
+        for c in text.chars() {
+            if matches!(c, '"' | '\\' | '`') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
     }
 }
