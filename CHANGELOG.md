@@ -4,6 +4,16 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The process-substitution installer check reads only the command its `<(` belongs to.**
+  - `source <(./scripts/env.sh) && curl -s http://localhost:3000/health` asked as a download-and-run installer, because any `curl` later on the line counted.
+  - Now only the rest of that simple command counts.
+  - Every `<(` on the line is checked, not only the first.
+- **The ask for shell code nested past the parser's depth limit says so.** It reused the "names a solana-family program" reason even when nothing on the line named one.
+
 ## [1.3.2] — 2026-11-10
 
 ### Security
