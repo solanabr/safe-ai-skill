@@ -1,8 +1,8 @@
-//! Scan-budget regressions: every performance probe from the WS-D2 round-2 review (`evade2.rs`
-//! perf cases and `perf2.rs`). Each crafted file must come back within the pack budget (plus
-//! slack for reading and splitting the file), and a pack cut short must never grade clean.
+//! Scan-budget regressions: crafted performance probes. Each crafted file must come back within
+//! the pack budget (plus slack for reading and splitting the file), and a pack cut short must
+//! never grade clean.
 //!
-//! Release builds use the review's full 16 MiB bodies; debug builds use 256 KiB so the default
+//! Release builds use full 16 MiB bodies; debug builds use 256 KiB so the default
 //! `cargo test` stays fast. Runs are serialised: several 16 MiB bodies at once would cost GBs.
 
 mod common;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use common::TempDir;
 use safe_ai_skill::verify::rules::{self, Grade, ScanBudget, PACK_BUDGET};
 
-/// Body size: the review's 16 MiB in release builds.
+/// Body size: 16 MiB in release builds.
 const SIZE: usize = if cfg!(debug_assertions) {
     256 * 1024
 } else {

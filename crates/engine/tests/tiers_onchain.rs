@@ -1,4 +1,4 @@
-//! D8 v2 on-chain split (spec §2, §3; issue #18): Class U (unrecoverable, the shared list's
+//! The on-chain split (issue #18): Class U (unrecoverable, the shared list's
 //! `irreversible` rows), default-wallet destruction, and Class C (counterparty) per tier.
 //!
 //! Library rows drive `gates::bash::decide` then the hook pipeline (`relax::apply`, then
@@ -157,7 +157,7 @@ fn x4(command: &str, setup: impl Fn(Tier) -> Setup) -> [&'static str; 4] {
 // Class U
 // ---------------------------------------------------------------------------------------
 
-/// The brief's Class U commands with `{c}` where the cluster argument goes.
+/// The Class U commands with `{c}` where the cluster argument goes.
 fn class_u_templates() -> Vec<String> {
     vec![
         "solana program deploy --final x.so {c}".into(),
@@ -365,7 +365,7 @@ fn class_c_on_mainnet_or_unknown_asks_below_high_and_denies_at_high() {
             let cmd = cmd.trim_end();
             assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{cmd}");
             // `$URL` may split into more words: a transfer's amount is then unclear, which no
-            // grant can budget. A token amount is never covered by a SOL grant (D3).
+            // grant can budget. A token amount is never covered by a SOL grant.
             let granted = if (cluster.contains('$') && cmd.contains("transfer"))
                 || cmd.starts_with("spl-token transfer")
             {
@@ -990,7 +990,7 @@ fn fast_path_lets_every_solana_shape_through() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 1 (review F3): compounds, in-line cluster changes, unresolved programs, wallet
+// Compounds, in-line cluster changes, unresolved programs, wallet
 // directories and globs, fast path, work cap.
 // ---------------------------------------------------------------------------------------
 
@@ -1220,7 +1220,7 @@ fn e2e_wallet_directories_globs_and_cd() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 2 (re-review 1): dynamic eval / -c scripts, find -exec {}, config writes after
+// Dynamic eval / -c scripts, find -exec {}, config writes after
 // cd, joined reasons, unreadable High reason, size cap only when not ruled out.
 // ---------------------------------------------------------------------------------------
 
@@ -1325,7 +1325,7 @@ fn any_command_over_the_size_cap_asks_whatever_it_names() {
     let w = World::new("onchain-cap-pad");
     // A large here-doc is a false positive the size cap accepts.
     let heredoc = format!("cat > notes.txt <<'EOF'\n{body}\nEOF");
-    // Padding must not switch off the parse-based routing (re-review 2, R7).
+    // Padding must not switch off the parse-based routing.
     let padded = [
         format!("/usr/local/bin/sol*a program close P --bypass-warning -um{pad}"),
         format!(

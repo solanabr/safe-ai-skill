@@ -1,6 +1,6 @@
 #!/bin/sh
 # Rewrite policy/shared/MANIFEST: the contract version, then one line per list file with its
-# record count and the sha256 of its exact bytes (shared contract §1.4).
+# record count and the sha256 of its exact bytes.
 #
 #   sh scripts/shared-manifest.sh [contract-version]
 #

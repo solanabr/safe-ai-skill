@@ -1,4 +1,4 @@
-//! `safe-ai-skill doctor`: setup checks, read-only (spec D3.6).
+//! `safe-ai-skill doctor`: setup checks, read-only.
 //!
 //! Secrets section: the read gate and the Bash reader list are nudges against a careless or
 //! prompt-injected model; Claude Code's sandbox is the only hard boundary. `doctor` reports

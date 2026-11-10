@@ -1,4 +1,4 @@
-//! Secret path classification (spec D3.1, D3.2), shared by the read gate, the Bash secrets
+//! Secret path classification, shared by the read gate, the Bash secrets
 //! gate, MCP path arguments and `safe-ai-skill env`.
 //!
 //! [`classify`] is pure string work (it reads `$HOME`/`$XDG_CONFIG_HOME`/`$CLAUDE_CONFIG_DIR`,
@@ -155,7 +155,7 @@ fn tree_class(full: &str) -> Option<Class> {
         return Some(Class::HardDeny("varlock key store"));
     }
     // Claude Code transcripts record hook `systemMessage`s, which carry safe-ai-skill's
-    // confirmation codes (spec D4.1): the agent must not read them back.
+    // confirmation codes: the agent must not read them back.
     if tree_rest(&rooted, ".claude/projects").is_some() || under_config_dir(full, "projects") {
         return Some(Class::HardDeny("Claude Code transcripts"));
     }

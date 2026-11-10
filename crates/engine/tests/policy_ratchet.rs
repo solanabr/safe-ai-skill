@@ -1,6 +1,6 @@
-//! Project policy ratchet (D1.10): a repo's `.safe-ai-skill/policy.yaml` may only tighten the
+//! Project policy ratchet: a repo's `.safe-ai-skill/policy.yaml` may only tighten the
 //! base policy; its `tier` / `active_profile` and the tier env vars are raise-only hints
-//! (D8 v2; the tier itself is covered by `tiers_select.rs`).
+//! (the tier itself is covered by `tiers_select.rs`).
 //!
 //! Library cases drive [`Policy::from_sources`] (hermetic: no env, no plugin root). End-to-end
 //! cases drive the real binary with the hook `cwd` at a sandbox project holding the overlay;

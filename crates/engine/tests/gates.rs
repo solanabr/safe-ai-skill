@@ -7,7 +7,7 @@
 //! `--provider.cluster` flags (highest-precedence in `context::resolve_network`), so no test
 //! shells out to `solana config get`.
 //!
-//! Covers the plan's Verification table (PreToolUse gate rows + redact + prompt-guard) and the
+//! Covers the PreToolUse gate rows, redact and prompt-guard, and the
 //! output contract: no opinion is empty stdout + exit 0, never a `defer` decision.
 
 mod common;
@@ -641,7 +641,7 @@ fn gate_bash_malformed_stdin_asks() {
 fn unreadable_ask_is_not_relaxed_by_a_grant() {
     // The unreadable-payload ask runs under a hard-guard meta, which no grant relaxes (unit:
     // `relax::tests::hard_guard_never_relaxed_even_with_grant`). The catch-all `other` scope
-    // that used to cover unclassified asks is gone (spec D1.9): asking for it is an error.
+    // that used to cover unclassified asks is gone: asking for it is an error.
     let data = TempDir::new("unread-grant-data");
     let home = TempDir::new("unread-grant-home");
     let grant = Invocation::new(&["allow", "--scope", "other", "--for", "1h"])

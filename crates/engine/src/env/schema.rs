@@ -1,4 +1,4 @@
-//! Native parser for varlock's `.env.schema` (env-spec), spec D3.8.2. safe-ai-skill never runs
+//! Native parser for varlock's `.env.schema` (env-spec). safe-ai-skill never runs
 //! varlock: loading a schema with varlock executes `$(cmd)`/`exec()` values and `@plugin` code,
 //! so this module reads the format itself and evaluates nothing.
 //!

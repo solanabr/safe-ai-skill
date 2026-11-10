@@ -1,4 +1,4 @@
-//! The headless rule (shared contract §3.3, D8 v2 spec §7) end to end: any signal turns it on,
+//! The headless rule end to end: any signal turns it on,
 //! nothing turns it off, every `ask` becomes a `deny`, env escapes are ignored, and only a grant
 //! the user confirmed beforehand still passes (below High). No headless row emits `ask`.
 

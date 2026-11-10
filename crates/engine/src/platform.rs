@@ -1,4 +1,4 @@
-//! SessionStart notices about the install and the platform (spec D5.1, D5.3, D5.5).
+//! SessionStart notices about the install and the platform.
 //!
 //! All best effort: a file that is missing, unreadable or in a format this doesn't know
 //! yields no notice, never an error. Nothing here touches the network or runs a process.
@@ -21,7 +21,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// The oldest Claude Code that honours `onFailure` (spec D5.5).
+/// The oldest Claude Code that honours `onFailure`.
 pub const MIN_CLAUDE_CODE: (u64, u64, u64) = (2, 1, 295);
 
 /// `installed_plugins.json` is read only up to this size.

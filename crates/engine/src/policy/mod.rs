@@ -5,7 +5,7 @@
 //! project override over the default — it may only tighten it, see [`ratchet`] — and FAILS
 //! CLOSED on any unrecoverable parse error.
 //!
-//! The strictness the user picked is a [`tier::Tier`] (D8 v2): [`load_runtime`] resolves it
+//! The strictness the user picked is a [`tier::Tier`]: [`load_runtime`] resolves it
 //! ([`tier::resolve`]) together with the sandbox state and the headless rule into
 //! [`Policy::runtime`], which gates read. The base policy names the base tier (`tier`, or the
 //! legacy `active_profile` alias); a project's `tier`/`active_profile` and `secrets.env_read`
@@ -885,7 +885,7 @@ mod tests {
     #[test]
     fn embedded_has_expanded_mcp_verbs_catalog_and_ext() {
         let p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
-        // Expanded value-moving verb list (G4).
+        // Expanded value-moving verb list.
         for verb in ["stake", "delegate", "mint", "bridge", "lend", "borrow"] {
             assert!(
                 p.mcp.sensitive_name_pattern.contains(verb),

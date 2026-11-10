@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""latency-budget.py — the hook latency budget (spec D5, WS-E E5), run by CI.
+"""latency-budget.py — the hook latency budget, run by CI.
 
     python3 -I scripts/latency-budget.py --engine <new build> --baseline <shipped binary>
 

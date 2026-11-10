@@ -432,7 +432,7 @@ fn a_panic_still_denies_with_exit_0() {
     assert_eq!(codex_label(&run), "deny", "{}", run.stderr);
 }
 
-/// Re-review R1: directory, glob, `cd`, `find` and `git` writes reaching protected files.
+/// Directory, glob, `cd`, `find` and `git` writes reaching protected files.
 #[test]
 fn directory_glob_cd_find_and_git_writes_to_protected_files_deny() {
     let w = World::new("adapt-r1");
@@ -472,7 +472,7 @@ fn directory_glob_cd_find_and_git_writes_to_protected_files_deny() {
     }
 }
 
-/// Re-review R2: an interactive shell or REPL would take `write_stdin` input unchecked.
+/// An interactive shell or REPL would take `write_stdin` input unchecked.
 #[test]
 fn interactive_shells_and_repls_deny() {
     let w = World::new("adapt-r2");
@@ -487,7 +487,7 @@ fn interactive_shells_and_repls_deny() {
     }
 }
 
-/// Re-review R4: a literal protected path inside interpreter code.
+/// A literal protected path inside interpreter code.
 #[test]
 fn protected_paths_in_interpreter_code_deny() {
     let w = World::new("adapt-r4");

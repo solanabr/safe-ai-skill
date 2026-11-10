@@ -8,7 +8,7 @@
 //! Everything is pure in-memory byte/char scanning with no compiled-regex dependency,
 //! so it stays cheap enough to run on every tool output.
 //!
-//! Hook contract (spec D3.5): the input is the PostToolUse `tool_response`, whose shape differs
+//! Hook contract: the input is the PostToolUse `tool_response`, whose shape differs
 //! per tool (Read `{type:"text",file:{filePath,content,…}}`, Bash `{stdout,stderr,…}`, Grep
 //! `{mode,filenames,content,…}`, MCP content blocks or a string). [`scrub_response`] rewrites
 //! the string leaves in place and keeps every other field, so the output has the tool's exact
@@ -59,7 +59,7 @@ pub fn contains_marker(text: &str) -> bool {
 /// bypassed on a read it would deny, the response is scrubbed. Bash output (`cat .env`) is
 /// always value-scrubbed: only the Read tool's response feeds an Edit. Bash output also gets
 /// [`scrub_env_lines`], so an allowed env dump (`printenv`, `env`, `set`, `export -p`,
-/// `declare -p`) reaches the model with its secret-named values blanked (decision D2).
+/// `declare -p`) reaches the model with its secret-named values blanked.
 pub fn scrub_tool_response(
     input: &HookInput,
     response: &Value,
@@ -298,7 +298,7 @@ pub(crate) fn names_secret_value(key: &str) -> bool {
 }
 
 /// Words that mark an environment variable name as secret when they appear anywhere in it,
-/// case-insensitively (decision D2): `HELIUS_API_KEY`, `GITHUB_TOKEN`, `DB_PASSWD`, `OAUTH_X`.
+/// case-insensitively: `HELIUS_API_KEY`, `GITHUB_TOKEN`, `DB_PASSWD`, `OAUTH_X`.
 const SECRET_ENV_WORDS: &[&str] = &[
     "KEY",
     "TOKEN",
@@ -360,7 +360,7 @@ const SECRET_ENV_SEGMENTS: &[&str] = &[
     "PAT", "SK", "PASS", "JWT", "COOKIE", "SESSION", "DSN", "PWD",
 ];
 
-/// Whether an environment variable name is secret-named (decision D2). A
+/// Whether an environment variable name is secret-named. A
 /// [`STRONG_SECRET_ENV_WORDS`] word always is; otherwise a [`NON_SECRET_ENV_SUFFIXES`] suffix
 /// is not (unless the name is a [`SECRET_URL_NAMES`] URL); otherwise the name holds a
 /// [`SECRET_ENV_WORDS`] word outside every [`NON_SECRET_ENV_PARTS`] occurrence, or a
@@ -439,7 +439,7 @@ const MAX_ENV_VALUE_BYTES: usize = 64 * 1024;
 const ENV_MARKER: &str = "***REDACTED:env***";
 
 /// Blank the values of secret-named variables ([`is_secret_env_name`]) in env-dump-shaped
-/// text, for Bash output (decision D2: bare `printenv`, `env`, `set`, `export -p`,
+/// text, for Bash output (bare `printenv`, `env`, `set`, `export -p`,
 /// `declare -p` are allowed and their secrets blanked here). Two shapes:
 ///
 /// - a line (`\n`- or NUL-separated, so `env -0` counts) `NAME=value`, optionally after

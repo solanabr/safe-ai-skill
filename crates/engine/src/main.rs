@@ -49,7 +49,7 @@ const OVERSIZED_REASON: &str =
 const MALFORMED_REASON: &str =
     "safe-ai-skill: hook input is malformed and was not inspected; review this call manually.";
 
-/// Bound on every PreToolUse gate (spec D1.3): past it the gate answers `ask`, well before
+/// Bound on every PreToolUse gate: past it the gate answers `ask`, well before
 /// Claude Code's hook timeout.
 const GATE_DEADLINE: Duration = Duration::from_secs(8);
 
@@ -462,7 +462,7 @@ fn finish_pretooluse(
 ) -> ExitCode {
     let plugin_data = dir.path.as_path();
     let decision = relax::apply(natural, meta, effective, dir);
-    // Headless (contract §3.3): every remaining ask becomes a deny; a grant the user confirmed
+    // Headless: every remaining ask becomes a deny; a grant the user confirmed
     // earlier has already become an allow above.
     let decision = headless::apply(decision, effective.runtime.headless);
     record_decision(&decision);
@@ -774,7 +774,7 @@ fn cmd_gate_webfetch() -> ExitCode {
     finish_pretooluse(decision, &meta, &effective, &dir, &input, &raw)
 }
 
-/// `ConfigChange`: block a settings change that turns protection off (D1). The answer is a
+/// `ConfigChange`: block a settings change that turns protection off. The answer is a
 /// top-level `decision: "block"`; Claude Code ignores a block on `policy_settings`.
 fn cmd_gate_config() -> ExitCode {
     let (raw, _) = read_input();
@@ -1108,7 +1108,7 @@ fn cmd_gate_tamper() -> ExitCode {
 }
 
 fn cmd_redact() -> ExitCode {
-    // Fails open: an unreadable or oversized payload passes unchanged (spec D3.5), except under
+    // Fails open: an unreadable or oversized payload passes unchanged, except under
     // the opt-in Codex route, where a result that cannot be scanned is withheld.
     let Ok(input) = io::read_payload_bounded(std::io::stdin(), redact::MAX_SCAN_BYTES).1 else {
         if adapt::is_codex() {
@@ -1195,7 +1195,7 @@ fn cmd_failure_notice() -> ExitCode {
 }
 
 /// `prompt-guard` — the UserPromptSubmit hook: block a prompt carrying a raw secret, else
-/// handle a `safe-ai-skill confirm <nonce>` prompt (spec D4.1). The nonce is read from the
+/// handle a `safe-ai-skill confirm <nonce>` prompt. The nonce is read from the
 /// UserPromptSubmit `prompt` alone ([`confirm::user_prompt`]).
 fn cmd_prompt_guard() -> ExitCode {
     let Ok(input) = read_input().1 else {
@@ -1473,7 +1473,7 @@ fn cmd_verify_session() -> ExitCode {
     };
 
     // The tier line and the hints the resolution ignored, overrides the policy ratchet refused
-    // (project overlay, removed settings), then the active loosenings (spec D4.4): shown to the
+    // (project overlay, removed settings), then the active loosenings: shown to the
     // user and given to the model.
     let root = tier::project_root(&cwd);
     let loosenings = notice::loosenings(&notice::Inputs {
@@ -1535,7 +1535,7 @@ fn cmd_verify_session() -> ExitCode {
         }
     }
     // The firewall block: re-applied when this engine ships a newer rule set or the declared
-    // tier rose (never lowered), then any drift between declared and enforced (T3, T6).
+    // tier rose (never lowered), then any drift between declared and enforced.
     if !adapt::is_foreign() {
         let home = datadir::passwd_home();
         let fw = safe_ai_skill::firewall::Ctx {
@@ -1589,7 +1589,7 @@ fn cmd_verify_session() -> ExitCode {
         res.system_message.push_str(&codes);
     }
 
-    // One-time tip (per project) when env files exist without a `.env.schema` (spec D3.8.6).
+    // One-time tip (per project) when env files exist without a `.env.schema`.
     if let Some(tip) = safe_ai_skill::env::schema_tip(&cwd, &dir.path) {
         if !res.system_message.is_empty() {
             res.system_message.push('\n');
@@ -1618,7 +1618,7 @@ fn cmd_verify_session() -> ExitCode {
 
 /// `verify approve <name|path>` / `verify trust <path>`: create a pending request and print its
 /// id, never a code. Nothing changes until the user types the code safe-ai-skill shows them as
-/// their next prompt (spec D4.1); the UserPromptSubmit hook then applies it
+/// their next prompt; the UserPromptSubmit hook then applies it
 /// ([`verify::apply_confirmed`]).
 fn cmd_verify_request(action: &str, target: &str) -> ExitCode {
     let command = format!("verify {action}");
@@ -2459,7 +2459,7 @@ fn cli_error(command: &str, error: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Park a relaxing action for confirmation (spec D4.1). The output names the request but
+/// Park a relaxing action for confirmation. The output names the request but
 /// carries **no code**: safe-ai-skill shows the code to the user alone, in a `systemMessage`
 /// (the PostToolUse `pending-notice` hook, or the next prompt or session start).
 fn park_pending(
@@ -2563,7 +2563,7 @@ fn cmd_mode(rest: &[String]) -> ExitCode {
 }
 
 /// `tier [<name>] [--project] [--env-read deny|tier] | --clear [--project]` — show the tier (no
-/// argument), or change the user's choice in `tier.json` (D8 v2 spec §1.3). Raising the tier or
+/// argument), or change the user's choice in `tier.json`. Raising the tier or
 /// tightening `env_read` to `deny` applies at once; lowering, or loosening it back to `tier`, is
 /// parked for the user's whole-prompt confirmation (the code reaches the user alone).
 fn cmd_tier(rest: &[String]) -> ExitCode {

@@ -11,10 +11,10 @@
 //! |-------------------------------------------------------|------|---------|--------|------|
 //! | project env file (`env_read: tier`, the default)      | n/o  | n/o     | n/o    | deny |
 //! | project env file, the user's `env_read: deny`         | deny | deny    | deny   | deny |
-//! | production project env file (`.env.production`, `.env.prod*`, [`production_verdict`], D5) | n/o | deny | deny | deny |
+//! | production project env file (`.env.production`, `.env.prod*`, [`production_verdict`]) | n/o | deny | deny | deny |
 //! | other env files (`.envrc`, `*.env`, `.dev.vars`, the Solana CLI config, any env file outside the project) | deny | deny | deny | deny |
 //! | env data flowing into a network sink (`creddump::env_to_network`) | deny | deny | deny | deny |
-//! | Bash: `/proc/*/environ`, `ps e`, printing a secret-named variable ([`decide_bash`], D2) | deny | deny | deny | deny |
+//! | Bash: `/proc/*/environ`, `ps e`, printing a secret-named variable ([`decide_bash`]) | deny | deny | deny | deny |
 //! | Bash: bare `printenv`/`env`/`export -p`/`set`/`declare -p` (values blanked by `redact`) | n/o | n/o | n/o | n/o |
 //!
 //! At the tiers that open them the model sees the values: the guarantee is that a value does not
@@ -390,7 +390,7 @@ pub fn decision(policy: &Policy, project: bool, reason: String) -> Decision {
 }
 
 /// Whether a file name is a production env file (`.env.production`, `.env.prod`,
-/// `.env.prod*`, case-insensitive, not a template; decision D5): a project env file name whose raw read counts
+/// `.env.prod*`, case-insensitive, not a template): a project env file name whose raw read counts
 /// as a secret from tier Relaxed up ([`production_verdict`]).
 pub fn is_production_env_name(name: &str) -> bool {
     const TEMPLATES: &[&str] = &[".example", ".sample", ".template", ".dist", ".schema"];
@@ -400,7 +400,7 @@ pub fn is_production_env_name(name: &str) -> bool {
         && is_project_env_name(&lower)
 }
 
-/// The verdict for a raw read of the project env file `file` (decision D5 on top of
+/// The verdict for a raw read of the project env file `file` (on top of
 /// [`verdict`]): a production env file ([`is_production_env_name`], by the name as given) is
 /// denied at Relaxed, Medium and High, as a secret; Off keeps the project-file row.
 pub fn production_verdict(
@@ -454,7 +454,7 @@ fn with_env_commands(reason: String) -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// Env dumps in Bash (decision D2)
+// Env dumps in Bash
 // ---------------------------------------------------------------------------------------
 
 /// Bytes that must appear in a command for [`decide_bash`] to parse it: an expansion, a
@@ -487,7 +487,7 @@ const CODE_ENV_READS: &[&str] = &[
     "env::var(",
 ];
 
-/// The verdict for a Bash `command` that prints environment values (decision D2), at every
+/// The verdict for a Bash `command` that prints environment values, at every
 /// tier (Off is not DISABLE, as in `creddump`); `None` is no opinion:
 ///
 /// - **Deny** a read of a process environment file: `/proc/<pid|self|thread-self>/environ`
@@ -552,7 +552,7 @@ const DUMP_SAFE_FILTERS: &[&str] = &[
 /// Whether a bare env dump (`env`, `printenv`, `export -p`, `set`, `declare -p`/`-x`,
 /// `typeset -p`/`-x`) is piped into anything but a [`DUMP_SAFE_FILTERS`] filter (or a
 /// keys-only `cut -d= -f1`), or written to a file: the PostToolUse redaction then cannot see
-/// its `NAME=value` lines (decision D2 allows the bare dump because of that redaction).
+/// its `NAME=value` lines (the bare dump is allowed because of that redaction).
 fn dump_leaves_redaction(command: &str) -> bool {
     split_unquoted(command, &[";", "&&", "||", "\n"])
         .iter()

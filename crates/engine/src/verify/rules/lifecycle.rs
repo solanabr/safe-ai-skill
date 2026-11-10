@@ -1,4 +1,4 @@
-//! Install-time behaviour (spec D2.4): `package.json` lifecycle scripts (and every script run as
+//! Install-time behaviour: `package.json` lifecycle scripts (and every script run as
 //! shell code), package-registry rewrites, git hook writes, and unpinned package runners.
 
 use serde_json::Value;
@@ -10,7 +10,7 @@ use super::context::{
 use super::network_ctx::VarCache;
 use super::{line_no, Ctx, FileOut, Severity, Signal};
 
-/// Scripts that run at install time (spec D2.4): on `npm install` / `npm ci` in the package
+/// Scripts that run at install time: on `npm install` / `npm ci` in the package
 /// (`prepublish` still runs there; `dependencies` runs when `node_modules` changes), on a git
 /// dependency (`prepack`, `postpack`), and pnpm's root install hook.
 const LIFECYCLE: &[&str] = &[

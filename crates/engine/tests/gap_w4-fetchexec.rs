@@ -1,4 +1,4 @@
-//! W4 fixture: download-and-run gate (`gates::fetchexec`), headless conversion included.
+//! Fixture tests: download-and-run gate (`gates::fetchexec`), headless conversion included.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

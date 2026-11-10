@@ -973,7 +973,7 @@ pub fn quarantined_packs(plugin_data: &Path, st: &State) -> Vec<String> {
         .collect()
 }
 
-/// What a pack verdict from [`enforce`] becomes at `tier` (D8 v2 spec §6).
+/// What a pack verdict from [`enforce`] becomes at `tier`.
 ///
 /// `Deny` is a blocked or unscanned pack: denied in place at Relaxed, Medium and High, and only
 /// reported (at SessionStart) at Off. `Ask` is the marker for a first-seen HIGH heuristic
@@ -1566,7 +1566,7 @@ fn record_unscanned(
     }
 }
 
-/// Carry a pack seen for the first time over from the v1 lockfile (spec D2.3).
+/// Carry a pack seen for the first time over from the v1 lockfile.
 ///
 /// Returns the pin, the state floor and a one-off note. v1 keyed pins by bare name:
 /// - a pin whose recorded location is another pack, or which another pack already matched, is a
@@ -1850,7 +1850,7 @@ impl PackReportLine {
     }
 }
 
-/// Run the SessionStart supply-chain sweep (spec D2): state v2, deny in place by default.
+/// Run the SessionStart supply-chain sweep: state v2, deny in place by default.
 ///
 /// Sweeps each root in `policy.supply_chain.verify_skills_dirs` (`~` expands to HOME; a relative
 /// root resolves against `project_dir`, the session cwd), plus the packs `install --from` put in
@@ -2323,7 +2323,7 @@ fn ctx_word(ctx: grading::Ctx) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------------------
-// verify trust / verify approve (spec D2.8, D4.1): pending requests and their confirmation.
+// verify trust / verify approve: pending requests and their confirmation.
 // ---------------------------------------------------------------------------------------
 
 /// A pending trust or approval: the user confirms it with the code safe-ai-skill shows them
@@ -2515,7 +2515,7 @@ fn request_approve_in(
     }) = moved_pack(&st, &project, &parents, cwd, target)?
     {
         let from = PathBuf::from(e.quarantined_to.clone().unwrap_or_default());
-        // A combination rule is never approved (spec D2.8), so moving the pack back would only
+        // A combination rule is never approved, so moving the pack back would only
         // put blocked content where it runs: refuse now, before anything is restored.
         if e.reason == Some(state::Reason::Combo) || e.escapes() {
             return Err(Error::Other(format!(
@@ -2884,7 +2884,7 @@ fn pending_approve(
 
 /// Perform a confirmed `verify trust` or `verify approve` request.
 ///
-/// **For the UserPromptSubmit hook (WS-B):** after
+/// **For the UserPromptSubmit hook:** after
 /// `confirm::confirm_from_prompt(dir, confirm::user_prompt(&input)?, now)` returns
 /// `Some(c)` with `c.kind` [`PendingKind::Trust`] or [`PendingKind::Approve`], call
 /// `verify::apply_confirmed(dir, &c)` and show the returned text to the user in the hook's
@@ -3122,7 +3122,7 @@ fn kind_of(payload: &serde_json::Value) -> PackKind {
 ///
 /// Refused (`false`, the entry left blocked) when the content fires a combination rule (a
 /// symlink resolving outside the pack among them): approval clears drift, `unreviewed` and a
-/// reviewed `packs.lock` mismatch, never a BLOCK combo (spec D2.8).
+/// reviewed `packs.lock` mismatch, never a BLOCK combo.
 fn approve_entry(
     dir: &DataDir,
     st: &mut State,
@@ -5401,7 +5401,7 @@ mod enforce_tests {
         }
     }
 
-    // ---- Review fixtures (rr5 p1–p9, pa, pb), recreated ----
+    // ---- Pack fixtures (p1–p9, pa, pb) ----
 
     /// An empty project with its data dir.
     fn fresh(tag: &str) -> (DataDir, PathBuf) {
@@ -5676,7 +5676,7 @@ mod enforce_tests {
         assert!(report.combos.iter().any(|c| c.rule == "symlink_escape"));
     }
 
-    // ---- fix round 4 ----------------------------------------------------------------------
+    // ---- stat fingerprints, sweep budgets and escaping links ------------------------------
 
     fn fresh_trusted(tag: &str) -> (DataDir, PathBuf) {
         let (mut d, project) = fresh(tag);
@@ -5708,7 +5708,7 @@ mod enforce_tests {
         sweep_within(d, project, &no_user_skills(), &policy(), scanner, budget)
     }
 
-    /// The WS-D2 re-review's `sameshape` probe, on state v2: a pinned pack whose scan is
+    /// The `sameshape` probe, on state v2: a pinned pack whose scan is
     /// expensive gets an equal-length payload swap (same file count, sizes and names). Short
     /// sweep budgets must never let the swapped content pass: the full hash runs before the
     /// scan, so the pack is drift-blocked or, if even the hash is cut, left unscanned (denied).
@@ -6219,7 +6219,7 @@ mod enforce_tests {
         check("after a sweep");
     }
 
-    // ---- fix round 5 ----------------------------------------------------------------------
+    // ---- budget cuts, fingerprint matches and packs.lock ----------------------------------
 
     fn copy_data(from: &DataDir, tag: &str) -> DataDir {
         let to = from.path.with_file_name(format!("{tag}-copy"));

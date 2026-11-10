@@ -1,4 +1,4 @@
-//! Read / Grep / Glob / MCP-path secret gate (spec D3.1, D3.2, D3.3, D3.8.1).
+//! Read / Grep / Glob / MCP-path secret gate.
 //!
 //! A path is judged on two candidates, the path as given (relative paths join the hook `cwd`)
 //! and its symlink-resolved form, by the built-in classes of [`secretpath`] plus the policy's
@@ -17,7 +17,7 @@
 //!
 //! Grep is judged on `path` and `glob`, never on its regex `pattern`. A directory Grep gets an
 //! `updatedInput` that appends env/key exclusions to `glob` (no permission decision: Claude
-//! Code applies it without `allow`, research hooks-empirical-2.1.304 Q10). Glob is never gated.
+//! Code 2.1.304 applies it without `allow`, as observed). Glob is never gated.
 //! MCP tools get the path check on every single-line string argument.
 
 use std::path::{Path, PathBuf};
@@ -340,7 +340,7 @@ pub fn env_verdict(file: &str, project: bool, policy: &Policy, varlock: bool) ->
     envread::decision_for(policy, file, project, env_reason(file, varlock))
 }
 
-/// The actionable env-class message (spec D3.3, D3.8.6). `varlock` adds the varlock hint.
+/// The actionable env-class message. `varlock` adds the varlock hint.
 pub fn env_reason(file: &str, varlock: bool) -> String {
     let label = shell_label(file);
     let mut out = format!(
@@ -394,7 +394,7 @@ pub fn varlock_hint(cwd: &Path, file: &Path) -> bool {
     })
 }
 
-/// Content guard for an allow-listed `.env.schema` (spec D3.8.1): denied when it resolves to a
+/// Content guard for an allow-listed `.env.schema`: denied when it resolves to a
 /// file not itself named `.env.schema`, is not a regular file, is larger than 64 KiB, or holds key material, a high-confidence API key, or a
 /// literal secret-looking value for a sensitive key. A missing schema is no opinion. The schema
 /// is parsed natively ([`Schema`]); nothing in it is evaluated.
@@ -640,7 +640,7 @@ fn expand_braces(glob: &str, depth: usize) -> Vec<String> {
 // MCP
 // ---------------------------------------------------------------------------------------
 
-/// Run the read check on every path-like string argument of an MCP call (spec D3.2): every
+/// Run the read check on every path-like string argument of an MCP call: every
 /// single-line string up to [`MAX_MCP_PATH_LEN`] bytes, spaces included. The first non-`Defer`
 /// verdict wins. A payload with more strings than [`MAX_MCP_PATHS`], or nested deeper than
 /// [`MAX_MCP_DEPTH`], cannot be checked whole: a hard-guard ask (deny at High).

@@ -1,11 +1,11 @@
-//! Tiers (D8 v2, firewall split spec §1): the strictness the user picked, as an input.
+//! Tiers: the strictness the user picked, as an input.
 //!
 //! `off < relaxed < medium < high`; `relaxed` is the default. **Off is not DISABLE**: every
-//! deny row of spec §2 holds at Off, and `SAFE_AI_SKILL_DISABLE=1` stays the only no-guards
-//! switch. The old profile names are input aliases (`strict`/`autopilot` → relaxed,
-//! `paranoid` → high).
+//! row of the per-gate table in `docs/tiers.md` that denies at Off still denies, and
+//! `SAFE_AI_SKILL_DISABLE=1` stays the only no-guards switch. The old profile names are input
+//! aliases (`strict`/`autopilot` → relaxed, `paranoid` → high).
 //!
-//! ## Resolution ([`resolve`], spec §1.2), per hook, for the project root of the payload cwd
+//! ## Resolution ([`resolve`]), per hook, for the project root of the payload cwd
 //!
 //! 1. `base`: the plugin default policy's `tier` (`relaxed`).
 //! 2. `user`: the authenticated `tier.json` in a trusted data dir ([`crate::tierstate`]):
@@ -95,7 +95,7 @@ impl Tier {
     }
 
     /// The label shown at SessionStart and in `status`: `relaxed (hooks only)` when the Claude
-    /// Code sandbox is not on (spec §1.4).
+    /// Code sandbox is not on.
     pub fn display(self, sandbox: SandboxState) -> String {
         if sandbox == SandboxState::On {
             self.label().to_string()
@@ -214,7 +214,7 @@ pub struct TierContext {
     pub env_read: EnvRead,
     /// Declared Claude Code sandbox state for the project.
     pub sandbox: SandboxState,
-    /// Whether the session is headless (contract §3.3).
+    /// Whether the session is headless.
     pub headless: bool,
 }
 
@@ -264,7 +264,7 @@ pub struct Inputs {
     pub env: Vec<RawHint>,
 }
 
-/// Resolve the effective tier and `env_read` for the project at `root` (spec §1.2).
+/// Resolve the effective tier and `env_read` for the project at `root`.
 ///
 /// `base`, `base_env_read`, the repo hints and the repo `env_read` come from the loaded
 /// policy (`policy`); `env` looks up an environment variable.

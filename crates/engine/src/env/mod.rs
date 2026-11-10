@@ -1,5 +1,5 @@
 //! `safe-ai-skill env keys|set|unset`: read and edit env-class files without printing values
-//! (#7, spec D3.4).
+//! (#7).
 //!
 //! Raw reads of env files follow the env-read tier rule (`gates::envread`: project `.env`/`.env.*`
 //! open below High, other env files denied); this subcommand is the sanctioned
@@ -53,7 +53,7 @@ From a Claude Code session, `set` and `unset` are refused at tier medium (and at
 files other than the project's .env/.env.*; the session's hook denies them first).
 ";
 
-/// Whether `path` names an env-class file (spec D3.1, case-insensitive): `.env`, `.env.*`,
+/// Whether `path` names an env-class file (case-insensitive): `.env`, `.env.*`,
 /// `*.env`, `.envrc`, `.dev.vars[.*]`, `.varlock-frozen-env`, or
 /// `~/.config/solana/cli/config.yml`. Templates (`.env.example|.sample|.template|.dist`) and
 /// the varlock `.env.schema` are not env-class. Windows separators, an NTFS `:stream` suffix
@@ -62,8 +62,8 @@ pub fn is_env_class(path: &Path) -> bool {
     secretpath::classify(&path.to_string_lossy()) == Class::Env
 }
 
-/// The one-time SessionStart tip for a project with env-class files and no `.env.schema`
-/// (spec D3.8.6). Shown once per project directory: a marker under
+/// The one-time SessionStart tip for a project with env-class files and no `.env.schema`.
+/// Shown once per project directory: a marker under
 /// `<plugin_data>/tips/` records it, and when the marker cannot be written the tip is skipped
 /// (a tip that repeats every session is noise). Only `cwd` itself is checked.
 pub fn schema_tip(cwd: &Path, plugin_data: &Path) -> Option<String> {

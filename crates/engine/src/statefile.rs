@@ -1,4 +1,4 @@
-//! Authenticated JSON state files in the plugin data dir (spec D4.2).
+//! Authenticated JSON state files in the plugin data dir.
 //!
 //! Each file is an envelope `{"v": 1, "gen": <n>, "mac": "<hex>", "body": <state>}`. The MAC
 //! is HMAC-SHA256 under a 32-byte key in `${DATA}/key` (mode 0600, created on the first

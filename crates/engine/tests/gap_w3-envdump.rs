@@ -1,4 +1,4 @@
-//! Gap closure W3 (env dumps, decisions D2 and D5): the fixture
+//! Env dumps and production env files: the fixture
 //! `tests/fixtures/gap/w3-envdump.jsonl` through `envread::decide_bash` and
 //! `envread::production_verdict`, and the PostToolUse redaction of env-dump output end to end.
 

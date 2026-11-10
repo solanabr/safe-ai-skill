@@ -1,8 +1,8 @@
-//! Relaxation integrity, end to end (spec D4, D1.9; D8 v2 §1.3): prompt-nonce confirmation,
+//! Relaxation integrity, end to end: prompt-nonce confirmation,
 //! authenticated state, the tier CLI and the SessionStart notices.
 //!
 //! These runs use a sandboxed `CLAUDE_PLUGIN_DATA` under the temp dir, which is never a
-//! trusted data dir (spec D2.8), so a confirmed grant is stored but never relaxes anything
+//! trusted data dir, so a confirmed grant is stored but never relaxes anything
 //! here; the trusted path is covered by the `relax`/`grants`/`mode` unit tests, which build a
 //! trusted `DataDir` directly.
 
@@ -170,7 +170,7 @@ fn allow_transfer(sb: &Sandbox) -> Run {
 }
 
 // ---------------------------------------------------------------------------------------
-// B1: prompt-nonce confirmation
+// Prompt-nonce confirmation
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -293,7 +293,7 @@ fn a_secret_in_a_confirm_prompt_is_still_blocked() {
 }
 
 // ---------------------------------------------------------------------------------------
-// B4: scope validation
+// Scope validation
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -406,7 +406,7 @@ fn tier_with_no_argument_shows_the_resolution() {
 }
 
 // ---------------------------------------------------------------------------------------
-// B2: authenticated state
+// Authenticated state
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -494,7 +494,7 @@ fn v1_state_is_migrated_once_and_listed_at_session_start() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 1: the agent never sees the code
+// The agent never sees the code
 // ---------------------------------------------------------------------------------------
 
 #[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
@@ -625,7 +625,7 @@ fn a_clean_session_start_stays_silent() {
 }
 
 // ---------------------------------------------------------------------------------------
-// B3: tiers
+// Tiers
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -636,7 +636,7 @@ fn high_never_allows_and_paranoid_is_its_alias() {
         ("SAFE_AI_SKILL_PROFILE", "paranoid"),
     ] {
         assert_eq!(sb.bash(&devnet_transfer("0.5"), &[env]), "", "{env:?}");
-        // Spec §2: Class C on mainnet denies at High.
+        // Class C on mainnet denies at High.
         assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[env]), "deny", "{env:?}");
     }
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "allow");

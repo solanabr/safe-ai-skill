@@ -1,4 +1,4 @@
-//! Model-facing text (spec D2.4, D2.3 `prompt_injection`): the `SKILL.md` description is
+//! Model-facing text (rule `prompt_injection` among others): the `SKILL.md` description is
 //! injected into every session, so shell syntax, a URL with an action verb or next to a
 //! credential, or injected instructions in it block; a bare URL warns. A frontmatter that never
 //! closes or runs past [`MAX_FRONTMATTER_LINES`] is HIGH. Prompt-injection phrasing and
@@ -341,7 +341,7 @@ fn check_description(d: &str) -> Verdict {
 }
 
 /// A URL that comes with an action verb in its sentence, or any URL in a description that also
-/// names a secret path or a credential term (spec D2.4 deviation, see `docs/scanner-coverage.md`).
+/// names a secret path or a credential term (a deviation, see `docs/scanner-coverage.md`).
 fn url_instruction(d: &str) -> bool {
     let urls = url_spans(d);
     if urls.is_empty() {

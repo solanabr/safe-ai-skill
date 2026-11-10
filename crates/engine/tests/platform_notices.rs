@@ -1,4 +1,4 @@
-//! SessionStart platform notices (spec D5.1, D5.5): duplicate installs and an old Claude
+//! SessionStart platform notices: duplicate installs and an old Claude
 //! Code, driven through the real `verify session` binary.
 
 mod common;

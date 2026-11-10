@@ -1,10 +1,10 @@
-//! Legacy profile state (`${DATA}/mode.json`), kept as an alias shim for tiers (D8 v2).
+//! Legacy profile state (`${DATA}/mode.json`), kept as an alias shim for tiers.
 //!
 //! Profiles are gone: `safe-ai-skill mode <name>` is a deprecated alias of
 //! `safe-ai-skill tier <name>` (`strict`/`autopilot` → relaxed, `paranoid` → high, see
 //! [`crate::policy::tier::Tier::parse`]), and gates never read `mode.json`. What remains is
-//! the record format, which [`crate::migrate`] reads once to carry a 1.0 plain file or a WS-B
-//! authenticated file over to `tier.json` ([`crate::tierstate`]).
+//! the record format, which [`crate::migrate`] reads once to carry a 1.0 plain file or a 1.1.0
+//! development build's authenticated file over to `tier.json` ([`crate::tierstate`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,7 @@ pub struct ModeRecord {
     pub set_at: u64,
 }
 
-/// Load and authenticate a WS-B `mode.json`.
+/// Load and authenticate a 1.1.0 development `mode.json`.
 pub fn load(dir: &DataDir) -> Loaded<ModeRecord> {
     statefile::load(dir, MODE_FILE)
 }

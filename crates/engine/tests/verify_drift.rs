@@ -137,7 +137,7 @@ fn approve_run(
     let run = inv.run();
     let v = run.json();
     assert_eq!(v["status"], "pending", "approve failed: {}", run.stdout);
-    // A request id only: the confirmation code never reaches the agent (WS-B).
+    // A request id only: the confirmation code never reaches the agent.
     let id = v["request"].as_str().unwrap_or_default();
     assert!(id.starts_with('r'), "{v}");
     assert!(v.get("nonce").is_none(), "{v}");

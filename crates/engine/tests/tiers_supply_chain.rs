@@ -1,4 +1,4 @@
-//! Supply chain per tier (D8 v2 spec §6, issue #17), through the built binary.
+//! Supply chain per tier (issue #17), through the built binary.
 //!
 //! The same pack, probed by the Skill tool, a typed `/slash`, Read, Grep and Bash, at each
 //! tier: Off only reports, Relaxed and Medium deny a blocked (combo, drift, `packs.lock`

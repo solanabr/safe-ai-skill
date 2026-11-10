@@ -1,6 +1,6 @@
-//! W12: `safe-ai-skill firewall apply|show|check` — the settings manager (X1–X9, P14, P21, T3,
-//! T6). Library-level: apply/show/check on temp project dirs, idempotence, user rules kept,
-//! lowering parked for confirmation, `sandbox.enabled` never written false.
+//! `safe-ai-skill firewall apply|show|check` — the settings manager, its drift check and
+//! rule-set versioning. Library-level: apply/show/check on temp project dirs, idempotence, user
+//! rules kept, lowering parked for confirmation, `sandbox.enabled` never written false.
 
 mod common;
 

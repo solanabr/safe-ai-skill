@@ -1,4 +1,4 @@
-//! Secret-name heuristic and transformed env dumps (W3 follow-up to the coverage round).
+//! Secret-name heuristic and transformed env dumps (a follow-up to `gap_w3-envdump`).
 
 use safe_ai_skill::gate::Verdict;
 use safe_ai_skill::gates::envread;

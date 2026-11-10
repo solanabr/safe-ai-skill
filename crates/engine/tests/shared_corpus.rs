@@ -1,4 +1,4 @@
-//! The shared conformance corpus (`policy/shared/corpus/*.jsonl`, contract §2) and its engine
+//! The shared conformance corpus (`policy/shared/corpus/*.jsonl`) and its engine
 //! runner.
 //!
 //! - `shared_corpus_schema` (always on): every row parses against the schema, ids are unique,
@@ -42,7 +42,7 @@ use serde_json::Value;
 const TIERS: [Tier; 4] = [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High];
 const TIER_WORDS: [&str; 4] = ["off", "relaxed", "medium", "high"];
 
-/// The corpus files, one per topic (contract §2.1, split spec F6).
+/// The corpus files, one per topic (listed in `policy/shared/corpus/README.md`).
 const FILES: [&str; 8] = [
     "cluster",
     "wrappers",
@@ -226,7 +226,8 @@ fn text_of(v: Verdicts) -> String {
     v.iter().collect()
 }
 
-/// Contract §2.2 invariants 1 to 3 for one tier: `Some(message)` on a violation.
+/// The three corpus invariants (`policy/shared/corpus/README.md`) for one tier: `Some(message)`
+/// on a violation.
 fn invariant(plugin: char, kit: char, headless: bool) -> Option<String> {
     if headless && (plugin == 'A' || kit == 'A') {
         return Some("invariant 3: an ask in a headless row".into());

@@ -1,7 +1,7 @@
 //! `safe-ai-skill firewall apply|show|check`: the Claude Code sandbox and permission block.
 //!
-//! A plugin cannot ship `permissions` or `sandbox` settings, so these protections (coverage map
-//! X1–X9, P14, P21) only exist when a user-run CLI writes them. This module writes a
+//! A plugin cannot ship `permissions` or `sandbox` settings, so these protections only exist
+//! when a user-run CLI writes them. This module writes a
 //! safe-ai-skill-owned block into the project's `.claude/settings.local.json` (it outranks the
 //! shared `.claude/settings.json` for scalars, and every list merges across files; docs:
 //! settings.md "Settings precedence", "Lists merge instead of overriding"), the same block
@@ -21,8 +21,8 @@
 //! file [`RECORD_FILE`] in the data dir, never a key in the settings file, so Claude Code never
 //! sees an unknown key and the agent cannot forge ownership with a file tool.
 //!
-//! Drift (T3): [`check`] and [`session_note`] compare the declared tier (the engine's effective
-//! tier) with the enforced one, and the recorded entries with the live file. Versioning (T6):
+//! Drift: [`check`] and [`session_note`] compare the declared tier (the engine's effective
+//! tier) with the enforced one, and the recorded entries with the live file. Versioning:
 //! [`rules::RULE_SET_VERSION`]; [`session_resync`] re-applies an older record at SessionStart.
 
 pub mod json;
@@ -629,7 +629,7 @@ impl Report {
     }
 }
 
-/// Compare declared and enforced for the project at `ctx.cwd` (T3). Reads one settings file
+/// Compare declared and enforced for the project at `ctx.cwd`. Reads one settings file
 /// and the record; writes nothing.
 pub fn check(ctx: &Ctx<'_>) -> Report {
     let t = target::locate(ctx.cwd, ctx.home);
@@ -746,7 +746,7 @@ pub fn show(ctx: &Ctx<'_>) -> Value {
     v
 }
 
-/// The SessionStart drift line (T3), or `None` when nothing was ever applied here or nothing
+/// The SessionStart drift line, or `None` when nothing was ever applied here or nothing
 /// drifted. One short sentence per finding, joined; never file content.
 pub fn session_note(ctx: &Ctx<'_>) -> Option<String> {
     let report = check(ctx);
@@ -761,7 +761,7 @@ pub fn session_note(ctx: &Ctx<'_>) -> Option<String> {
     Some(format!("safe-ai-skill firewall: {}.", lines.join("; ")))
 }
 
-/// At SessionStart, re-apply a trusted record when the shipped rule set is newer (T6) or the
+/// At SessionStart, re-apply a trusted record when the shipped rule set is newer or the
 /// declared tier is higher than the enforced one. It never lowers. Returns a note when it wrote.
 pub fn session_resync(ctx: &Ctx<'_>) -> Option<String> {
     if !ctx.dir.trusted {

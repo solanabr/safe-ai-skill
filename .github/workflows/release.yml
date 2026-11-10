@@ -38,7 +38,7 @@
 # compiles C, so musl-tools provides musl-gcc. ubuntu-24.04-arm is a native arm64
 # runner (free for public repositories).
 #
-# Windows (1.1.0 tier: Git Bash only, spec D5.3) links the C runtime statically
+# Windows (1.1.0 tier: Git Bash only) links the C runtime statically
 # (+crt-static), so the .exe needs no VC++ redistributable, and links with
 # /Brepro (no timestamp) so it can rebuild byte-identically. The release smoke
 # checks the hard guards (scripts/gate-smoke.sh).
@@ -342,8 +342,8 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      # The shim refuses a prebuilt whose sha256 differs from its stamped constant
-      # (spec D6.1), so the stamp lands in the same commit as the binaries.
+      # The shim refuses a prebuilt whose sha256 differs from its stamped constant,
+      # so the stamp lands in the same commit as the binaries.
       - name: Stage binaries, stamp the shim, regenerate SHA256SUMS
         run: |
           set -euo pipefail

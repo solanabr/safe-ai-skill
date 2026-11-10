@@ -1,4 +1,4 @@
-//! Harness configuration shipped inside a pack (spec D2.4): Claude Code settings, plugin hooks,
+//! Harness configuration shipped inside a pack: Claude Code settings, plugin hooks,
 //! MCP configs, nested skills dirs, root instruction files, `.gitmodules`, and broad tool asks.
 //! Settings that bypass permissions feed the `harness_bypass` combo.
 

@@ -12,7 +12,7 @@
 #
 #   --column      which corpus column to compare (default kit)
 #   --interim     compare against expect.interim.<column> where a row has one (the state before
-#                 the kit's M5), else the end-state column
+#                 the kit's planned changes), else the end-state column
 #   --allow-missing  accept corpus rows the results file does not cover (a partial run); without
 #                   it every uncovered row is a failure and is listed as MISSING
 #   --show-missing  with --allow-missing, still list the uncovered rows

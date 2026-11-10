@@ -1,4 +1,4 @@
-//! One-time conversion of 1.0 relaxation state (spec D4.2, WS-B fix round 1).
+//! One-time conversion of 1.0 relaxation state.
 //!
 //! 1.0 wrote `grants.json`, `mode.json` and `spend.json` as plain JSON. 1.1.0 reads only
 //! [`crate::statefile`] envelopes, so a plain file is "tampered". [`run`] converts 1.0 files
@@ -8,13 +8,13 @@
 //!   grant request for its remaining time and budget. The user sees their confirmation codes
 //!   in that SessionStart's `systemMessage` and keeps what they confirm. An authority or
 //!   destructive grant is dropped, and the notice says those scopes are hard guards now;
-//! - a 1.0 mode becomes a tier (D8 v2 spec §9), never below `relaxed`: `strict` and
+//! - a 1.0 mode becomes a tier, never below `relaxed`: `strict` and
 //!   `autopilot` are `relaxed` (the notice names what changed, and `allow --scope transfer`
 //!   for autopilot users), `paranoid` is `tier.json` `high`;
 //! - a 1.0 spend ledger becomes an exhausted ledger for today (fresh tomorrow);
 //! - an unreadable file, and the removed `off` mode, are renamed to `<name>.v1-unmigrated`.
 //!
-//! [`mode_to_tier`] does the same, once, for an authenticated WS-B `mode.json` (1.1.0
+//! [`mode_to_tier`] does the same, once, for an authenticated `mode.json` (1.1.0
 //! development builds), renaming it to `mode.json.migrated`.
 //!
 //! Each converted file is renamed to `<name>.v1-migrated`, each item is audited and listed in
@@ -229,7 +229,7 @@ fn migrate_mode(dir: &DataDir, now: u64, lines: &mut Vec<String>) {
 const OFF_LINE: &str = "mode off from 1.0 was not migrated (relaxed applies): run `safe-ai-skill \
      tier off` and confirm it, or set SAFE_AI_SKILL_DISABLE=1 to turn the hooks off";
 
-/// Carry a known profile over as its tier (spec §9): never below `relaxed`, so nothing is
+/// Carry a known profile over as its tier: never below `relaxed`, so nothing is
 /// pending; `paranoid` raises `tier.json` to `high`.
 fn carry_profile(dir: &DataDir, profile: &str, tier: Tier, now: u64, lines: &mut Vec<String>) {
     match profile {
@@ -254,9 +254,9 @@ fn carry_profile(dir: &DataDir, profile: &str, tier: Tier, now: u64, lines: &mut
     }
 }
 
-/// Carry an authenticated WS-B `mode.json` over to `tier.json`, once: it is renamed to
-/// `mode.json.migrated` (or `.unmigrated` when it fails authentication). Returns one line
-/// per item. A trusted data dir only: an untrusted one's state was never applied.
+/// Carry an authenticated 1.1.0 development `mode.json` over to `tier.json`, once: it is
+/// renamed to `mode.json.migrated` (or `.unmigrated` when it fails authentication). Returns
+/// one line per item. A trusted data dir only: an untrusted one's state was never applied.
 pub fn mode_to_tier(dir: &DataDir, now: u64) -> Vec<String> {
     let path = dir.path.join(MODE_FILE);
     if dir.is_unresolved() || !dir.trusted || std::fs::symlink_metadata(&path).is_err() {

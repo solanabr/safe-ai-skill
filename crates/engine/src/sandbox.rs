@@ -1,4 +1,4 @@
-//! Claude Code sandbox detection (D8 v2 spec §1.4).
+//! Claude Code sandbox detection.
 //!
 //! [`state`] reads `sandbox.enabled` from the settings files, highest precedence first —
 //! managed settings, `<project>/.claude/settings.local.json`, `<project>/.claude/settings.json`,

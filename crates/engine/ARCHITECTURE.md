@@ -498,8 +498,8 @@ pub fn report::session_end(dir: &DataDir, raw: &[u8], now: u64) -> Option<Sessio
 ```rust
 pub fn firewall::run(cmd: &Command, ctx: &Ctx) -> Outcome;          // Ok | Drift | Park | Error
 pub fn firewall::parse_args(rest: &[String]) -> Result<Command, String>;
-pub fn firewall::session_note(ctx: &Ctx) -> Option<String>;          // SessionStart drift line (T3)
-pub fn firewall::session_resync(ctx: &Ctx) -> Option<String>;        // re-apply an older rule set or a lower enforced tier (T6); never lowers
+pub fn firewall::session_note(ctx: &Ctx) -> Option<String>;          // SessionStart drift line
+pub fn firewall::session_resync(ctx: &Ctx) -> Option<String>;        // re-apply an older rule set or a lower enforced tier; never lowers
 ```
 `safe-ai-skill firewall apply|show|check` writes the sandbox block and permission denies a
 plugin cannot ship into the project's `.claude/settings.local.json` (`target.rs` finds it, at the

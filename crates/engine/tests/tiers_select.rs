@@ -1,8 +1,8 @@
-//! Tier selection (D8 v2 spec §1.2-§1.3, §9; shared contract §3): the effective tier for every
+//! Tier selection: the effective tier for every
 //! source, the lowering confirmation, forged state, `env_read`, and migration.
 //!
 //! The CLI and hooks run as the real binary in a temp HOME and data dir. That data dir lives
-//! under the temp dir, which is never trusted (spec D2.8), so the effective tier is read back
+//! under the temp dir, which is never trusted, so the effective tier is read back
 //! through the library with the same directory marked trusted, as it is under
 //! `~/.claude/plugins/data` in a real install.
 
@@ -529,7 +529,7 @@ fn a_stored_env_read_ask_is_migrated_once_with_a_notice() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Migration (spec §9)
+// Migration
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -679,7 +679,7 @@ fn agents_may_request_a_tier_but_not_write_tier_json() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 1: base spoofing, base floor, untrusted note, replay
+// Base spoofing, base floor, untrusted note, replay
 // ---------------------------------------------------------------------------------------
 
 /// A `CLAUDE_PLUGIN_ROOT` whose default policy says `tier` / `env_read` as given.
@@ -694,7 +694,7 @@ fn evil_root(tier_line: &str, env_read: &str) -> TempDir {
 }
 
 /// `tier --clear` (global and `--project`) stays pending even when the agent points
-/// `CLAUDE_PLUGIN_ROOT` at a default policy whose base equals the stored tier (review #1).
+/// `CLAUDE_PLUGIN_ROOT` at a default policy whose base equals the stored tier.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_spoofed_plugin_root_cannot_make_clear_immediate() {
@@ -725,8 +725,8 @@ fn a_spoofed_plugin_root_cannot_make_clear_immediate() {
     }
 }
 
-/// The plugin default policy is floored at relaxed and its env_read must be a known word
-/// (review #2): the retired `ask` falls back to `tier`.
+/// The plugin default policy is floored at relaxed and its env_read must be a known word:
+/// the retired `ask` falls back to `tier`.
 #[test]
 fn the_plugin_default_policy_cannot_lower_or_open_env_reads() {
     let w = World::new("tiers-base-floor");

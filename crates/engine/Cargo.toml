@@ -48,7 +48,7 @@ walkdir = "2"
 bs58 = "0.5"
 # rustls TLS only (no native-tls/OpenSSL); default features dropped for a lean binary.
 ureq = { version = "2", default-features = false, features = ["tls"] }
-# Ed25519 session keypairs (Phase 3). rand_core for keygen in round-2.
+# Ed25519 session keypairs; the `rand_core` feature is for key generation.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # OS CSPRNG (`OsRng`) for confirmation nonces and the state MAC key. Already in the tree via
 # ed25519-dalek; the `getrandom` feature reuses the getrandom crate rustls/ring already build.

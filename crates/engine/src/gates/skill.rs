@@ -1,8 +1,8 @@
-//! Skill-pack gates (spec D2.6): `gate-skill` (PreToolUse `Skill`) and `gate-prompt-expansion`
+//! Skill-pack gates: `gate-skill` (PreToolUse `Skill`) and `gate-prompt-expansion`
 //! (`UserPromptExpansion`, and a raw `/name` in `UserPromptSubmit`). Both deny a skill whose
 //! pack is blocked; the lookup and the TOCTOU re-hash live in [`crate::verify::enforce`].
 //!
-//! The tier decides what a bad pack gets (D8 v2 spec §6, [`crate::verify::tier_action`]): Off
+//! The tier decides what a bad pack gets ([`crate::verify::tier_action`]): Off
 //! only reports it at SessionStart, Relaxed and Medium deny a blocked or unscanned pack, High
 //! also denies a pack with an unreviewed HIGH finding until the user trusts it.
 

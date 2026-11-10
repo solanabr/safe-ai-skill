@@ -1,4 +1,4 @@
-//! The grading boundary between the pack scanner and the verify state machine (spec D2.4).
+//! The grading boundary between the pack scanner and the verify state machine.
 //!
 //! The state machine grades with the rule engine ([`super::rules`]): [`PackReport`]
 //! `{findings, combos, capped}`, [`Finding`] `{rule, sev, path, line, ctx}`, [`ComboHit`],

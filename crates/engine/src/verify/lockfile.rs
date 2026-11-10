@@ -2,7 +2,7 @@
 //!
 //! The lockfile lives at `${CLAUDE_PLUGIN_DATA}/lockfile.json` and records, per skill /
 //! MCP / ext submodule name, the identity pinned on first use. Since state v2
-//! ([`super::state`]) the session sweep only reads it: to carry v1 pins over (spec D2.3) and to
+//! ([`super::state`]) the session sweep only reads it: to carry v1 pins over and to
 //! find the packs `install --from` put in `~/.claude/skills`. `add` / `install` still write
 //! their pins here, with the v1 [`hash_tree`].
 //!

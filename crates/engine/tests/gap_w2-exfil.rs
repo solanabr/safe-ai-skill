@@ -1,4 +1,4 @@
-//! Gap closure W2 (#19): the exfil tripwire on Bash, MCP and WebFetch payloads.
+//! The exfil tripwire (#19) on Bash, MCP and WebFetch payloads.
 //!
 //! `fixtures/gap/w2-exfil.jsonl` holds one case per line; `want` is `D`, `A` or `-`.
 //! `GAP_CORPUS=<jsonl>` runs the ignored corpus check and benchmark over a differential corpus.

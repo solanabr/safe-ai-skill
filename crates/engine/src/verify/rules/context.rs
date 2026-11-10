@@ -1,4 +1,4 @@
-//! Context classifier (spec D2.5): decides whether text is code, documentation or metadata,
+//! Context classifier: decides whether text is code, documentation or metadata,
 //! splits Markdown into frontmatter, prose, fenced blocks and inline code, and groups lines into
 //! statements and commands so a tool and its marker are only matched inside one command.
 //!

@@ -1,4 +1,4 @@
-//! Binary content (spec D2.4): magic-byte sniffing for archives and executables behind a text
+//! Binary content: magic-byte sniffing for archives and executables behind a text
 //! extension, native host-arch executables (BPF/SBF `.so` exempt), shipped Python bytecode, and
 //! plain archives. Binary files skip every text rule.
 

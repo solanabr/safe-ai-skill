@@ -1,4 +1,4 @@
-//! End-to-end tests for the self-grant / state-tamper tripwire (spec D4.3).
+//! End-to-end tests for the self-grant / state-tamper tripwire.
 //!
 //! The tripwire has two entry points, both driven through the real binary:
 //! - `gate-bash-secrets` (the unconditional Bash hook) denies a command that references
@@ -249,7 +249,7 @@ fn bash_install_and_hook_only_verify_deny() {
 
 #[test]
 fn bash_env_subcommand_has_no_opinion() {
-    // Placeholder for WS-C: the `env` subcommand is the sanctioned way to touch `.env`.
+    // The `env` subcommand is the sanctioned way to touch `.env`.
     let sb = Sandbox::new("tw-env");
     assert_no_opinion(
         &sb.bash("safe-ai-skill env keys .env"),

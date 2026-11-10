@@ -1,8 +1,8 @@
-//! User-scope pack trust (spec D2.8): `${DATA}/trust.json`, keyed by content hash.
+//! User-scope pack trust: `${DATA}/trust.json`, keyed by content hash.
 //!
 //! `{"<tree_hash>": {"acked_rules": [...], "confirmed_via": "prompt-nonce", "at": <unix>}}`.
 //! An entry is written only by [`super::apply_confirmed`], i.e. after the user typed the
-//! confirmation nonce of a `verify trust` or `verify approve` request (spec D4.1). Keying by
+//! confirmation nonce of a `verify trust` or `verify approve` request. Keying by
 //! hash means a worktree, a fresh clone or a move of the same content needs no re-trust.
 //!
 //! Trust is honoured only when the data dir is trusted ([`DataDir::trusted`]: under the

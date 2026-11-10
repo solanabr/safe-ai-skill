@@ -1,4 +1,4 @@
-//! Acceptance corpus for the rule engine (spec D2.10).
+//! Acceptance corpus for the rule engine.
 //!
 //! * `shapes/` — re-synthesised malicious shapes (Trail of Bits ×4, the #10 stealer, the scanner
 //!   research demo, harness bypass, bang exfil) must BLOCK; Google's `exec(base64.b64decode(…))`

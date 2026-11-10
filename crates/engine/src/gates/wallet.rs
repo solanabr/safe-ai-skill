@@ -1,4 +1,4 @@
-//! Default-wallet destruction (D8 v2 spec §3.1; owned by F3): `solana-keygen new|recover` with
+//! Default-wallet destruction: `solana-keygen new|recover` with
 //! `--force/-f` and no `-o` (and no `--no-outfile`) or an outfile naming `~/.config/solana/id.json`
 //! or the CLI config's `keypair_path`; Bash `rm|mv|cp|tee|dd of=|>` onto that file, and
 //! `rm`/`mv` of a directory holding it; Write/Edit/NotebookEdit to it. Denied on every cluster

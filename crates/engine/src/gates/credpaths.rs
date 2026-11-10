@@ -1,6 +1,6 @@
-//! Key material and home credential stores by path (D8 v2 spec §4; owned by F1).
+//! Key material and home credential stores by path.
 //!
-//! [`is_credential`] matches a path against every `credentials.list` record (contract §1.3
+//! [`is_credential`] matches a path against every `credentials.list` record (the list's glob
 //! dialect; classes and the `sb` column are ignored: every class is denied at every tier, `!`
 //! exceptions stay readable). The 1.1.0 trees in [`crate::gates::secretpath`] still apply
 //! after it. Matching is deliberately wider than the list in three ways, all tightening:
@@ -17,7 +17,7 @@
 //!
 //! Command-form readers and the generic Bash path check live in [`crate::gates::creddump`].
 //!
-//! Call lines (shared files; F1 edits only this file):
+//! Call lines (in shared files; the logic stays in this file):
 //! - `secretpath::classify_with_homes` → [`is_credential`] (Read, file Grep, MCP path args,
 //!   Bash readers and sinks all classify through it);
 //! - `read::decide_grep` → [`grep_root`] and, through `read::grep_exclusion`,

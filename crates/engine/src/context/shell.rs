@@ -1,4 +1,4 @@
-//! Shell command parsing for the Bash gate (spec D1.8).
+//! Shell command parsing for the Bash gate.
 //!
 //! [`parse`] turns a Bash tool command into the simple commands it runs, the way a POSIX shell
 //! would split it: on newline, `;`, `&`, `&&`, `||` and `|`, honoring quotes, escapes and

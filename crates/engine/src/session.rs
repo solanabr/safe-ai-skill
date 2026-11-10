@@ -1,4 +1,4 @@
-//! Session keypairs (Phase 3): ephemeral, spend-capped signing keys.
+//! Session keypairs: ephemeral, spend-capped signing keys.
 //!
 //! A session key is a freshly generated Ed25519 keypair written in the Solana CLI keypair
 //! format (a JSON array of 64 bytes: 32-byte secret seed followed by the 32-byte public key)

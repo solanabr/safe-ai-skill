@@ -1,4 +1,4 @@
-//! Gap W1 (tamper): content-aware settings and hook-file checks, driven by
+//! Tamper: content-aware settings and hook-file checks, driven by
 //! `fixtures/gap/w1-tamper.jsonl`. Each row runs through `decide_file_content_in` (file tools)
 //! or `decide_bash_writes_in` (Bash) in a fresh project and home, then the headless conversion.
 

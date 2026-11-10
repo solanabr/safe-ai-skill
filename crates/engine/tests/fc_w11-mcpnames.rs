@@ -1,4 +1,4 @@
-//! Full coverage W11: ai-kit's MCP tool-name denies (P17, P18, P19), through the real
+//! ai-kit's MCP tool-name denies, through the real
 //! `gate-mcp` binary.
 //!
 //! `fixtures/fc/w11-mcpnames.jsonl` holds one case per line; `want` is `D`, `A` or `-`.

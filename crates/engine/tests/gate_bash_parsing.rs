@@ -1,5 +1,5 @@
 //! Command parsing, network resolution, amounts, deadline and the indirection prefilter for
-//! `gate-bash` (spec D1.3–D1.8, D6.3).
+//! `gate-bash`.
 //!
 //! In-process tests drive `gates::bash::decide` with pinned default networks; no opinion is
 //! `Decision::Defer`. End-to-end tests drive the built binary with a stub `solana` on `PATH`.
@@ -58,7 +58,7 @@ fn is_deny(d: &Decision) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------
-// A2 command parsing (D1.8)
+// Command parsing
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -146,7 +146,7 @@ fn separators_inside_quotes_do_not_split_a_transfer() {
 
 #[test]
 fn indirect_transfer_follows_spend_rules_but_the_prefilter_never_allows() {
-    // Fully parsed, so the gate's own rules apply (fix round 2); the always-on hook that
+    // Fully parsed, so the gate's own rules apply; the always-on hook that
     // routes it never emits the allow itself.
     let policy = Policy::default();
     for cmd in [
@@ -246,7 +246,7 @@ fn descriptor_glued_to_a_redirection_is_not_the_amount() {
 }
 
 // ---------------------------------------------------------------------------------------
-// A1 network resolution (D1.4)
+// Network resolution
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -300,7 +300,7 @@ fn solana_commands_use_the_cli_default_and_anchor_its_own() {
     let policy = Policy::default();
     let (d, meta) = bash::decide("solana program deploy ./p.so", &ctx, &policy);
     assert!(is_ask(&d), "{d:?}");
-    // Class C (D8 v2 §2): a grantable ask on mainnet.
+    // Class C: a grantable ask on mainnet.
     assert!(!meta.hard_guard);
     assert_eq!(meta.scope, safe_ai_skill::gate::Scope::Deploy);
     let (d, _) = bash::decide("anchor deploy", &ctx, &policy);
@@ -346,7 +346,7 @@ fn mainnet_deny_policy_denies_mainnet_value_moves() {
 }
 
 // ---------------------------------------------------------------------------------------
-// A3 amounts (D1.5)
+// Amounts
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -388,7 +388,7 @@ fn amounts_are_positional_and_exact() {
 }
 
 // ---------------------------------------------------------------------------------------
-// A5 indirection prefilter (D6.3)
+// Indirection prefilter
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -450,7 +450,7 @@ fn prefilter_leaves_direct_and_unrelated_commands_alone() {
     }
 }
 
-/// The review's probe rows (fix round 1): each got no opinion from either hook before.
+/// Probe rows: each got no opinion from either hook before.
 fn probe_rows() -> Vec<String> {
     let t = format!("transfer -um {DEST} 1");
     vec![
@@ -499,7 +499,7 @@ fn probe_rows_get_a_verdict_from_the_always_on_hook() {
     }
 }
 
-/// Commands built from expansions around a family name (fix round 2): a hard-guard ask from
+/// Commands built from expansions around a family name: a hard-guard ask from
 /// both hooks, whatever their words.
 fn expansion_rows() -> Vec<String> {
     vec![
@@ -536,7 +536,7 @@ fn expansion_built_family_commands_ask_as_hard_guard() {
     assert!(unseen.reason().contains("expansion"), "{unseen:?}");
 }
 
-/// Round-3 rows: path-qualified programs in opaque code, write-then-run variants, and
+/// Path-qualified programs in opaque code, write-then-run variants, and
 /// dynamic programs with literal value-moving words. Each is a hard-guard ask from both hooks.
 fn round3_rows() -> Vec<String> {
     let release = "~/.local/share/solana/install/active_release/bin/solana";
@@ -585,7 +585,7 @@ fn e2e_round3_rows_ask_in_the_secrets_hook() {
     }
 }
 
-/// Fix round 4: ordinary commands that redirect, `tee`, or run a script, and English words
+/// Ordinary commands that redirect, `tee`, or run a script, and English words
 /// after an expanded program. Only emitted script text counts as a write, and a dynamic
 /// program asks only when it could spell a family name: no opinion from either hook.
 fn round4_quiet_rows() -> Vec<&'static str> {
@@ -616,7 +616,7 @@ fn round4_quiet_rows_have_no_opinion() {
     }
 }
 
-/// Fix round 4: emitted scripts that are then run (every shape), and expansions that spell a
+/// Emitted scripts that are then run (every shape), and expansions that spell a
 /// family program. Each is a hard-guard ask from both hooks.
 fn round4_ask_rows() -> Vec<String> {
     let t = format!("solana transfer -um {DEST} 1");
@@ -635,7 +635,7 @@ fn round4_ask_rows() -> Vec<String> {
         format!("$(printf %s ./solana) transfer -um {DEST} 1"),
         format!("${{S}}olana transfer -um {DEST} 1"),
         format!("$X transfer -um {DEST} 1"),
-        // Fix round 5: dynamic programs and printf formats inside emitted scripts.
+        // Dynamic programs and printf formats inside emitted scripts.
         format!("echo 'X=solana; $X transfer -um {DEST} 1' > x.sh; bash x.sh"),
         format!("echo 'for p in solana; do $p transfer -um {DEST} 1; done' > x.sh; bash x.sh"),
         format!("printf '%s' '{t}' > x.sh; bash x.sh"),

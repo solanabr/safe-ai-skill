@@ -1,4 +1,4 @@
-//! The user-scope tier file `${DATA}/tier.json` (D8 v2 spec §1.2-§1.3, contract §3.1).
+//! The user-scope tier file `${DATA}/tier.json`.
 //!
 //! One authenticated [`crate::statefile`] envelope whose body is
 //! `{v: 1, global?: {tier, env_read?}, projects: {<root>: {tier, env_read?}}}`, keyed by the
@@ -25,7 +25,7 @@ use crate::statefile::{self, FileLock, Loaded};
 /// State file holding the user's tier choices.
 pub const TIER_FILE: &str = "tier.json";
 
-/// The base tier changes are planned against: fixed at compile time (spec §1.2 `base =
+/// The base tier changes are planned against: fixed at compile time (`base =
 /// relaxed`), never read from a policy file an environment variable can point elsewhere.
 pub const BASE: Tier = Tier::Relaxed;
 

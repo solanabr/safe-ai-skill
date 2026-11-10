@@ -35,7 +35,7 @@ use crate::policy::tier::Tier;
 use crate::policy::Policy;
 
 /// Commands that read or copy file contents — the ones that can leak a secret file. A nudge,
-/// not the control (spec D3.6): the sandbox and the redact hook are the backstops.
+/// not the control: the sandbox and the redact hook are the backstops.
 const READER_COMMANDS: &[&str] = &[
     "cat", "less", "more", "head", "tail", "xxd", "od", "base64", "strings", "cp", "mv", "scp",
     "rsync", "source", ".", "grep", "egrep", "fgrep", "rg", "sed", "awk", "nl", "tac", "bat",
@@ -758,7 +758,7 @@ fn runner_call_script(tokens: &[String]) -> Option<&str> {
 }
 
 /// varlock subcommands that print resolved values are treated like `cat .env`; turning off
-/// `varlock run` output redaction asks (spec D3.8.5). safe-ai-skill never runs varlock itself.
+/// `varlock run` output redaction asks. safe-ai-skill never runs varlock itself.
 fn decide_varlock(args: &[String], assignments: &[&String], policy: &Policy) -> Decision {
     let positional: Vec<&str> = args
         .iter()

@@ -1,4 +1,4 @@
-//! Self-grant / state-tamper tripwire (spec D4.3).
+//! Self-grant / state-tamper tripwire.
 //!
 //! Denies an agent-initiated tool call that would loosen safe-ai-skill from the inside:
 //!
@@ -17,7 +17,7 @@
 //!   `safe-ai-skill@…` plugin off or drops it, sets `disableAllHooks`,
 //!   `allowManagedHooksOnly`, `env.SAFE_AI_SKILL_DISABLE` or `permissions.defaultMode:
 //!   bypassPermissions`, or removes or narrows a guard hook, and an agent definition with
-//!   `permissionMode: bypassPermissions`, is denied at every tier and never relaxed (D1). A git
+//!   `permissionMode: bypassPermissions`, is denied at every tier and never relaxed. A git
 //!   hook, a git config key that runs a program, a new or changed `.mcp.json` server or npm
 //!   lifecycle script, a kit hook script, a lower kit tier in `.claude/security.json`, and an
 //!   `export` of a `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` switch ask. A Bash write whose text the
@@ -44,7 +44,7 @@
 //! - the installed plugin, `…/plugins/cache/<marketplace>/safe-ai-skill/…`;
 //! - the live plugin's `hooks/hooks.json` (`$CLAUDE_PLUGIN_ROOT`);
 //! - the state files of a project `.safe-ai-skill/` dir. Its `policy.yaml` stays editable because
-//!   the repo overlay can only tighten (D1.10).
+//!   the repo overlay can only tighten.
 //!
 //! A checkout named like the plugin (`safe-ai-skill-fork`) is not protected state: a component
 //! of the project root (`$CLAUDE_PROJECT_DIR` or the session's working directory) never counts as
@@ -197,7 +197,7 @@ const GLOB_OPTIONS: glob::MatchOptions = glob::MatchOptions {
 /// Subcommands only the user may run: `confirm` (and the 1.0 `grant` / `revoke`). `allow`,
 /// `tier` and its `mode` alias are not here: raising applies at once, and anything that loosens
 /// only parks a pending request, which the agent can never confirm (the code reaches the user
-/// alone, spec D4.1).
+/// alone).
 const MUTATING_SUBCOMMANDS: &[&str] = &["grant", "revoke", "confirm"];
 
 /// Hook-only subcommands: run through Bash they could replay a forged hook payload (a fake
@@ -872,12 +872,12 @@ const HOOK_WEAKEN_FLAGS: &[&str] = &[
     "--allow-dangerously-skip-permissions",
 ];
 
-/// Decide a nested Claude Code launch that escapes the policy (F3, F4): a weakening flag
+/// Decide a nested Claude Code launch that escapes the policy: a weakening flag
 /// ([`WEAKEN_FLAGS`]), `claude mcp add…` or `claude setup-token` on the plain `claude` is a
 /// deny at every tier; through a package runner, a path, a JS runtime or `$(which claude)`,
 /// with the hook-only flags or a `CLAUDE_CONFIG_DIR=` assignment, a deny below Off, as the
 /// kit's hook has it. `claude plugin disable|uninstall` of safe-ai-skill is a deny at every
-/// tier (D1). `None` is no opinion.
+/// tier. `None` is no opinion.
 pub fn decide_nested_claude_flags(command: &str, tier: Tier) -> Option<Verdict> {
     if !contains_ci(command, "claude") {
         return None;
@@ -2349,14 +2349,14 @@ fn classify_path(path: &Path, homes: &ConfigHomes) -> Option<Guarded> {
 }
 
 /// A path the kit Edit-denies whatever the write makes it say: code that runs on the next
-/// ordinary command (P3, `DENY_CODE_ON_NEXT_BUILD`), an administrator's managed settings (P5)
-/// and, at High, Claude Code's user-scope policy surface (P8, `DENY_SELF_PROTECTION`).
+/// ordinary command (`DENY_CODE_ON_NEXT_BUILD`), an administrator's managed settings and, at
+/// High, Claude Code's user-scope policy surface (`DENY_SELF_PROTECTION`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     NextBuild,
     Managed,
     UserPolicy,
-    /// A project's `.safe-ai-skill/` dir other than its `policy.yaml` (P6).
+    /// A project's `.safe-ai-skill/` dir other than its `policy.yaml`.
     PolicyDir,
 }
 

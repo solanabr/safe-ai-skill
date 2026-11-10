@@ -1,4 +1,4 @@
-//! D8 v2 spec §4 (F1): home credential stores and command-form credential readers.
+//! Home credential stores and command-form credential readers.
 //!
 //! Every row denies at every tier (Off too, with `--features test-hooks`: Off is not DISABLE).
 //! Paths use a temp HOME; commands are only ever fed to the hook as strings.
@@ -203,7 +203,7 @@ const BASH_DENIED: &[&str] = &[
     "TOKEN=$(gh auth token)",
     "/usr/local/bin/gh auth token",
     "timeout 5 pass show solana",
-    // fix round 1 #4, #11: npm's `get` alias, gh config, keychain export
+    // npm's `get` alias, gh config, keychain export
     "npm get //registry.npmjs.org/:_authToken",
     "gh config get oauth_token -h github.com",
     "security export -t privKeys",
@@ -252,12 +252,12 @@ const BASH_DENIED: &[&str] = &[
     "ssh -i ~/.ssh/id_rsa host cat ~/.aws/credentials",
     "ssh -F ~/.aws/credentials host",
     "sftp ~/.ssh/id_rsa",
-    // fix round 2 R1: `..` cannot widen the Solana signer exemption
+    // `..` cannot widen the Solana signer exemption
     "solana-keygen pubkey ~/.config/solana/../../.aws/credentials",
     "anchor run x ~/.config/solana/../../.ssh/id_rsa",
     "solana balance --keypair ~/.config/solana/../../.npmrc",
     "solana-keygen pubkey ~/.config/solanax/../../.aws/credentials",
-    // R2: the SSH identity exemption is for keys under ~/.ssh only
+    // The SSH identity exemption is for keys under ~/.ssh only
     "ssh -i ~/.aws/credentials host",
     "ssh -o IdentityFile=~/.aws/credentials host",
     "ssh -oIdentityFile=~/.aws/credentials host",

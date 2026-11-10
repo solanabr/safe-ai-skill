@@ -1,5 +1,5 @@
-//! The D8 v2 tier matrix (F8): every F1 (credentials), F2 (project env), F3 (on-chain) and F5
-//! (supply chain) brief row at Off / Relaxed / Medium / High, through the real hook entries.
+//! The tier matrix: every credential, project-env, on-chain and supply-chain row at Off /
+//! Relaxed / Medium / High, through the real hook entries.
 //!
 //! The entries a tool call reaches are read from `plugins/safe-ai-skill/hooks/hooks.json`
 //! (every PreToolUse block whose matcher matches the tool), each runs as its own process, and
@@ -35,7 +35,7 @@ const ASK4: [&str; 4] = ["ask"; 4];
 const NO4: [&str; 4] = [""; 4];
 /// Ask below High, deny at High.
 const ASK_HIGH_DENY: [&str; 4] = ["ask", "ask", "ask", "deny"];
-/// ai-kit's tool-name deny (P17): today's verdict below Medium, deny from Medium up.
+/// ai-kit's tool-name deny: today's verdict below Medium, deny from Medium up.
 const MEDIUM_UP_DENY: [&str; 4] = ["", "", "deny", "deny"];
 const ASK_MEDIUM_UP_DENY: [&str; 4] = ["ask", "ask", "deny", "deny"];
 
@@ -328,7 +328,7 @@ fn a_fresh_install_allows_a_within_cap_devnet_transfer_after_another_hook_audite
 }
 
 // ---------------------------------------------------------------------------------------
-// F1: home credential stores and command-form credential readers
+// Home credential stores and command-form credential readers
 // ---------------------------------------------------------------------------------------
 
 const F1_READ_DENIED: &[&str] = &[
@@ -483,7 +483,7 @@ fn f1_ordinary_commands_and_readable_ssh_files_have_no_opinion() {
 }
 
 // ---------------------------------------------------------------------------------------
-// F2: project env
+// Project env
 // ---------------------------------------------------------------------------------------
 
 const HELIUS: &str = "hk7Qw2Lp9Xz4Rt6Yb1Nc8Vd3Fg5Hj0Ks";
@@ -705,7 +705,7 @@ fn bs58_secret() -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// F3: Class U, the default wallet, Class C
+// Class U, the default wallet, Class C
 // ---------------------------------------------------------------------------------------
 
 fn class_u_templates() -> Vec<String> {
@@ -837,7 +837,7 @@ fn f3_class_c_on_mainnet_or_unknown() {
         ] {
             let cmd = cmd.trim_end();
             check(cmd, w.x4("Bash", &bash(cmd)), ASK_HIGH_DENY);
-            // A token amount is never covered by a SOL grant (D3).
+            // A token amount is never covered by a SOL grant.
             let granted_want = if cmd.starts_with("spl-token transfer") {
                 ASK_HIGH_DENY
             } else {
@@ -1223,7 +1223,7 @@ fn only_allow_listed_loaders_may_name_an_env_file() {
         "dotenv -e .env -- printenv",
         "dotenvx run -f .env -- node -e 'console.log(process.env)'",
         "dotenv -e .env node app.js",
-        // Package-manager spellings that run a printer or arbitrary code (R5).
+        // Package-manager spellings that run a printer or arbitrary code.
         "dotenv -e .env -- npm run env",
         "dotenv -e .env -- npm env",
         "dotenv -e .env -- pnpm exec printenv",
@@ -1235,7 +1235,7 @@ fn only_allow_listed_loaders_may_name_an_env_file() {
         "dotenv -e .env -- yarn node -e \"console.log(process.env)\"",
         "dotenvx run -f .env -- pnpm exec node -e 'console.log(process.env)'",
         "dotenvx run --env-file=.env -- npm exec -- printenv",
-        // Module flags carrying inline code (R6).
+        // Module flags carrying inline code.
         "node --env-file=.env --import=data:text/javascript,console.log(process.env) server.js",
         "node --env-file=.env --import data:text/javascript,console.log(1) server.js",
         "node --env-file=.env --loader=data:text/javascript,x server.js",
@@ -1336,7 +1336,7 @@ fn f3_no_opinion_rows() {
 }
 
 // ---------------------------------------------------------------------------------------
-// F5: supply chain
+// Supply chain
 // ---------------------------------------------------------------------------------------
 
 impl World {
@@ -1587,7 +1587,7 @@ fn f5_a_clean_pack_has_no_opinion_at_every_tier() {
 }
 
 // ---------------------------------------------------------------------------------------
-// F4 (exfil tripwire): deferred out of this release (#19). No rows; the existing curl-POST
+// Exfil tripwire: deferred out of this release (#19). No rows; the existing curl-POST
 // ask in gate-bash-secrets is pinned by its own suites.
 // TODO(#19): add the exfil rows (env -> network deny, git push, anchor deploy) × 4 tiers here when the tripwire ships.
 // ---------------------------------------------------------------------------------------
@@ -1809,7 +1809,7 @@ fn i22_interpreter_code_naming_an_env_file_is_a_read() {
         "python3 <<< \"print(open('.env').read())\"",
         "echo \"print(open('.env').read())\" | python3",
         "bash <<< 'cat .env'",
-        // An apostrophe outside a string does not hide the path (review round 1).
+        // An apostrophe outside a string does not hide the path.
         "python3 -c \"# it's\nprint(open('.env').read())\"",
         "python3 -c \"x=1 # don't\nprint(open('.env').read())\"",
         "python3 - <<'PY'\n# load the config, don't print\nprint(open('.env').read())\nPY",
@@ -1827,7 +1827,7 @@ fn i22_interpreter_code_naming_an_env_file_is_a_read() {
         "uv run python -c \"print(open('.env').read())\"",
         "uv run --with requests python -c \"print(open('.env').read())\"",
         "poetry run python -c \"print(open('.env').read())\"",
-        // `npx tsx` (an undeclared runner) also asks under D4; `gap_w4-fetchexec` covers it.
+        // `npx tsx` (an undeclared runner) also asks; `gap_w4-fetchexec` covers it.
         "tsx -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "ts-node -e \"console.log(require('fs').readFileSync('.env','utf8'))\"",
         "pypy3 -c \"print(open('.env').read())\"",
@@ -1993,7 +1993,7 @@ fn i22_templates_and_metadata_have_no_opinion() {
         "file .env",
         "echo .env | xargs ls -la",
         "node -e \"console.log(process.env)\"",
-        // Printing a secret-named variable is a deny under D2 (`gap_w3-envdump` covers it).
+        // Printing a secret-named variable is a deny (`gap_w3-envdump` covers it).
         "python3 -c \"import os; print(os.environ.get('HOME'))\"",
         "node -e \"console.log('process.env')\"",
         "awk '$0 ~ \".env\"' .gitignore",

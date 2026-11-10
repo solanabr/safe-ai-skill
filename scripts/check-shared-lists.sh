@@ -1,6 +1,6 @@
 #!/bin/sh
-# Lint policy/shared (shared contract §1.1-§1.4): records sorted (LC_ALL=C) and unique within
-# each [section], valid enums, lowercase hosts without scheme/port/trailing dot, no brace or
+# Lint policy/shared (the files shared with solana-ai-kit): records sorted (LC_ALL=C) and unique
+# within each [section], valid enums, lowercase hosts without scheme/port/trailing dot, no brace or
 # character-class globs, no tabs, LF only, and MANIFEST counts and hashes matching the bytes.
 # Also checks that the engine crate's embedded copy (crates/engine/policy/shared/) is
 # byte-identical to policy/shared.

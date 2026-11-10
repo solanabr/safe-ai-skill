@@ -1,4 +1,4 @@
-//! The naive-exfil tripwire, best-effort (D8 v2 spec §5; #19): a network call whose destination
+//! The naive-exfil tripwire, best-effort (#19): a network call whose destination
 //! is on the tier's exfil list ([`crate::lists::exfil_hosts`] plus `secrets.exfil_hosts_extra`),
 //! or that carries secret-shaped data or an encoded blob to a host that is not a known
 //! developer service.

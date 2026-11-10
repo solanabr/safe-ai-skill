@@ -1,4 +1,4 @@
-//! G4: the session report (SessionEnd JSON + summary, SessionStart one-line recap).
+//! The session report (SessionEnd JSON + summary, SessionStart one-line recap).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

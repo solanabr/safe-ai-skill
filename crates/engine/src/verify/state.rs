@@ -1,4 +1,4 @@
-//! Supply-chain state v2 (spec D2.2): `${DATA}/state.json`, one entry per pack keyed by its
+//! Supply-chain state v2: `${DATA}/state.json`, one entry per pack keyed by its
 //! canonical absolute path, stored authenticated through [`crate::statefile`].
 //!
 //! An entry's `tree_hash` is the pack's pin: the content it was first recorded at, or last
@@ -33,7 +33,7 @@ const STAT_DOMAIN: &[u8] = b"safe-ai-skill/stat/v1\0";
 /// scan ran out of budget).
 pub const SCAN_BUDGET_RULE: &str = "scan_budget_exceeded";
 /// Rule id of the combo for a symlink that resolves outside its pack. Neither approval nor trust
-/// clears it (spec D2.8): its content lives outside what was reviewed.
+/// clears it: its content lives outside what was reviewed.
 pub const SYMLINK_ESCAPE_RULE: &str = "symlink_escape";
 
 /// How a pack is laid out.
@@ -122,7 +122,7 @@ pub enum StoredSev {
     Block,
 }
 
-/// One finding as stored: `{rule, sev, path, line, ctx}` (spec D2.2).
+/// One finding as stored: `{rule, sev, path, line, ctx}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredFinding {
     /// Rule (or combo) id.
@@ -341,13 +341,13 @@ pub struct Transition {
     pub pin: String,
 }
 
-/// The pure state transition (spec D2.4, D2.7, D2.8).
+/// The pure state transition.
 ///
 /// `pin` is the entry's current pin (`None` on first sight). `floor` raises the state for a v1
 /// re-baseline (`Warned`) or a v1 pin recorded with a HIGH scan (`Unreviewed`).
 ///
-/// In order: a combo, or a symlink escaping the pack, blocks (trust never clears a BLOCK, spec
-/// D2.8); trusted content is clean and becomes the pin; content that
+/// In order: a combo, or a symlink escaping the pack, blocks (trust never clears a
+/// BLOCK); trusted content is clean and becomes the pin; content that
 /// differs from its pin blocks (drift); content that differs from the committed `packs.lock`
 /// blocks; otherwise the grade decides (HIGH → unreviewed, unless `packs.lock` pins this
 /// exact content, which counts as reviewed → warned).
@@ -471,7 +471,7 @@ fn rel_display(path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// tree_hash (spec D2.2)
+// tree_hash
 // ---------------------------------------------------------------------------------------
 
 /// The content identity of a pack: SHA-256 over its full entry set, never running git.
@@ -1006,7 +1006,7 @@ fn yaml_scalar(v: &serde_yaml::Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// packs.lock (spec D2.7)
+// packs.lock
 // ---------------------------------------------------------------------------------------
 
 /// Project-relative location of the committed pack lock.

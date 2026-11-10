@@ -1,4 +1,4 @@
-//! SessionStart sweep budget (spec D2.9): a full sweep of an ai-kit-sized tree stays under 5 s.
+//! SessionStart sweep budget: a full sweep of an ai-kit-sized tree stays under 5 s.
 //!
 //! The corpus is synthetic but shaped like the ai-kit checkout the budget was measured on
 //! (46 packs, ~13.5k files of docs and code). Debug builds scan several times slower than the

@@ -1,4 +1,4 @@
-//! Enforcement of blocked skill packs without moving them (spec D2.6).
+//! Enforcement of blocked skill packs without moving them.
 //!
 //! - `Skill` (PreToolUse) and a typed `/name` (`UserPromptExpansion`, or a raw `/name` in
 //!   `UserPromptSubmit`): the name is mapped to every swept pack providing it (its directory
@@ -18,11 +18,11 @@
 //!
 //! The read and Bash checks only consult the stored state (no hashing), so they stay cheap.
 //!
-//! Tiers (D8 v2 spec §6). A pack is in one of two classes. A **hard** pack is blocked (combo,
+//! Tiers: a pack is in one of two classes. A **hard** pack is blocked (combo,
 //! drift, `packs.lock` mismatch) or was never fully scanned: its verdict is `Deny`, which
 //! [`super::tier_action`] keeps at every tier but Off (Off only reports it). A **high** pack has
 //! a first-seen HIGH heuristic finding nobody reviewed (also when a committed `packs.lock`
-//! matches it, Q4): its verdict is `Ask`, a marker [`super::tier_action`] turns into a denial at
+//! matches it): its verdict is `Ask`, a marker [`super::tier_action`] turns into a denial at
 //! High and drops below. The functions here never look at the tier; callers apply
 //! [`super::tier_action`].
 

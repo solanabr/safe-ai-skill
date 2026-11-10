@@ -18,9 +18,9 @@ struct NameRule {
 }
 
 /// ai-kit's tool-name denies, tier for tier. Medium and High refuse context-mode's executor,
-/// fetcher and directory indexer (P17) and Playwright's code runner and raw HTTP client
-/// (P18); High also refuses Playwright's in-page evaluator (P18) and Cloudflare's `execute`
-/// (P19). Off and Relaxed keep every tool and rely on the content checks.
+/// fetcher and directory indexer and Playwright's code runner and raw HTTP client; High also
+/// refuses Playwright's in-page evaluator and Cloudflare's `execute`. Off and Relaxed keep
+/// every tool and rely on the content checks.
 const NAME_RULES: &[NameRule] = &[
     NameRule {
         server: "context-mode",
@@ -213,7 +213,7 @@ pub fn decide(
     };
     let guarded = matches!(scope, Scope::Authority | Scope::Destructive | Scope::Deploy);
     // A token transfer moves value in TOKEN units, never SOL: no SOL grant or cap covers it
-    // (D3), so it is never relaxed and carries no SOL amount. A transfer is one whatever its
+    // so it is never relaxed and carries no SOL amount. A transfer is one whatever its
     // tool is called when its tool or action names a token or another asset (`transferSpl`,
     // `send_ETH`), when its server does and the call does not name SOL (`mcp__spl__transfer`),
     // or when its payload names a mint (the wSOL mint too: an SPL transfer of wrapped SOL is
@@ -243,7 +243,7 @@ pub fn decide(
     meta.amount_sol = amount;
     meta.destination = dest.clone();
     // Never relaxable: authority changes, approvals, freezes, closes and burns; staking and
-    // delegation; token transfers (D3); a pre-built transaction; and any value-moving call
+    // delegation; token transfers; a pre-built transaction; and any value-moving call
     // whose SOL amount cannot be read (an unknown field, `transfer_all`, a non-numeric value)
     // or is given twice with different values.
     if guarded
@@ -899,7 +899,7 @@ fn names_sol(tokens: &[String]) -> bool {
 
 /// Whether the tokens indicate a TOKEN (SPL) transfer: a `token` token alongside a
 /// transfer/send verb (`transferToken`, `sendToken`), whatever else the call is (a swap too).
-/// Token amounts are not SOL (D3).
+/// Token amounts are not SOL.
 fn is_token_transfer(tokens: &[String]) -> bool {
     tokens.iter().any(|t| t == "token")
         && tokens
