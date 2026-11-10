@@ -8,6 +8,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ### Fixed
 
+- **A Solana transaction signature is no longer treated as a private key.** A signature and a base58 keypair are both 64 bytes.
+  - `prompt-guard` blocked any prompt holding a signature ("a raw 64-byte base58 private key"), so `/debug-user-tx <signature>` was refused.
+  - `redact` replaced the signature in `solana confirm` and `solana transfer` output with `***REDACTED:base58_secret_key***`.
+  - Both now act on two things: a keypair, meaning 64 bytes whose second half is the Ed25519 public key of the first (how every Solana keypair is stored), and any 64-byte value right after a key name (`PRIVATE_KEY=`, `"secretKey":`, `--keypair`). The key-name rule is the one the exfil tripwire already uses.
+  - A signature, unnamed or under a `signature` or `tx` name, passes.
+  - The deny paths keep the wider 64-byte shape: the exfil tripwire, the env-file content check and keypair files.
 - **The process-substitution installer check reads only the command its `<(` belongs to.**
   - `source <(./scripts/env.sh) && curl -s http://localhost:3000/health` asked as a download-and-run installer, because any `curl` later on the line counted.
   - Now only the rest of that simple command counts.
