@@ -6,6 +6,10 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Security
+
+- **Secret reads and uploads inside an opaque dynamic shell script are now seen (#19).** A secret file read or upload wrapped in a script whose body holds an expansion (`$PWD`, `$HOME`) — a double-quoted `sh -c`/`eval`, a here-string (`sh <<< "…$VAR…"`), a launcher command line (`watch`/`tmux …`), or `su -c "…$VAR…"` — used to pass the secrets/exfil gate silently, because the parser leaves such a script opaque and the gate only scanned listed commands. The gate now re-parses these (locally, mirroring the on-chain and wallet gates) and denies the upload/read. Benign dynamic scripts keep no opinion.
+
 ### Changed
 
 - **`install.sh` also installs the Claude Code plugin.** When `claude` is on `PATH`, it runs the same `claude plugin marketplace add` and `claude plugin install` a manual install runs, so one command sets up the hooks and the CLI. It leaves an installed copy (such as `safe-ai-skill@stbr` from solana-ai-kit) alone, and exits 1 with the two commands to run if the plugin install fails. `SAFE_AI_SKILL_PLUGIN=0` installs the CLI only.
