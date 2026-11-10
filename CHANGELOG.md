@@ -4,6 +4,13 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **`install.sh` also installs the Claude Code plugin.** When `claude` is on `PATH`, it runs the same `claude plugin marketplace add` and `claude plugin install` a manual install runs, so one command sets up the hooks and the CLI. It leaves an installed copy (such as `safe-ai-skill@stbr` from solana-ai-kit) alone, and exits 1 with the two commands to run if the plugin install fails. `SAFE_AI_SKILL_PLUGIN=0` installs the CLI only.
+- README: the install section leads with `install.sh`, the features are one table, and the opening warning is folded into "Security model and limitations".
+
 ## [1.3.1] — 2026-11-09
 
 ### Behaviour changes (read before upgrading)

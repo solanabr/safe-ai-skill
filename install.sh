@@ -1,10 +1,16 @@
 #!/bin/sh
-# install.sh — standalone installer for the safe-ai-skill CLI
+# install.sh — installer for safe-ai-skill: the Claude Code plugin and the CLI
 #
 # Downloads the prebuilt safe-ai-skill binary for the current platform from the
 # GitHub Release matching $SAFE_AI_SKILL_VERSION (default: latest pinned below),
 # verifies its SHA-256 against the release's published SHA256SUMS, and installs
 # it to $SAFE_AI_SKILL_BIN_DIR (default: ~/.local/bin).
+#
+# Then, when `claude` is on PATH, it installs the Claude Code plugin, which is what
+# runs the hooks: the same `claude plugin marketplace add` + `claude plugin install`
+# a manual install runs. It leaves an already installed copy (for example
+# safe-ai-skill@stbr from solana-ai-kit) alone, since two copies don't both run.
+# SAFE_AI_SKILL_PLUGIN=0 installs the CLI only.
 #
 # From 1.3.0 a release also ships the plugin's POSIX shim (safe-ai-skill-shim). On
 # macOS and Linux it is installed as `safe-ai-skill`, with the binary beside it as
@@ -21,10 +27,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 #   SAFE_AI_SKILL_BIN_DIR=/usr/local/bin sh install.sh
 #   SAFE_AI_SKILL_VERSION=1.3.1 sh install.sh
+#   curl -fsSL …/install.sh | SAFE_AI_SKILL_PLUGIN=0 sh     # CLI only, no hooks
 
 set -eu
 
 REPO="solanabr/safe-ai-skill"
+# HTTPS, so adding the marketplace doesn't need a GitHub SSH key.
+MARKETPLACE_URL="https://github.com/${REPO}.git"
+PLUGIN_ID="safe-ai-skill@safe-ai-skill"
 # Default version — scripts/check-versions.sh keeps it equal to every manifest.
 VERSION="${SAFE_AI_SKILL_VERSION:-1.3.1}"
 TAG="v${VERSION}"
@@ -163,3 +173,38 @@ case ":${PATH}:" in
   *":${BIN_DIR}:"*) ;;
   *) err "note: ${BIN_DIR} is not on your PATH. Add it, e.g.: export PATH=\"${BIN_DIR}:\$PATH\"" ;;
 esac
+
+# ── Claude Code plugin (the hooks) ──────────────────────────────────────────
+
+plugin_commands() {
+  err "  claude plugin marketplace add ${MARKETPLACE_URL}"
+  err "  claude plugin install ${PLUGIN_ID}"
+}
+
+if [ "${SAFE_AI_SKILL_PLUGIN:-1}" = "0" ]; then
+  err "SAFE_AI_SKILL_PLUGIN=0: the Claude Code plugin was not installed, so no hooks run."
+  exit 0
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  err "the hooks are NOT installed: claude (Claude Code) is not on PATH. Install Claude Code, then run:"
+  plugin_commands
+  exit 0
+fi
+
+installed="$(claude plugin list --json 2>/dev/null \
+  | grep -o '"id": *"safe-ai-skill@[^"]*"' | head -n1 | sed 's/.*"\(safe-ai-skill@[^"]*\)"$/\1/')" || installed=""
+if [ -n "${installed}" ]; then
+  err "the Claude Code plugin is already installed as ${installed}; left as it is."
+  exit 0
+fi
+
+log="${tmp_dir}/plugin.log"
+if claude plugin marketplace add "${MARKETPLACE_URL}" >"${log}" 2>&1 \
+  && claude plugin install "${PLUGIN_ID}" >>"${log}" 2>&1; then
+  err "installed the Claude Code plugin ${PLUGIN_ID}: the hooks run from your next Claude Code session."
+else
+  cat "${log}" >&2
+  err "INSTALL FAILED — the CLI is installed, but the Claude Code plugin is not, so no hooks run. Run:"
+  plugin_commands
+  exit 1
+fi

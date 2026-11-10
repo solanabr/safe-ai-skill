@@ -1,6 +1,6 @@
 # Firewall tiers
 
-safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own) applies at every tier. This page describes the 1.3.1 behaviour; the [CHANGELOG](../CHANGELOG.md) lists what changed in each release.
+safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#security-model-and-limitations) applies at every tier. This page describes the 1.3.1 behaviour; the [CHANGELOG](../CHANGELOG.md) lists what changed in each release.
 
 ## Who owns what
 
@@ -529,7 +529,7 @@ Three line-oriented files at the root of this repository in `policy/shared/`, pl
 
 ## See also
 
-- [README: Read this first](../README.md#read-this-first-what-this-plugin-cannot-protect-on-its-own)
+- [README: Security model and limitations](../README.md#security-model-and-limitations)
 - [docs/cli.md](cli.md): every command and flag, and the hook table
 - [docs/upgrading.md](upgrading.md): moving from 1.0.x
 - [SECURITY.md](../SECURITY.md#recommended-setup): recommended setup, known holes by layer
