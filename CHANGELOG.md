@@ -9,6 +9,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 ### Security
 
 - **Shell nesting past the parser depth limit is no longer silent.** A value-moving or irreversible Solana command whose program name comes from an expansion, nested deeper than the parser follows (8 levels), used to get no opinion from the on-chain gate — the parser bailed `unparseable` but nothing family-shaped was visible. Such a too-deeply-nested command is now treated as unreadable regardless of what it names: ask at Medium, deny at High, on both the single- and double-quoted routes.
+- **Secret reads and uploads inside an opaque dynamic shell script are now seen (#19).** A secret file read or upload wrapped in a script whose body holds an expansion (`$PWD`, `$HOME`) — a double-quoted `sh -c`/`eval`, a here-string (`sh <<< "…$VAR…"`), a launcher command line (`watch`/`tmux …`), or `su -c "…$VAR…"` — used to pass the secrets/exfil gate silently, because the parser leaves such a script opaque and the gate only scanned listed commands. The gate now re-parses these (locally, mirroring the on-chain and wallet gates) and denies the upload/read. Benign dynamic scripts keep no opinion.
 
 ### Changed
 
