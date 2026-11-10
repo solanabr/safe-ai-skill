@@ -106,24 +106,41 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
+      # cargo-nextest runs the suites below. Cached by its version, so it installs only on a bump.
+      - name: Cache cargo-nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ runner.arch }}-0.9.151
+
+      # Installed from crates.io (no extra action), version-pinned and --locked; skipped when the
+      # cache above restored the binary.
+      - name: Install cargo-nextest (0.9.151)
+        run: command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest --locked --version 0.9.151
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      # Builds the crate (bin included, for the integration tests and the npm smoke below) and
-      # runs the default suite; a standalone `cargo build` beforehand only compiled it twice.
-      - name: cargo test --verbose
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose --no-fail-fast
+      # nextest runs each test in its own process (faster, more isolated). It does NOT run
+      # doctests, so `cargo test --doc` keeps the crate's doctests. nextest builds the crate and
+      # its binary (for the integration tests and the npm smoke below), so no standalone build.
+      - name: nextest + doctests (default)
         env:
           # The opencode plugin's Node tests (real engine) must run, not skip.
           SAFE_AI_SKILL_REQUIRE_NODE_TESTS: "1"
+        run: |
+          cargo nextest run --manifest-path ${{ env.MANIFEST }} --no-fail-fast
+          cargo test --manifest-path ${{ env.MANIFEST }} --doc --no-fail-fast
 
       # The test-only overrides (trusted data dir, sandbox state, crash trigger) exist only in
       # these builds: the tier matrix, the shared corpus plugin column and the Off /
       # `env_read: deny` / grant rows that drive the binary run here. A separate target dir
-      # keeps the release-shaped debug binary for the steps below.
-      - name: cargo test --features test-hooks
-        run: cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --no-fail-fast --target-dir crates/engine/target/test-hooks
+      # keeps the default debug binary (used by the npm smoke) from being clobbered.
+      - name: nextest + doctests (test-hooks)
+        run: |
+          cargo nextest run --manifest-path ${{ env.MANIFEST }} --features test-hooks --no-fail-fast --target-dir crates/engine/target/test-hooks
+          cargo test --manifest-path ${{ env.MANIFEST }} --features test-hooks --doc --no-fail-fast --target-dir crates/engine/target/test-hooks
 
       # Prove the npm launcher stub (bin/cli.js) resolves and execs the binary.
       # No network: we use the freshly built binary, not a release download.
