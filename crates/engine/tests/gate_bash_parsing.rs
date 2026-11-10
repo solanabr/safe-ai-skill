@@ -867,6 +867,81 @@ fn e2e_deadline_does_not_turn_a_deny_into_an_ask() {
     assert_eq!(label(&run).as_deref(), Some("deny"), "{}", run.stdout);
 }
 
+// The `solana` stub is a #!/bin/sh script, which Windows cannot exec. `test-hooks` only: the
+// probe has to outlast the deadline, and its 2 s bound equals the deadline floor, so in a
+// default build whichever timer fires first decides the answer.
+#[cfg(all(unix, feature = "test-hooks"))]
+#[test]
+fn e2e_permission_request_answers_by_the_deadline() {
+    // `gate-permission` runs the same slow CLI probe; past its deadline it answers the
+    // `PermissionRequest` itself: a deny where nobody would see the prompt, else the prompt.
+    let bin = stub_solana("sleep 30");
+    let project = TempDir::new("deadline-permission");
+    for (mode, headless, want) in [
+        ("dontAsk", false, Some("deny")),
+        ("default", true, Some("deny")),
+        ("default", false, None),
+    ] {
+        let data = TempDir::new("parse-data");
+        let home = TempDir::new("parse-home");
+        let payload = serde_json::json!({
+            "session_id": "it-parsing",
+            "cwd": project.path().to_str().unwrap(),
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": { "command": format!("solana transfer {DEST} 0.5") },
+            "permission_mode": mode,
+        })
+        .to_string();
+        let started = Instant::now();
+        let run = Invocation::new(&["gate-permission"])
+            .plugin_data(data.path())
+            .home(home.path())
+            .env("PATH", &format!("{}:/usr/bin:/bin", bin.path().display()))
+            .env("SAFE_AI_SKILL_DEADLINE_MS", "200")
+            // Past the 2 s deadline floor, so the deadline answers, not the probe's timeout.
+            .env("SAFE_AI_SKILL_TEST_SOLANA_TIMEOUT_MS", "10000")
+            .headless(headless)
+            .stdin(payload)
+            .run();
+        let elapsed = started.elapsed();
+        assert_eq!(run.code, Some(0), "stderr: {}", run.stderr);
+        assert!(elapsed < Duration::from_secs(6), "{mode}: took {elapsed:?}");
+        let out = run.json();
+        let decision = &out["hookSpecificOutput"]["decision"]["behavior"];
+        assert_eq!(decision.as_str(), want, "{mode} headless={headless}: {out}");
+        match want {
+            Some(_) => assert_eq!(
+                out["hookSpecificOutput"]["hookEventName"],
+                "PermissionRequest"
+            ),
+            None => assert!(out["systemMessage"].as_str().is_some(), "{out}"),
+        }
+    }
+}
+
+#[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
+#[test]
+fn e2e_nested_process_substitutions_keep_a_deny() {
+    let bin = stub_solana(MAINNET_STUB);
+    let project = TempDir::new("nested-procsub");
+    let mut nested = "echo x".to_string();
+    for _ in 0..20 {
+        nested = format!("bash <({nested})");
+    }
+    let started = Instant::now();
+    let run = run_hook(
+        "gate-bash-secrets",
+        &format!("cat ~/.ssh/id_ed25519; {nested}"),
+        bin.path(),
+        project.path(),
+        &[],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(label(&run).as_deref(), Some("deny"), "{}", run.stdout);
+    assert!(elapsed < Duration::from_secs(6), "took {elapsed:?}");
+}
+
 #[cfg(unix)] // the `solana` stub is a #!/bin/sh script, which Windows cannot exec
 #[test]
 fn e2e_probe_rows_ask_in_the_secrets_hook() {

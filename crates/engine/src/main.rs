@@ -70,7 +70,8 @@ const CRASH_REASON: &str =
 const DEADLINE_REASON: &str =
     "safe-ai-skill: the gate did not finish within its time limit; review this call manually.";
 
-/// The PreToolUse gates run under [`GATE_DEADLINE`].
+/// The gates that run under [`GATE_DEADLINE`]: the PreToolUse gates, and `gate-permission`,
+/// which runs the same Bash gates on a `PermissionRequest`.
 const DEADLINE_GATES: &[&str] = &[
     "gate-bash",
     "gate-bash-secrets",
@@ -79,10 +80,11 @@ const DEADLINE_GATES: &[&str] = &[
     "gate-webfetch",
     "gate-tamper",
     "gate-skill",
+    "gate-permission",
 ];
 
-/// The PreToolUse gates whose panic writes a hard-guard `ask` before the process ends
-/// (release builds abort on panic, so the deadline path never sees it).
+/// The gates whose panic writes a hard-guard answer before the process ends (release builds
+/// abort on panic, so the deadline path never sees it).
 const PANIC_ASK_GATES: &[&str] = &[
     "gate-bash",
     "gate-bash-secrets",
@@ -91,7 +93,36 @@ const PANIC_ASK_GATES: &[&str] = &[
     "gate-webfetch",
     "gate-tamper",
     "gate-skill",
+    "gate-permission",
 ];
+
+/// What a gate that did not finish (past its deadline, or panicked) emits: the answer to the
+/// event it was wired for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unfinished {
+    /// A PreToolUse decision ([`deadline_decision`]).
+    PreToolUse,
+    /// A `PermissionRequest` answer ([`permission_fallback`]).
+    Permission,
+}
+
+impl Unfinished {
+    fn of(sub: &str) -> Self {
+        if sub == "gate-permission" {
+            Unfinished::Permission
+        } else {
+            Unfinished::PreToolUse
+        }
+    }
+
+    /// Emit the answer for a gate stopped for `reason`.
+    fn emit(self, reason: &str) {
+        let _ = match self {
+            Unfinished::PreToolUse => io::emit_pretooluse(&deadline_decision(reason)),
+            Unfinished::Permission => io::emit_value(permission_fallback(reason)),
+        };
+    }
+}
 
 /// A subcommand handler: gets the arguments after the subcommand name.
 type Handler = fn(&[String]) -> ExitCode;
@@ -140,16 +171,19 @@ fn main() -> ExitCode {
     let rest: &[String] = if args.len() > 2 { &args[2..] } else { &[] };
 
     if PANIC_ASK_GATES.contains(&sub) {
-        install_panic_ask();
+        install_panic_ask(Unfinished::of(sub));
     }
     // `<command> --help` prints the usage instead of running the command.
     if let Some(code) = help::flag(sub, rest) {
         return code;
     }
     match SUBCOMMANDS.iter().find(|(name, _)| *name == sub) {
-        Some((name, handler)) if DEADLINE_GATES.contains(name) => {
-            run_with_deadline(gate_deadline(), *handler, rest.to_vec())
-        }
+        Some((name, handler)) if DEADLINE_GATES.contains(name) => run_with_deadline(
+            gate_deadline(),
+            Unfinished::of(name),
+            *handler,
+            rest.to_vec(),
+        ),
         Some((_, handler)) => handler(rest),
         None => cmd_unknown(sub),
     }
@@ -200,10 +234,39 @@ fn deadline_decision(reason: &str) -> Decision {
     }
 }
 
+/// The permission mode of the request `gate-permission` is judging, once it is read.
+static PERMISSION_MODE: Mutex<Option<String>> = Mutex::new(None);
+
+/// The deny `gate-permission` rendered, recorded before it audits and emits.
+static PERMISSION_DENY: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// `gate-permission`'s answer when it did not finish: the deny it already rendered, else the
+/// request as a hard-guard ask, denied when nobody would see the prompt and otherwise left to
+/// the user with a note ([`permreq::render`]).
+///
+/// [`permreq::render`]: safe_ai_skill::gates::permreq::render
+fn permission_fallback(reason: &str) -> Option<serde_json::Value> {
+    use safe_ai_skill::gates::permreq;
+    if let Some(deny) = PERMISSION_DENY.lock().ok().and_then(|d| d.clone()) {
+        return Some(deny);
+    }
+    let mode = PERMISSION_MODE.lock().ok().and_then(|m| m.clone());
+    let class = permreq::Class::HardGuard {
+        reason: reason.trim_start_matches("safe-ai-skill: ").to_string(),
+        denied: false,
+    };
+    permreq::render(&class, mode.as_deref(), headless::detect())
+}
+
 /// Run a gate under `budget`. Past it, or when the gate panics, emit an `ask` (the gate's
-/// deny if it already decided one; nothing if it already answered) and exit 0: no gate fails
-/// open.
-fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> ExitCode {
+/// deny if it already decided one; nothing if it already answered), in the shape `unfinished`
+/// names, and exit 0: no gate fails open.
+fn run_with_deadline(
+    budget: Duration,
+    unfinished: Unfinished,
+    handler: Handler,
+    rest: Vec<String>,
+) -> ExitCode {
     let reason = match within(budget, move || {
         // Test-only crash trigger (the `test-hooks` feature is never built for release).
         #[cfg(feature = "test-hooks")]
@@ -216,17 +279,17 @@ fn run_with_deadline(budget: Duration, handler: Handler, rest: Vec<String>) -> E
         Err(mpsc::RecvTimeoutError::Timeout) => DEADLINE_REASON,
         Err(mpsc::RecvTimeoutError::Disconnected) => CRASH_REASON,
     };
-    let _ = io::emit_pretooluse(&deadline_decision(reason));
+    unfinished.emit(reason);
     std::process::exit(0)
 }
 
-/// On a panic, write the hard-guard `ask` (the gate's deny if it already reached one) before
-/// the default report and the abort. Best effort: a write error is ignored, and a decision
-/// already written is never followed by a second one.
-fn install_panic_ask() {
+/// On a panic, write the hard-guard `ask` (the gate's deny if it already reached one), in the
+/// shape `unfinished` names, before the default report and the abort. Best effort: a write
+/// error is ignored, and a decision already written is never followed by a second one.
+fn install_panic_ask(unfinished: Unfinished) {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = io::emit_pretooluse(&deadline_decision(CRASH_REASON));
+        unfinished.emit(CRASH_REASON);
         // Codex (and the opencode plugin) read stdout only on exit 0, and a release build
         // aborts after this hook: end here so the deny counts.
         if adapt::is_foreign() {
@@ -803,6 +866,9 @@ fn cmd_gate_permission() -> ExitCode {
     let Ok(input) = parsed else {
         return ExitCode::SUCCESS;
     };
+    if let Ok(mut mode) = PERMISSION_MODE.lock() {
+        mode.clone_from(&input.permission_mode);
+    }
     let Some(tool) = input.tool_name.as_deref() else {
         return ExitCode::SUCCESS;
     };
@@ -821,6 +887,9 @@ fn cmd_gate_permission() -> ExitCode {
         .as_ref()
         .and_then(|v| v["hookSpecificOutput"]["decision"]["message"].as_str())
     {
+        if let Ok(mut deny) = PERMISSION_DENY.lock() {
+            deny.clone_from(&out);
+        }
         write_audit(
             &effective,
             &dir.path,
@@ -1023,15 +1092,22 @@ fn cmd_adapt(rest: &[String]) -> ExitCode {
             let Some((_, handler)) = SUBCOMMANDS.iter().find(|(name, _)| *name == gate) else {
                 return ExitCode::from(EXIT_USAGE);
             };
-            install_panic_ask();
+            // The adapters translate a PreToolUse answer for their client.
+            install_panic_ask(Unfinished::PreToolUse);
             if client == adapt::Client::OpenCode {
                 return run_with_deadline(
                     gate_deadline(),
+                    Unfinished::PreToolUse,
                     cmd_adapt_opencode,
                     vec![gate.to_string()],
                 );
             }
-            run_with_deadline(gate_deadline(), *handler, Vec::new())
+            run_with_deadline(
+                gate_deadline(),
+                Unfinished::PreToolUse,
+                *handler,
+                Vec::new(),
+            )
         }
         Route::SessionStart => cmd_verify_session(),
         Route::RedactBlock => cmd_redact(),
@@ -2987,6 +3063,41 @@ mod tests {
         let (d, _) = join_tier(Some(allow()), Decision::Defer, GateMeta::unknown());
         assert_eq!(d, Decision::Defer);
         let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn permission_fallback_answers_the_permission_request() {
+        let set_mode = |mode: Option<&str>| {
+            *PERMISSION_MODE.lock().unwrap() = mode.map(str::to_string);
+        };
+        let behavior = |out: &Option<serde_json::Value>| {
+            out.as_ref()
+                .and_then(|v| v["hookSpecificOutput"]["decision"]["behavior"].as_str())
+                .map(str::to_string)
+        };
+        // Nobody would see the prompt in `dontAsk`: the request is denied.
+        set_mode(Some("dontAsk"));
+        let out = permission_fallback(DEADLINE_REASON);
+        assert_eq!(behavior(&out).as_deref(), Some("deny"), "{out:?}");
+        let event = &out.as_ref().unwrap()["hookSpecificOutput"]["hookEventName"];
+        assert_eq!(event, "PermissionRequest");
+        // In Manual mode the prompt is left to the user (headless, as in CI, denies it).
+        set_mode(Some("default"));
+        let out = permission_fallback(DEADLINE_REASON);
+        if headless::detect() {
+            assert_eq!(behavior(&out).as_deref(), Some("deny"), "{out:?}");
+        } else {
+            assert_eq!(behavior(&out), None, "{out:?}");
+            let note = out.as_ref().unwrap()["systemMessage"].as_str().unwrap();
+            assert!(note.contains("did not finish"), "{note}");
+        }
+        // A deny the gate already rendered is the answer.
+        let deny =
+            serde_json::json!({ "hookSpecificOutput": { "decision": { "behavior": "deny" } } });
+        *PERMISSION_DENY.lock().unwrap() = Some(deny.clone());
+        assert_eq!(permission_fallback(DEADLINE_REASON), Some(deny));
+        *PERMISSION_DENY.lock().unwrap() = None;
+        set_mode(None);
     }
 
     #[test]

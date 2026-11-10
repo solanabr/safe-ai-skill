@@ -13,6 +13,8 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - More than 64 of them in one command, or more text than the parser reads, asks like a command too large to check.
 
 ### Fixed
+- **A process substitution's body is parsed once.** The code it feeds a shell or `source` comes from the parse the body already gets, so the work grows with the command's length instead of doubling with each level of nesting. A here-string `cat` in the body counts as a producer too.
+- **`gate-permission` answers within the 8-second gate deadline.** It runs the same Bash gates as `gate-bash-secrets`. Past the deadline, or if it crashes, it answers the `PermissionRequest` itself: the deny it already reached, else a deny where nobody would see the prompt (headless, `dontAsk`), else the prompt with a note. It used to run until its 15-second hook timeout.
 
 - **Anchor and Solana CLI dev-loop commands no longer ask on a test cluster.** Each of these asked at every tier, so CI denied it.
   - `anchor run <script>` now follows `anchor test`: no opinion on a positively identified localnet, devnet or testnet, an ask anywhere else.

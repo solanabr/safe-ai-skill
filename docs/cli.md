@@ -233,7 +233,7 @@ Other hooks' jobs: `prompt-guard` blocks a prompt that holds a pasted keypair by
 | `SAFE_AI_SKILL_PLUGIN` | `0`: `install.sh` installs the CLI only, without the Claude Code plugin that runs the hooks |
 | `SAFE_AI_SKILL_HOME` | Install root for `install --from`, like `--home` |
 | `SAFE_AI_SKILL_HEADLESS`, `KIT_FIREWALL_HEADLESS` | `1` or `true` makes the run headless: every `ask` becomes a `deny` (CI variables do the same; see below) |
-| `SAFE_AI_SKILL_DEADLINE_MS` | Shortens the 8 s per-gate deadline after which a gate answers `ask`; it cannot lengthen it, and the floor is 2 s |
+| `SAFE_AI_SKILL_DEADLINE_MS` | Shortens the 8 s per-gate deadline after which a gate answers `ask` (`gate-permission`: its hard-guard answer); it cannot lengthen it, and the floor is 2 s |
 | `SAFE_AI_SKILL_ENGINE` | Engine path for the opencode plugin |
 | `CLAUDE_PLUGIN_DATA`, `CLAUDE_CONFIG_DIR`, `CLAUDE_PROJECT_DIR` | Set by Claude Code; the CLI reads them to find the same state and project |
 
