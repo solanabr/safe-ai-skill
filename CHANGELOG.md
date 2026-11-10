@@ -6,6 +6,10 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Security
+
+- **Shell nesting past the parser depth limit is no longer silent.** A value-moving or irreversible Solana command whose program name comes from an expansion, nested deeper than the parser follows (8 levels), used to get no opinion from the on-chain gate — the parser bailed `unparseable` but nothing family-shaped was visible. Such a too-deeply-nested command is now treated as unreadable regardless of what it names: ask at Medium, deny at High, on both the single- and double-quoted routes.
+
 ### Changed
 
 - **`install.sh` also installs the Claude Code plugin.** When `claude` is on `PATH`, it runs the same `claude plugin marketplace add` and `claude plugin install` a manual install runs, so one command sets up the hooks and the CLI. It leaves an installed copy (such as `safe-ai-skill@stbr` from solana-ai-kit) alone, and exits 1 with the two commands to run if the plugin install fails. `SAFE_AI_SKILL_PLUGIN=0` installs the CLI only.

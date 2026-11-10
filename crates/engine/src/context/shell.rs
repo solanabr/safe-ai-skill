@@ -653,6 +653,11 @@ pub struct Parsed {
     pub commands: Vec<SimpleCommand>,
     /// Quotes, substitutions or subshells do not balance, or nesting is too deep.
     pub unparseable: bool,
+    /// Nesting of substitutions and `-c`/`eval` scripts ran past [`MAX_DEPTH`], so the parser
+    /// stopped before reading the deepest commands. Set together with `unparseable`; unlike a
+    /// plain unbalanced parse, a too-deep one is treated as unreadable by the on-chain gate
+    /// whatever the visible text names, since a hidden family program could sit below the cut.
+    pub too_deep: bool,
     /// Code runs whose text the command line does not spell out: a shell reading a pipe or a
     /// process substitution, `eval` of an expansion, interpreter code naming a solana-family
     /// program, a `source` of a process substitution.
@@ -824,7 +829,11 @@ pub fn base_name(word: &str) -> String {
 /// Parse `script` into `out` at nesting `depth`; `indirect` marks every command found.
 fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) {
     if depth > MAX_DEPTH {
+        // Past the depth limit the deepest commands go unread: mark the parse unreadable and
+        // record that the cause is excessive nesting, so the gate can ask even when nothing
+        // family-shaped is visible above the cut.
         out.unparseable = true;
+        out.too_deep = true;
         return;
     }
     let mut lx = Lexer {
@@ -2504,6 +2513,21 @@ mod tests {
             format!("bash -c {}", shell_quote(&s))
         });
         assert!(parse(&deep).unparseable);
+    }
+
+    #[test]
+    fn nesting_past_the_depth_limit_is_both_unparseable_and_too_deep() {
+        // A parse that stops short of the deepest commands sets `too_deep` (and `unparseable`
+        // with it); a parse within the limit sets neither.
+        let deep = (0..12).fold("solana".to_string(), |s, _| {
+            format!("bash -c {}", shell_quote(&s))
+        });
+        let deep = parse(&deep);
+        assert!(deep.unparseable);
+        assert!(deep.too_deep);
+        let shallow = parse("bash -c 'bash -c \"solana transfer X 1\"'");
+        assert!(!shallow.unparseable);
+        assert!(!shallow.too_deep);
     }
 
     #[test]
