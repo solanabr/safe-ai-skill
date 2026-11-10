@@ -1,0 +1,16 @@
+# cargo-nextest configuration for the safe-ai-skill engine crate.
+#
+# Nextest runs each test in its own process. That is more isolation than `cargo test` (which runs
+# a binary's tests as threads in one process), and it defeats the in-process `ONE_AT_A_TIME` mutex
+# in tests/rules_perf.rs that serialises its scan-budget probes so only one large body is built and
+# scanned at a time (release builds use 16 MiB bodies; several at once would cost gigabytes).
+#
+# Pin that one binary's tests to a single thread so nextest serialises them the same way. Other
+# tests still run fully in parallel.
+
+[test-groups]
+rules-perf-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(rules_perf)"
+test-group = "rules-perf-serial"
