@@ -62,11 +62,11 @@ set -fu
 
 # sha256 of each prebuilt, stamped by scripts/stamp-shim.sh when release.yml vendors the
 # binaries. Empty: this release ships no prebuilt for that platform.
-sha256_darwin_arm64=afd35eaf1d852d686dcc441ec1356404af3e881a93dbd282b03edd5ff64cf8d8
-sha256_darwin_x64=2ceeedd6656f560d464337696ee8179f028fab87bb13f28fe72a8f0bbfd62402
-sha256_linux_x64=9e798f0e98aeab20b04c1bd561ad8920c72cd4b9dc6a1fc2414f93ec816bfb5f
-sha256_linux_arm64=06cefdcbf16b09759542f80644784fdb28d76ad4d5fc627d39f6761895ab0804
-sha256_windows_x64=cf1c6c8c018f636869d98cac6c122920c226b555b37214d8babbe9d57e60ecca
+sha256_darwin_arm64=32945ee2142cf902e6c7ce37f0cd66762b50c6241f321b8c334624ac0f0b1bb7
+sha256_darwin_x64=e567f50faddecf21573c6ba4f1a0aeab65ba85ab5eb791f09de54623f01e9cf0
+sha256_linux_x64=6bd33868932a419016aa506268892eba676093b48232322f39ee83da9e7130fc
+sha256_linux_arm64=fd5bfae9b8993e09f0b056a82c5416fd5b78401adeaac6e349e92f8f6dca96ac
+sha256_windows_x64=dff549cf342a1af27b1522089b165be10147845d3f14fcb8c684e81ffd69e6a8
 
 case $0 in
   */*) self_dir=${0%/*} ;;
