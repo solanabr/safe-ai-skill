@@ -21,6 +21,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a PR cancels the superseded run; pushes to a branch (main included) never cancel
+# each other, so branch history keeps one full run per commit.
+concurrency:
+  group: "ci-${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_TOOLCHAIN: "1.98.1"   # same pin as release.yml; bump both together
   MANIFEST: crates/engine/Cargo.toml
@@ -30,6 +36,7 @@ jobs:
   # ── lint (fmt + clippy) ───────────────────────────────────────────────────
   lint:
     name: Lint (fmt + clippy)
+    timeout-minutes: 15
     runs-on: ubuntu-latest     # fast, free, consistent lint runner
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +70,7 @@ jobs:
   # ── build + test matrix ──────────────────────────────────────────────────
   build-test:
     name: Build + test / ${{ matrix.name }}
+    timeout-minutes: 30
     needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
@@ -139,6 +147,7 @@ jobs:
   # to catch compile regressions on that target before a release tag.
   cross-build:
     name: Cross-build / ${{ matrix.target }}
+    timeout-minutes: 30
     needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
@@ -177,6 +186,7 @@ jobs:
   # each binary is static and runs on alpine, debian:11 and ubuntu:20.04.
   linux-musl:
     name: Linux static (musl) / ${{ matrix.target }}
+    timeout-minutes: 30
     needs: lint
     runs-on: ${{ matrix.os }}
     strategy:
@@ -239,6 +249,7 @@ jobs:
   # plugin.json (release.yml builds and vendors there; docs/RELEASING.md).
   verify-attestations:
     name: Verify binary provenance
+    timeout-minutes: 20
     needs: lint
     runs-on: ubuntu-24.04
     permissions:
@@ -273,6 +284,7 @@ jobs:
   # binaries for the version in plugin.json.
   binary-versions:
     name: Binary versions / ${{ matrix.os }}
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -287,6 +299,7 @@ jobs:
   # ── plugin binary checksum + shim syntax ─────────────────────────────────
   verify-plugin-bin:
     name: Verify committed plugin binaries
+    timeout-minutes: 20
     needs: lint
     runs-on: ubuntu-latest
     steps:
@@ -323,6 +336,7 @@ jobs:
   # bash --posix wherever they exist.
   shim-tests:
     name: Shim tests / ${{ matrix.os }}
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -345,6 +359,7 @@ jobs:
   # crates/engine/tests/windows-known-failures.txt fails the job.
   windows:
     name: Windows / x86_64-pc-windows-msvc
+    timeout-minutes: 40
     needs: lint
     runs-on: windows-2025
     defaults:
@@ -400,6 +415,7 @@ jobs:
   # same runner, so the bound tracks the hardware.
   latency:
     name: Latency budget
+    timeout-minutes: 30
     needs: lint
     runs-on: ubuntu-24.04
     steps:
@@ -420,6 +436,22 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --manifest-path "$MANIFEST" --release --locked --target x86_64-unknown-linux-musl
 
+      # The wall-clock budgets are gated out of the normal `cargo test` run (they flaked on
+      # variable runners). Here, in a release build on this stable latency runner, we turn the
+      # gate on so the real budgets are still enforced where timing is meaningful. Same target
+      # and profile as the build above, so the release artifacts are reused, not rebuilt.
+      - name: Perf budgets (release, SAFE_AI_SKILL_PERF=1)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          SAFE_AI_SKILL_PERF: "1"
+        run: |
+          cargo test --manifest-path "$MANIFEST" --release --locked \
+            --target x86_64-unknown-linux-musl \
+            --test verify_perf full_sweep_of_an_aikit_sized_tree_fits_the_budget
+          cargo test --manifest-path "$MANIFEST" --release --locked \
+            --target x86_64-unknown-linux-musl \
+            --lib long_non_ascii_names_cost_bounded_work_and_no_allocation_per_entry
+
       - name: scripts/latency-budget.py
         run: |
           python3 -I scripts/latency-budget.py \
@@ -429,6 +461,7 @@ jobs:
   # ── package + script checks (npm wrapper, install.sh, version consistency) ─
   package-checks:
     name: Package + script checks
+    timeout-minutes: 20
     runs-on: ubuntu-latest      # ships shellcheck + node preinstalled
     steps:
       - uses: actions/checkout@v4

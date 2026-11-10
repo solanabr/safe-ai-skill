@@ -75,13 +75,18 @@ fn full_sweep_of_an_aikit_sized_tree_fits_the_budget() {
     let took = started.elapsed();
     assert_eq!(run.code, Some(0), "{}", run.stderr);
 
-    let budget = if cfg!(debug_assertions) {
-        Duration::from_secs(20)
-    } else {
-        Duration::from_secs(5)
-    };
-    assert!(
-        took < budget,
-        "sweep of {files} files took {took:?} (budget {budget:?})"
-    );
+    // The wall-clock budget is hardware-dependent, so it is asserted only under the perf gate
+    // (the `latency` CI job runs this in release with `SAFE_AI_SKILL_PERF=1`); the normal
+    // `cargo test` run still builds the tree and holds the always-on exit-code-0 check above.
+    if common::perf_assertions_enabled() {
+        let budget = if cfg!(debug_assertions) {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(5)
+        };
+        assert!(
+            took < budget,
+            "sweep of {files} files took {took:?} (budget {budget:?})"
+        );
+    }
 }

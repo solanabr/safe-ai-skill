@@ -474,6 +474,12 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
+    /// Whether wall-clock assertions run: off by default (deterministic on any hardware), on
+    /// when `SAFE_AI_SKILL_PERF` is set, as the `latency` CI job does in a release build.
+    fn perf_assertions_enabled() -> bool {
+        std::env::var_os("SAFE_AI_SKILL_PERF").is_some()
+    }
+
     fn temp(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "safe-ai-skill-gittracked-{tag}-{}-{:?}",
@@ -838,16 +844,21 @@ mod tests {
         let started = Instant::now();
         let (hit, work) = scan_index(&idx, "x/y").unwrap();
         assert!(!hit);
+        // The real correctness bound: the work cap holds regardless of hardware (always-on).
         assert!(work < MAX_WORK, "{work}");
         // The worst case for the comparison: a 3999-byte target equal to every name but its
         // last byte. The work cap ends the parse, and the pack counts as tracked.
         let long_target = format!("{}x", "é".repeat(1999));
         assert_eq!(scan_index(&idx, &long_target), Err(()));
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "both scans took {:?}",
-            started.elapsed()
-        );
+        // The wall-clock bound is hardware-dependent, so it is asserted only under the perf gate
+        // (the `latency` CI job runs this in release with `SAFE_AI_SKILL_PERF=1`).
+        if perf_assertions_enabled() {
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "both scans took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

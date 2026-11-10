@@ -1410,18 +1410,10 @@ fn padding_the_hit_cap_hides_no_combo() {
 
 #[test]
 fn budget_cut_packs_keep_what_they_found_and_never_grade_clean() {
+    use std::time::Duration;
     let pad = " ".repeat(200);
     let mal_js = format!("x();{pad}eval(atob(s));\n");
-    // Far longer to scan than the 300 ms allowance in either build.
-    let mib = if cfg!(debug_assertions) { 2 } else { 8 };
-    let dense = "curl x;".repeat(mib * 1024 * 1024 / 7);
     let cut = |r: &PackReport| r.findings.iter().any(|f| f.rule == "scan_budget_exceeded");
-    let budget = || {
-        rules::ScanBudget::new(
-            std::time::Duration::from_millis(300),
-            std::time::Duration::from_secs(60),
-        )
-    };
     let pack = |files: &[(&str, &str)]| {
         let tmp = TempDir::new("budget");
         for (rel, body) in files {
@@ -1429,31 +1421,55 @@ fn budget_cut_packs_keep_what_they_found_and_never_grade_clean() {
         }
         tmp
     };
-    // bud-dense-alone / bud-dense-before-mal: cut, unreviewed (HIGH), never clean.
+    // An elapsed time allowance cuts the pack at the first budget check on any hardware: the
+    // deadline is `now`, already reached when the walk starts, so nothing is scanned. The pack
+    // is therefore unreviewed — HIGH, never clean — whether a malware file sits behind the cut
+    // (nothing scanned) or not.
+    let elapsed = || rules::ScanBudget::new(Duration::ZERO, Duration::from_secs(60));
     for files in [
-        vec![("a.sh", dense.as_str())],
-        vec![("a1.sh", dense.as_str()), ("z.js", mal_js.as_str())],
+        vec![("a.sh", "echo hi\n")],
+        vec![("a1.sh", "echo hi\n"), ("z.js", mal_js.as_str())],
     ] {
         let tmp = pack(&files);
-        let r = rules::scan_pack_within(tmp.path(), &budget());
+        let r = rules::scan_pack_within(tmp.path(), &elapsed());
         assert!(cut(&r), "{r:?}");
         assert_eq!(rules::grade(&r), Grade::High, "{r:?}");
     }
-    // bud-mal-before-dense: the payload found before the cut still blocks.
-    let tmp = pack(&[("a.js", mal_js.as_str()), ("b1.sh", dense.as_str())]);
-    let r = rules::scan_pack_within(tmp.path(), &budget());
-    assert!(cut(&r), "{r:?}");
-    assert_eq!(rules::grade(&r), Grade::Block, "{r:?}");
-    // sweep-a/b/c: a pack that burns its allowance does not cut the small ones after it.
-    let sweep = rules::ScanBudget::new(
-        std::time::Duration::from_millis(300),
-        std::time::Duration::from_secs(60),
-    );
-    let a = pack(&[("a1.sh", dense.as_str())]);
-    let b = pack(&[("z.js", mal_js.as_str())]);
-    assert!(cut(&rules::scan_pack_within(a.path(), &sweep)));
-    let rb = rules::scan_pack_within(b.path(), &sweep);
-    assert!(!cut(&rb) && rules::grade(&rb) == Grade::Block, "{rb:?}");
+    // A payload found before a cut is kept and still blocks: `grade` takes any combo to BLOCK
+    // first, so a co-occurring `scan_budget_exceeded` (meta HIGH) never pulls it down. Proven
+    // by composing two deterministic scans — an ample scan that finds the combo, and an elapsed
+    // scan that is cut — so there is no clock to race.
+    let ample = || rules::ScanBudget::new(Duration::from_secs(60), Duration::from_secs(60));
+    let found_pack = pack(&[("a.js", mal_js.as_str())]);
+    let found = rules::scan_pack_within(found_pack.path(), &ample());
+    assert_eq!(rules::grade(&found), Grade::Block, "{found:?}");
+    let cut_pack = pack(&[("a.sh", "echo hi\n")]);
+    let cut_only = rules::scan_pack_within(cut_pack.path(), &elapsed());
+    assert!(cut(&cut_only), "{cut_only:?}");
+    let mut both = found.clone();
+    both.findings.extend(cut_only.findings.iter().cloned());
+    assert!(cut(&both), "{both:?}");
+    assert_eq!(rules::grade(&both), Grade::Block, "{both:?}");
+
+    // Real wall-clock coverage (the `latency` CI job, `SAFE_AI_SKILL_PERF`): a genuinely dense
+    // pack takes longer than its 300 ms allowance, so the cut lands end to end, a malware file
+    // found before it still blocks (bud-mal-before-dense), and a pack that burns its own
+    // per-pack allowance does not cut the small ones after it in the same sweep (sweep-a/b/c).
+    if common::perf_assertions_enabled() {
+        let mib = if cfg!(debug_assertions) { 2 } else { 8 };
+        let dense = "curl x;".repeat(mib * 1024 * 1024 / 7);
+        let budget = || rules::ScanBudget::new(Duration::from_millis(300), Duration::from_secs(60));
+        let tmp = pack(&[("a.js", mal_js.as_str()), ("b1.sh", dense.as_str())]);
+        let r = rules::scan_pack_within(tmp.path(), &budget());
+        assert!(cut(&r), "{r:?}");
+        assert_eq!(rules::grade(&r), Grade::Block, "{r:?}");
+        let sweep = budget();
+        let a = pack(&[("a1.sh", dense.as_str())]);
+        let b = pack(&[("z.js", mal_js.as_str())]);
+        assert!(cut(&rules::scan_pack_within(a.path(), &sweep)));
+        let rb = rules::scan_pack_within(b.path(), &sweep);
+        assert!(!cut(&rb) && rules::grade(&rb) == Grade::Block, "{rb:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------

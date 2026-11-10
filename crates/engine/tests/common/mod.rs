@@ -44,6 +44,14 @@ pub enum SandboxMode {
     Unset,
 }
 
+/// Whether wall-clock (timing) assertions should run. Off by default so the normal `cargo test`
+/// run is deterministic on any hardware; on when `SAFE_AI_SKILL_PERF` is set (any value), as the
+/// `latency` CI job does in a release build to hold the real budgets. Tests keep every
+/// correctness assertion always-on and wrap only the `assert!(took < budget)` in this.
+pub fn perf_assertions_enabled() -> bool {
+    std::env::var_os("SAFE_AI_SKILL_PERF").is_some()
+}
+
 /// Absolute path to the built `safe-ai-skill` binary (Cargo-provided).
 /// The standalone data dir an [`Invocation`] pins inside its `home` (`SAFE_AI_SKILL_DATA`).
 pub fn standalone_data(home: &Path) -> PathBuf {

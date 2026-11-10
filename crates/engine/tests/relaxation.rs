@@ -51,6 +51,12 @@ impl Sandbox {
             .home(self.home.path())
             .cwd(self.proj.path())
             .env("PATH", no_tools.path().to_str().unwrap())
+            // Make the ancestry verdict deterministic: this forces `session_check` to read the
+            // session as interactive (test-hooks only), so announcing and confirming codes does
+            // not depend on a real `ps` run finishing within `PS_DEADLINE` on a loaded runner.
+            // A per-call `SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE` still wins (checked first), so the
+            // unreadable-table test keeps forcing its `Unknown` path.
+            .env("SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF", "1")
             .stdin(payload.to_string());
         for (k, v) in env {
             inv = inv.env(k, v);
@@ -438,7 +444,11 @@ fn a_deleted_spend_ledger_exhausts_the_budget() {
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "ask");
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table, which native Windows lacks (by design). The verdict that
+// shows the migration's confirm code is made deterministic by `SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF`
+// (set in `Sandbox::hook`), which only the `test-hooks` build reads — so this runs there, never
+// depending on a real `ps` finishing in time in the plain `cargo test` build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn v1_state_is_migrated_once_and_listed_at_session_start() {
     let sb = Sandbox::new("relax-migrate");
