@@ -1,0 +1,108 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    # Every PR is reviewed once when it opens, leaves draft, or reopens.
+    # `synchronize` is left out on purpose: a review on every push would mostly
+    # re-review the same diff. For a fresh review of a later head, close and
+    # reopen the PR.
+    types: [opened, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    # - Drafts wait for ready_for_review, so they aren't reviewed twice.
+    # - Fork and Dependabot PRs get no repository secrets on `pull_request`, so
+    #   the action could only fail there.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+
+    # One review per PR at a time: a newer run cancels the one in flight, so a
+    # review of an older head is never posted as current. Job-level, so a run
+    # whose `if` is false never cancels anything.
+    concurrency:
+      group: claude-code-review-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # post the review on the PR
+      issues: write # PR conversation comments use the issues-comments API
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029 # v1.0.239
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Required: without it the review runs but is never published. It
+          # forces tag mode, which posts the report as a tracking comment.
+          track_progress: true
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          prompt: |
+            Run /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
+            with these safe-ai-skill priorities layered on top.
+
+            This repo is a security plugin for Claude Code. A Rust engine (crates/engine) runs as the
+            hooks in plugins/safe-ai-skill/hooks/hooks.json: it gates Bash, file, web, MCP and Skill
+            calls, redacts secrets from tool output and verifies skill packs. It installs from git and
+            through solana-ai-kit, and it guards keypairs, seed phrases and mainnet actions, so a gate
+            that lets a call through by mistake ships to every session that runs it.
+
+            First read README.md, SECURITY.md (Known holes, Design guarantees), docs/tiers.md and the
+            top of CHANGELOG.md. If the PR body says "Closes #N", read issue #N (gh issue view N) and
+            its comments (later comments often correct the issue body), then check the diff meets each
+            acceptance item. Say which items are unmet. A PR that says "Part of #N" only has to meet
+            what it claims.
+
+            Scrutinize these hardest. They must never ship broken:
+            - Gate verdicts. A change may loosen only the forms it sets out to loosen. Check that the
+              neighbouring forms (wrappers, env prefixes, quoting, option clusters, nesting, other
+              shells) still get the same ask or deny, at every tier and headless. The hard guards
+              (set_authority, account_close, irreversible on-chain actions, secret_read) hold at every
+              tier and grant; project policy and .claude/security.json may only raise the tier;
+              headless turns every ask into a deny.
+            - Bounded work. Every hook runs under a timeout (hooks.json) and CI has a latency budget
+              (scripts/latency-budget.py). Parsing and scanning of model-written text stay bounded in
+              depth and work, and input past a limit asks; it is never allowed.
+            - Hook wiring and releases. hooks.json matchers, timeouts and onFailure values change only
+              with a stated reason. main gets new hooks.json or shim code only together with the
+              binaries that run it (docs/RELEASING.md), so outside a release/vX.Y.Z merge the plugin
+              binaries, SHA256SUMS and the shim's stamped hashes don't change. A release PR bumps
+              every manifest scripts/check-versions.sh checks and dates its CHANGELOG entry; other PRs
+              add their lines under ## [Unreleased].
+            - Shared lists. policy/shared/ is a contract with solana-ai-kit (.github/CODEOWNERS):
+              crates/engine/policy/shared/ stays byte-identical to it (scripts/check-shared-lists.sh),
+              and a list change updates MANIFEST.
+            - Docs that state behaviour. docs/tiers.md, SECURITY.md and docs/cli.md must match the code
+              after the PR. A claim the code doesn't back is a finding.
+            - Tests. A behaviour change comes with tests that pin both what now passes and the nearby
+              forms that must still ask or deny (unit tests beside the code, integration tests and
+              fixtures in crates/engine/tests/). Timing-based tests keep margins that hold on a loaded
+              CI runner.
+            - Supply chain. Dependency changes (Cargo.lock, npm/) are deliberate and pinned; no new
+              unpinned remote code; an action in a job holding secrets, id-token or write permissions
+              is pinned by commit SHA.
+
+            This repository and this review are public. Fixes for gate gaps land without describing
+            the gap, on purpose: don't explain how the code before the PR could be evaded. If you find
+            a way past a gate, name the gate and the file:line and say it needs a private follow-up,
+            with no working command, payload or step-by-step evasion.
+
+            Repo conventions to hold the PR to: no AI or Claude attribution in commits or the PR body;
+            CHANGELOG lines describe behaviour a user sees.
+
+            Output: lead with BLOCKING findings (correctness, security, or does-not-meet-acceptance),
+            then non-blocking suggestions. Be decisive, cite file:line, and skip nits.
+            This review is ADVISORY: CI is the hard gate, and a maintainer signs off on anything
+            touching gate verdicts, hooks.json, the shim, the binaries or the shared lists. Never
+            suggest or imply a self-merge.

@@ -6,11 +6,20 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
 - **Shell code a command hands a shell gets every Bash gate.** A producer's output that a shell or `source` runs, and a dynamic `-c`, `eval`, here-string, launcher or `su -c` script, now go through the full gate list, as a decoded payload does. That holds in `gate-bash-secrets`, `gate-bash`, `gate-mcp` and `PermissionRequest`.
   - Scripts inside such scripts are followed 4 levels down.
   - More than 64 of them in one command, or more text than the parser reads, asks like a command too large to check.
+
+### Fixed
+
+- **A Solana transaction signature is no longer treated as a private key.** A signature and a base58 keypair are both 64 bytes.
+  - `prompt-guard` blocked any prompt holding a signature ("a raw 64-byte base58 private key"), so `/debug-user-tx <signature>` was refused.
+  - `redact` replaced the signature in `solana confirm` and `solana transfer` output with `***REDACTED:base58_secret_key***`.
+  - Both now act on two things: a keypair, meaning 64 bytes whose second half is the Ed25519 public key of the first (how every Solana keypair is stored), and any 64-byte value right after a key name (`PRIVATE_KEY=`, `"secretKey":`, `--keypair`). The key-name rule is the one the exfil tripwire already uses.
+  - A signature, unnamed or under a `signature` or `tx` name, passes.
+  - The deny paths keep the wider 64-byte shape: the exfil tripwire, the env-file content check and keypair files.
 
 ## [1.3.2] — 2026-11-10
 
