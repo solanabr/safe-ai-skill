@@ -25,6 +25,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::env::values::KnownValue;
+use crate::gates::exfil;
 use crate::gates::read::{self, ReadVerdict};
 use crate::gates::secretpath::{self, Class};
 use crate::io::{Decision, HookInput};
@@ -781,7 +782,9 @@ struct Span {
 /// Returns `Some(scrubbed)` only when at least one redaction was made; `None` means the
 /// text is unchanged (no `updatedToolOutput` is emitted). Detected classes:
 /// - Solana keypair JSON byte arrays (`[12,34,...]` of 32 or 64 ints in `0..=255`).
-/// - 64-byte base58 secret keys, plus `"secretKey"`/`"privateKey"` JSON field values.
+/// - Base58 Solana keypairs, and any 64-byte base58 value after a key name
+///   ([`is_keypair_or_named_key`]; a transaction signature, also 64 bytes, is left alone), plus
+///   `"secretKey"`/`"privateKey"` JSON field values.
 /// - BIP-39 seed phrases ([`crate::seedphrase`]: checksum-valid runs of wordlist words, and
 ///   phrase-shaped runs when a mnemonic/seed/phrase/recovery/secret keyword is in the string).
 /// - Common API-key shapes (`*_API_KEY=`, `PRIVATE_KEY=`, `sk-…`, `eyJ…` JWTs).
@@ -795,7 +798,7 @@ pub fn scrub(text: &str) -> Option<String> {
 
     collect_keypair_arrays(text, &mut spans);
     collect_seed_phrases(text, &mut spans);
-    collect_base58_secret_keys(text, &mut spans);
+    collect_base58_secret_keys(text, &mut spans, is_keypair_or_named_key);
     collect_json_secret_fields(text, &mut spans);
     collect_api_keys(text, &mut spans);
     collect_pem_blocks(text, &mut spans);
@@ -857,17 +860,79 @@ pub(crate) fn find_keypair_array(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Returns `true` if `s` is a base58 string that decodes to exactly 64 bytes (an Ed25519
-/// secret key). 32-byte values (public keys) intentionally return `false`.
+/// Returns `true` if `s` is a base58 string that decodes to exactly 64 bytes: the shape of an
+/// Ed25519 secret key, which a transaction signature shares. 32-byte values (public keys)
+/// intentionally return `false`. [`is_keypair_or_named_key`] tells the two apart.
 pub(crate) fn is_base58_secret_key(s: &str) -> bool {
+    decode_base58_64(s).is_some()
+}
+
+/// Whether the 64-byte base58 value `run`, preceded by `head`, is a key for the output scrub
+/// and the prompt guard: a Solana keypair, or any 64-byte value right after a key name
+/// (`PRIVATE_KEY=`, `"secretKey":`, `--keypair`, `wallet:`; the exfil tripwire's rule). A
+/// transaction signature, unnamed or under a `signature`/`tx` name, passes.
+fn is_keypair_or_named_key(run: &str, head: &str) -> bool {
+    decode_base58_64(run).is_some_and(|bytes| {
+        if is_keypair_bytes(&bytes) {
+            return true;
+        }
+        // A key name is short. In a list of signatures the word before each one is the
+        // previous signature, whose 88 random characters can hold `seed` or end in `key`.
+        let name = exfil::name_before(head);
+        name.len() <= MAX_KEY_NAME && exfil::names_key(&name)
+    })
+}
+
+/// The longest word [`is_keypair_or_named_key`] reads as a key name.
+const MAX_KEY_NAME: usize = 64;
+
+/// Whether `text` holds a base58 key that [`scrub`] would redact ([`is_keypair_or_named_key`]).
+pub(crate) fn has_base58_key(text: &str) -> bool {
+    let mut spans = Vec::new();
+    collect_base58_secret_keys(text, &mut spans, is_keypair_or_named_key);
+    !spans.is_empty()
+}
+
+/// Whether `b` is an Ed25519 keypair as Solana stores it (`id.json`, a base58 private-key
+/// export): a 32-byte seed followed by the public key it derives. A signature (`R ‖ S`) is
+/// also 64 bytes, but its second half is not the public key of its first.
+pub(crate) fn is_keypair_bytes(b: &[u8]) -> bool {
+    let (Some(seed), Some(public)) = (b.get(..32), b.get(32..)) else {
+        return false;
+    };
+    let Ok(seed) = <[u8; 32]>::try_from(seed) else {
+        return false;
+    };
+    public.len() == 32
+        && ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .as_bytes()
+            .as_slice()
+            == public
+}
+
+/// A base58 keypair built from `seed`, as `solana-keygen` and wallet exports write it.
+#[cfg(test)]
+pub(crate) fn test_keypair_b58(seed: [u8; 32]) -> String {
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+    bs58::encode([seed.as_slice(), public.as_bytes()].concat()).into_string()
+}
+
+/// A base58 transaction-style signature made with the keypair built from `seed`.
+#[cfg(test)]
+pub(crate) fn test_signature_b58(seed: [u8; 32]) -> String {
+    use ed25519_dalek::Signer;
+    let signature = ed25519_dalek::SigningKey::from_bytes(&seed).sign(b"a transaction message");
+    bs58::encode(signature.to_bytes()).into_string()
+}
+
+/// The 64 bytes `s` decodes to, when it is a base58 token of that size.
+fn decode_base58_64(s: &str) -> Option<Vec<u8>> {
     // Length pre-filter: 64 raw bytes encode to ~87-88 base58 chars.
-    if s.len() < 80 || s.len() > 90 {
-        return false;
+    if s.len() < 80 || s.len() > 90 || !s.bytes().all(is_base58_char) {
+        return None;
     }
-    if !s.bytes().all(is_base58_char) {
-        return false;
-    }
-    matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 64)
+    bs58::decode(s).into_vec().ok().filter(|v| v.len() == 64)
 }
 
 /// Every seed phrase in `text` ([`crate::seedphrase::find`]).
@@ -889,7 +954,7 @@ pub(crate) fn contains_key_material(text: &str) -> bool {
         return true;
     }
     let mut spans = Vec::new();
-    collect_base58_secret_keys(text, &mut spans);
+    collect_base58_secret_keys(text, &mut spans, |run, _| is_base58_secret_key(run));
     collect_jwts(text, &mut spans);
     if !spans.is_empty() || has_secret_token(text) {
         return true;
@@ -1034,8 +1099,11 @@ fn collect_seed_phrases(text: &str, spans: &mut Vec<Span>) {
     }
 }
 
-fn collect_base58_secret_keys(text: &str, spans: &mut Vec<Span>) {
-    // Walk maximal base58 token runs; redact only those decoding to 64 bytes.
+/// Walk maximal base58 token runs and record those `is_key(run, text_before_run)` accepts:
+/// [`is_keypair_or_named_key`] for the output scrub, so transaction signatures survive, and
+/// any 64-byte value ([`is_base58_secret_key`]) for the deny paths behind
+/// [`contains_key_material`], which keep the wider shape.
+fn collect_base58_secret_keys(text: &str, spans: &mut Vec<Span>, is_key: fn(&str, &str) -> bool) {
     let bytes = text.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -1045,7 +1113,7 @@ fn collect_base58_secret_keys(text: &str, spans: &mut Vec<Span>) {
                 i += 1;
             }
             let tok = &text[start..i];
-            if is_base58_secret_key(tok) {
+            if is_key(tok, &text[..start]) {
                 spans.push(Span {
                     start,
                     end: i,
@@ -1649,12 +1717,62 @@ mod tests {
 
     #[test]
     fn base58_secret_key_redacted() {
-        // 64 bytes encoded to base58.
-        let secret = bs58::encode(vec![7u8; 64]).into_string();
+        // A keypair: a seed followed by the public key it derives, base58-encoded.
+        let secret = test_keypair_b58([7u8; 32]);
         let text = format!("found key {secret} in logs");
-        let out = scrub(&text).expect("64-byte base58 should redact");
+        let out = scrub(&text).expect("a base58 keypair should redact");
         assert!(out.contains("***REDACTED:base58_secret_key***"));
         assert!(!out.contains(&secret));
+    }
+
+    #[test]
+    fn transaction_signature_not_redacted() {
+        // A signature is 64 bytes of base58 too, but not seed ‖ public key, so `solana confirm`
+        // and `solana transfer` output keeps the value the next command needs.
+        let signature = test_signature_b58([7u8; 32]);
+        for text in [
+            format!("Signature: {signature}\nStatus: Ok"),
+            format!("{signature}\n{}\n", test_signature_b58([8u8; 32])),
+            format!("{{\"signatures\": [\"{signature}\"]}}"),
+        ] {
+            assert_eq!(scrub(&text), None, "{text}");
+            assert!(!has_base58_key(&text), "{text}");
+        }
+        // The deny paths behind `contains_key_material` keep the wider 64-byte shape.
+        assert!(is_base58_secret_key(&signature));
+        assert!(contains_key_material(&signature));
+    }
+
+    #[test]
+    fn a_list_of_signatures_is_not_redacted() {
+        // `solana transaction-history` style: each signature's preceding word is the previous
+        // signature, which is never read as a key name, whatever letters it happens to hold.
+        let list: Vec<String> = (0..200u8).map(|i| test_signature_b58([i; 32])).collect();
+        for sep in ["\n", " ", ", "] {
+            let text = list.join(sep);
+            assert_eq!(scrub(&text), None, "separator {sep:?}");
+        }
+    }
+
+    #[test]
+    fn named_64_byte_value_redacted_even_when_not_a_keypair() {
+        // After a key name any 64-byte value counts, as in the exfil tripwire; unnamed, only a
+        // keypair does.
+        let value = bs58::encode([7u8; 64]).into_string();
+        for text in [
+            format!("PRIVATE_KEY={value}"),
+            format!("WALLET_SECRET={value}"),
+            format!("{{\"secretKey\": \"{value}\"}}"),
+            format!("--keypair {value}"),
+        ] {
+            let out = scrub(&text).expect(&text);
+            assert!(!out.contains(&value), "{out}");
+        }
+        assert_eq!(scrub(&format!("b58 {value}")), None);
+        assert!(has_base58_key(&format!(
+            "b58 {}",
+            test_keypair_b58([7u8; 32])
+        )));
     }
 
     #[test]
