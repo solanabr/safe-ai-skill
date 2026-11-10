@@ -5965,8 +5965,16 @@ mod enforce_tests {
                 .map(|n| n.to_string())
                 .collect()
         };
-        let budget = Duration::from_secs(1);
-        sweep_scanned(&d, &project, slow_scan, budget);
+        // Each sweep has room for two of the slow packs. A hash budget stands in for their scan
+        // time, so the cut falls between the same packs on any hardware; the time budget is
+        // ample and never cuts.
+        let sweep = || {
+            state::HASHES_LEFT.with(|h| h.set(Some(2)));
+            let r = sweep_scanned(&d, &project, counting_scan, Duration::from_secs(60));
+            state::HASHES_LEFT.with(|h| h.set(None));
+            r
+        };
+        sweep();
         let st = state::load(&d).state;
         let deferred = unscanned(&st);
         assert!(deferred.contains(&"slow3".to_string()), "{deferred:?}");
@@ -5978,13 +5986,13 @@ mod enforce_tests {
         // unchanged ones cost no scan.
         md(&skills_of(&project).join("slow0"), "slow0");
         md(&skills_of(&project).join("slow00"), "slow00");
-        let r = sweep_scanned(&d, &project, slow_scan, budget);
+        let r = sweep();
         assert!(unscanned(&state::load(&d).state).is_empty());
         assert!(
             r.blocked.is_empty(),
             "no drift from a pack first left unhashed"
         );
-        sweep_scanned(&d, &project, slow_scan, budget);
+        sweep();
         let st = state::load(&d).state;
         for n in ["slow0", "slow00"] {
             assert!(
@@ -5994,7 +6002,7 @@ mod enforce_tests {
         }
         // Nothing changed: the last sweep re-hashes but scans nothing.
         let scans = SCANS.with(|n| n.get());
-        sweep_scanned(&d, &project, slow_scan, budget);
+        sweep();
         assert_eq!(SCANS.with(|n| n.get()), scans);
     }
 
@@ -6135,14 +6143,22 @@ mod enforce_tests {
             entry_of(&state::load(&d).state, &skills_of(&project).join("zzz")).state,
             PackStatus::Blocked
         );
-        // And the next sweep, which takes it first, blocks it too.
+        // And the next sweep, which takes it first, blocks it too. Hash budgets place the cuts
+        // on any hardware: the first sweep has room for the three aaa packs, the next for one
+        // pack, and that is zzz.
         let (d, project) = fresh_trusted("rr6-aaa-next");
         for n in ["aaa1", "aaa2", "aaa3", "zzz"] {
             md(&skills_of(&project).join(n), n);
         }
-        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(1));
-        let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(1));
-        assert_eq!(r.blocked, vec![".claude/skills/zzz".to_string()]);
+        let sweep = |hashes: usize| {
+            state::HASHES_LEFT.with(|h| h.set(Some(hashes)));
+            let r = sweep_scanned(&d, &project, slow_scan, Duration::from_secs(60));
+            state::HASHES_LEFT.with(|h| h.set(None));
+            r
+        };
+        sweep(3);
+        assert!(entry_of(&state::load(&d).state, &skills_of(&project).join("zzz")).unscanned());
+        assert_eq!(sweep(1).blocked, vec![".claude/skills/zzz".to_string()]);
     }
 
     #[test]
