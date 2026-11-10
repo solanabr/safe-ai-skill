@@ -17,6 +17,10 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - `echo -e` output is read with its escapes decoded.
   - Output redirected into a process substitution that runs a shell is that shell's script.
   - `source /dev/stdin` runs its here-string or here-document.
+- **A shell running what a command substitution prints is no longer silent (#50).**
+  - Through a pipe, a here-string or a process substitution, such code asks, and denies at High, like a command nested past the parser's depth limit. `docs/tiers.md` gains the row.
+  - A substitution that only prints a literal (`echo`, `printf`) is read in its place instead, there and in a `-c` script or `eval`.
+  - A substitution that supplies an argument, a `-c` script, an `eval` or a program word keeps no opinion: `eval "$(ssh-agent -s)"`, `$(npm bin)/eslint .`, `sh -c "$(curl …)"` installers.
 
 - **A Solana transaction signature is no longer treated as a private key.** A signature and a base58 keypair are both 64 bytes.
   - `prompt-guard` blocked any prompt holding a signature ("a raw 64-byte base58 private key"), so `/debug-user-tx <signature>` was refused.

@@ -546,6 +546,10 @@ pub const GATE_TABLE: &[(&str, [&str; 4])] = &[
         ["ask", "ask", "ask", "deny"],
     ),
     (
+        "Shell code a command substitution prints, run through a pipe, here-string or process substitution",
+        ["ask", "ask", "ask", "deny"],
+    ),
+    (
         "MCP value-moving or signing tool",
         ["ask", "ask", "ask", "deny"],
     ),

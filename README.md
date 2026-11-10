@@ -246,7 +246,7 @@ safe-ai-skill protects against a careless model and prompt-injected instructions
 In short; the full table, with what closes each, is in [SECURITY.md](SECURITY.md#known-holes).
 
 - **Cross-call write-then-run:** a script written in one call and run in a later one.
-- **Encoded and indirect forms:** `base64 -d`, `$'…'`, variables, runtime-built paths, `python3 -c` one-liners. The encoded-command gate decodes literal payloads; one it can't decode asks (deny at High).
+- **Encoded and indirect forms:** `base64 -d`, `$'…'`, variables, runtime-built paths, `python3 -c` one-liners. The encoded-command gate decodes literal payloads; one it can't decode asks (deny at High). A shell fed what a command substitution prints, through a pipe, a here-string or a process substitution, asks the same way, unless the substitution only prints a literal, which is read.
 - **Project `.env` values below High:** at Off, Relaxed and Medium the model can read `.env` and `.env.*`. A value it has seen can leave through channels the hooks can't fully gate (a `WebFetch` URL or MCP argument to a host the exfil list doesn't name, MCP servers, DNS). The control is the kit's sandbox `deniedDomains`, or Claude Code's sandbox; High, or `safe-ai-skill tier --env-read deny`, keeps the values out of the transcript. `.env.production` is denied from Relaxed, but not when reached through a glob, a differently named symlink or a directory Grep.
 - **Bash writes to `.env` the hooks can't follow** (a script written earlier, encoded or runtime-built commands): only the sandbox's `denyWrite` closes them.
 - **Any process running as you outside the sandbox:** test suites, `build.rs`, postinstall scripts, MCP server processes.
