@@ -22,12 +22,19 @@ on:
   workflow_dispatch:
   workflow_call:
 
+# Groups duplicate runs at the same ref; cancel-in-progress is false for every trigger here
+# (none is a pull_request), so release, scheduled and called runs are never cancelled.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # The scheduled run tests whatever version the manifest declares; before that version is
   # released there is nothing to download, so skip with a notice. Every other trigger runs
   # unconditionally (a missing release there is a real failure).
   release-present:
     name: release for manifest version exists
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,6 +60,7 @@ jobs:
     name: npm install + verify + exec / ${{ matrix.os }}
     needs: release-present
     if: needs.release-present.outputs.run == 'true'
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -92,6 +100,7 @@ jobs:
     name: npm install + exec / ${{ matrix.image }} / ${{ matrix.os }}
     needs: release-present
     if: needs.release-present.outputs.run == 'true'
+    timeout-minutes: 20
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

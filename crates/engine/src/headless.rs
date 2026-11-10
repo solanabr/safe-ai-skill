@@ -225,6 +225,32 @@ fn process_table() -> Result<std::collections::HashMap<u32, Proc>, &'static str>
     if std::env::var_os("SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE").is_some() {
         return Err("test: the process table is unavailable");
     }
+    // Symmetric to the env above: a synthetic ancestry whose immediate parent is an ordinary
+    // (non-shell, non-Claude) process, so `ancestry_verdict` returns `Interactive` by the
+    // "not started by a Claude Code CLI" rule. Lets the relaxation suite announce and confirm
+    // codes without depending on a real `ps` run finishing within `PS_DEADLINE` on a loaded
+    // runner. Checked after the "no table" env so a test can still force the unavailable path.
+    #[cfg(feature = "test-hooks")]
+    if std::env::var_os("SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF").is_some() {
+        let me = std::process::id();
+        let parent = if me == 1 { 2 } else { 1 };
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            me,
+            Proc {
+                ppid: parent,
+                args: vec!["safe-ai-skill".to_string()],
+            },
+        );
+        table.insert(
+            parent,
+            Proc {
+                ppid: 0,
+                args: vec!["test".to_string()],
+            },
+        );
+        return Ok(table);
+    }
     if !cfg!(unix) {
         return Err("no process table on this platform");
     }
@@ -490,6 +516,17 @@ mod tests {
             (8, 7, "safe-ai-skill prompt-guard"),
         ]);
         assert_eq!(ancestry_verdict(8, &harness), Ancestry::Interactive);
+    }
+
+    #[test]
+    fn a_self_parented_table_reads_as_interactive() {
+        // The shape `SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF` builds in `process_table`: this
+        // process under an ordinary (non-shell, non-Claude) parent that exists in the table.
+        // A single self entry with a missing parent would be Unknown, so the parent is present.
+        let me = 4242;
+        let parent = 1;
+        let t = table(&[(me, parent, "safe-ai-skill"), (parent, 0, "test")]);
+        assert_eq!(ancestry_verdict(me, &t), Ancestry::Interactive);
     }
 
     #[test]

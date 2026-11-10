@@ -25,6 +25,11 @@ on:
 permissions:
   contents: read
 
+# A new PR push cancels the superseded run; non-PR events (this workflow is manual) never cancel.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

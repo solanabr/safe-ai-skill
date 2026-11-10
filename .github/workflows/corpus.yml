@@ -17,6 +17,11 @@ on:
   pull_request:
     types: [labeled, synchronize]
 
+# A new push to a labeled PR cancels the superseded corpus run; non-PR events never cancel.
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUST_TOOLCHAIN: "1.98.1"   # same pin as ci.yml and release.yml
   MANIFEST: crates/engine/Cargo.toml
@@ -26,6 +31,7 @@ jobs:
   aikit-corpus:
     name: ai-kit corpus acceptance
     if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'corpus')
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

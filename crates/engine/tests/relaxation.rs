@@ -51,6 +51,12 @@ impl Sandbox {
             .home(self.home.path())
             .cwd(self.proj.path())
             .env("PATH", no_tools.path().to_str().unwrap())
+            // Make the ancestry verdict deterministic: this forces `session_check` to read the
+            // session as interactive (test-hooks only), so announcing and confirming codes does
+            // not depend on a real `ps` run finishing within `PS_DEADLINE` on a loaded runner.
+            // A per-call `SAFE_AI_SKILL_TEST_NO_PROCESS_TABLE` still wins (checked first), so the
+            // unreadable-table test keeps forcing its `Unknown` path.
+            .env("SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF", "1")
             .stdin(payload.to_string());
         for (k, v) in env {
             inv = inv.env(k, v);
@@ -136,6 +142,7 @@ fn has_digit_run(text: &str, n: usize) -> bool {
 impl Sandbox {
     /// Run the PostToolUse `pending-notice` hook (as Claude Code does after the Bash call)
     /// and return the code it shows the user, asserting it is in `systemMessage` only.
+    #[cfg(all(unix, feature = "test-hooks"))] // used only by the confirmation tests, which are gated
     fn code_shown(&self) -> String {
         let run = self.hook(
             &["pending-notice"],
@@ -151,6 +158,7 @@ impl Sandbox {
 }
 
 /// The code after `safe-ai-skill confirm ` in a systemMessage.
+#[cfg(all(unix, feature = "test-hooks"))] // used only by the confirmation tests, which are gated
 fn code_in(msg: &str) -> String {
     let code: String = msg
         .split("safe-ai-skill confirm ")
@@ -185,7 +193,10 @@ fn allow_parks_a_pending_entry_and_grants_nothing() {
     assert_eq!(sb.bash(&mainnet_transfer("0.5"), &[]), "ask");
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
     let sb = Sandbox::new("relax-confirm");
@@ -219,7 +230,10 @@ fn the_users_confirm_prompt_activates_the_grant_and_echoes_it() {
         .contains("nothing confirmed"));
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn a_nonce_outside_the_users_prompt_never_confirms() {
     let sb = Sandbox::new("relax-elsewhere");
@@ -438,7 +452,11 @@ fn a_deleted_spend_ledger_exhausts_the_budget() {
     assert_eq!(sb.bash(&devnet_transfer("0.5"), &[]), "ask");
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table, which native Windows lacks (by design). The verdict that
+// shows the migration's confirm code is made deterministic by `SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF`
+// (set in `Sandbox::hook`), which only the `test-hooks` build reads — so this runs there, never
+// depending on a real `ps` finishing in time in the plain `cargo test` build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn v1_state_is_migrated_once_and_listed_at_session_start() {
     let sb = Sandbox::new("relax-migrate");
@@ -497,7 +515,10 @@ fn v1_state_is_migrated_once_and_listed_at_session_start() {
 // The agent never sees the code
 // ---------------------------------------------------------------------------------------
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
     // The exact attack: the agent runs `allow`, then pipes a fake UserPromptSubmit into
@@ -559,7 +580,10 @@ fn the_agent_cannot_confirm_from_anything_the_cli_printed() {
     }
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn pending_notice_needs_a_post_tool_use_bash_payload() {
     let sb = Sandbox::new("relax-notice-shape");
@@ -576,7 +600,10 @@ fn pending_notice_needs_a_post_tool_use_bash_payload() {
     assert_eq!(sb.code_shown().len(), 8);
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn the_code_is_announced_once_in_system_message_only() {
     let sb = Sandbox::new("relax-announce");
@@ -600,7 +627,10 @@ fn the_code_is_announced_once_in_system_message_only() {
         .contains(&code));
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn a_request_made_outside_a_tool_call_is_announced_at_the_next_prompt() {
     let sb = Sandbox::new("relax-terminal");
@@ -678,7 +708,10 @@ fn a_raised_tier_and_ignored_hints_are_listed_at_session_start() {
 // No confirmation or announcement in a headless session (nested `claude -p`)
 // ---------------------------------------------------------------------------------------
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn a_headless_session_neither_announces_nor_confirms() {
     let sb = Sandbox::new("relax-headless");
@@ -724,6 +757,7 @@ fn a_headless_session_neither_announces_nor_confirms() {
 // ---------------------------------------------------------------------------------------
 
 impl Sandbox {
+    #[cfg(all(unix, feature = "test-hooks"))] // used only by the confirmation tests, which are gated
     fn prompt_in(&self, session: &str, prompt: &str) -> serde_json::Value {
         let run = self.hook(
             &["prompt-guard"],
@@ -739,7 +773,10 @@ impl Sandbox {
     }
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn another_session_neither_sees_nor_confirms_a_request() {
     let sb = Sandbox::new("relax-other-session");
@@ -770,7 +807,10 @@ fn another_session_neither_sees_nor_confirms_a_request() {
     );
 }
 
-#[cfg(unix)] // confirmations need the process table, which native Windows lacks (by design)
+// Confirmations need the process table (native Windows lacks it); the harness forces an
+// interactive ancestry via SAFE_AI_SKILL_TEST_PROCESS_TABLE_SELF (test-hooks only), so these
+// run there and never depend on a real `ps` finishing within PS_DEADLINE in the plain build.
+#[cfg(all(unix, feature = "test-hooks"))]
 #[test]
 fn a_request_made_in_a_session_belongs_to_it_from_the_start() {
     let sb = Sandbox::new("relax-bound");
