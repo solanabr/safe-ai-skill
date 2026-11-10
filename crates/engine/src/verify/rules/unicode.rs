@@ -1,4 +1,4 @@
-//! Invisible and bidirectional Unicode (spec D2.4): bidi controls (Trojan Source), zero-width
+//! Invisible and bidirectional Unicode: bidi controls (Trojan Source), zero-width
 //! characters and tag characters (invisible ASCII smuggling). WARN in code and metadata; in
 //! documentation bidi and zero-width are INFO (emoji joiners, RTL text) and tag characters WARN.
 

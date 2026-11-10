@@ -1,5 +1,5 @@
-//! Irreversible-action and unknown-network guards for `gate-bash` (#13, spec D1.4–D1.7, as
-//! amended by D8 v2 §3: Class U denies off positively identified localnet/devnet).
+//! Irreversible-action and unknown-network guards for `gate-bash` (#13; Class U denies off
+//! positively identified localnet/devnet).
 //!
 //! Most tests drive `gates::bash::decide` in-process with a pinned network and assert on the
 //! `Decision` value; no opinion is `Decision::Defer`. The end-to-end tests drive the built binary
@@ -73,7 +73,7 @@ fn gate_bash(command: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------
-// D8 v2 §3.1 Class U: a hard-guard ask on identified localnet/devnet/testnet, a deny on
+// Class U: a hard-guard ask on identified localnet/devnet/testnet, a deny on
 // mainnet and unknown clusters (program and buffer closes included). Authority changes to a
 // new key are Class C.
 // ---------------------------------------------------------------------------------------
@@ -173,7 +173,7 @@ fn every_irreversible_command_asks_on_devnet_and_testnet_as_hard_guard() {
 
 #[test]
 fn irreversible_without_final_denies_on_mainnet() {
-    // D8 v2 §3.1: every Class U shape denies on mainnet, not only `--final`.
+    // Every Class U shape denies on mainnet, not only `--final`.
     for cmd in [
         format!("spl-token authorize {MINT} mint --disable"),
         format!("spl-token close-mint {MINT}"),
@@ -188,7 +188,7 @@ fn irreversible_without_final_denies_on_mainnet() {
 
 #[test]
 fn final_on_unknown_network_denies() {
-    // D8 v2 §3.1: an unidentified cluster is not a positively identified localnet/devnet.
+    // An unidentified cluster is not a positively identified localnet/devnet.
     let (d, meta) = decide("solana program deploy --final ./p.so", Network::Unknown);
     assert!(is_deny(&d), "{d:?}");
     assert!(meta.hard_guard);
@@ -243,7 +243,7 @@ fn custom_rpc_url_is_unknown_not_config_fallback() {
 
 #[test]
 fn mainnet_deploy_is_a_grantable_ask() {
-    // D8 v2 §2: Class C on mainnet asks below High, and a covering confirmed grant allows it.
+    // Class C on mainnet asks below High, and a covering confirmed grant allows it.
     let (d, meta) = decide("solana program deploy ./p.so", Network::Mainnet);
     assert!(is_ask(&d), "{d:?}");
     assert!(!meta.hard_guard);
@@ -404,7 +404,7 @@ fn memo_text_does_not_name_a_cluster() {
 }
 
 // ---------------------------------------------------------------------------------------
-// D1.5 amounts: positional only, flag values skipped, `ALL` accepted, ambiguous → ask.
+// Amounts: positional only, flag values skipped, `ALL` accepted, ambiguous → ask.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -476,7 +476,7 @@ fn spl_token_positionals_and_flags() {
         ),
         Network::Devnet,
     );
-    // A token transfer on devnet: no opinion, and never a SOL amount (D3).
+    // A token transfer on devnet: no opinion, and never a SOL amount.
     assert_eq!(d, Decision::Defer);
     assert_eq!(meta.amount_sol, None);
     assert_eq!(
@@ -490,7 +490,7 @@ fn spl_token_positionals_and_flags() {
 fn transfer_all_asks_as_hard_guard() {
     for cmd in [
         format!("solana transfer {DEST} ALL -ud"),
-        // A token transfer is judged on its cluster alone (D3): ALL asks off devnet/localnet.
+        // A token transfer is judged on its cluster alone: ALL asks off devnet/localnet.
         format!("spl-token transfer {MINT} ALL {DEST} -um"),
     ] {
         let (d, meta) = decide(&cmd, Network::Devnet);
@@ -577,7 +577,7 @@ fn unknown_flag_before_the_subcommand_asks() {
 }
 
 // ---------------------------------------------------------------------------------------
-// D1.7 read-only fast path: no opinion, trimmed of state-changing commands.
+// Read-only fast path: no opinion, trimmed of state-changing commands.
 // ---------------------------------------------------------------------------------------
 
 #[test]

@@ -1,4 +1,4 @@
-//! Combination rules (spec D2.4): the only source of BLOCK. Each rule promotes signals recorded
+//! Combination rules: the only source of BLOCK. Each rule promotes signals recorded
 //! during the walk — per file (padding + sink, exec over a base64 literal, registry hijack, …)
 //! or per pack (eval + decoder anywhere, `.pyc` beside its `.py`, a masquerade SKILL.md names).
 

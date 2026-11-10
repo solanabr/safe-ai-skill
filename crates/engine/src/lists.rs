@@ -1,4 +1,4 @@
-//! The shared list files (shared contract §1), embedded at build time.
+//! The shared list files (`policy/shared/`), embedded at build time.
 //!
 //! `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` and `MANIFEST` are compiled in
 //! with `include_str!` from the crate's own copy in `crates/engine/policy/shared/`, so the
@@ -40,7 +40,7 @@ impl std::fmt::Display for ListsUnavailable {
     }
 }
 
-/// `credentials.list` classes (contract §1.2).
+/// `credentials.list` classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredClass {
     /// Signing keys and key-equivalent files.
@@ -90,7 +90,7 @@ pub struct Credential {
     pub os: Os,
     /// Sandbox tier.
     pub sb: SbTier,
-    /// The glob (contract §1.3 dialect).
+    /// The glob, in the dialect `credentials.list`'s header describes.
     pub glob: String,
     /// A readable exception (`!` line).
     pub exception: bool,

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::datadir::{self, DataDir};
 use crate::statefile::{self, Loaded};
 
-/// How long `solana config get` may run before the CLI network counts as unknown (D1.3).
+/// How long `solana config get` may run before the CLI network counts as unknown.
 pub const SOLANA_CONFIG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a cached `solana config get` URL stays fresh, in seconds.

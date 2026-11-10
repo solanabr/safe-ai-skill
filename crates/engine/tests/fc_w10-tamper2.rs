@@ -1,6 +1,6 @@
-//! FC W10 (tamper extensions and the ConfigChange guard), driven by
-//! `fixtures/fc/w10-tamper2.jsonl`: nested-claude escapes (F3, F4), code-on-next-build and
-//! managed-settings writes (P3, P5), the user-scope policy surface at High (P8), and the
+//! Tamper extensions and the ConfigChange guard, driven by
+//! `fixtures/fc/w10-tamper2.jsonl`: nested-claude escapes, code-on-next-build and
+//! managed-settings writes, the user-scope policy surface at High, and the
 //! `ConfigChange` hook. Each row runs in a fresh project and home, then the headless conversion.
 
 mod common;

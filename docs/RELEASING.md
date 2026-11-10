@@ -186,11 +186,11 @@ and is hashed again. `SAFE_AI_SKILL_SHIM_CACHE=0` turns it off. The residual is 
 
 **The shim is the trust anchor.** The pins are only as good as the shim that holds them, and
 anything that can write the plugin's `bin/` can rewrite the shim (and its constants) as easily as
-the binary. The shim's own integrity rests on the H5 write tripwire, which denies the agent's
-writes under `~/.claude/plugins`, and on the user's file permissions. Two residuals are equivalent
-to a shim rewrite and are accepted: replacing the binary between the hash and the exec (a TOCTOU
-window of a few milliseconds), and editing the shim itself. Both need write access to the
-plugin directory, which the pin does not try to defend.
+the binary. The shim's own integrity rests on the state-tamper tripwire (`gates/tamper.rs`),
+which denies the agent's writes under `~/.claude/plugins`, and on the user's file permissions.
+Two residuals are equivalent to a shim rewrite and are accepted: replacing the binary between the
+hash and the exec (a TOCTOU window of a few milliseconds), and editing the shim itself. Both need
+write access to the plugin directory, which the pin does not try to defend.
 
 ## Not done yet
 

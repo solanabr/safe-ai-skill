@@ -1,20 +1,20 @@
-//! Padding detectors (spec D2.4/D2.5): horizontal whitespace runs and vertical blank-line runs
+//! Padding detectors: horizontal whitespace runs and vertical blank-line runs
 //! that push a payload out of view, plus long-line inventory with the printable-ratio split
 //! between base64 data (INFO) and encoded text (WARN).
 
 use super::context::{self, Document, FileClass, Role};
 use super::{line_no, Ctx, FileOut, Severity, Signal};
 
-/// Whitespace run that pushes the rest of a line out of view (spec D2.4).
+/// Whitespace run that pushes the rest of a line out of view.
 const HORIZONTAL_RUN: usize = 100;
-/// Blank lines that push what follows out of view (spec D2.4).
+/// Blank lines that push what follows out of view.
 const VERTICAL_RUN: usize = 50;
 /// Lines longer than this are inventoried (issue #10: ~500).
 const LONG_LINE: usize = 500;
 /// Base64 run inside a long line worth decoding.
 const LONG_B64_RUN: usize = 256;
-/// Decoded printable ratio at or above which a run is encoded text, not data. Spec D2.5 puts
-/// data below ~0.4; random bytes sit near 0.38, so text is only claimed well above that.
+/// Decoded printable ratio at or above which a run is encoded text, not data. Data sits
+/// below ~0.4; random bytes sit near 0.38, so text is only claimed well above that.
 const TEXT_RATIO: f64 = 0.75;
 
 pub(super) fn scan(doc: &Document<'_>, out: &mut FileOut) {

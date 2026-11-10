@@ -1,4 +1,4 @@
-//! G5 fixture: key and secret file hygiene (`gates::keyfiles`), the git staging gate with the
+//! Fixture tests: key and secret file hygiene (`gates::keyfiles`), the git staging gate with the
 //! headless conversion, and the SessionStart sweep.
 
 use std::path::{Path, PathBuf};

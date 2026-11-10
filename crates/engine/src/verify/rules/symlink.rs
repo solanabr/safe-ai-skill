@@ -1,4 +1,4 @@
-//! Symlinks (spec D2.4): never followed, always reported; a target that leaves the pack feeds
+//! Symlinks: never followed, always reported; a target that leaves the pack feeds
 //! the `symlink_escape` combo. The target is resolved from the link's own directory, expanding
 //! in-pack symlinks met on the way (`a -> sub/l/..` with `sub/l -> ..` leaves the pack); nothing
 //! outside the pack is ever touched.

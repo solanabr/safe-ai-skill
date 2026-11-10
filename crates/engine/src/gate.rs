@@ -99,12 +99,12 @@ impl GateMeta {
     }
 }
 
-/// What a gate concludes about a call (spec D1.1).
+/// What a gate concludes about a call.
 ///
 /// [`Verdict::NoOpinion`] emits nothing (empty stdout, exit 0) and leaves Claude Code's
 /// permission flow in charge; it is never sent as `defer`. [`Verdict::Allow`] requires an
 /// [`AllowReason`], and no code outside this crate can build one, so the only allows are the
-/// two D1.1 permits. Convert to [`crate::io::Decision`] to render.
+/// two [`AllowReason`] permits. Convert to [`crate::io::Decision`] to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// No opinion.

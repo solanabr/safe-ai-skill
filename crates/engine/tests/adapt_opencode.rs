@@ -542,7 +542,7 @@ fn a_panic_still_denies_with_exit_0() {
     assert_eq!(label(&run), "deny", "{}", run.stderr);
 }
 
-/// Review finding 1: opencode searches a file `path`'s whole parent directory.
+/// opencode searches a file `path`'s whole parent directory.
 #[test]
 fn grep_with_a_file_path_is_judged_as_its_directory() {
     let w = World::new("oc-grep-file");
@@ -590,7 +590,7 @@ fn markdown_includes_are_not_code_only() {
     assert_eq!(label(&run), "deny");
 }
 
-/// Review finding 2: an engine planted earlier on `PATH`.
+/// An engine planted earlier on `PATH`.
 #[test]
 fn engine_names_in_every_path_dir_are_protected() {
     let bin = TempDir::new("oc-pathbin");
@@ -613,7 +613,7 @@ fn engine_names_in_every_path_dir_are_protected() {
     }
 }
 
-/// Review finding 3: quoting and globs in the shell mention check.
+/// Quoting and globs in the shell mention check.
 #[test]
 fn quoted_and_globbed_opencode_paths_deny() {
     let w = World::new("oc-quoted");
@@ -628,7 +628,7 @@ fn quoted_and_globbed_opencode_paths_deny() {
     }
 }
 
-/// Review finding 4: plugin code outside the protected dirs.
+/// Plugin code outside the protected dirs.
 #[test]
 fn configured_plugins_this_plugin_and_the_npm_cache_are_protected() {
     let w = World::new("oc-plugins");
@@ -662,7 +662,7 @@ fn configured_plugins_this_plugin_and_the_npm_cache_are_protected() {
     assert_eq!(label(&run), "deny", "{}", run.stdout);
 }
 
-/// Review finding 5: Claude Code settings and plugins, as under Codex.
+/// Claude Code settings and plugins, as under Codex.
 #[test]
 fn claude_code_settings_and_plugins_are_protected() {
     let cc = TempDir::new("oc-ccdir");
@@ -690,7 +690,7 @@ fn claude_code_settings_and_plugins_are_protected() {
     assert_eq!(label(&run), "deny");
 }
 
-/// Re-review 1a: opencode resolves the grep path with realpath before taking its directory.
+/// opencode resolves the grep path with realpath before taking its directory.
 #[cfg(unix)]
 #[test]
 fn grep_through_a_symlinked_file_is_judged_at_the_link_target() {
@@ -737,7 +737,7 @@ fn grep_through_a_symlinked_file_is_judged_at_the_link_target() {
     }
 }
 
-/// Re-review 6a: a grep at `/` reaches `$HOME`.
+/// A grep at `/` reaches `$HOME`.
 #[test]
 fn an_include_at_the_filesystem_root_denies() {
     let w = World::new("oc-grep-root-dir");
@@ -749,7 +749,7 @@ fn an_include_at_the_filesystem_root_denies() {
     assert_eq!(label(&run), "deny", "{}", run.stdout);
 }
 
-/// Re-review 2a: a `PATH` line in a shell startup file could plant an engine for the next start.
+/// A `PATH` line in a shell startup file could plant an engine for the next start.
 #[test]
 fn path_lines_in_shell_startup_files_deny() {
     let w = World::new("oc-rc");
@@ -777,11 +777,12 @@ fn path_lines_in_shell_startup_files_deny() {
         "write",
         json!({ "filePath": zshrc.to_str().unwrap(), "content": "alias ll='ls -la'\n" }),
     );
-    // Any agent edit to a shell startup file is denied at every tier (ai-kit's P3 row).
+    // Any agent edit to a shell startup file is denied at every tier (as ai-kit's
+    // `DENY_CODE_ON_NEXT_BUILD` denies it).
     assert_eq!(label(&run), "deny");
 }
 
-/// Re-review 3a: `dir/*` does not name `.opencode` or `opencode.json`.
+/// `dir/*` does not name `.opencode` or `opencode.json`.
 #[test]
 fn plain_wildcards_in_writing_commands_pass() {
     let w = World::new("oc-star");

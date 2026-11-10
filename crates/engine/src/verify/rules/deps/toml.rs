@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_long_header_is_shared_not_copied_per_entry() {
-        // The review's repro: a long header followed by many short entries.
+        // Repro: a long header followed by many short entries.
         let text = format!(
             "[{}]\n{}",
             "a".repeat(4 * 1024 * 1024),

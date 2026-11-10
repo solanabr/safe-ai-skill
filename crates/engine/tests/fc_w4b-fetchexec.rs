@@ -1,4 +1,5 @@
-//! W4b fixture (ai-kit F1 parity): download-and-run gate (`gates::fetchexec`), headless conversion included.
+//! Fixture tests, at parity with ai-kit: download-and-run gate (`gates::fetchexec`), headless
+//! conversion included.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

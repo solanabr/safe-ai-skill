@@ -1,6 +1,6 @@
 //! Plugin data dir resolution, shared by every hook and CLI subcommand.
 //!
-//! The CLI must find the same state the hooks read, so both resolve it here (spec D2.8):
+//! The CLI must find the same state the hooks read, so both resolve it here:
 //!
 //! 1. `CLAUDE_PLUGIN_DATA` (always set for a plugin hook);
 //! 2. else an existing `safe-ai-skill-*` dir under the plugin-data root:

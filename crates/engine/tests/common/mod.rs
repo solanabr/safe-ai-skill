@@ -21,7 +21,7 @@ pub use safe_ai_skill::policy::tier::{EnvRead, Tier};
 /// which honours the trusted-data-dir and sandbox overrides [`Invocation`] sets.
 pub const TEST_HOOKS: bool = cfg!(feature = "test-hooks");
 
-/// Env vars that make a session headless (contract §3.3): cleared from every run unless
+/// Env vars that make a session headless: cleared from every run unless
 /// [`Invocation::headless`] asks for it.
 const HEADLESS_VARS: [&str; 7] = [
     "SAFE_AI_SKILL_HEADLESS",
@@ -136,7 +136,7 @@ impl Run {
 /// and clears the tier, profile, headless and CI variables, `ANCHOR_PROVIDER_URL` and
 /// `CLAUDE_PLUGIN_DATA` inheritance to keep the run hermetic (not headless by default).
 ///
-/// Tier setup (D8 v2):
+/// Tier setup:
 ///
 /// - [`Invocation::tier`] / [`Invocation::env_read`] write an authenticated `tier.json` `global`
 ///   entry in the plugin data dir (requires [`Invocation::plugin_data`]). With `test-hooks`

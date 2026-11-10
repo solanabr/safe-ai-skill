@@ -1,11 +1,11 @@
-//! Scoped, expiring, audited grants (`${DATA}/grants.json`, authenticated, spec D4.2).
+//! Scoped, expiring, audited grants (`${DATA}/grants.json`, authenticated).
 //!
 //! A grant is a user-issued escape hatch that lets the relaxation layer upgrade an `Ask`
 //! into an `Allow` for actions matching its scope, within a budget and before it expires.
 //! Hard guards are never relaxable, so a grant cannot cover them.
 //!
 //! `grants.json` is a [`crate::statefile`] envelope. A grant only ever reaches it through a
-//! confirmed prompt nonce (spec D4.1): `safe-ai-skill allow` builds a [`GrantRequest`] and
+//! confirmed prompt nonce: `safe-ai-skill allow` builds a [`GrantRequest`] and
 //! parks it as a pending entry; the `UserPromptSubmit` hook turns it into a [`Grant`] when the
 //! user types the nonce ([`crate::relax::confirm_prompt`]). [`live`] is the only view the
 //! relaxation layer reads: it is empty unless the file authenticates and the data dir is
@@ -29,7 +29,7 @@ const GRANTS_LOCK: &str = "grants.lock";
 /// Longest a grant may run (30 days).
 const MAX_GRANT_SECS: u64 = 30 * 86_400;
 
-/// The scopes a grant may name. `other` is gone (spec D1.9); `authority`, `destructive` and
+/// The scopes a grant may name. `other` is gone; `authority`, `destructive` and
 /// `secret_read` are hard guards wherever a gate emits them, so a grant could never apply to
 /// them.
 pub const GRANTABLE_SCOPES: [Scope; 3] = [Scope::Transfer, Scope::Swap, Scope::Deploy];

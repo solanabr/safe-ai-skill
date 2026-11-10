@@ -1,4 +1,4 @@
-//! W6b: a decoded payload reaching a shell through a wrapper, `source`/`.` of standard input,
+//! A decoded payload reaching a shell through a wrapper, `source`/`.` of standard input,
 //! process substitution, a `$(…)` command word or a subshell group is judged like one piped
 //! straight into `sh`, end to end through both `gate-bash` and `gate-bash-secrets`. An
 //! interpreter given a script file reads the decoded bytes as data and stays silent, and so

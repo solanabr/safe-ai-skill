@@ -1,4 +1,4 @@
-//! W6 gap-closure fixture: MCP routed-action gating (token-boundary names, nested params)
+//! Fixture tests: MCP routed-action gating (token-boundary names, nested params)
 //! and the encoded-payload expander feeding the Bash/secrets gates.
 //!
 //! The Bash cases emulate the integrator's wiring exactly: `encoded::expand` is run, each

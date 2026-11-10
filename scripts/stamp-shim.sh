@@ -1,6 +1,6 @@
 #!/bin/sh
 # stamp-shim.sh — write each prebuilt's sha256 into the plugin shim's `sha256_<plat>=`
-# constants (spec D6.1), or with --check, fail unless they already match.
+# constants, or with --check, fail unless they already match.
 #
 #   sh scripts/stamp-shim.sh [--check] <bin-dir>
 #

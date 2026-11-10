@@ -1,4 +1,4 @@
-//! Execution sinks (spec D2.4, D2.3 `eval`/`download_and_run`): eval and `new Function`,
+//! Execution sinks (rules `eval`, `download_and_run` and others): eval and `new Function`,
 //! obfuscated sinks, process spawning, decoders, download-and-run, and the
 //! exec-over-base64-literal combo input.
 
@@ -36,7 +36,7 @@ const SHELLS: &[&str] = &[
 const DOWNLOADERS: &[&str] = &["curl", "wget"];
 /// Words that skip ahead to the real command after a pipe (`| sudo -E bash`).
 const PREFIX_WORDS: &[&str] = &["sudo", "env", "exec", "command", "nohup", "time", "doas"];
-/// Base64 literal length that turns an exec sink into a combo (spec D2.4).
+/// Base64 literal length that turns an exec sink into a combo.
 const B64_LITERAL: usize = 64;
 /// A literal decoding to at least this printable ratio is code or text, not key or hash bytes.
 const TEXT_RATIO: f64 = 0.85;

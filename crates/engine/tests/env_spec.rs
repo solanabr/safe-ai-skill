@@ -1,5 +1,5 @@
 //! `safe-ai-skill env keys` with a varlock `.env.schema` beside the env file, and
-//! `safe-ai-skill env init-schema` (spec D3.8.4). The schema is parsed natively; varlock is
+//! `safe-ai-skill env init-schema`. The schema is parsed natively; varlock is
 //! never run, and no value is ever printed or copied.
 
 mod common;
@@ -185,7 +185,7 @@ fn env_set_refuses_the_schema() {
 }
 
 // ---------------------------------------------------------------------------------------
-// C8 SessionStart tip and C6 doctor
+// SessionStart tip and doctor
 // ---------------------------------------------------------------------------------------
 
 fn session(project: &Path, data: &Path, home: &Path) -> Run {

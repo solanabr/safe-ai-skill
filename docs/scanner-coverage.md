@@ -288,7 +288,7 @@ SessionStart must stay fast, so a crafted pack cannot stall it:
   * **Limit.** A pack whose hash or scan never fits its allowance stays unscanned, and so denied,
     until the user scans it with `verify check` and approves it (`verify approve`).
 
-`tests/rules_perf.rs` replays the 23 performance probes from the round-2 review, at 16 MiB each in
+`tests/rules_perf.rs` replays 23 crafted performance probes, at 16 MiB each in
 release builds and 256 KiB in debug builds. Each must return within the pack budget plus 3 s of
 slack (reading and splitting a 16 MiB file is not interruptible). A pack that was cut must grade
 HIGH or worse.
@@ -343,8 +343,8 @@ rule ideas were reimplemented here; no rule lists were copied.
 
   Timing depends on machine load; record the load average with any number.
   * About 2.5 s warm, against 2.3 s for the pre-lexer engine, interleaved on a quiet machine
-    (load average ~11, before the round-2 fixes).
-  * After the round-2 fixes: 3.5–3.6 s against 3.0–3.2 s, interleaved at load average 33–39,
+    (load average ~11, before the later evasion fixes).
+  * After those fixes: 3.5–3.6 s against 3.0–3.2 s, interleaved at load average 33–39,
     about 10% more CPU per pass.
 
   At load average 20 and above, the same binaries vary two- to threefold from run to run. At

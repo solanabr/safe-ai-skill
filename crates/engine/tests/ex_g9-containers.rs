@@ -1,4 +1,4 @@
-//! G9 fixture: container privilege guard (`gates::containers`), headless conversion included.
+//! Fixture tests: container privilege guard (`gates::containers`), headless conversion included.
 
 use std::path::PathBuf;
 use std::time::Instant;

@@ -305,7 +305,7 @@ jobs:
       - name: Shim passes sh -n (syntax check)
         run: sh -n plugins/safe-ai-skill/bin/safe-ai-skill
 
-      # The shim refuses a prebuilt whose sha256 isn't its stamped constant (D6.1).
+      # The shim refuses a prebuilt whose sha256 isn't its stamped constant.
       - name: Shim sha256 constants match the committed binaries
         run: sh scripts/stamp-shim.sh --check plugins/safe-ai-skill/bin
 
@@ -394,7 +394,7 @@ jobs:
       - name: Engine suite (fails on any failure not in the known-failures list)
         run: python -I scripts/windows-test-gate.py
 
-  # ── latency budget (spec D5, cold gate < 50 ms, sweep <= 2x baseline) ─────
+  # ── latency budget (cold gate < 50 ms, sweep <= 2x baseline) ──────────────
   # The cold gate-read goes through the real shim with the static musl build;
   # the SessionStart sweep is compared with the shipped linux-x64 binary on the
   # same runner, so the bound tracks the hardware.

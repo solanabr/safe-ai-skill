@@ -1,4 +1,4 @@
-//! Prompt-code confirmation for relaxing actions (spec D4.1, amended in WS-B fix round 1).
+//! Prompt-code confirmation for relaxing actions.
 //!
 //! `allow`, `tier <lower>` (and its `mode` alias), `verify trust` and `verify approve` do not
 //! take effect when run:

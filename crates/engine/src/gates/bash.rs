@@ -8,7 +8,7 @@
 //! decision (`Deny` > `Ask` > `Allow` > `Defer`). The returned [`GateMeta`] describes the most
 //! significant gated command so the relaxation layer and grants can reason about it.
 //!
-//! D8 v2 (spec §2, §3) splits on-chain actions by recoverability:
+//! On-chain actions are split by recoverability:
 //!
 //! - **Class U** (the shared list's `irreversible net` rows, [`lists::irreversible`]): denied
 //!   with the command echoed on mainnet and any cluster not positively identified (Unknown), a
@@ -18,7 +18,7 @@
 //!   account close or an unbudgetable amount) and a deny at High. `Allow` comes only from a
 //!   within-cap SOL transfer on a positively identified devnet/testnet/localnet, and only when
 //!   every command is a direct solana-family command; deploys there get no opinion. An
-//!   `spl-token transfer` amount is in tokens (D3): never budgeted or granted as SOL, no
+//!   `spl-token transfer` amount is in tokens: never budgeted or granted as SOL, no
 //!   opinion on identified devnet/testnet/localnet, a hard-guard ask anywhere else.
 //! - A command naming a solana-family program that cannot be parsed, runs code the command
 //!   line does not spell out, or runs an expansion as its program asks as a hard guard, and
@@ -294,7 +294,7 @@ fn xargs_placeholders(command: &str) -> Vec<String> {
     out
 }
 
-/// The indirection prefilter of the unconditional Bash hook (spec D6.3, default-route).
+/// The indirection prefilter of the unconditional Bash hook (default-route).
 ///
 /// Claude Code runs `gate-bash` only for commands its case-sensitive `if: Bash(solana *)`
 /// filters match: a command spelled exactly `solana …`, `spl-token …` or `anchor …` at top
@@ -1078,7 +1078,7 @@ fn cluster_label(network: Network) -> &'static str {
     }
 }
 
-/// The Class U decision for `row` on `cluster` (spec §3.1): a hard-guard ask on positively
+/// The Class U decision for `row` on `cluster`: a hard-guard ask on positively
 /// identified localnet/devnet, a deny everywhere else. Never granted: the meta is a hard
 /// guard, and the deny echoes `command` for the user to run themselves.
 fn class_u(row: &str, cluster: &Cluster, command: &str, ctx: &Context) -> (Decision, GateMeta) {
@@ -1117,7 +1117,7 @@ fn class_u(row: &str, cluster: &Cluster, command: &str, ctx: &Context) -> (Decis
     (decision, meta)
 }
 
-/// Class C at High (spec §2): on mainnet or an unidentified cluster, an ask for a transfer,
+/// Class C at High: on mainnet or an unidentified cluster, an ask for a transfer,
 /// deploy, authority change or close is a deny, whatever grant exists. Other tiers keep it.
 fn class_c_at(
     decision: Decision,
@@ -1153,7 +1153,7 @@ fn is_unreadable_meta(meta: &GateMeta) -> bool {
     meta.scope == Scope::Other && meta.hard_guard
 }
 
-/// An unreadable solana-family command (spec §2, WS-A row): its hard-guard ask is a deny at
+/// An unreadable solana-family command: its hard-guard ask is a deny at
 /// High.
 fn unreadable_at((decision, meta): (Decision, GateMeta), tier: Tier) -> (Decision, GateMeta) {
     match decision {
@@ -1393,7 +1393,7 @@ fn transfer_decision(
     (decision, meta)
 }
 
-/// Build an `spl-token transfer` decision (spec D3). Its amount is in TOKEN units: it never
+/// Build an `spl-token transfer` decision. Its amount is in TOKEN units: it never
 /// reaches the SOL caps or the ledger, and no SOL grant covers it (a hard guard with no
 /// `amount_sol`). A positively identified devnet, testnet or localnet gets no opinion; mainnet
 /// and an unidentified cluster ask, which is a deny headless and at High.
@@ -1443,7 +1443,7 @@ fn deploy_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, Gate
         );
     }
 
-    // Grantable on any cluster (spec §2: a covering confirmed grant allows below High).
+    // Grantable on any cluster (a covering confirmed grant allows below High).
     let mut meta = GateMeta::new(Scope::Deploy, false);
     meta.program = Some(program.to_string());
 
@@ -1921,7 +1921,7 @@ mod tests {
 
     #[test]
     fn mainnet_deploy_asks_and_is_grantable() {
-        // Class C (spec §2): a covering confirmed grant may allow it below High.
+        // Class C: a covering confirmed grant may allow it below High.
         let ctx = ctx_with(Network::Mainnet, "mainnet_deploy");
         let (d, meta) = decide("solana program deploy ./prog.so", &ctx, &policy());
         assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
@@ -2001,7 +2001,7 @@ mod tests {
 
     #[test]
     fn spl_burn_is_class_u() {
-        // Class U (spec §3.1): a hard-guard ask on devnet, a deny on mainnet.
+        // Class U: a hard-guard ask on devnet, a deny on mainnet.
         let ctx = ctx_with(Network::Devnet, "burn");
         let (d, meta) = decide(&format!("spl-token burn {DEST} 100"), &ctx, &policy());
         assert!(matches!(d, Decision::Ask { .. }), "{d:?}");

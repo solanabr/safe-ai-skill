@@ -1,4 +1,4 @@
-//! The shared list files (`policy/shared/`, shared contract §1): embedded byte-for-byte, every
+//! The shared list files (`policy/shared/`): embedded byte-for-byte, every
 //! file parses, MANIFEST counts and hashes match, and the seeded counts are pinned.
 
 use std::path::PathBuf;
@@ -110,7 +110,7 @@ fn lists_kit_derived_credentials_are_pinned() {
         find("**/Local Extension Settings/").class,
         CredClass::WalletExt
     );
-    // Q1: ssh config, known_hosts and public keys are readable exceptions.
+    // ssh config, known_hosts and public keys are readable exceptions.
     for g in [
         "~/.ssh/config",
         "~/.ssh/known_hosts",

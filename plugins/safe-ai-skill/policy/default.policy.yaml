@@ -21,7 +21,7 @@ mcp:
   # value-moving verbs matched in MCP tool names (expanded for heliusWrite staking + future tools)
   sensitive_name_pattern: "transfer|sign|swap|send|withdraw|burn|pay|upgrade|stake|delegate|mint|bridge|lend|borrow|trade|buy|sell|drain|deposit|execute|submit|authority|launch|deploy|close|unstake|deactivate"
 swap:
-  rugcheck: true                # GET rugcheck report before allowing swaps (Phase 2)
+  rugcheck: true                # GET rugcheck report before allowing swaps
   rugcheck_max_score: 40        # deny above
   rugcheck_timeout_ms: 3000     # on timeout/API-down → ask (never hard-block on third-party uptime)
   trusted_mints: [ "So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" ]

@@ -7,13 +7,13 @@
 //!
 //! ## Tier vs grant split
 //!
-//! 1. **High** — the engine never emits `allow` at High (D8 v2 spec §2): [`apply_verdict`]
+//! 1. **High** — the engine never emits `allow` at High: [`apply_verdict`]
 //!    turns an `Allow` into no opinion (Claude Code's own flow decides) and consults no grant.
 //! 2. **Grant half** — below High, a time-boxed, budgeted [`crate::grants::Grant`] can upgrade
 //!    a residual `Ask` to `Allow` and debit its budget. Only authenticated grants in a trusted
 //!    data dir count ([`grants::live`]).
 //!
-//! ## Confirmation (spec D4.1)
+//! ## Confirmation
 //!
 //! `safe-ai-skill allow` and `tier <lower>` (alias `mode`) only park a pending entry, with no code
 //! ([`crate::confirm::create_pending`]). [`announce`] makes the code and returns it for a

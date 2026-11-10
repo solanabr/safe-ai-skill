@@ -1,4 +1,4 @@
-//! `` !`cmd` `` lines (spec D2.4): Claude Code runs them when the skill or command file loads,
+//! `` !`cmd` `` lines: Claude Code runs them when the skill or command file loads,
 //! and no PreToolUse Bash hook fires. Outside fences they are code (HIGH); with network or
 //! secret access — directly, or in a pack script the command runs — they feed the `bang_exfil`
 //! combo.

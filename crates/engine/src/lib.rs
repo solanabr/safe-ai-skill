@@ -11,9 +11,9 @@
 //! - Output / prompt guards: [`redact`], [`promptguard`].
 //! - Secrets CLI: [`env`] (`safe-ai-skill env keys|set|unset`).
 //! - Spend & swap: [`spend`], [`rugcheck`].
-//! - Relaxation layer: [`grants`], [`relax`], plus [`migrate`] (1.0 and WS-B state) and
-//!   [`notice`] (the SessionStart tier line and loosenings notice).
-//! - Tiers (D8 v2): [`policy::tier`] (tier, sources, resolution), [`tierstate`] (`tier.json`),
+//! - Relaxation layer: [`grants`], [`relax`], plus [`migrate`] (1.0 and 1.1.0 development
+//!   state) and [`notice`] (the SessionStart tier line and loosenings notice).
+//! - Tiers: [`policy::tier`] (tier, sources, resolution), [`tierstate`] (`tier.json`),
 //!   [`mode`] (legacy profile alias shim), [`sandbox`] (declared sandbox state),
 //!   [`headless`] (the shared headless rule), [`lists`] (the embedded `policy/shared` lists).
 //! - Supply chain & session: [`verify`], [`registry`], [`squads`], [`session`].

@@ -1,8 +1,8 @@
 //! The per-tier rule tables: what `firewall apply <tier>` writes.
 //!
 //! Ported from ai-kit `.claude/bin/firewall.sh` at `main@72aca8c` (line numbers below are that
-//! file's), restricted to coverage-map items X1–X9, P14 and P21. The kit's `permissions.allow`
-//! list (P20) and its other deny groups are not written: this writer only adds deny rules and
+//! file's), restricted to the sandbox settings and deny rules below. The kit's `permissions.allow`
+//! list and its other deny groups are not written: this writer only adds deny rules and
 //! sandbox restrictions, and the other deny groups are hook verdicts in this engine.
 //!
 //! Departures from the kit, each by a decision already in force:
@@ -19,9 +19,9 @@
 use crate::policy::tier::Tier;
 
 /// The rule-set version this engine ships. Bump whenever a tier's generated block changes in a
-/// way an existing install needs; SessionStart re-applies a record below it (T6).
+/// way an existing install needs; SessionStart re-applies a record below it.
 ///
-/// - 1: first rule set (X1–X9, P14, P21 from kit rule set 10).
+/// - 1: first rule set (from kit rule set 10).
 /// - 2: the repository's `.git` write carve-out is absolute ([`MachineInputs::git_dir`]), and
 ///   the project root is added absolute ([`MachineInputs::project_root`]) beside `"."` in
 ///   `allowWrite` and High's `allowRead`: relative entries anchor at the session's working
@@ -33,7 +33,7 @@ pub const RULE_SET_VERSION: u32 = 2;
 const RETIRED: &[(&str, &str)] = &[("sandbox.filesystem.allowWrite", ".git")];
 
 /// `DENY_BASH_C` (l.1032–1034), written at High only (the kit: Medium and High, l.1747): a
-/// skill's set-up line reaches Claude Code's permission rules only, never a hook (P14).
+/// skill's set-up line reaches Claude Code's permission rules only, never a hook.
 pub const DENY_BASH_C: &[&str] = &["Bash(bash -c *)"];
 
 /// `EXCLUDED_COMMANDS` (l.1393–1402), Relaxed and up (l.1777). Each entry is a hole kept for

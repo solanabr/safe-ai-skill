@@ -236,8 +236,7 @@ fn hooks_json_wires_the_shared_contract_hooks() {
         })
     };
     let runs = |event: &str, matcher: &str, sub: &str| wired(event, matcher, sub, "continue");
-    // The Skill gate fails closed: failing open would run a blocked pack's !`cmd` (D6.2 as
-    // amended for WS-D1).
+    // The Skill gate fails closed: failing open would run a blocked pack's !`cmd`.
     assert!(wired("PreToolUse", "Skill", "gate-skill", "block"));
     assert!(runs("UserPromptExpansion", "", "gate-prompt-expansion"));
     // A typed `/name` is also checked at UserPromptSubmit, for versions without the event.
@@ -250,7 +249,7 @@ fn hooks_json_wires_the_shared_contract_hooks() {
 }
 
 /// The final shape: `onFailure: block` on the unconditional Bash `gate-bash` entry and the Skill
-/// matcher only, `continue` everywhere else, and every hook the workstreams added is present.
+/// matcher only, `continue` everywhere else, and every expected hook is present.
 #[test]
 fn hooks_json_final_shape() {
     let events = [

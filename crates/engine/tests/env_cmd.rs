@@ -1,4 +1,4 @@
-//! End-to-end tests for `safe-ai-skill env keys|set|unset` (#7, spec D3.4).
+//! End-to-end tests for `safe-ai-skill env keys|set|unset` (#7).
 //!
 //! Every test drives the real binary in a sandboxed temp dir (cwd and `HOME` pinned to it) and
 //! feeds values on stdin exactly as the agent would:
@@ -1215,7 +1215,7 @@ fn never_prints_values() {
 }
 
 // ---------------------------------------------------------------------------------------
-// D8 v2 tier check: an agent's `env set|unset` (spec §2)
+// Tier check: an agent's `env set|unset`
 // ---------------------------------------------------------------------------------------
 
 /// `safe-ai-skill env <args>` as a Claude Code session runs it (marker `marker=1`) at `tier`

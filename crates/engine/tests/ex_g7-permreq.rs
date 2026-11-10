@@ -1,4 +1,4 @@
-//! G7 fixture: `PermissionRequest` hardening (`gates::permreq`).
+//! Fixture tests: `PermissionRequest` hardening (`gates::permreq`).
 
 mod common;
 

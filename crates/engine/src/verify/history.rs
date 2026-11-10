@@ -1,4 +1,4 @@
-//! Git history scan of a pack (#10), at `verify add|check` and `install` only (spec D2 §9: the
+//! Git history scan of a pack (#10), at `verify add|check` and `install` only (the
 //! SessionStart sweep keeps its budget).
 //!
 //! A pack checked out from git carries every earlier version of its files in `.git`: content

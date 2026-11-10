@@ -1,4 +1,4 @@
-//! Container privilege guard (G9): a container run that hands the container host-level access.
+//! Container privilege guard: a container run that hands the container host-level access.
 //!
 //! Covers `docker`, `podman`, `nerdctl` and `finch` `run` / `create` / `exec` (and the
 //! `container run|create|exec` spellings), and `compose up|run|create` (`docker compose`,

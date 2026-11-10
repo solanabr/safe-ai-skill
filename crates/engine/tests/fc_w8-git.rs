@@ -1,4 +1,4 @@
-//! W8 fixture: git and gh guards (`gates::gitguard`), headless conversion included.
+//! Fixture tests: git and gh guards (`gates::gitguard`), headless conversion included.
 
 use std::path::Path;
 use std::time::Instant;

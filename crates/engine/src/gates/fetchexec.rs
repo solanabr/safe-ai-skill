@@ -10,7 +10,7 @@
 //!    interpreter running a fetched script as `-c` code (`bash -c "$(curl URL)"`, `eval`);
 //! 3. PowerShell `iex (iwr URL)` / `irm URL | iex`;
 //! 4. one-shot package runners (`npx`, `npm exec`, `pnpm dlx`, `pnpx`, `yarn dlx`, `bunx`,
-//!    `uvx`, `uv tool run`, `pipx run`) of a package the project does not declare (decision D4);
+//!    `uvx`, `uv tool run`, `pipx run`) of a package the project does not declare;
 //! 5. `cargo install --git` from anything but the official Solana, Anza and Anchor orgs;
 //! 6. a Node script (`node`, `ts-node`, `tsx`, `bun`, `deno`, directly or behind a runner) run
 //!    while the command, `ANCHOR_PROVIDER_URL` or `Anchor.toml` names mainnet: it can send

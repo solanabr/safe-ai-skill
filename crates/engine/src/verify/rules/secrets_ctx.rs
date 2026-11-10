@@ -1,5 +1,5 @@
-//! Secrets context (spec D2.3 `secret_read`, D2.4 env dump): a read of a keypair, credential
-//! or `.env` path in one command, wholesale environment dumps, and key-shaped literals.
+//! Secrets context (rules `secret_read` and `env_dump` among others): a read of a keypair,
+//! credential or `.env` path in one command, wholesale environment dumps, and key-shaped literals.
 
 use super::context::{find_any, shell_tokens, Cmd, Document, Lang, T_DOTENV, T_ENV, T_SECRET};
 use super::{line_no, FileOut, Severity, Signal};

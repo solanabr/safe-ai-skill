@@ -1,4 +1,4 @@
-//! Spec D3 / D3.8 end to end: the secret path matcher behind `gate-read` (Read, Grep, Glob),
+//! End to end: the secret path matcher behind `gate-read` (Read, Grep, Glob),
 //! MCP path arguments, the Bash reader and varlock rules in `gate-bash-secrets`, and the
 //! PostToolUse `redact` contract (`tool_response` in, `hookSpecificOutput.updatedToolOutput`
 //! out, shaped per tool) with value-based scrubbing.
@@ -153,7 +153,7 @@ fn keypair_json() -> String {
 }
 
 // ---------------------------------------------------------------------------------------
-// C1 Read: path matcher
+// Read: path matcher
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -405,7 +405,7 @@ fn repo_can_remove_schema_from_the_allow_list() {
 }
 
 // ---------------------------------------------------------------------------------------
-// C2 Grep / Glob / MCP
+// Grep / Glob / MCP
 // ---------------------------------------------------------------------------------------
 
 const EXCLUSION_HEAD: &str = "!{**/.[eE][nN][vV],**/.[eE][nN][vV].*";
@@ -520,7 +520,7 @@ fn mcp_prose_mentioning_env_has_no_opinion() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Bash: reader nudge list and varlock rules (D3.6, D3.8.5)
+// Bash: reader nudge list and varlock rules
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -642,7 +642,7 @@ fn bash_deny_message_mentions_varlock_when_installed() {
 }
 
 // ---------------------------------------------------------------------------------------
-// C5 redact contract
+// Redact contract
 // ---------------------------------------------------------------------------------------
 
 const VALUE: &str = "hx_live_9f8e7d6c5b4a3210";
@@ -904,7 +904,7 @@ fn redact_never_prints_values_on_stderr() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 1
+// Grep exclusions, redaction and reader forms
 // ---------------------------------------------------------------------------------------
 
 /// `**/.ssh/**` as `rg --glob` sees it: every letter a two-case class.
@@ -920,7 +920,7 @@ fn two_case(glob: &str) -> String {
         .collect()
 }
 
-/// D8 v2 spec §4: a Grep at or above `$HOME` is no longer denied; it runs with every
+/// A Grep at or above `$HOME` is no longer denied; it runs with every
 /// credential glob excluded (the key trees included).
 #[test]
 fn grep_over_an_ancestor_of_a_key_tree_excludes_every_credential_glob() {
@@ -1075,7 +1075,7 @@ fn read_private_key_header_without_body_has_no_opinion() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 2
+// Sensitive values, `npx` call scripts and the failure notice
 // ---------------------------------------------------------------------------------------
 
 #[test]

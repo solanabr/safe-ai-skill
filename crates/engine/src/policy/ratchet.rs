@@ -1,4 +1,4 @@
-//! Project overlay ratchet (D1.10).
+//! Project overlay ratchet.
 //!
 //! `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only tighten the base policy,
 //! field by field. Each refused change becomes an `ignored_overrides` note. Notes name the

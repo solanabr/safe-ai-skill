@@ -334,7 +334,8 @@ assistant_text() {
     "$(T "$1")" || true
 }
 
-# run_problem CASE — prints why the run can't be judged or broke the D1 contract, else nothing.
+# run_problem CASE — prints why the run can't be judged or broke the hook output contract, else
+# nothing.
 # BLOCKED and INCONCLUSIVE problems are environment or model limits, not conformance failures.
 run_problem() {
   rp="$(T "$1")"
@@ -478,9 +479,9 @@ from that file."
   pass env_set_no_leak "written via safe-ai-skill env set; existing value never shown"
 }
 
-# write_evil_pack PROJECT — a skill the D2 combination rules BLOCK: a !`cmd` line outside fences
-# with network and secret access. The line only writes $CC_CONF_MARK; `true ||` keeps the curl
-# from ever running.
+# write_evil_pack PROJECT — a skill the supply-chain combination rules BLOCK: a !`cmd` line
+# outside fences with network and secret access. The line only writes $CC_CONF_MARK; `true ||`
+# keeps the curl from ever running.
 write_evil_pack() {
   mkdir -p "$1/.claude/skills/cc-conf-evil"
   cat > "$1/.claude/skills/cc-conf-evil/SKILL.md" <<EOF

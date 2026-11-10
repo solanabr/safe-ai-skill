@@ -1,4 +1,4 @@
-//! The headless rule (shared contract §3.3, D8 v2 spec §7), identical on the kit's side.
+//! The headless rule, identical on the kit's side.
 //!
 //! Headless = any of: `SAFE_AI_SKILL_HEADLESS` or `KIT_FIREWALL_HEADLESS` = `1|true`; any of
 //! `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `BUILDKITE`, `JENKINS_URL` set (non-empty) and not

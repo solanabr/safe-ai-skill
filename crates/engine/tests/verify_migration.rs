@@ -1,4 +1,4 @@
-//! v1 → state v2 migration (spec D2.3), against state the real v1.0.0 engine wrote.
+//! v1 → state v2 migration, against state the real v1.0.0 engine wrote.
 //!
 //! `tests/fixtures/v1/data` is the plugin data dir `tests/fixtures/v1/generate.sh` produced by
 //! running the v1.0.0 binary over two scratch projects (absolute paths replaced by `@ROOT@`).

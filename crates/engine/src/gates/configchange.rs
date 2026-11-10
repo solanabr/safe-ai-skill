@@ -2,7 +2,7 @@
 //! during a session (`user_settings`, `project_settings`, `local_settings`, `skills`,
 //! `policy_settings`). The payload carries `source` and, optionally, `file_path`, not the new
 //! text, so the guard reads the file as it now is, finds the switches in it that turn
-//! protection off by the D1 rule ([`tamper::settings_disable_reasons`]), and blocks the change
+//! protection off by the rule in [`tamper::settings_disable_reasons`], and blocks the change
 //! only when one of them is new: not in the snapshot of that file's switches it kept the last
 //! time it let a change through. With no snapshot (first sighting, an untrusted or unresolved
 //! data dir, a tampered state file) every switch counts as new. A `skills` change and every

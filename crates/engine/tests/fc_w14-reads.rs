@@ -1,7 +1,7 @@
-//! FC W14 (credential-store read coverage and two false positives), driven by
-//! `fixtures/fc/w14-reads.jsonl`: cloud CLI token printers (S1), gh's host file through a hard
-//! link or a config-dir variable (S3), context-mode `path` arguments reaching a store (S7), the
-//! Bitwarden data directory (P1), a here-document that writes prose naming a keypair, and a
+//! Credential-store read coverage and two false positives, driven by
+//! `fixtures/fc/w14-reads.jsonl`: cloud CLI token printers, gh's host file through a hard
+//! link or a config-dir variable, context-mode `path` arguments reaching a store, the
+//! Bitwarden data directory, a here-document that writes prose naming a keypair, and a
 //! JSON-RPC POST split by a line continuation. Each row runs the real binary the way
 //! hooks.json does (Bash: `gate-bash` and `gate-bash-secrets`, strictest wins; Read/Grep:
 //! `gate-read`; `mcp__*`: `gate-mcp`) in a fresh project and home.

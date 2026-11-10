@@ -1,4 +1,4 @@
-//! W5b (full coverage, usability floor): `anchor test` on a positively identified
+//! Usability floor: `anchor test` on a positively identified
 //! localnet/devnet/testnet gets no opinion; mainnet and an unidentified cluster keep the ask.
 //!
 //! The fixture `fixtures/fc/w5b-onchain.jsonl` runs through the real `gate-bash` binary with a

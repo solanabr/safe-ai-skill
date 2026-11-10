@@ -1,4 +1,4 @@
-//! The SessionStart notices: the tier line and the loosenings notice (spec D4.4, D8 v2 §1.3).
+//! The SessionStart notices: the tier line and the loosenings notice.
 //!
 //! [`tier_line`] is printed by `status`, and at SessionStart whenever there is anything else to
 //! say or the tier is not the plain default (a clean default session stays silent):

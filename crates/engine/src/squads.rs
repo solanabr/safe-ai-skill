@@ -1,4 +1,4 @@
-//! Squads upgrade-authority advisory (Phase 3, read-only).
+//! Squads upgrade-authority advisory (read-only).
 //!
 //! A program whose upgrade authority is a single raw keypair is a rug-risk: one compromised
 //! key can push a malicious upgrade. This advisory recommends moving the authority to a

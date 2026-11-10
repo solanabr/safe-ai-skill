@@ -1,4 +1,4 @@
-//! Literal secret values for the redact hook's value-based scrubbing (spec D3.5, D3.8.3).
+//! Literal secret values for the redact hook's value-based scrubbing.
 //!
 //! Collects the literal values of the project's env-class files (`.env`, `.env.local`,
 //! `.env.<env>`, `*.env`, `.envrc`, `.dev.vars`, … found under the hook cwd) so PostToolUse
@@ -136,7 +136,7 @@ pub fn collect(bytes: &[u8], schema: Option<&Schema>, out: &mut Vec<KnownValue>)
     }
 }
 
-/// Whether a literal value is scrubbed (fix rounds 1–2 rulings):
+/// Whether a literal value is scrubbed:
 /// - never: shorter than [`MIN_VALUE_LEN`], empty, a placeholder;
 /// - always (otherwise): the key carries an explicit item `@sensitive` (`explicit`);
 /// - never: a verbatim-safe word;

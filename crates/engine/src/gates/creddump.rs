@@ -1,4 +1,4 @@
-//! Credential readers in Bash (D8 v2 spec §4; owned by F1), denied at every tier (Off included:
+//! Credential readers in Bash, denied at every tier (Off included:
 //! Off is not DISABLE). Two checks over the parsed simple commands
 //! ([`crate::context::shell::parse`]: wrappers, `bash -c`, `$(…)`, pipelines and absolute
 //! program paths are already split out, quotes and backslash escapes removed):

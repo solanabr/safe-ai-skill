@@ -26,7 +26,8 @@ One JSON object per line, eight topic files. The plugin's engine runner
 
 - `id`: unique across all files. Contract seed ids (`DEV-1`, `CL-2`, `MN-1`, `IR-1`, ...) keep their
   names; derived rows use `CC-`, `WR-`, `U<nn>-<c>`, `UW<nn>-<w>`, `WL-`, `CRD-`, `XF-`, `EV`, `TI-`, `HL-`.
-- `rows`: the F4 overlap-matrix row numbers the case exercises (empty when none applies).
+- `rows`: the row numbers, in the plugin/kit overlap matrix (not published), that the case
+  exercises (empty when none applies).
 - `tool`, `input`: the PreToolUse payload (`Bash`, `Read`, `Grep`, `Write`, `Edit`, `MultiEdit`,
   `mcp__*`). In `input` string values and in `files` contents, `{HOME}` is the runner's temporary HOME
   and `{CWD}` the project directory (tool path fields are absolute, as in Claude Code). Bash command
@@ -40,7 +41,7 @@ One JSON object per line, eight topic files. The plugin's engine runner
   (as the real CLI does). Nothing else runs.
 - `ctx`:
   - `sandbox`: `on | off | unset` (declared Claude Code sandbox).
-  - `headless`: contract section 3.3; a headless row has no `A` anywhere.
+  - `headless`: the headless rule; a headless row has no `A` anywhere.
   - `user_policy`: user-scope policy. `secrets.env_read` is the user's tier.json choice; other keys
     (for example `network.mainnet`, `secrets.exfil_hosts_extra`) form the base policy.
   - `repo_policy`: the repo's `.safe-ai-skill/policy.yaml` (raise-only; may carry a `tier` hint).
@@ -55,10 +56,10 @@ One JSON object per line, eight topic files. The plugin's engine runner
 - `expect`: four characters for Off Relaxed Medium High: `D` deny, `A` ask, `L` allow, `-` no opinion.
   - `plugin` is the end state this engine must give; `kit` the end state of the kit's own layers;
     `combined = max(plugin, kit)` with `D > A > L > -`; `owner` the engine whose reason text shows.
-  - `interim` (optional): the state before the end state. May carry `kit` (before the kit's M5) and
-    `plugin` (the shipped engine differs from its end state); the other side defaults to the end
-    state; `combined` is recomputed. End-state invariants are not checked on a row that has
-    `interim`'s kit value, only on the end state.
+  - `interim` (optional): the state before the end state. May carry `kit` (before the kit's
+    planned changes) and `plugin` (the shipped engine differs from its end state); the other side
+    defaults to the end state; `combined` is recomputed. End-state invariants are not checked on a
+    row that has `interim`'s kit value, only on the end state.
     - Additive: `reason` (required with `interim.plugin`): why the shipped engine differs, for
       example `a file-body upload keeps the POST ask at every tier`. The engine runner asserts `interim.plugin` on such a
       row.
@@ -71,7 +72,7 @@ One JSON object per line, eight topic files. The plugin's engine runner
   `D` where the plugin denies and `?` elsewhere; runners and the diff script skip a `?` tier. It never
   appears in `plugin`.
 
-Invariants (contract section 2.2): never `plugin=A` and `kit=A`; never `plugin=L` and `kit=A`; no `A`
+Invariants: never `plugin=A` and `kit=A`; never `plugin=L` and `kit=A`; no `A`
 in a headless row. The schema test checks them on the end-state columns of every row; the engine runner
 checks them again on its actual verdicts for rows without `interim`.
 
@@ -82,23 +83,23 @@ checks them again on its actual verdicts for rows without `interim`.
 - `kit`: read from solanabr/solana-ai-kit `42755ab` (`onchain-guard.sh`, `secrets-guard.awk`,
   `egress-guard.sh`, `firewall.sh` deny lists), nothing executed. The pin is `42755ab`; the permanent
   wrapper denies below were re-checked at kit HEAD `edf0cb5` (same entries, different line numbers).
-  The end-state kit value assumes M3 to M7 as the contract describes them: its `onchain-guard` no
-  longer resolves clusters, so Class U and Class C rows are `----` and the plugin carries them;
-  `interim` records what the kit does today. **Exception:** the kit keeps `Bash(env *)`,
-  `Bash(sh -c *)`, `Bash(bash -c *)` and `Bash(sudo *)` in its unconditional deny list (M5 only removes
-  `DENY_IRREVERSIBLE_ONCHAIN` entries), so every `env`, `sh -c`, `bash -c` (also behind `timeout`) and
-  `sudo` row has kit `DDDD` at every tier in the end state, and its `combined` is `DDDD`; those rows
-  only verify the engine. Rows where a wrapper might defeat a kit deny glob are `?`. A kit owner should
-  review the whole column.
+  The end-state kit value assumes the kit's planned changes: its `onchain-guard` no longer
+  resolves clusters, so Class U and Class C rows are `----` and the plugin carries them; `interim`
+  records what the kit does today. **Exception:** the kit keeps `Bash(env *)`, `Bash(sh -c *)`,
+  `Bash(bash -c *)` and `Bash(sudo *)` in its unconditional deny list (the planned changes only
+  remove `DENY_IRREVERSIBLE_ONCHAIN` entries), so every `env`, `sh -c`, `bash -c` (also behind
+  `timeout`) and `sudo` row has kit `DDDD` at every tier in the end state, and its `combined` is
+  `DDDD`; those rows only verify the engine. Rows where a wrapper might defeat a kit deny glob are
+  `?`. A kit owner should review the whole column.
 - Project `.env` rows (engine 1.2.0, #16): the kit column is `?` at High for reads and at Medium for
   writes, pending the kit owner (ai-kit's FIREWALL-SPEC denies them there); `combined` is the plugin's
   `D` in those cells.
 - Seed ambiguities, resolved here: IR-1 and the other `--final` rows give the kit an end-state `----`
   (the contract's "both layers" is read as the interim state); DEV-3 uses 5 SOL, because the contract's
   50 SOL exceeds `hard_tx_sol_max` and denies (kept as DEV-3B); MN-3 and MN-4 get interim kit values.
-- P2 is open: no row freezes the precedence between `ANCHOR_PROVIDER_URL` and `Anchor.toml` for
+- Open: no row freezes the precedence between `ANCHOR_PROVIDER_URL` and `Anchor.toml` for
   `anchor *`; CL-3, CL-3B and CL-8 cover only the `solana`-side and flag cases.
-- Not covered here: supply chain (F5, needs pack fixtures), PostToolUse redaction, and the tripwire
+- Not covered here: supply chain (needs pack fixtures), PostToolUse redaction, and the tripwire
   gates' own cases (tamper content, download-and-run, encoded commands, env dumps, `gate-webfetch`),
   which are held by `crates/engine/tests/gap_w*.rs`.
 
@@ -112,7 +113,8 @@ checks them again on its actual verdicts for rows without `interim`.
 - **Class U on testnet.** The `-t` rows (`IR-6`, `U01-t`, ...) expect `AAAA`: testnet is treated like
   devnet, a hard-guard ask, not a deny.
 - **Sandbox.** `sandbox: unset` and `off` both map to the engine's "off" override under `test-hooks`,
-  so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by F2's tests.
+  so Unset-versus-Off and "Linux without bwrap" are not distinguishable here. Covered by the unit
+  tests in `crates/engine/src/sandbox.rs`.
 - **Not in the corpus:** supply chain (needs pack fixtures) and PostToolUse redaction.
 - **MANIFEST.** The corpus is not hash-pinned in `../MANIFEST`; versioning follows the contract.
 

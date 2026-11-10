@@ -1,5 +1,5 @@
-//! Evasion regressions for the rule engine: every shape from the WS-D2 review probe
-//! (`examples/evade.rs`) with the verdict it must get.
+//! Evasion regressions for the rule engine: every probed evasion shape, with the verdict it
+//! must get.
 
 mod common;
 
@@ -624,7 +624,8 @@ fn many_unclosed_fence_openers_scan_in_linear_time() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Round 2 (review of b19ebad): probes from `evade2.rs` / `evade3.rs`.
+// Interpolation frames, f-strings, byte order marks, indirect sinks, regex division and shell
+// quoting.
 // ---------------------------------------------------------------------------------------
 
 /// `(probe name, path, body, grade it must get, combo that must fire)`.
@@ -1252,7 +1253,7 @@ fn regex_division_and_shell_quoting_probes() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Round 3 (review of 5f7a053): padding the per-rule hit cap hides nothing (`evade4.rs`).
+// Padding the per-rule hit cap hides nothing.
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -1456,7 +1457,7 @@ fn budget_cut_packs_keep_what_they_found_and_never_grade_clean() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round 4 (`evade5.rs`): flooding the per-file combo store hides nothing, combos split
+// Flooding the per-file combo store hides nothing, combos split
 // across files still fire, and a budget cut keeps what it found.
 // ---------------------------------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # test-shim.sh — failure-contract tests for the plugin shim
-# (plugins/safe-ai-skill/bin/safe-ai-skill, spec D6.1) and the onFailure wiring in
-# plugins/safe-ai-skill/hooks/hooks.json (D6.2).
+# (plugins/safe-ai-skill/bin/safe-ai-skill) and the onFailure wiring in
+# plugins/safe-ai-skill/hooks/hooks.json.
 #
 # Self-contained: each case copies the shim into a temp plugin layout beside fake engine
 # binaries, with a fake `uname` first on PATH, so no real engine runs. The matrix repeats
@@ -1039,7 +1039,7 @@ matrix() {
   expect_ran safe-ai-skill-linux-x64
   expect_not_ran safe-ai-skill
 
-  # The prebuilt must match the sha256 stamped into the shim at release (D6.1). A mismatch
+  # The prebuilt must match the sha256 stamped into the shim at release. A mismatch
   # is tamper: the Solana and MCP gates block, PreToolUse gates ask, the rest continue.
   fresh
   engine "$bin_dir/safe-ai-skill-linux-x64" ok

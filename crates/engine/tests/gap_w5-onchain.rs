@@ -1,4 +1,4 @@
-//! W5 (on-chain CLI) gap closure: authority verbs, token units (D3) and an unquoted glob in
+//! On-chain CLI: authority verbs, token units and an unquoted glob in
 //! `--url`.
 //!
 //! The fixture `fixtures/gap/w5-onchain.jsonl` runs through the real `gate-bash` binary with a
@@ -397,7 +397,7 @@ fn bench_decide_over_difftest_payloads() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fix round: red-team R1, R2, R7, R8 and read-only lookups
+// Regressions and read-only lookups
 // ---------------------------------------------------------------------------------------
 
 /// The natural decision for `command` with the CLI default `network`, run in a project dir

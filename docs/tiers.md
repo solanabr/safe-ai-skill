@@ -316,7 +316,7 @@ Residuals are the tripwire's: variable indirection, a script written in one call
 - a download written to a file that a later command runs (`curl -o i.sh URL && bash i.sh`, `wget URL/x && chmod +x x && ./x`);
 - a download piped into, or fed by process substitution to, an interpreter that reads its program from standard input (`curl URL | python3 -`, `node <(curl URL)`), and `bash -c "$(curl URL)"` or `eval` of a fetched script;
 - PowerShell `iex (iwr URL)` and `irm URL | iex`;
-- a one-shot runner (`npx`, `npm exec`, `pnpm dlx`, `pnpx`, `yarn dlx`, `bunx`, `uvx`, `uv tool run`, `pipx run`) of a package the project does not declare (decision D4: its `package.json`, `pyproject.toml`, requirements files or lockfile must name it);
+- a one-shot runner (`npx`, `npm exec`, `pnpm dlx`, `pnpx`, `yarn dlx`, `bunx`, `uvx`, `uv tool run`, `pipx run`) of a package the project does not declare (its `package.json`, `pyproject.toml`, requirements files or lockfile must name it);
 - `cargo install --git` of a repository outside the allowlisted organizations;
 - a Node script (`node`, `ts-node`, `tsx`, `bun`, `deno`, directly or behind a runner) run while the command line, `ANCHOR_PROVIDER_URL` or `Anchor.toml` names mainnet.
 
@@ -418,7 +418,7 @@ Off acts as Relaxed, and headless turns every ask into a deny. Ordinary runs (pu
 
 ## Environment dumps
 
-`gates/envread.rs` and the `redact` hook (decision D2) keep secret values out of the transcript when the model dumps the environment.
+`gates/envread.rs` and the `redact` hook keep secret values out of the transcript when the model dumps the environment.
 
 - **Deny at every tier:** reading a process environment (`/proc/<pid|self|thread-self>/environ`, `/proc/*/task/*/environ`, in any word, redirect, `xargs -a` file or interpreter code, or a glob that can match it) and `ps` with BSD `e` or `-E`; and printing a secret-named variable: `echo`, `printf` or `print` of `$X`, `printenv NAME`, `declare -p NAME`, a here-string `<<< "$X"`, `${!x}` indirection, and interpreter code printing an env read (`print(os.environ['X'])`, `console.log(process.env.X)`). `${#X}` and `${X:+set}` print no value and pass.
 - **No opinion on bare dumps:** `printenv`, `env`, `export -p`, `set`, `declare -p`/`-x`, `typeset -p`/`-x`, and their `| grep` filters. The PostToolUse `redact` hook (Bash output only) replaces the values of secret-named variables in their output with `***REDACTED:env***`. It recognises:
@@ -433,7 +433,7 @@ Off acts as Relaxed, and headless turns every ask into a deny. Ordinary runs (pu
   2. it is a database, Redis or RPC URL name (`DATABASE_URL`, `DB_URL`, `REDIS_URL`, `RPC_URL`, `MONGO…`); or
   3. it does not end in a locator suffix (`_PATH`, `_FILE`, `_DIR`, `_MINT`, `_ADDRESS`, `_ID`, `_URL`, `_URI`) and holds `KEY`, `TOKEN`, `SEED`, `AUTH`, `PRIVATE`, `SECRET`, `PASSWORD`, `PASSWD`, `MNEMONIC` or `CREDENTIAL` outside the public parts (`PUBKEY`, `PUBLIC_KEY`, `AUTHORITY`, `GIT_AUTHOR_*`, `SSH_AUTH_SOCK`, `TOKENIZERS*`, `HASHSEED`, `KEYBOARD`, `MONKEY`); `AUTHORIZATION` counts, `AUTHOR` does not; or
   4. it has a whole `_`-separated segment `PAT`, `SK`, `PASS`, `JWT`, `COOKIE`, `SESSION`, `DSN` or `PWD` (`PATH`, `SKIP` and the shell's own `PWD`/`OLDPWD` stay public).
-- **Production env files:** a raw read of `.env.production` or `.env.prod*` is denied from Relaxed up (decision D5), in the [project `.env` table](#project-env-files). The rule keys on the file name as given: the same file reached through a glob that does not spell the name, a symlink with another name, or a directory Grep is judged as an ordinary project env read (open below High).
+- **Production env files:** a raw read of `.env.production` or `.env.prod*` is denied from Relaxed up, in the [project `.env` table](#project-env-files). The rule keys on the file name as given: the same file reached through a glob that does not spell the name, a symlink with another name, or a directory Grep is judged as an ordinary project env read (open below High).
 
 Residuals: a value copied to an innocently named variable first (`k=$HELIUS_API_KEY; echo $k`), `eval` with built names, a script file that prints it, a secret printed by a tool other than `echo`/`printf`/`print`/`printenv`/`declare -p` (any other program or interpreter that reads the variable), and a `/proc/<pid>/environ` read whose path is not a literal the gate can see (built at runtime). The value blanking sees only the shapes above in successful Bash output; a secret printed in another layout, in another tool's result, or in a failed command's output reaches the model as is. Redaction applies to successful results only, and only under Claude Code (and Codex with the opt-in `redact`); opencode has no redaction ([adapters](adapters.md#not-covered-opencode)).
 

@@ -1,4 +1,4 @@
-//! Network context (spec D2.3 `telemetry_post`, D2.4): outbound POSTs with a body to an
+//! Network context (rule `telemetry_post` among others): outbound POSTs with a body to an
 //! external host, hardcoded public IP destinations, and the network sink signal combos use.
 //!
 //! The destination is resolved, not guessed: curl/wget arguments are parsed (option values

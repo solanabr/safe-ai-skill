@@ -1,15 +1,15 @@
-//! Rule-based supply-chain scanner for skill packs (spec D2.4, D2.5, D2.10).
+//! Rule-based supply-chain scanner for skill packs.
 //!
 //! One module per detector family; [`combo`] owns every BLOCK decision and [`context`] decides
 //! whether text is code, documentation or metadata. Pure and hermetic: no network, no process
 //! execution, symlinks are never followed, `.git/` is never entered, and each file is read once
 //! (capped at [`MAX_SCAN_BYTES`]) and scanned line by line.
 //!
-//! # API (consumed by the verify state machine, WS-D1)
+//! # API (consumed by the verify state machine)
 //!
 //! * [`scan_pack`] walks one pack (a directory, or a single file) and returns a [`PackReport`]:
 //!   per-file [`Finding`]s plus pack-level [`ComboHit`]s.
-//! * [`grade`] folds a report into a [`Grade`] (spec D2.4):
+//! * [`grade`] folds a report into a [`Grade`]:
 //!   - findings in docs are capped at WARN — the cap is applied when a finding is created, so a
 //!     `ctx: Doc` finding never carries `High`;
 //!   - a single code-context signal is HIGH: record the pack as `unreviewed` and surface it as a
@@ -210,7 +210,7 @@ impl ScanBudget {
     }
 }
 
-/// Pack-level verdict (spec D2.4).
+/// Pack-level verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Grade {
@@ -224,7 +224,7 @@ pub enum Grade {
     Block,
 }
 
-/// Grade a pack report (spec D2.4): any combo → `Block`; else the worst effective severity.
+/// Grade a pack report: any combo → `Block`; else the worst effective severity.
 pub fn grade(report: &PackReport) -> Grade {
     if !report.combos.is_empty() {
         return Grade::Block;
@@ -966,7 +966,7 @@ fn scan_body(rel: &Path, body: &FileBody<'_>, out: &mut FileOut, facts: &mut Pac
         .unwrap_or_default();
     let shebang = readings.iter().any(|t| first_line(t).starts_with("#!"));
     if is_lockfile(&name) && !executable && !shebang {
-        // Generated dependency data: read by the `deps` family (spec D7.2), not text-scanned.
+        // Generated dependency data: read by the `deps` family, not text-scanned.
         return;
     }
     for (k, text) in readings.iter().enumerate() {

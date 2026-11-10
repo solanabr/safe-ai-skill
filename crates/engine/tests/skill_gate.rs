@@ -1,4 +1,4 @@
-//! Enforcement of a blocked skill pack in place (spec D2.6), end to end through the hooks:
+//! Enforcement of a blocked skill pack in place, end to end through the hooks:
 //! `gate-skill` (PreToolUse `Skill`), `gate-prompt-expansion` (`UserPromptExpansion` and a
 //! raw `/name` in `UserPromptSubmit`), `gate-read` (Read/Grep/Glob) and `gate-bash-secrets`
 //! (every Bash call). A pack is blocked here by drift: recorded by a first sweep, then edited.

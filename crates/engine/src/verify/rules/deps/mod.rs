@@ -1,4 +1,4 @@
-//! Dependency manifests, lockfiles and launch specs (issue #11, spec D7.2).
+//! Dependency manifests, lockfiles and launch specs (issue #11).
 //!
 //! A pack is pinned by its content, but what it causes a package manager to fetch and run is a
 //! second trust decision. This family reads the dependency files a pack ships and reports, from

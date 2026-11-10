@@ -1,4 +1,4 @@
-//! Daily spend ledger (`${CLAUDE_PLUGIN_DATA}/spend.json`, authenticated, spec D4.2).
+//! Daily spend ledger (`${CLAUDE_PLUGIN_DATA}/spend.json`, authenticated).
 //!
 //! The ledger tracks SOL spent within the current UTC day. It rolls over (resets to
 //! zero) when the UTC date changes. Two evaluation paths are provided so callers can
@@ -215,7 +215,7 @@ pub fn check(amount: f64, ledger: &SpendLedger, policy: &Policy) -> Decision {
 /// The gate verdict for a transfer of `amount` SOL on `network` (predict-only, like [`check`]).
 ///
 /// Over a cap, [`check`] decides on any cluster. Within the caps this is the only place that
-/// mints [`AllowReason::WithinCapTestnet`] (spec D1.1(ii)), and only for a positively
+/// mints [`AllowReason::WithinCapTestnet`], and only for a positively
 /// identified devnet/testnet/localnet; mainnet and an unidentified network ask.
 pub fn verdict(amount: f64, ledger: &SpendLedger, policy: &Policy, network: Network) -> Verdict {
     match check(amount, ledger, policy) {
