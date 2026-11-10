@@ -1,5 +1,6 @@
 # Upgrading
 
+- [From 1.3.1 to 1.3.2](#from-131-to-132)
 - [From 1.3.0 to 1.3.1](#from-130-to-131)
 - [From 1.0.x to 1.3.0](#from-10x-to-130)
 - [Notes carried over from 1.2.0](#upgrading-to-120-read-before-upgrading)
@@ -7,6 +8,13 @@
 - [Moving from `safe-ai-skill@stbr`](#moving-from-safe-ai-skillstbr)
 
 The complete list of changes is in the [CHANGELOG](../CHANGELOG.md).
+
+## From 1.3.1 to 1.3.2
+
+A security hotfix. Two gates deny or ask in a few more cases; nothing else changes.
+
+1. **Secret reads and uploads inside a dynamic shell script are now seen.** A read or upload wrapped in a script whose body holds an expansion (`$PWD`, `$HOME`) — a double-quoted `sh -c`/`eval`, a here-string (`sh <<< "…$VAR…"`), a launcher command line (`watch`/`tmux …`), or `su -c "…$VAR…"` — used to pass the secrets gate silently; it is now re-parsed and the upload/read is denied. Benign dynamic scripts are unaffected.
+2. **Shell nesting past the parser's depth limit is no longer silent.** A value-moving or irreversible Solana command whose program name comes from an expansion, nested deeper than the parser follows (8 levels), is now treated as unreadable regardless of what it names: ask at Medium, deny at High. Deeply nested commands are rare in normal use.
 
 ## From 1.3.0 to 1.3.1
 
