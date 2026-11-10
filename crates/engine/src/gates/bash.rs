@@ -404,8 +404,11 @@ fn decide_parsed_at(
     // of what it names, since a hidden family program could sit below the cut the parser made.
     // It could be any command at all: a hard-guard ask, whatever its words.
     let named = shell::mentions_family(command);
-    if (parsed.unparseable && named) || parsed.opaque_mention || parsed.too_deep {
+    if (parsed.unparseable && named) || parsed.opaque_mention {
         return unreadable_at(ask_unparseable(), tier);
+    }
+    if parsed.too_deep {
+        return unreadable_at(ask_too_deep(), tier);
     }
 
     let mut best: Option<(Decision, GateMeta)> = None;
@@ -908,7 +911,7 @@ fn hidden_decision(
     let tier = policy.tier();
     if let Some(script) = dynamic_script(cmd) {
         if depth >= MAX_HIDDEN_DEPTH || over_work_cap(&script) {
-            return Some(unreadable_at(ask_unparseable(), tier));
+            return Some(unreadable_at(ask_too_deep(), tier));
         }
         let inner = shell::parse(&script);
         let (decision, meta) = decide_parsed_at(command, &inner, ctx, policy, depth + 1);
@@ -1661,6 +1664,19 @@ fn ask_unparseable() -> (Decision, GateMeta) {
     (
         Decision::Ask {
             reason: "Could not parse this command, and it names a solana-family program — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
+/// Shell code nested deeper than the parser follows, or too long to read in time: a command
+/// could sit below the cut, whatever the visible words name. A hard-guard ask.
+fn ask_too_deep() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "This command nests shell code deeper, or runs longer, than the gate can read \
+                     — approve to proceed"
                 .to_string(),
         },
         GateMeta::unreadable(),

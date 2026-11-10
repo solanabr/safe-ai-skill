@@ -20,6 +20,11 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - Both now act on two things: a keypair, meaning 64 bytes whose second half is the Ed25519 public key of the first (how every Solana keypair is stored), and any 64-byte value right after a key name (`PRIVATE_KEY=`, `"secretKey":`, `--keypair`). The key-name rule is the one the exfil tripwire already uses.
   - A signature, unnamed or under a `signature` or `tx` name, passes.
   - The deny paths keep the wider 64-byte shape: the exfil tripwire, the env-file content check and keypair files.
+- **The process-substitution installer check reads only the command its `<(` belongs to.**
+  - `source <(./scripts/env.sh) && curl -s http://localhost:3000/health` asked as a download-and-run installer, because any `curl` later on the line counted.
+  - Now only the rest of that simple command counts.
+  - Every `<(` on the line is checked, not only the first.
+- **The ask for shell code nested past the parser's depth limit says so.** It reused the "names a solana-family program" reason even when nothing on the line named one.
 
 ## [1.3.2] — 2026-11-10
 
