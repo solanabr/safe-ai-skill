@@ -4,6 +4,14 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Shell code a command hands a shell gets every Bash gate.** A producer's output that a shell or `source` runs, and a dynamic `-c`, `eval`, here-string, launcher or `su -c` script, now go through the full gate list, as a decoded payload does. That holds in `gate-bash-secrets`, `gate-bash`, `gate-mcp` and `PermissionRequest`.
+  - Scripts inside such scripts are followed 4 levels down.
+  - More than 64 of them in one command, or more text than the parser reads, asks like a command too large to check.
+
 ## [1.3.2] — 2026-11-10
 
 ### Security

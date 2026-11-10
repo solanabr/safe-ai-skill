@@ -454,6 +454,8 @@ The decoded text goes back through every Bash gate (the Solana gate in `gates/ba
 
 A payload the gate cannot read (a variable, a command substitution, a fetched body decoded into a shell), or a decode chain nested past 3 levels, asks, and denies at High.
 
+Shell code a command hands a shell without the parser listing it as commands gets the same treatment, through `shellcmd::recovered_verdict` in `gate-bash`, `gate-bash-secrets`, `gate-mcp` and `PermissionRequest`. That code is a producer's output a shell or `source` runs (`echo '…' | sh`, `bash <(printf '…')`), or a dynamic `-c`, `eval`, here-string, launcher or `su -c` script. Scripts inside such scripts are followed 4 levels down. More than 64 of them in one command, or more text than the parser reads, asks like a command too large to check.
+
 ## Supply chain
 
 Grading, state v2, pins, `packs.lock`, trust and approve are unchanged; only the action varies by tier (the [table above](#behaviour-per-gate)). **Deny** means the Skill tool, `/slash` expansion and Read, Grep and Bash access under the pack are refused in place. **Report** means SessionStart output naming the pack, the rule, `path:line` and the approve command.

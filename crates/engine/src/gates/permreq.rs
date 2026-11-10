@@ -143,8 +143,8 @@ pub fn classify(
     found.class()
 }
 
-/// The Bash gates on `command`; decoded payloads and git-nested commands are judged the same
-/// way (`nested`), `depth` levels down.
+/// The Bash gates on `command`; decoded payloads, git-nested commands and the shell code it
+/// hands a shell are judged the same way (`nested`), `depth` levels down.
 fn bash_call(
     command: &str,
     cwd: &Path,
@@ -185,9 +185,16 @@ fn bash_call(
     if depth == 0 {
         return;
     }
+    // The shell code the command hands a shell, every level of it (or the over-cap ask).
+    let recovered = shellcmd::recovered_scripts(command).unwrap_or_else(|| {
+        let (d, meta) = bash::over_cap(policy);
+        found.meta(d, &meta);
+        Vec::new()
+    });
     for inner in encoded::expand(command)
         .into_iter()
         .chain(gitguard::inner_commands(command))
+        .chain(recovered)
     {
         bash_call(&inner, cwd, policy, dir, depth - 1, true, found);
     }
