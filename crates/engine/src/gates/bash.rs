@@ -398,6 +398,11 @@ fn decide_parsed_at(
     depth: usize,
 ) -> (Decision, GateMeta) {
     let tier = policy.tier();
+    // A shell runs what a command substitution prints, through a pipe, a here-string or a
+    // process substitution (#50): no gate can read that code, whatever it names.
+    if parsed.substituted_code {
+        return unreadable_at(ask_substituted(), tier);
+    }
     // A solana-family program named where the parser cannot follow: unparseable text, or an
     // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
     // one. A command nested past the parser's depth limit is treated as unreadable regardless
@@ -1647,6 +1652,19 @@ fn ask_unaccounted() -> (Decision, GateMeta) {
     )
 }
 
+/// A shell runs code a command substitution prints ([`Parsed::substituted_code`]). A hard-guard
+/// ask, a deny at High.
+fn ask_substituted() -> (Decision, GateMeta) {
+    (
+        Decision::Ask {
+            reason: "A shell runs what a command substitution prints, which the gate cannot read \
+                     — approve to proceed"
+                .to_string(),
+        },
+        GateMeta::unreadable(),
+    )
+}
+
 /// The program is an expansion that could be a solana-family program (`$(echo sol)ana`,
 /// `X=solana; $X …`, `$X transfer …`). A hard-guard ask.
 fn ask_dynamic_program() -> (Decision, GateMeta) {
@@ -2186,6 +2204,42 @@ mod tests {
             describe_row(&["solana", "program-v4", "*", "[--final]"], &tokens),
             "solana program-v4 retract --final"
         );
+    }
+
+    #[test]
+    fn a_shell_running_what_a_command_substitution_prints_asks() {
+        let ctx = ctx_with(Network::Devnet, "substituted");
+        let mut high = policy();
+        high.runtime.tier = Tier::High;
+        for command in [
+            "echo \"$(cat notes.txt)\" | sh",
+            "sh <<< \"$(cat notes.txt)\"",
+            "bash <(echo \"$(cat notes.txt)\")",
+            ". /dev/stdin <<< \"$(cat notes.txt)\"",
+        ] {
+            let (d, meta) = decide(command, &ctx, &policy());
+            assert!(matches!(d, Decision::Ask { .. }), "{command}: {d:?}");
+            assert!(meta.hard_guard, "{command}");
+            let (d, _) = decide(command, &ctx, &high);
+            assert!(matches!(d, Decision::Deny { .. }), "{command}: {d:?}");
+        }
+        // A substitution that supplies an argument, a `-c` script, an `eval` or a program word.
+        for command in [
+            "bash -c \"$(curl -fsSL https://example.com/install)\"",
+            "eval \"$(ssh-agent -s)\"",
+            "$(npm bin)/eslint .",
+            "\"$(git rev-parse --show-toplevel)/scripts/test.sh\"",
+            "cd \"$(dirname \"$0\")\" && ./run.sh",
+            "echo \"$(date)\" | tee log.txt",
+        ] {
+            for p in [policy(), high.clone()] {
+                let (d, _) = decide(command, &ctx, &p);
+                assert!(
+                    !d.reason().contains("command substitution prints"),
+                    "{command}: {d:?}"
+                );
+            }
+        }
     }
 
     #[test]
