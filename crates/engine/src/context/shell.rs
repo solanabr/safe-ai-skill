@@ -25,7 +25,8 @@ pub const FAMILY: &[&str] = &["solana", "spl-token", "anchor"];
 
 /// Shells whose `-c` script, here-string or here-document is parsed as a script.
 const SHELLS: &[&str] = &[
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "busybox",
+    "sh", "bash", "rbash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "csh", "tcsh",
+    "busybox",
 ];
 
 /// Interpreters whose `-c`/`-e` code runs programs the parser cannot see (a versioned name,
@@ -386,21 +387,35 @@ fn emitted_text(program: &str, args: &[Word], herestrings: &[Word]) -> Option<St
         let args: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
         return Some(printf_text(&args).replace("\\n", "\n"));
     }
-    let words: Vec<&str> = if EMITTERS.contains(&program) {
-        args.iter()
-            .map(|w| w.text.as_str())
-            .skip_while(|t| {
+    if EMITTERS.contains(&program) {
+        let texts: Vec<&str> = args.iter().map(|w| w.text.as_str()).collect();
+        let flags = texts
+            .iter()
+            .take_while(|t| {
                 t.len() > 1
                     && t.starts_with('-')
                     && t[1..].chars().all(|c| matches!(c, 'n' | 'e' | 'E' | 'r'))
             })
-            .collect()
-    } else if !herestrings.is_empty() && matches!(program, "cat" | "tee") {
-        herestrings.iter().map(|w| w.text.as_str()).collect()
-    } else {
-        return None;
-    };
-    Some(words.join(" ").replace("\\n", "\n"))
+            .count();
+        let options = texts[..flags].concat();
+        let words = texts[flags..].join(" ");
+        // `echo -e` (the last of `-e`/`-E` wins) and zsh's `print` (unless `-r`) decode
+        // backslash escapes.
+        let decodes = match program {
+            "echo" => options.chars().rfind(|c| matches!(c, 'e' | 'E')) == Some('e'),
+            _ => !options.contains('r'),
+        };
+        return Some(if decodes {
+            decode_escapes(&words)
+        } else {
+            words.replace("\\n", "\n")
+        });
+    }
+    if !herestrings.is_empty() && matches!(program, "cat" | "tee") {
+        let words: Vec<&str> = herestrings.iter().map(|w| w.text.as_str()).collect();
+        return Some(words.join(" ").replace("\\n", "\n"));
+    }
+    None
 }
 
 /// What `printf FORMAT ARGS…` writes, best effort: each conversion (`%s`, `%b`, `%5d`, …)
@@ -846,33 +861,77 @@ pub fn base_name(word: &str) -> String {
     }
 }
 
+/// What a script writes to its standard output, as far as the parser can tell.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Output {
+    /// Nothing so far.
+    #[default]
+    Nothing,
+    /// Literal text: what `echo`, `printf` or a here-string `cat` print.
+    Text(String),
+    /// Output the parser cannot resolve.
+    Unknown,
+}
+
+impl Output {
+    /// `self`, then `next` written after it.
+    fn then(self, next: Output) -> Output {
+        match (self, next) {
+            (Output::Unknown, _) | (_, Output::Unknown) => Output::Unknown,
+            (Output::Nothing, next) => next,
+            (done, Output::Nothing) => done,
+            (Output::Text(a), Output::Text(b)) => Output::Text(format!("{a}\n{b}")),
+        }
+    }
+
+    /// The text, when it is resolved and not blank.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Output::Text(text) if !text.trim().is_empty() => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// What [`parse_into`] learned about a script, for the command it is part of.
+#[derive(Default)]
+struct Script {
+    /// What it writes to its standard output.
+    output: Output,
+    /// Its first command runs its standard input as shell code (`>(sh)`, `>(bash -s)`).
+    runs_stdin: bool,
+}
+
 /// Parse `script` into `out` at nesting `depth`; `indirect` marks every command found. Returns
-/// what the script writes to its standard output when it is a lone command whose output the
-/// parser can resolve (`echo 'cat .env'` → `cat .env`, `cat <<< '…'`); `None` for anything
-/// else, as a pipeline's output is its last stage's and a nested command may write too.
-fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) -> Option<String> {
+/// what the script writes and whether it runs its standard input ([`Script`]).
+fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) -> Script {
     if depth > MAX_DEPTH {
         // Past the depth limit the deepest commands go unread: mark the parse unreadable and
         // record that the cause is excessive nesting, so the gate can ask even when nothing
         // family-shaped is visible above the cut.
         out.unparseable = true;
         out.too_deep = true;
-        return None;
+        return Script {
+            output: Output::Unknown,
+            runs_stdin: false,
+        };
     }
-    let before = out.commands.len();
     let mut lx = Lexer {
         chars: script.chars().collect(),
         i: 0,
         depth,
         line_writes: false,
         compound_seen: false,
-        finished: 0,
-        emitted: None,
+        output: Output::Nothing,
+        groups: Vec::new(),
+        first_reads: None,
         out,
     };
     lx.run(indirect);
-    let emitted = lx.emitted.take().filter(|_| lx.finished == 1);
-    emitted.filter(|_| out.commands.len() == before + 1)
+    Script {
+        output: lx.output,
+        runs_stdin: lx.first_reads == Some(Reads::Shell),
+    }
 }
 
 /// A here-document waiting for its body.
@@ -910,6 +969,10 @@ struct Pending {
     /// The output of each process substitution among its words that [`parse_into`] resolved
     /// (`<(echo 'cat .env')` → `cat .env`): the code a shell or `source` reading it runs.
     procsubs: Vec<(String, String)>,
+    /// What a subshell `( … )` in its place writes: the command it stands for.
+    subshell: Option<Output>,
+    /// Its output is redirected into a process substitution that runs it as shell code (`> >(sh)`).
+    output_runs: bool,
 }
 
 struct Lexer<'p> {
@@ -921,11 +984,12 @@ struct Lexer<'p> {
     /// A compound command (`for`, `case`, `while`, …) or a `case` pattern was seen at this
     /// level: later commands sit inside it, where the hook's `if` filters may not look.
     compound_seen: bool,
-    /// Commands with words finished at this level.
-    finished: usize,
-    /// What the last command recorded at this level writes to its standard output, when the
-    /// parser resolves it ([`emitted_text`]).
-    emitted: Option<String>,
+    /// What the commands finished at this level have written to standard output.
+    output: Output,
+    /// The level's output from before each brace group `{ …; }` still open, put back at its `}`.
+    groups: Vec<Output>,
+    /// What the first command at this level reads from its standard input.
+    first_reads: Option<Reads>,
     out: &'p mut Parsed,
 }
 
@@ -1040,7 +1104,8 @@ impl Lexer<'_> {
                     }
                     match self.matching_paren() {
                         Some(body) => {
-                            parse_into(&body, self.depth + 1, true, self.out);
+                            let script = parse_into(&body, self.depth + 1, true, self.out);
+                            cmd.subshell = Some(script.output);
                         }
                         None => {
                             self.out.unparseable = true;
@@ -1088,11 +1153,24 @@ impl Lexer<'_> {
     /// Finish the pending command, if any. Returns what it reads from stdin.
     fn flush(&mut self, cmd: &mut Pending, indirect: bool, pipe_next: bool) -> Reads {
         let pending = std::mem::take(cmd);
+        // A brace group's `}` stands for the group: it writes what the commands inside wrote.
+        let closed = if is_lone(&pending.words, "}") {
+            let before = self.groups.pop();
+            before.map(|before| std::mem::replace(&mut self.output, before))
+        } else {
+            None
+        };
+        let group = pending.subshell.clone().or(closed);
         cmd.piped_in = pipe_next;
         if pipe_next {
             let words: Vec<&str> = pending.words.iter().map(|w| w.text.as_str()).collect();
             cmd.upstream = format!("{} {}", pending.upstream, words.join(" "));
-            cmd.upstream_emits = pipe_emits(&pending);
+            cmd.upstream_emits = match &group {
+                Some(group) => group.text().unwrap_or_default().to_string(),
+                None => pipe_emits(&pending),
+            };
+        } else if let Some(group) = group {
+            self.output = std::mem::take(&mut self.output).then(group);
         }
         self.line_writes |= pending.writes_file || {
             // `tee x.sh <<EOF`: the here-document is the file's content.
@@ -1109,6 +1187,14 @@ impl Lexer<'_> {
         if pending.words.is_empty() {
             return Reads::Data;
         }
+        if pending
+            .words
+            .first()
+            .is_some_and(|w| w.text == "{" && !w.quoted)
+        {
+            // A brace group opens: what it writes is collected apart until its `}`.
+            self.groups.push(std::mem::take(&mut self.output));
+        }
         let indirect = indirect || self.compound_seen;
         self.compound_seen |= pending.words.first().is_some_and(|w| {
             !w.quoted
@@ -1117,14 +1203,28 @@ impl Lexer<'_> {
                     "for" | "select" | "while" | "until" | "if" | "case" | "function" | "repeat"
                 )
         });
-        self.finished += 1;
         let herestrings = pending.herestrings.clone();
+        let upstream = pending.piped_in.then(|| pending.upstream_emits.clone());
+        let output_runs = pending.output_runs;
+        let silent = pending.words.iter().all(|w| {
+            !w.quoted && (RESERVED.contains(&w.text.as_str()) || assignment_name(w).is_some())
+        });
         let before = self.out.commands.len();
         let reads = finish_command(pending, indirect, self.depth, self.out);
+        self.first_reads.get_or_insert(reads);
         // The command it recorded is the last one (anything nested in it comes first).
-        if let Some(cmd) = self.out.commands.get(before..).and_then(<[_]>::last) {
-            let args = cmd.words.get(1..).unwrap_or_default();
-            self.emitted = emitted_text(&cmd.program(), args, &herestrings);
+        let written = match self.out.commands.get(before..).and_then(<[_]>::last) {
+            Some(recorded) => command_output(recorded, &herestrings, upstream.as_deref()),
+            None if silent => Output::Nothing,
+            None => Output::Unknown,
+        };
+        if output_runs {
+            // `cmd > >(sh)`: what the command writes runs as shell code.
+            executes(self.out);
+            self.out.opaque = true;
+            runs_producer(self.out, written.text().map(str::to_string));
+        } else if !pipe_next {
+            self.output = std::mem::take(&mut self.output).then(written);
         }
         reads
     }
@@ -1162,8 +1262,9 @@ impl Lexer<'_> {
                 Some(body) => {
                     self.out.substitution = true;
                     let text = format!("{first}({body})");
-                    if let Some(code) = parse_into(&body, self.depth + 1, true, self.out) {
-                        cmd.procsubs.push((text.clone(), code));
+                    let script = parse_into(&body, self.depth + 1, true, self.out);
+                    if let Some(code) = script.output.text() {
+                        cmd.procsubs.push((text.clone(), code.to_string()));
                     }
                     cmd.words.push(Word {
                         text,
@@ -1201,6 +1302,17 @@ impl Lexer<'_> {
             _ => {}
         }
         self.skip_blanks();
+        if first == '>' && self.peek() == Some('>') && self.peek_at(1) == Some('(') {
+            // `cmd > >(…)`: the output goes to a process substitution, which may run it as code.
+            self.i += 2;
+            let Some(body) = self.matching_paren() else {
+                self.out.unparseable = true;
+                return;
+            };
+            self.out.substitution = true;
+            cmd.output_runs |= parse_into(&body, self.depth + 1, true, self.out).runs_stdin;
+            return;
+        }
         let target = match self.peek() {
             Some(c) if !is_metachar(c) => self.read_word(),
             _ => None,
@@ -1364,8 +1476,9 @@ impl Lexer<'_> {
             depth: self.depth,
             line_writes: false,
             compound_seen: false,
-            finished: 0,
-            emitted: None,
+            output: Output::Nothing,
+            groups: Vec::new(),
+            first_reads: None,
             out: &mut *self.out,
         };
         let mut sink = Word::default();
@@ -1666,6 +1779,32 @@ fn is_config_var(name: &str) -> bool {
         || name.starts_with("ANCHOR_")
 }
 
+/// Programs that write nothing to standard output.
+const SILENT: &[&str] = &[
+    "true", ":", "false", "cd", "export", "unset", "sleep", "wait", "shift",
+];
+
+/// What a finished command writes to its standard output: an emitter's literal text, what a
+/// pass-through `cat`/`tee` received (`upstream`, when it reads a pipe), nothing for a program
+/// that prints nothing, else output the parser cannot resolve.
+fn command_output(cmd: &SimpleCommand, herestrings: &[Word], upstream: Option<&str>) -> Output {
+    let program = cmd.program();
+    let args = cmd.words.get(1..).unwrap_or_default();
+    if let Some(text) = emitted_text(&program, args, herestrings) {
+        return Output::Text(text);
+    }
+    match (program.as_str(), upstream) {
+        ("cat" | "tee", Some(text)) if !text.is_empty() => Output::Text(text.to_string()),
+        (p, _) if SILENT.contains(&p) => Output::Nothing,
+        _ => Output::Unknown,
+    }
+}
+
+/// Whether `words` is the one unquoted word `text`.
+fn is_lone(words: &[Word], text: &str) -> bool {
+    matches!(words, [w] if w.text == text && !w.quoted)
+}
+
 /// The script text a pipeline stage hands the next one: an emitter's words or here-string, or
 /// what a pass-through `tee`/`cat` received from its own upstream.
 fn pipe_emits(pending: &Pending) -> String {
@@ -1700,6 +1839,8 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         upstream,
         upstream_emits,
         procsubs,
+        subshell: _,
+        output_runs: _,
     } = pending;
     let mut indirect = indirect || after_pipe;
     let canonical_head = words
@@ -1864,9 +2005,20 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 // returns `None` and nothing is recorded.
                 runs_producer(out, procsub_code(&procsubs, &word.text));
             }
-            // `… | source /dev/stdin`: the pipeline's output is the sourced script.
-            if piped_in && args.iter().any(|w| is_stdin_path(&w.text)) {
-                runs_producer(out, Some(upstream_emits.clone()));
+            if args.iter().any(|w| is_stdin_path(&w.text)) {
+                // `source /dev/stdin`: its standard input is the script, from a pipe, a
+                // here-string or a here-document.
+                reads = Reads::Shell;
+                if piped_in {
+                    runs_producer(out, Some(upstream_emits.clone()));
+                }
+                for here in &herestrings {
+                    if here.dynamic {
+                        opaque_script(out, &here.text);
+                    } else {
+                        parse_into(&here.text, depth + 1, true, out);
+                    }
+                }
             }
         }
         "eval" => {
@@ -1879,16 +2031,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             }
         }
         p if SHELLS.contains(&p) => {
-            let args = if p == "busybox" {
-                // `busybox sh -c …`
-                match args.first().map(|w| base_name(&w.text)) {
-                    Some(sh) if SHELLS.contains(&sh.as_str()) => args.get(1..).unwrap_or_default(),
-                    _ => args,
-                }
-            } else {
-                args
-            };
-            match shell_script(args) {
+            match shell_script(shell_args(p, args)) {
                 ShellInput::Script(script) if script.dynamic => opaque(out, &script.text),
                 ShellInput::Script(script) => {
                     parse_into(&script.text, depth + 1, true, out);
@@ -2077,10 +2220,36 @@ enum ShellInput<'w> {
     Stdin,
 }
 
+/// The arguments of the shell `busybox` runs (`busybox sh -c …`); `args` for any other shell.
+fn shell_args<'w>(program: &str, args: &'w [Word]) -> &'w [Word] {
+    if program != "busybox" {
+        return args;
+    }
+    match args.first().map(|w| base_name(&w.text)) {
+        Some(sh) if SHELLS.contains(&sh.as_str()) => args.get(1..).unwrap_or_default(),
+        _ => args,
+    }
+}
+
+/// The script a shell runs with `-c` (`sh -c S`, `bash -ec S`, `bash -c -- S`, `busybox sh -c
+/// S`), found the way the shell finds it; `None` for a program that is not a shell, or a shell
+/// given no `-c` script.
+pub(crate) fn c_script<'w>(program: &str, args: &'w [Word]) -> Option<&'w Word> {
+    if !SHELLS.contains(&program) {
+        return None;
+    }
+    match shell_script(shell_args(program, args)) {
+        ShellInput::Script(script) => Some(script),
+        _ => None,
+    }
+}
+
 /// Find a shell's input among its arguments: `-c SCRIPT` (also in a cluster: `-lc`, `-ec`),
-/// else the first non-option word, else stdin.
+/// else stdin under `-s` (the words after it are positional parameters), else the first
+/// non-option word, else stdin.
 fn shell_script(args: &[Word]) -> ShellInput<'_> {
     let mut wants_script = false;
+    let mut reads_stdin = false;
     let mut i = 0;
     while let Some(word) = args.get(i) {
         i += 1;
@@ -2089,22 +2258,24 @@ fn shell_script(args: &[Word]) -> ShellInput<'_> {
             break;
         }
         if text.starts_with('-') || text.starts_with('+') {
-            if !text.starts_with("--") && text.contains('c') {
-                wants_script = true;
+            if !text.starts_with("--") {
+                wants_script |= text.contains('c');
+                reads_stdin |= text.starts_with('-') && text.contains('s');
             }
             if matches!(text, "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file") {
                 i += 1;
             }
             continue;
         }
-        return if wants_script {
-            ShellInput::Script(word)
-        } else {
-            ShellInput::File(word)
+        return match (wants_script, reads_stdin) {
+            (true, _) => ShellInput::Script(word),
+            (false, true) => ShellInput::Stdin,
+            (false, false) => ShellInput::File(word),
         };
     }
     match args.get(i) {
         Some(word) if wants_script => ShellInput::Script(word),
+        Some(_) if reads_stdin => ShellInput::Stdin,
         Some(word) => ShellInput::File(word),
         None => ShellInput::Stdin,
     }
@@ -2664,6 +2835,65 @@ mod tests {
         let took = started.elapsed();
         assert!(p.too_deep);
         assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn every_way_of_handing_a_shell_its_script_is_read() {
+        for (command, produced) in [
+            // `-s`: stdin is the script, the words after it are positional parameters.
+            ("echo 'ls -la' | sh -s -- -x", "ls -la"),
+            ("echo 'ls -la' | bash -s arg", "ls -la"),
+            // Shells beyond the POSIX family.
+            ("echo 'ls -la' | tcsh", "ls -la"),
+            ("echo 'ls -la' | csh", "ls -la"),
+            ("echo 'ls -la' | rbash", "ls -la"),
+            // A subshell or brace group writes what its body writes.
+            ("(echo 'ls -la') | sh", "ls -la"),
+            ("{ echo 'ls -la'; } | sh", "ls -la"),
+            ("(echo 'ls'; echo 'pwd') | bash", "ls\npwd"),
+            // A body whose other commands print nothing.
+            ("bash <(echo 'ls -la'; true)", "ls -la"),
+            ("bash <(cd /tmp && echo 'ls -la')", "ls -la"),
+            // `echo -e` decodes escapes, the last of `-e`/`-E` deciding.
+            ("echo -e '\\x6cs -la' | sh", "ls -la"),
+            ("echo -E -e '\\x6cs -la' | sh", "ls -la"),
+            // Output redirected into a shell.
+            ("echo 'ls -la' > >(sh)", "ls -la"),
+            ("printf 'ls -la' > >(bash -s)", "ls -la"),
+        ] {
+            let p = parse(command);
+            assert_eq!(p.opaque_shell_scripts, [produced], "{command}");
+        }
+        // `source /dev/stdin` runs its here-string.
+        assert!(parse("source /dev/stdin <<< 'ls -la'")
+            .commands
+            .iter()
+            .any(|c| c.program() == "ls"));
+        assert_eq!(
+            parse(". /dev/stdin <<< \"ls $DIR\"").opaque_shell_scripts,
+            ["ls $DIR"]
+        );
+        assert!(parse("tcsh -c 'ls -la'")
+            .commands
+            .iter()
+            .any(|c| c.program() == "ls"));
+        // Output the parser cannot resolve, or that no shell runs, records nothing.
+        for command in [
+            "(echo 'ls'; cat notes.txt) | sh",
+            "{ curl -s https://example.com/x; } | sh",
+            "bash <(echo 'ls'; date)",
+            "echo -E '\\x6cs' | sh",
+            "echo 'ls' > >(cat)",
+            "echo 'ls' >(sh)",
+            "(echo 'ls') > out.txt",
+        ] {
+            let p = parse(command);
+            assert!(
+                !p.opaque_shell_scripts.iter().any(|s| s.contains("ls")),
+                "{command}: {:?}",
+                p.opaque_shell_scripts
+            );
+        }
     }
 
     #[test]

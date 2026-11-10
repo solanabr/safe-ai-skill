@@ -853,17 +853,7 @@ pub(crate) fn dynamic_script(cmd: &SimpleCommand) -> Option<String> {
                 .join(" ")
         });
     }
-    const SHELLS: &[&str] = &[
-        "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "busybox",
-    ];
-    if !SHELLS.contains(&program.as_str()) {
-        return None;
-    }
-    let at = args.iter().position(|w| {
-        w.text == "-c"
-            || (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.ends_with('c'))
-    })?;
-    let script = args.get(at + 1)?;
+    let script = shell::c_script(&program, args)?;
     script.dynamic.then(|| script.text.clone())
 }
 
@@ -1850,6 +1840,37 @@ fn looks_like_pubkey(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_dynamic_c_script_is_found_the_way_the_shell_finds_it() {
+        for command in [
+            "bash -c \"ls $D\"",
+            "bash -ec \"ls $D\"",
+            "bash -ce \"ls $D\"",
+            "bash -c -x \"ls $D\"",
+            "bash -c -- \"ls $D\"",
+            "bash -c -o pipefail \"ls $D\"",
+            "bash -o pipefail -c \"ls $D\"",
+            "busybox sh -c \"ls $D\"",
+            "tcsh -c \"ls $D\"",
+        ] {
+            let parsed = shell::parse(command);
+            let scripts: Vec<String> = parsed.commands.iter().filter_map(dynamic_script).collect();
+            assert_eq!(scripts, ["ls $D"], "{command}");
+        }
+        for command in [
+            "bash \"$SCRIPT\"",
+            "bash -x \"$SCRIPT\"",
+            "bash -c 'ls'",
+            "echo \"$D\"",
+        ] {
+            let parsed = shell::parse(command);
+            assert!(
+                parsed.commands.iter().all(|c| dynamic_script(c).is_none()),
+                "{command}"
+            );
+        }
+    }
 
     /// A context with a fixed network and an isolated, per-test plugin-data dir.
     fn ctx_with(network: Network, tag: &str) -> Context {
