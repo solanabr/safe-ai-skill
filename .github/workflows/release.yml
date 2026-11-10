@@ -100,6 +100,7 @@ jobs:
   # ── 1. built from release/v<version>, versions agree, tags are free ───────
   preflight:
     name: Preflight
+    timeout-minutes: 15
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
@@ -142,6 +143,7 @@ jobs:
   # ── 1. per-platform builds: smoke test, reproducibility ────────────────────
   build:
     name: Build / ${{ matrix.artifact_name }}
+    timeout-minutes: 45
     needs: preflight
     runs-on: ${{ matrix.os }}
     permissions:
@@ -291,6 +293,7 @@ jobs:
   # SHA-pinned actions.
   attest:
     name: Attest build provenance
+    timeout-minutes: 20
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -320,6 +323,7 @@ jobs:
   # pushed fast-forward only, so a branch that moved during the run fails here.
   vendor:
     name: Vendor binaries (release branch)
+    timeout-minutes: 20
     needs: [build, attest]
     runs-on: ubuntu-24.04
     permissions:
@@ -381,6 +385,7 @@ jobs:
   # ── 3. publish the release from the tagged commit's binaries ──────────────
   publish:
     name: Publish GitHub Release
+    timeout-minutes: 20
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     permissions:

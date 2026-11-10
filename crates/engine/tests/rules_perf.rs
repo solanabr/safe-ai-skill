@@ -38,7 +38,12 @@ fn within_budget(name: &str, rel: &str, body: String) {
         "{name:24} {took:>10.1?} cut={cut} grade={:?}",
         rules::grade(&r)
     );
-    assert!(took < PACK_BUDGET + SLACK, "{name}: {took:?}");
+    // The wall-clock budget is hardware-dependent, so it is asserted only under the perf gate
+    // (the `latency` CI job runs the budgeted tests in release with `SAFE_AI_SKILL_PERF=1`); the
+    // normal `cargo test` run still scans each crafted body and holds the cut/grade check below.
+    if common::perf_assertions_enabled() {
+        assert!(took < PACK_BUDGET + SLACK, "{name}: {took:?}");
+    }
     if cut {
         assert!(rules::grade(&r) >= Grade::High, "{name}: {r:?}");
     }

@@ -13,8 +13,11 @@
 name: CI
 
 on:
+  # Push CI only on main (post-merge). A branch with an open PR is covered by the
+  # pull_request event; running push too would double every same-repo PR branch's CI.
+  # (A branch with no PR does not run this workflow — open a PR to get CI.)
   push:
-    branches: ["**"]
+    branches: ["main"]
   pull_request:
     branches: ["main"]
 
@@ -103,13 +106,12 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: cargo build --verbose
-        run: cargo build --manifest-path ${{ env.MANIFEST }} --verbose
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
+      # Builds the crate (bin included, for the integration tests and the npm smoke below) and
+      # runs the default suite; a standalone `cargo build` beforehand only compiled it twice.
       - name: cargo test --verbose
         run: cargo test --manifest-path ${{ env.MANIFEST }} --verbose --no-fail-fast
         env:
@@ -448,6 +450,9 @@ jobs:
           cargo test --manifest-path "$MANIFEST" --release --locked \
             --target x86_64-unknown-linux-musl \
             --test verify_perf full_sweep_of_an_aikit_sized_tree_fits_the_budget
+          cargo test --manifest-path "$MANIFEST" --release --locked \
+            --target x86_64-unknown-linux-musl \
+            --test rules_perf
           cargo test --manifest-path "$MANIFEST" --release --locked \
             --target x86_64-unknown-linux-musl \
             --lib long_non_ascii_names_cost_bounded_work_and_no_allocation_per_entry
