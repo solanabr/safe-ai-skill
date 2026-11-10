@@ -22,8 +22,12 @@ const JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkw
 const MNEMONIC: &str = "abandon ability able about above absent absorb abstract absurd abuse \
                         access accident";
 
+/// A base58 keypair: a seed followed by the public key it derives. Unnamed, a 64-byte value that
+/// is not a keypair reads as a transaction signature and is not redacted.
 fn base58_secret() -> String {
-    bs58::encode((1u8..=64).collect::<Vec<u8>>()).into_string()
+    let seed: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+    let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+    bs58::encode([seed.as_slice(), public.as_bytes()].concat()).into_string()
 }
 
 fn keypair_array() -> String {

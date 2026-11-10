@@ -1383,7 +1383,8 @@ fn is_base58_byte(b: u8) -> bool {
 }
 
 /// The lowercase name right before a value: a path segment, query key, flag or JSON key.
-fn name_before(head: &str) -> String {
+/// [`redact`] reads 64-byte base58 values with the same rule.
+pub(crate) fn name_before(head: &str) -> String {
     let head = head.trim_end_matches(|c: char| {
         c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ':' | '=' | '/' | '[')
     });
@@ -1396,7 +1397,7 @@ fn name_before(head: &str) -> String {
     head[from..].to_ascii_lowercase()
 }
 
-fn names_key(name: &str) -> bool {
+pub(crate) fn names_key(name: &str) -> bool {
     ["secret", "priv", "keypair", "seed", "mnemonic", "wallet"]
         .iter()
         .any(|w| name.contains(w))
