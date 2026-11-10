@@ -4,6 +4,17 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Anchor and Solana CLI dev-loop commands no longer ask on a test cluster.** Each of these asked at every tier, so CI denied it.
+  - `anchor run <script>` now follows `anchor test`: no opinion on a positively identified localnet, devnet or testnet, an ask anywhere else.
+  - `anchor codama` and `anchor idl build|parse|type|convert` work on local files, and `anchor idl fetch|authority` only read. All of them have no opinion.
+  - `anchor idl init|upgrade|write-buffer|set-buffer` are judged by the resolved cluster, like a deploy.
+  - `solana config set` pointing at an identified localnet, devnet or testnet has no opinion. A mainnet or unidentified URL, and a new default `--keypair`, still ask.
+- **The download-and-run runner allowlist no longer passes more at High than at Relaxed.** `codama`, `solana-mobile` and `@colosseum-org/copilot-connect` were allowed at High but asked at Relaxed and Medium. They are now in the Relaxed list too, and a test keeps the High list a subset of it.
+
 ## [1.3.2] — 2026-11-10
 
 ### Security

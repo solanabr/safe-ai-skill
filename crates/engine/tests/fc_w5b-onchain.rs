@@ -1,5 +1,6 @@
-//! Usability floor: `anchor test` on a positively identified
-//! localnet/devnet/testnet gets no opinion; mainnet and an unidentified cluster keep the ask.
+//! Usability floor: `anchor test`, and `anchor run` with the same provider cluster, on a
+//! positively identified localnet/devnet/testnet gets no opinion; mainnet and an unidentified
+//! cluster keep the ask.
 //!
 //! The fixture `fixtures/fc/w5b-onchain.jsonl` runs through the real `gate-bash` binary with a
 //! fake home, an isolated data dir, a stub `solana` printing the CLI config's RPC URL, and the
