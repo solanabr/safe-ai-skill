@@ -1,7 +1,12 @@
+
 # ── Secrets — never commit ───────────────────────────────────────────────────
 .env
 .env.*
 .env.example
+# Keypairs (solana-keygen, anchor target/deploy) and registry auth
+*-keypair.json
+id.json
+.npmrc
 
 # ── Local dev / dogfooding config ────────
 .claude/
@@ -9,17 +14,40 @@ CLAUDE.local.md
 CLAUDE.md
 .mcp.json
 .gitmodules
+# Same for the Codex and opencode adapters' project installs (docs/adapters.md)
+AGENTS.md
+.codex/
+.opencode/
+opencode.json
+opencode.jsonc
 
 # ── Rust / Cargo ─────────────────────────────────────────────────────────────
 target/
 **/*.rs.bk
 *.pdb
+*.profraw
+*.profdata
 # Keep Cargo.lock committed
+
+# ── Python (scripts/, scripts/cc-simulate) ───────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
 
 # ── Node / npm ───────────────────────────────────────────────────────────────
 node_modules/
 npm-debug.log*
 *.tgz
+
+# ── Logs, coverage, profiling ────────────────────────────────────────────────
+*.log
+coverage/
+lcov.info
+*.lcov
+tarpaulin-report.*
+cobertura.xml
+perf.data*
+flamegraph.svg
 
 # ── OS clutter ───────────────────────────────────────────────────────────────
 .DS_Store
@@ -38,9 +66,15 @@ desktop.ini
 .idea/
 .vscode/
 *.code-workspace
+.zed/
+*.iml
+*.orig
+*.rej
+*.bak
 
 # ── Local agent / planning artifacts ─────────────────────────────────────────
 docs/superpowers/
 .superpowers/
 .worktrees/
 .memsearch/
+.superstack/
