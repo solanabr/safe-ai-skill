@@ -7,9 +7,8 @@
 # NOTE: There is no workspace Cargo.toml at the repo root; the engine
 # crate lives at crates/engine/ and all cargo commands use
 # --manifest-path crates/engine/Cargo.toml explicitly.  Adding a
-# minimal workspace root was considered but the crate builds cleanly
-# without it, and adding one would require touching Cargo files that
-# are marked FROZEN by the round-2 contract in ARCHITECTURE.md.
+# minimal workspace root was considered, but the crate builds cleanly
+# without it.
 
 name: CI
 

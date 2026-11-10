@@ -1,7 +1,6 @@
 # ai-kit acceptance corpus (spec D2.10). Not vendored: the opt-in test
 # (SAFE_AI_SKILL_CORPUS=1) fetches it at the pinned commit and checks every pack SHA.
-# `expected` is what the rule engine must grade; `precise_py` is the research baseline
-# (docs/superpowers/research/2026-10-21/aikit_precise.tsv).
+# `expected` is what the rule engine must grade; `precise_py` is the research baseline.
 # repo	https://github.com/solanabr/ai-kit
 # commit	f70345db63014c3fb42b872ddfca65f80c83a418
 # packs	.claude/skills/ext
