@@ -1206,6 +1206,20 @@ fn classify_solana(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, Ga
         "program" => classify_program(argv, "solana", ctx),
         "config" => match word_or_ask(argv, 1, "solana") {
             Ok(action) if action == "get" => readonly("solana"),
+            // Pointing the CLI at a positively identified localnet/devnet/testnet changes no
+            // state on any cluster, and each later command is judged by the cluster it resolves
+            // to. A mainnet or unidentified URL, and a new default signer, still ask.
+            Ok(action)
+                if action == "set"
+                    && !argv.has_flag("--keypair")
+                    && !argv.has_flag("-k")
+                    && matches!(
+                        ctx.network,
+                        Network::Localnet | Network::Devnet | Network::Testnet
+                    ) =>
+            {
+                readonly("solana")
+            }
             Ok(action) => ask_not_readonly("solana", &format!("config {action}")),
             Err(verdict) => verdict,
         },
@@ -1313,11 +1327,15 @@ fn classify_anchor(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision, G
         "deploy" | "upgrade" | "migrate" => deploy_decision("anchor", ctx, argv),
         "program" => classify_program(argv, "anchor", ctx),
         "idl" | "legacy-idl" => classify_anchor_idl(argv, &sub, ctx),
-        // Local/dev operations.
-        "build" | "keys" | "verify" | "localnet" | "expand" | "new" | "init" => readonly("anchor"),
-        // `test` deploys to the resolved cluster (usually its own local validator): no opinion
-        // on a positively identified localnet/devnet/testnet, an ask anywhere else.
-        "test"
+        // Local/dev operations (`codama` generates clients from the local IDL).
+        "build" | "keys" | "verify" | "localnet" | "expand" | "new" | "init" | "codama" => {
+            readonly("anchor")
+        }
+        // `test` deploys to the resolved cluster (usually its own local validator) and runs the
+        // `Anchor.toml` test script; `run` runs another `Anchor.toml` script with that cluster as
+        // its provider. No opinion on a positively identified localnet/devnet/testnet, an ask
+        // anywhere else.
+        "test" | "run"
             if matches!(
                 ctx.network,
                 Network::Localnet | Network::Devnet | Network::Testnet
@@ -1325,14 +1343,14 @@ fn classify_anchor(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision, G
         {
             readonly("anchor")
         }
-        // `run` executes repo-defined scripts.
         "test" | "run" => ask_not_readonly("anchor", &sub),
         _ => ask_unknown("anchor"),
     }
 }
 
 /// Classify `anchor idl|legacy-idl <action> ...`: authority changes and closes are
-/// irreversible, and no IDL command is on the read-only fast path.
+/// irreversible, writes are judged by the resolved cluster like a deploy, and reads and local
+/// builds get no opinion. Anything else asks.
 fn classify_anchor_idl(argv: &Argv, sub: &str, ctx: &Context) -> (Decision, GateMeta) {
     let action = match word_or_ask(argv, 1, "anchor") {
         Ok(action) => action,
@@ -1352,6 +1370,10 @@ fn classify_anchor_idl(argv: &Argv, sub: &str, ctx: &Context) -> (Decision, Gate
         "close" => {
             irreversible_decision("anchor", ctx, argv, Scope::Destructive, "IDL account close")
         }
+        // Writes the IDL, or a buffer for it, on-chain.
+        "init" | "upgrade" | "write-buffer" | "set-buffer" => deploy_decision("anchor", ctx, argv),
+        // Reads the on-chain IDL or its authority, or works on local files only.
+        "fetch" | "authority" | "build" | "parse" | "type" | "convert" => readonly("anchor"),
         _ => ask_not_readonly("anchor", &format!("{sub} {action}")),
     }
 }

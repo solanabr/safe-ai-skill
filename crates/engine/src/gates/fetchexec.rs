@@ -67,12 +67,18 @@ const KNOWN_INSTALLER_HOSTS: &[&str] = &[
 /// - `create-next-app`: Vercel's Next.js scaffolder, the kit's frontend starter.
 /// - `@stbr/safe-ai-skill`: this firewall's own CLI.
 /// - `helius-mcp`, `helius-cli`: Helius's published tools, which the kit's MCP config names.
+/// - `codama`, `solana-mobile`, `@colosseum-org/copilot-connect`: run by the kit's own commands
+///   (`/generate-idl-client`, `/scaffold`, `/doctor`). [`HIGH_NPM_ALLOW`] must stay a subset of
+///   this list, or a package would pass at High and ask at Relaxed.
 const NPM_ALLOW: &[&str] = &[
     "create-solana-dapp",
     "create-next-app",
     "@stbr/safe-ai-skill",
     "helius-mcp",
     "helius-cli",
+    "codama",
+    "solana-mobile",
+    "@colosseum-org/copilot-connect",
 ];
 
 /// npm scopes whose packages a runner may fetch (a scope belongs to one npm organization, so
@@ -1961,6 +1967,18 @@ mod tests {
             decide(command, &dir, &Policy::default(), Tier::Relaxed),
             Some(Verdict::Ask(_))
         )
+    }
+
+    #[test]
+    fn high_allowlist_is_a_subset_of_the_relaxed_one() {
+        for pkg in HIGH_NPM_ALLOW {
+            assert!(
+                NPM_ALLOW.contains(pkg) || NPM_ALLOW_SCOPES.iter().any(|s| pkg.starts_with(s)),
+                "{pkg} passes at High but would ask at Relaxed"
+            );
+        }
+        assert!(!ask("npx --yes @colosseum-org/copilot-connect status"));
+        assert!(!ask("npx codama run js"));
     }
 
     #[test]
