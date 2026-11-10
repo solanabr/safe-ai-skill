@@ -55,11 +55,18 @@ impl World {
 
     fn run(&self, args: &[&str], body: String) -> Run {
         let no_tools = TempDir::new("oc-path");
+        // opencode's config and cache dirs follow `XDG_*_HOME` before `HOME` (a CI runner sets
+        // them): pin them inside the fake home. `with_env` comes later and wins.
         let mut inv = Invocation::new(args)
             .plugin_data(self.data.path())
             .home(self.home.path())
             .cwd(self.proj.path())
             .env("PATH", no_tools.path().to_str().unwrap())
+            .env(
+                "XDG_CONFIG_HOME",
+                self.home.join(".config").to_str().unwrap(),
+            )
+            .env("XDG_CACHE_HOME", self.home.join(".cache").to_str().unwrap())
             .stdin(body);
         for (k, v) in &self.env {
             inv = inv.env(k, v);
@@ -255,10 +262,6 @@ fn writes_into_the_data_dir_deny() {
 }
 
 #[test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "quarantined (#33): the global opencode plugin path gets no opinion on Linux"
-)]
 fn opencode_config_and_plugin_code_are_protected_from_file_tools() {
     let w = World::new("oc-cfg");
     let global = w.home.join(".config/opencode/plugins/safe-ai-skill.js");

@@ -29,11 +29,19 @@ fn node_major() -> Option<u32> {
         .ok()
 }
 
+/// The headless markers `common::Invocation` clears: on a CI runner the real engine would deny
+/// the mainnet deploy as headless, not with opencode's no-ask reason the test expects.
+const HEADLESS_VARS: [&str; 7] = [
+    "SAFE_AI_SKILL_HEADLESS",
+    "KIT_FIREWALL_HEADLESS",
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITLAB_CI",
+    "BUILDKITE",
+    "JENKINS_URL",
+];
+
 #[test]
-#[cfg_attr(
-    any(target_os = "macos", target_os = "linux"),
-    ignore = "quarantined (#33): the real-engine subtest gets a wrong verdict on macOS and Linux"
-)]
 fn plugin_fails_closed_under_node() {
     match node_major() {
         Some(major) if major >= 22 => {}
@@ -50,8 +58,8 @@ fn plugin_fails_closed_under_node() {
     }
     let home = TempDir::new("oc-plugin-home");
     let tmp = TempDir::new("oc-plugin-tmp");
-    let out = Command::new("node")
-        .arg("--test")
+    let mut cmd = Command::new("node");
+    cmd.arg("--test")
         .arg("--test-reporter=tap")
         .arg(TESTS)
         .env("HOME", home.path())
@@ -62,9 +70,11 @@ fn plugin_fails_closed_under_node() {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("OPENCODE_CONFIG")
         .env_remove("OPENCODE_CONFIG_DIR")
-        .env_remove("OPENCODE_CONFIG_CONTENT")
-        .output()
-        .expect("run node --test");
+        .env_remove("OPENCODE_CONFIG_CONTENT");
+    for var in HEADLESS_VARS {
+        cmd.env_remove(var);
+    }
+    let out = cmd.output().expect("run node --test");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success(),
