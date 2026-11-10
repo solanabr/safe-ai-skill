@@ -26,7 +26,7 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 #   SAFE_AI_SKILL_BIN_DIR=/usr/local/bin sh install.sh
-#   SAFE_AI_SKILL_VERSION=1.3.1 sh install.sh
+#   SAFE_AI_SKILL_VERSION=1.3.2 sh install.sh
 #   curl -fsSL …/install.sh | SAFE_AI_SKILL_PLUGIN=0 sh     # CLI only, no hooks
 
 set -eu
@@ -36,7 +36,7 @@ REPO="solanabr/safe-ai-skill"
 MARKETPLACE_URL="https://github.com/${REPO}.git"
 PLUGIN_ID="safe-ai-skill@safe-ai-skill"
 # Default version — scripts/check-versions.sh keeps it equal to every manifest.
-VERSION="${SAFE_AI_SKILL_VERSION:-1.3.1}"
+VERSION="${SAFE_AI_SKILL_VERSION:-1.3.2}"
 TAG="v${VERSION}"
 RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 BIN_DIR="${SAFE_AI_SKILL_BIN_DIR:-${HOME}/.local/bin}"

@@ -1,6 +1,6 @@
 # Firewall tiers
 
-safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#security-model-and-limitations) applies at every tier. This page describes the 1.3.1 behaviour; the [CHANGELOG](../CHANGELOG.md) lists what changed in each release.
+safe-ai-skill takes a **tier** as an input and varies its gates with it. The tier is a posture, not a sandbox: the plugin is hook-level string analysis, and [what it cannot protect on its own](../README.md#security-model-and-limitations) applies at every tier. This page describes the 1.3.2 behaviour; the [CHANGELOG](../CHANGELOG.md) lists what changed in each release.
 
 ## Who owns what
 
