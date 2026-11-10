@@ -26,6 +26,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - Every `<(` on the line is checked, not only the first.
 - **The ask for shell code nested past the parser's depth limit says so.** It reused the "names a solana-family program" reason even when nothing on the line named one.
 
+### Documentation
+
+- `docs/tiers.md`:
+  - The settings manager's wallet rule. Below High the default wallet is never in `denyRead`. At High the `~/` read fence covers it, as in solana-ai-kit, so signing has to run outside the sandbox.
+  - The shared lists, which solana-ai-kit does not vendor yet.
+
 ## [1.3.2] — 2026-11-10
 
 ### Security
