@@ -384,7 +384,7 @@ A **hard-guard** call is a deny, or an ask no grant may relax. A grantable ask i
 | `auto`, `acceptEdits` or `bypassPermissions`, and a gate only asks | left to you: Claude Code still shows a hook-forced prompt in these modes |
 | `default`, `manual` or `plan` | left to you, with a one-line `systemMessage` warning |
 
-The hook **never allows**, so it cannot weaken a verdict, and a call with no hard-guard class gets no output. Each deny it issues is written to the audit log with the class `permission_request`. The verdict does not depend on the tier beyond what the PreToolUse gates decide.
+The hook **never allows**, so it cannot weaken a verdict, and a call with no hard-guard class gets no output. Like the PreToolUse gates it answers within 8 s: past that, or if it crashes, the call is treated as a hard-guard ask (the table above), or gets the deny it had already reached. Each deny it issues is written to the audit log with the class `permission_request`. The verdict does not depend on the tier beyond what the PreToolUse gates decide.
 
 A `Bash` call goes through the same list of command gates as `gate-bash-secrets` (`gates/shellcmd.rs`), the container and key-file checks included. If the engine crashes, its binary fails the hash check or `SAFE_AI_SKILL_STRICT=1` is set, the shim answers with a `PermissionRequest` deny (that event ignores exit 2); if the engine cannot run on the platform it prints nothing and Claude Code shows its own prompt.
 

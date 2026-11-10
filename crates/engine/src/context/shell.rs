@@ -846,25 +846,33 @@ pub fn base_name(word: &str) -> String {
     }
 }
 
-/// Parse `script` into `out` at nesting `depth`; `indirect` marks every command found.
-fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) {
+/// Parse `script` into `out` at nesting `depth`; `indirect` marks every command found. Returns
+/// what the script writes to its standard output when it is a lone command whose output the
+/// parser can resolve (`echo 'cat .env'` → `cat .env`, `cat <<< '…'`); `None` for anything
+/// else, as a pipeline's output is its last stage's and a nested command may write too.
+fn parse_into(script: &str, depth: usize, indirect: bool, out: &mut Parsed) -> Option<String> {
     if depth > MAX_DEPTH {
         // Past the depth limit the deepest commands go unread: mark the parse unreadable and
         // record that the cause is excessive nesting, so the gate can ask even when nothing
         // family-shaped is visible above the cut.
         out.unparseable = true;
         out.too_deep = true;
-        return;
+        return None;
     }
+    let before = out.commands.len();
     let mut lx = Lexer {
         chars: script.chars().collect(),
         i: 0,
         depth,
         line_writes: false,
         compound_seen: false,
+        finished: 0,
+        emitted: None,
         out,
     };
     lx.run(indirect);
+    let emitted = lx.emitted.take().filter(|_| lx.finished == 1);
+    emitted.filter(|_| out.commands.len() == before + 1)
 }
 
 /// A here-document waiting for its body.
@@ -899,6 +907,9 @@ struct Pending {
     upstream: String,
     /// The text emitters upstream in its pipeline write to it (`printf '…' | tee x.sh`).
     upstream_emits: String,
+    /// The output of each process substitution among its words that [`parse_into`] resolved
+    /// (`<(echo 'cat .env')` → `cat .env`): the code a shell or `source` reading it runs.
+    procsubs: Vec<(String, String)>,
 }
 
 struct Lexer<'p> {
@@ -910,6 +921,11 @@ struct Lexer<'p> {
     /// A compound command (`for`, `case`, `while`, …) or a `case` pattern was seen at this
     /// level: later commands sit inside it, where the hook's `if` filters may not look.
     compound_seen: bool,
+    /// Commands with words finished at this level.
+    finished: usize,
+    /// What the last command recorded at this level writes to its standard output, when the
+    /// parser resolves it ([`emitted_text`]).
+    emitted: Option<String>,
     out: &'p mut Parsed,
 }
 
@@ -945,7 +961,9 @@ impl Lexer<'_> {
                     for doc in heredocs.drain(..) {
                         let body = self.read_heredoc_body(&doc);
                         match line_reads {
-                            Reads::Shell => parse_into(&body, self.depth + 1, true, self.out),
+                            Reads::Shell => {
+                                parse_into(&body, self.depth + 1, true, self.out);
+                            }
                             // Interpreter code the parser cannot read.
                             Reads::Interpreter => {
                                 opaque(self.out, &body);
@@ -1021,7 +1039,9 @@ impl Lexer<'_> {
                         continue;
                     }
                     match self.matching_paren() {
-                        Some(body) => parse_into(&body, self.depth + 1, true, self.out),
+                        Some(body) => {
+                            parse_into(&body, self.depth + 1, true, self.out);
+                        }
                         None => {
                             self.out.unparseable = true;
                             return;
@@ -1097,7 +1117,16 @@ impl Lexer<'_> {
                     "for" | "select" | "while" | "until" | "if" | "case" | "function" | "repeat"
                 )
         });
-        finish_command(pending, indirect, self.depth, self.out)
+        self.finished += 1;
+        let herestrings = pending.herestrings.clone();
+        let before = self.out.commands.len();
+        let reads = finish_command(pending, indirect, self.depth, self.out);
+        // The command it recorded is the last one (anything nested in it comes first).
+        if let Some(cmd) = self.out.commands.get(before..).and_then(<[_]>::last) {
+            let args = cmd.words.get(1..).unwrap_or_default();
+            self.emitted = emitted_text(&cmd.program(), args, &herestrings);
+        }
+        reads
     }
 
     /// Spaces, tabs and line continuations.
@@ -1132,9 +1161,12 @@ impl Lexer<'_> {
             match self.matching_paren() {
                 Some(body) => {
                     self.out.substitution = true;
-                    parse_into(&body, self.depth + 1, true, self.out);
+                    let text = format!("{first}({body})");
+                    if let Some(code) = parse_into(&body, self.depth + 1, true, self.out) {
+                        cmd.procsubs.push((text.clone(), code));
+                    }
                     cmd.words.push(Word {
-                        text: format!("{first}({body})"),
+                        text,
                         dynamic: true,
                         ..Word::default()
                     });
@@ -1332,6 +1364,8 @@ impl Lexer<'_> {
             depth: self.depth,
             line_writes: false,
             compound_seen: false,
+            finished: 0,
+            emitted: None,
             out: &mut *self.out,
         };
         let mut sink = Word::default();
@@ -1665,6 +1699,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
         after_pipe,
         upstream,
         upstream_emits,
+        procsubs,
     } = pending;
     let mut indirect = indirect || after_pipe;
     let canonical_head = words
@@ -1825,11 +1860,9 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                 opaque(out, &word.text);
                 // `source <(echo 'cat .env')` / `. <(printf …)`: the current shell runs the
                 // producer's output as code. A `$(…)`/`$VAR` resolving to a filename is a
-                // normal file source (the runtime path), not a producer — `procsub_emits`
+                // normal file source (the runtime path), not a producer — `procsub_code`
                 // returns `None` and nothing is recorded.
-                if depth < MAX_DEPTH {
-                    runs_producer(out, procsub_emits(&word.text));
-                }
+                runs_producer(out, procsub_code(&procsubs, &word.text));
             }
             // `… | source /dev/stdin`: the pipeline's output is the sourced script.
             if piped_in && args.iter().any(|w| is_stdin_path(&w.text)) {
@@ -1857,7 +1890,9 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
             };
             match shell_script(args) {
                 ShellInput::Script(script) if script.dynamic => opaque(out, &script.text),
-                ShellInput::Script(script) => parse_into(&script.text, depth + 1, true, out),
+                ShellInput::Script(script) => {
+                    parse_into(&script.text, depth + 1, true, out);
+                }
                 ShellInput::File(file) if is_stdin_path(&file.text) => {
                     reads = Reads::Shell;
                     executes(out);
@@ -1872,9 +1907,7 @@ fn finish_command(pending: Pending, indirect: bool, depth: usize, out: &mut Pars
                     if file.dynamic {
                         opaque(out, &file.text);
                         // `bash <(echo 'cat .env')`: the process substitution is the script.
-                        if depth < MAX_DEPTH {
-                            runs_producer(out, procsub_emits(&file.text));
-                        }
+                        runs_producer(out, procsub_code(&procsubs, &file.text));
                     }
                 }
                 ShellInput::Stdin => {
@@ -1992,31 +2025,16 @@ fn runs_producer(out: &mut Parsed, code: Option<String>) {
     }
 }
 
-/// The shell code a process substitution `<(…)` / `>(…)` feeds its consumer, when the parser
-/// can resolve the producer's output: `<(echo 'cat .env')` → `cat .env`. `None` when the body
-/// is not a lone emitter (`<(curl …)`, a pipeline, a compound) — its output is not computable,
-/// and a read in the body (`<(cat .env)`) is already a listed indirect command.
-fn procsub_emits(word: &str) -> Option<String> {
-    let body = word
-        .strip_prefix("<(")
-        .or_else(|| word.strip_prefix(">("))?
-        .strip_suffix(')')?;
-    produced_code(body)
-}
-
-/// The emitted text of a lone producer command (`echo "cat .env"` → `cat .env`), or `None` for
-/// anything the parser cannot resolve to literal output (a pipeline, a reader like `cat FILE`,
-/// a command naming no emitter).
-fn produced_code(body: &str) -> Option<String> {
-    let parsed = parse_uncached(body);
-    // Only a single, direct producer: a pipeline's output is the last stage, not the first, so
-    // resolving the first word would be wrong — leave it unresolved.
-    let [cmd] = parsed.commands.as_slice() else {
-        return None;
-    };
-    let program = cmd.program();
-    let args: Vec<Word> = cmd.words.iter().skip(1).cloned().collect();
-    emitted_text(&program, &args, &[])
+/// The shell code a process substitution word (`<(…)` / `>(…)`) feeds its consumer, as the
+/// parse of its body resolved it ([`Pending::procsubs`]): `<(echo 'cat .env')` → `cat .env`.
+/// `None` when the body is not a lone emitter (`<(curl …)`, a pipeline, a compound): its output
+/// is not computable, and a read in the body (`<(cat .env)`) is already a listed indirect
+/// command.
+fn procsub_code(procsubs: &[(String, String)], word: &str) -> Option<String> {
+    procsubs
+        .iter()
+        .find(|(text, _)| text == word)
+        .map(|(_, code)| code.clone())
 }
 
 /// Whether an interpreter without `-c`/`-e` code reads its program from stdin: no script
@@ -2620,6 +2638,32 @@ mod tests {
                 parse(command).opaque_shell_scripts
             );
         }
+    }
+
+    #[test]
+    fn a_process_substitutions_output_comes_from_its_one_parse() {
+        // The code a body feeds a shell or `source` is read from the parse the body gets where
+        // it stands, a here-string `cat` included.
+        for command in [
+            "bash <(cat <<< 'cat .env')",
+            "source <(cat <<< \"cat .env\")",
+        ] {
+            assert_eq!(
+                parse(command).opaque_shell_scripts,
+                ["cat .env"],
+                "{command}"
+            );
+        }
+        // Nesting costs work in proportion to its length: each body is parsed once.
+        let mut command = "echo x".to_string();
+        for _ in 0..20 {
+            command = format!("bash <({command})");
+        }
+        let started = std::time::Instant::now();
+        let p = parse(&command);
+        let took = started.elapsed();
+        assert!(p.too_deep);
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     #[test]
