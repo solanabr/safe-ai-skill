@@ -14,8 +14,9 @@ use crate::{bip39, redact};
 /// Inspect a user prompt for raw secrets.
 ///
 /// Returns `Some(reason)` to block the prompt when it contains a Solana keypair byte
-/// array, a 64-byte base58 secret key, or a BIP-39 seed phrase. Returns `None` for a
-/// clean prompt. The reason names the detected class but never echoes the secret.
+/// array, a base58 key ([`redact::has_base58_key`]: a keypair, or a 64-byte value after a key
+/// name), or a BIP-39 seed phrase. Returns `None` for a clean prompt. The reason names the
+/// detected class but never echoes the secret.
 pub fn check(prompt: &str) -> Option<String> {
     if redact::find_keypair_array(prompt).is_some() {
         return Some(
@@ -42,23 +43,18 @@ pub fn check(prompt: &str) -> Option<String> {
         );
     }
 
-    // Scan base58 token runs for a 64-byte secret key (skip ordinary 32-byte pubkeys).
-    for token in prompt.split(|c: char| !is_base58_char(c)) {
-        if redact::is_base58_secret_key(token) {
-            return Some(
-                "Prompt blocked: it contains a raw 64-byte base58 private key. The secret \
-                 was kept out of the model context — paste a public key or file path instead."
-                    .to_string(),
-            );
-        }
+    // A base58 keypair, or a 64-byte value after a key name. Ordinary 32-byte pubkeys are too
+    // short, and a transaction signature (64 bytes, but not seed ‖ public key) is what
+    // `/debug-user-tx` takes.
+    if redact::has_base58_key(prompt) {
+        return Some(
+            "Prompt blocked: it contains a raw 64-byte base58 private key. The secret \
+             was kept out of the model context — paste a public key or file path instead."
+                .to_string(),
+        );
     }
 
     None
-}
-
-#[inline]
-fn is_base58_char(c: char) -> bool {
-    matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
 }
 
 #[cfg(test)]
@@ -127,9 +123,16 @@ mod tests {
 
     #[test]
     fn base58_secret_key_blocks() {
-        let secret = bs58::encode(vec![9u8; 64]).into_string();
+        let secret = redact::test_keypair_b58([9u8; 32]);
         let prompt = format!("use private key {secret}");
         assert!(check(&prompt).is_some());
+    }
+
+    #[test]
+    fn transaction_signature_allows() {
+        let signature = redact::test_signature_b58([9u8; 32]);
+        assert_eq!(check(&format!("/debug-user-tx {signature}")), None);
+        assert_eq!(check(&format!("why did {signature} fail?")), None);
     }
 
     #[test]
