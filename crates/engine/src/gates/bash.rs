@@ -1207,7 +1207,7 @@ fn classify_solana(argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, Ga
             Ok(action) => ask_not_readonly("solana", &format!("config {action}")),
             Err(verdict) => verdict,
         },
-        "close" => destructive_decision("solana", ctx, true),
+        "close" => account_close_decision("solana", ctx),
         "program-v4" => match word_or_ask(argv, 1, "solana") {
             Ok(action) if action == "deploy" => deploy_decision("solana", ctx, argv),
             Ok(_) => ask_unknown("solana"),
@@ -1281,7 +1281,9 @@ fn classify_spl_token(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision
             "authority removal (--disable)",
         ),
         "authorize" | "approve" => authority_decision("spl-token", &sub, ctx, argv),
-        "burn" => destructive_decision("spl-token", ctx, false),
+        // `burn` is Class U, decided before this (shared list); a hard guard here too in case
+        // the list row goes.
+        "burn" => irreversible_decision("spl-token", ctx, argv, Scope::Destructive, "token burn"),
         "close" => irreversible_decision(
             "spl-token",
             ctx,
@@ -1293,7 +1295,7 @@ fn classify_spl_token(argv: &Argv, ctx: &Context, _policy: &Policy) -> (Decision
             irreversible_decision("spl-token", ctx, argv, Scope::Destructive, "mint close")
         }
         // `gc` closes empty token accounts.
-        "gc" => destructive_decision("spl-token", ctx, true),
+        "gc" => account_close_decision("spl-token", ctx),
         s if is_spl_readonly(s) => readonly("spl-token"),
         _ => ask_unknown("spl-token"),
     }
@@ -1563,16 +1565,11 @@ fn withdraw_decision(sub: &str, ctx: &Context) -> (Decision, GateMeta) {
     )
 }
 
-/// Build a destructive (burn/close) decision. Account closes are hard guards.
-fn destructive_decision(program: &str, ctx: &Context, account_close: bool) -> (Decision, GateMeta) {
-    let mut meta = GateMeta::new(Scope::Destructive, account_close);
+/// Build an account-close decision: a hard guard, so no grant relaxes it.
+fn account_close_decision(program: &str, ctx: &Context) -> (Decision, GateMeta) {
+    let mut meta = GateMeta::new(Scope::Destructive, true);
     meta.program = Some(program.to_string());
 
-    let what = if account_close {
-        "Account close"
-    } else {
-        "Token burn"
-    };
     let net = if matches!(ctx.network, Network::Mainnet) {
         "mainnet "
     } else {
@@ -1580,7 +1577,7 @@ fn destructive_decision(program: &str, ctx: &Context, account_close: bool) -> (D
     };
     (
         Decision::Ask {
-            reason: format!("{what} ({net}destructive) — approve to proceed"),
+            reason: format!("Account close ({net}destructive) — approve to proceed"),
         },
         meta,
     )
@@ -1993,10 +1990,13 @@ mod tests {
     #[test]
     fn solana_close_asks_hard_guard() {
         let ctx = ctx_with(Network::Devnet, "close");
-        let (d, meta) = decide(&format!("solana close {DEST}"), &ctx, &policy());
-        assert!(matches!(d, Decision::Ask { .. }), "{d:?}");
-        assert!(meta.hard_guard, "account_close is a hard guard");
-        assert_eq!(meta.scope, Scope::Destructive);
+        for cmd in [format!("solana close {DEST}"), "spl-token gc".to_string()] {
+            let (d, meta) = decide(&cmd, &ctx, &policy());
+            assert!(matches!(d, Decision::Ask { .. }), "{cmd}: {d:?}");
+            assert!(d.reason().starts_with("Account close"), "{cmd}: {d:?}");
+            assert!(meta.hard_guard, "{cmd}: an account close is a hard guard");
+            assert_eq!(meta.scope, Scope::Destructive, "{cmd}");
+        }
     }
 
     #[test]
@@ -2010,6 +2010,25 @@ mod tests {
         let ctx = ctx_with(Network::Mainnet, "burn_main");
         let (d, _) = decide(&format!("spl-token burn {DEST} 100"), &ctx, &policy());
         assert!(matches!(d, Decision::Deny { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn spl_burn_is_a_hard_guard_without_its_list_row() {
+        // The classifier behind the shared list: should the `spl-token burn` row go, a burn is
+        // still an ask no grant relaxes, on every cluster.
+        let parsed = shell::parse(&format!("spl-token burn {DEST} 100"));
+        let argv = Argv::from_shell(&parsed.commands[0].words);
+        for network in [Network::Devnet, Network::Mainnet, Network::Unknown] {
+            let ctx = ctx_with(network, "burn_fallback");
+            let (d, meta) = classify("spl-token", &argv, &ctx, &policy());
+            assert!(
+                d.reason().starts_with("Irreversible ") && d.reason().contains("token burn"),
+                "{network:?}: {d:?}"
+            );
+            assert!(matches!(d, Decision::Ask { .. }), "{network:?}: {d:?}");
+            assert!(meta.hard_guard, "{network:?}");
+            assert_eq!(meta.scope, Scope::Destructive);
+        }
     }
 
     #[test]

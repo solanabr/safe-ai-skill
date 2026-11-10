@@ -125,7 +125,7 @@ async function main() {
   if (!plat) {
     console.error(
       `safe-ai-skill: unsupported platform ${process.platform}/${process.arch}.\n` +
-      `Install cargo and run: cargo install safe-ai-skill`
+      `Install cargo and run: cargo install safe-ai-skill --version ${PKG_VERSION} --locked`
     );
     process.exit(1);
   }
@@ -154,7 +154,7 @@ async function main() {
         `  • Check your internet connection.\n` +
         `  • Verify that release ${RELEASE_TAG} exists at\n` +
         `    https://github.com/${GITHUB_REPO}/releases\n` +
-        `  • As a fallback, install via cargo: cargo install safe-ai-skill\n`
+        `  • As a fallback, install via cargo: cargo install safe-ai-skill --version ${PKG_VERSION} --locked\n`
       );
       process.exit(1);
     }
@@ -178,7 +178,7 @@ async function main() {
         `  Got:      ${actualHex}\n\n` +
         `The downloaded binary did not match the published checksum. This may\n` +
         `indicate a network issue, a tampered artifact, or an out-of-date release.\n` +
-        `Do NOT use this binary. Re-run the install or use: cargo install safe-ai-skill`
+        `Do NOT use this binary. Re-run the install or use: cargo install safe-ai-skill --version ${PKG_VERSION} --locked`
       );
       process.exit(1);
     }

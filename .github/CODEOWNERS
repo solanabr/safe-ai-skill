@@ -8,5 +8,7 @@
 /policy/shared/exfil-hosts.list      @kauenet
 /policy/shared/onchain-verbs.list    @kauenet
 /policy/shared/MANIFEST              @kauenet
+# The engine crate's embedded copy (byte-identical to policy/shared; check-shared-lists.sh).
+/crates/engine/policy/shared/        @kauenet
 /scripts/shared-manifest.sh          @kauenet
 /scripts/check-shared-lists.sh       @kauenet

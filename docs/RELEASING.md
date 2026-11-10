@@ -27,6 +27,9 @@ commit, pushes the tags and merges.
 - **Tag ruleset** for `v*` and `safe-ai-skill--v*`: only maintainers can create them, and nobody
   can update or delete them. A published tag never moves.
 - **Immutable releases** turned on, so release assets can't be swapped after publishing.
+- **crates.io token** for step 7: an API token from an owner of the `safe-ai-skill` crate
+  (`cargo owner --list safe-ai-skill`), scoped to publish-update for that crate, used with
+  `cargo login`.
 - **`RELEASE_PAT`** secret (optional): a fine-grained token with contents write whose owner may
   push to `release/v*`. A push made with `GITHUB_TOKEN` doesn't trigger CI, so without it CI first
   runs on the vendor commit when you open the PR to `main` (step 5).
@@ -82,9 +85,25 @@ commit, pushes the tags and merges.
    commit**. Squash or rebase would give the tagged commit a new SHA, so `main` wouldn't contain
    it. This is the first time `main` sees the new version, and it gets the source and the
    binaries together.
-6. **Publish to npm** once the GitHub Release exists, because `postinstall` downloads from it:
-   `cd npm && npm publish`.
-7. **Downstream:** solana-ai-kit re-pins its `stbr` entry to the tagged commit in its own PR and
+6. **Publish to npm** from the tagged commit, once the GitHub Release exists, because
+   `postinstall` downloads from it: `git switch --detach vX.Y.Z && cd npm && npm publish`. The
+   package's README and fallback messages are the ones at the tag.
+7. **Publish to crates.io** from the tagged commit, also once the GitHub Release exists. The
+   fallbacks in `install.sh` and the npm wrapper tell users to run
+   `cargo install safe-ai-skill --version X.Y.Z --locked`, so every release is published. On a
+   clean checkout of the tag (cargo refuses a dirty tree), dry-run first; it builds the packaged
+   crate on its own, as CI's `cargo package` step does:
+
+   ```sh
+   git switch --detach vX.Y.Z
+   cd crates/engine
+   cargo publish --dry-run --locked
+   cargo publish --locked
+   ```
+
+   A published version can't be replaced or deleted, only yanked (`cargo yank --version X.Y.Z`),
+   so a bad publish is fixed with a new patch release.
+8. **Downstream:** solana-ai-kit re-pins its `stbr` entry to the tagged commit in its own PR and
    release.
 
 `claude plugin tag --dry-run plugins/safe-ai-skill` (on a clean checkout of the vendor commit)

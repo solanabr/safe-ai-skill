@@ -33,7 +33,8 @@ unix. No tokio, no async. A new dependency needs review (binary size, supply cha
 
 - **Gate purity.** Gates return a decision (+ metadata); they do NOT read stdin, load policy,
   audit, emit, or apply relaxation. `main.rs` owns all of that.
-- **Subcommands** are registered in `main.rs`'s `SUBCOMMANDS` table; the PreToolUse gates run
+- **Subcommands** are registered in `main.rs`'s `SUBCOMMANDS` table, each with an entry in
+  `help.rs` (a unit test checks both ways); the PreToolUse gates run
   under `DEADLINE_GATES` (8 s, `ask` past it) and `PANIC_ASK_GATES` (a panic writes a hard-guard
   `ask` before the abort).
 - **State** goes through `statefile` (authenticated envelopes) in the data dir `datadir`
@@ -164,7 +165,7 @@ passwd home and not inside the project or hook cwd (see `datadir` docs). Hooks r
 | `grants.json` | `grants` | scoped grants (authenticated; created only by a confirmed prompt nonce) |
 | `tier.json` | `tierstate` | user-scope tier `{global?, projects[root]}` with optional `env_read` (authenticated; a lowering or an `env_read` loosening needs a confirmed nonce). Replaces the pre-tier `mode.json`, which `migrate` converts once |
 | `sessions.json` | `session` | session-key metadata and the active-session pointer (authenticated) |
-| `lockfile.json` | `verify::lockfile` | v1 name-keyed pins; read for the state-v2 carry-over, still written by `add`/`install` |
+| `lockfile.json` | `verify::lockfile` | v1 name-keyed pins; read for the state-v2 carry-over, still written by `install` (`add` writes no pin) |
 | `state.json` | `verify::state` | state v2: per-pack pin, grade, findings, names, fingerprint (authenticated) |
 | `trust.json` | `verify::trust` | user trust by content hash (authenticated) |
 | `quarantine/<name>` | 1.0.0 `verify` (legacy) | skill dirs 1.0.0 moved; 1.0.1+ never writes here. `verify approve <name>` restores one, `verify session` lists leftovers |
@@ -188,12 +189,12 @@ The firewall takes a tier as an **input**; solana-ai-kit owns the sandbox, permi
 | `tierstate.rs` | The authenticated `tier.json` v1 under the statefile MAC and generation index; the writer behind `safe-ai-skill tier`. A raise applies at once; a lowering or an `env_read` loosening (`deny` < `tier`; a stored 1.1.0 `ask` loads as `tier` and is rewritten at SessionStart) becomes a `confirm::PendingKind::Tier` request. `mode.rs` stays as a deprecated alias. |
 | `sandbox.rs` | `state(root) -> {On, Off, Unknown}` from the first `sandbox.enabled` in managed, project-local, project, then user settings (passwd home, never env `HOME`; `$CLAUDE_CONFIG_DIR`). `On` also needs macOS or Linux with `bwrap` on a fixed path, never native Windows. Declared configuration, not a runtime proof. A test override exists only under `test-hooks`. |
 | `headless.rs` | `is_headless(env)`: any of `SAFE_AI_SKILL_HEADLESS`/`KIT_FIREWALL_HEADLESS` (`1`/`true`) or a CI variable not `0`/`false`. The shared rule's `/dev/tty` signal is not wired (hook processes never have a terminal, so it would deny every interactive ask). Any signal turns it on, nothing turns it off. `main.rs` post-processes every PreToolUse verdict: `ask` becomes `deny`; a grant confirmed earlier still allows below High. |
-| `lists.rs` | Parses the embedded `policy/shared/{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!`, `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
+| `lists.rs` | Parses the embedded `{credentials,exfil-hosts,onchain-verbs}.list` (`include_str!` from the crate's own copy in `crates/engine/policy/shared/`, so the published crate builds on its own; `scripts/check-shared-lists.sh` keeps it byte-identical to the canonical `policy/shared/`, and `tests/lists_shared.rs` pins the embedded bytes to the root files; `OnceLock`) and checks `MANIFEST` counts and sha256. Accessors for credentials, exfil hosts per tier, `irreversible()` and `recoverable()`. A parse failure is `ListsUnavailable`: the dependent gates answer a hard-guard `ask`. User or repo `secrets.exfil_hosts_extra` and `secrets.key_material_extra_globs` union in; nothing removes an entry. |
 | `gates/credpaths.rs`, `gates/creddump.rs` | Credential path classification and directory-Grep exclusion globs from `credentials.list`; the command-form readers (`gh auth token`, `git credential fill`, `security … -w`, `op read`, …) and any Bash word or `NAME=` prefix value naming a store (metadata-only programs excepted; an `ssh`/`scp`/`sftp` identity and `ssh-keygen -y -f` exempt). Deny at every tier. |
 | `gates/envread.rs`, `gates/envwrite.rs` | Project env files (`.env`/`.env.*` inside the project root, by name and resolved path) by tier, as solana-ai-kit: raw reads `(tier, env_read, project)` open at Off/Relaxed/Medium and denied at High (`env_read: deny` denies at every tier; other env files always deny); writes (Write/Edit/MultiEdit, agent `env set\|unset`, the Bash writes `creddump` recognises) denied at Medium (other env files Medium and High). A command line that reads an env file and runs a network program or network code denies at every tier. |
 | `gates/wallet.rs`, `gates/bash.rs` | Default-wallet destruction (deny at every tier); irreversible actions (Class U in docs/tiers.md; `irreversible` rows: deny on mainnet or Unknown, hard-guard ask on identified localnet/devnet/testnet, never grantable; `class_u` in `bash.rs`) and `spl-token transfer` amounts (token units, no opinion on identified devnet/testnet/localnet, ask elsewhere) and value-moving actions (Class C; caps, grants, mainnet/Unknown ask, High deny). A line joining two or more gated actions, or any hard-guard ask, is never grantable; a command over 256 KiB or with more than 2048 expansions asks unparsed. |
 | `gates/exfil.rs` | The exfil tripwire (#19): `decide_bash` (called from `gate-bash-secrets`), `decide_mcp` (`gate-mcp`) and `decide_webfetch` (`gate-webfetch`). Host list per tier from `exfil-hosts.list`, secret-shaped data and blobs to non-developer hosts, `git push` to a same-line remote, browser scripts. Secret uploads by path are denied by `gates/secrets.rs`; an env read beside a network command by `gates/creddump.rs` (`envread::to_network`). |
-| `gates/tamper.rs` | The self-grant tripwire (protected paths: `decide_bash`, `decide_file`, `decide_nested_claude`) and the content-aware checks (`decide_file_content`, `decide_bash_writes`): settings, hooks, git config, `.mcp.json`, lifecycle scripts, kit tier. `gate-tamper` covers Write/Edit/MultiEdit/NotebookEdit; `gate-bash-secrets` the Bash forms. |
+| `gates/tamper.rs` | The self-grant tripwire (protected paths: `decide_bash`, `decide_file`, `decide_nested_claude`) and the content-aware checks (`decide_file_content`, `decide_bash_writes`): settings, hooks, git config, `.mcp.json`, lifecycle scripts, kit tier. `gate-tamper` covers Write/Edit/MultiEdit/NotebookEdit; `gate-bash-secrets` the Bash forms. A word naming the plugin's installed binary or dir counts as the binary being run only when it is the program of a simple command (after the assignments and wrappers the shell parser strips) with one of its subcommands first (`binary_runs`, `SUBCOMMANDS`; the user-only and hook subcommands are denied before that); each such run excuses one reference to the same word, and every other reference gets the plugin directory's protection. |
 | `gates/fetchexec.rs` | Download-and-run (`decide`): a download then run, a downloaded script piped to an interpreter, undeclared one-shot runners, `cargo install --git` outside the allowlist, mainnet Node scripts. Called from `gate-bash-secrets`. |
 | `gates/shellcmd.rs` | The one list of gates a shell command text goes through, shared by `gate-bash-secrets` (`tier_verdict`), `gate-bash` (`encoded_verdict`), `PermissionRequest` (`flat_verdict`, its caller walks nested commands) and the MCP command runners (`mcpexec`, `tier_verdict`). `inner_verdict` judges a text found inside another (a decoded payload, a `git submodule foreach` or `rebase --exec` string) through `bash::decide`, `secrets::decide` and the whole list; `strictest` picks the verdict (deny over ask, the later on a tie). A gate added to the list reaches every entry. |
 | `gates/encoded.rs` | Encoded payloads: `expand` returns decoded texts (depth 3, 64 KiB), including payloads that reach a shell behind a wrapper, `source`, a process substitution, a command word or a subshell or group, and `decide` asks on an undecodable one. `shellcmd::encoded_verdict` runs each decoded text through `shellcmd::inner_verdict` and takes the strictest verdict. |
@@ -553,8 +554,9 @@ pub struct grants::Grant { pub id, pub scope: Scope, pub programs, pub to, pub m
                            pub spent_sol, pub expires_at: u64, pub danger: bool }
 pub struct grants::Grants { pub grants: Vec<Grant> }
 pub struct grants::GrantRequest { pub scope, pub for_secs, pub max_tx_sol, pub budget_sol, pub programs, pub to, pub danger }
-pub const grants::GRANTABLE_SCOPES: [Scope; 5];   // transfer swap deploy authority destructive
-pub fn grants::grantable_scope(label: &str) -> Result<Scope, String>;   // `other`/unknown → Err
+pub const grants::GRANTABLE_SCOPES: [Scope; 3];   // transfer swap deploy
+pub fn grants::grantable_scope(label: &str) -> Result<Scope, String>;   // `other`/unknown → Err; authority, destructive, secret_read → Err naming the hard guard
+pub fn grants::Grant::is_inert(&self) -> bool;     // scope outside GRANTABLE_SCOPES (a 1.3.0 authority/destructive grant): never matches
 pub fn grants::load(dir: &DataDir) -> Loaded<Grants>;
 pub fn grants::live(dir: &DataDir) -> Grants;       // Valid AND dir.trusted, else empty
 pub fn grants::save(dir: &DataDir, grants: &Grants) -> Result<(), EngineError>;
@@ -612,7 +614,22 @@ pub fn verify::run_session(dir: &DataDir, project_dir: &Path, policy: &Policy) -
 pub fn verify::request_approve(dir, cwd, target, policy) -> Result<PendingRequest, EngineError>; // id only
 pub fn verify::request_trust(dir, path) -> Result<PendingRequest, EngineError>;
 pub fn verify::apply_confirmed(dir: &DataDir, c: &confirm::Confirmed) -> Result<String, EngineError>;
+
+// `add` (a remote source; a local directory goes through check::check_dir)
+pub enum verify::AddKind { Skill, Mcp, Repo }
+pub struct verify::InstallCommand { pub run: Option<String>, pub pinned: bool, pub note: Option<String> }
+pub fn verify::pipeline_add(kind: AddKind, source: &str, online: bool) -> (provenance::Resolved, Report, InstallCommand);
+pub fn verify::install_command(kind: AddKind, resolved: &provenance::Resolved, source: &str) -> InstallCommand; // pure
+pub enum verify::provenance::SourceKind { GitHub, Npm, Local, Other }
+pub fn verify::provenance::classify_source(source: &str) -> SourceKind;   // by structure: exact host, shorthand, npm name
+pub fn verify::provenance::identity(source: &str) -> Option<String>;      // npm:<name> | github:<owner>/<repo> | other:<source>, lowercased; None for a local path
+pub fn verify::provenance::pin_github(r: &mut Resolved) -> bool;          // moving ref → commit (api.github.com)
+pub fn verify::provenance::pin_npm(r: &mut Resolved) -> bool;             // no version / dist-tag → exact version (registry)
+pub fn verify::osv::query(pkg: &str, version: &str) -> Report;            // follows next_page_token ≤ 5 pages; unreachable/HTTP error/malformed/unfinished → MEDIUM osv_unavailable
+pub fn verify::osv::skipped(pkg: &str) -> Finding;                        // LOW osv_skipped (--offline)
 ```
+
+Before any of it, `main.rs` (`catalog_match`) matches the source against the project catalog by id, literal source or `provenance::identity`, offline; a high-risk match gates the add, and a catalog id is graded as its entry's source. `pipeline_add` runs the network-free provenance check, then (online) the GitHub or npm lookup, then osv.dev for the exact npm version graded. Only a source the user pinned exactly passes: a resolved moving source keeps its MEDIUM `unpinned_*` finding (the detail names what it resolved to), while `pin` and the pinned `run` let `--yes` install exactly what was graded. An `other` source is a MEDIUM `unrecognised_source`. `install_command`'s skills forms follow `skills@1.7.6`'s `parseSource`: `owner/repo#<sha>[@<skill>]`, or a `tree/<sha>/<path>` URL with `--skill`. The network helpers read a loopback URL from `SAFE_AI_SKILL_TEST_NPM_REGISTRY`, `SAFE_AI_SKILL_TEST_GITHUB_API` and `SAFE_AI_SKILL_TEST_OSV_URL` only in `test-hooks` builds; their tests (`verify::testnet`, `tests/add_cmd.rs`) run against a loopback server.
 
 **`verify session` (state v2).** `run_session` sweeps each root in
 `supply_chain.verify_skills_dirs` (project `.claude/skills`; `~/.claude/skills` only when a
@@ -671,15 +688,20 @@ pub fn session::status(dir: &DataDir) -> error::Result<String>;
 
 `gate-bash` · `gate-bash-secrets` · `gate-read` · `gate-mcp` · `gate-webfetch` · `gate-tamper` · `gate-skill` · `gate-config` ·
 `gate-prompt-expansion` · `gate-permission` · `session-end` · `redact` · `failure-notice` · `prompt-guard` · `pending-notice` ·
-`verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source>` ·
-`install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry verify|list` ·
-`session init [--cap <SOL>]|status` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
-`tier [<name>] [--project] [--env-read deny|tier] | --clear` (`mode` is a deprecated alias) · `firewall apply [<tier>] [--project] [--dry-run] | show | check` · `revoke` · `status` · `--version`. `allow`, a tier lowering and
+`verify session|check|approve|trust` · `env keys|set|unset|init-schema` · `doctor` · `add skill|mcp|repo <source> [--yes] [--force] [--offline]` ·
+`install [--from <dir|tarball>] [--home <dir>] [--yes|--force]` · `registry [verify|list]` ·
+`session [init [--cap <SOL>]|status]` · `allow --scope --for --max-tx --budget --programs --to [--danger]` ·
+`tier [<name>] [--project] [--env-read deny|tier] | --clear` (`mode` is a deprecated alias) · `firewall apply [<tier>] [--project] [--dry-run|-n] | show | check` · `revoke` · `status` · `--version` ·
+`help [<command>]` · `--help` · `-h`. `allow`, a tier lowering and
 `verify approve|trust` only park a pending request (prompt-nonce confirmation) and print its id;
-an argument error exits 1.
+an argument error exits 1 (`add`'s usage errors exit 3; `install`, `registry` and most `verify` errors print a JSON error and exit 0).
 
 Gate subcommands emit the authoritative PreToolUse decision (nothing for no opinion); the rest
 print a JSON result line. Unknown or missing subcommand → empty stdout, stderr message, exit 3.
+`help.rs` holds the help: `--help`, `-h` and `help [<command>]` print the overview or one
+command's usage and exit 0; `<command> --help|-h`, as the first argument after a user command,
+prints that usage before the handler runs, so a help request never performs the action. Hook
+subcommands and `adapt` take no help flag (they read the hook payload); `help <unknown>` exits 3.
 
 **`install` (replaces `bootstrap`; remote tarball path REMOVED).** Hub-agnostic, LOCAL
 source only — there is no hardcoded download URL (the remote `skills.tar.gz` + the

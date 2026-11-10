@@ -20,13 +20,13 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/solanabr/safe-ai-skill/main/install.sh | sh
 #   SAFE_AI_SKILL_BIN_DIR=/usr/local/bin sh install.sh
-#   SAFE_AI_SKILL_VERSION=1.3.0 sh install.sh
+#   SAFE_AI_SKILL_VERSION=1.3.1 sh install.sh
 
 set -eu
 
 REPO="solanabr/safe-ai-skill"
 # Default version — scripts/check-versions.sh keeps it equal to every manifest.
-VERSION="${SAFE_AI_SKILL_VERSION:-1.3.0}"
+VERSION="${SAFE_AI_SKILL_VERSION:-1.3.1}"
 TAG="v${VERSION}"
 RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 BIN_DIR="${SAFE_AI_SKILL_BIN_DIR:-${HOME}/.local/bin}"
@@ -101,7 +101,7 @@ sha256_of() {
 
 # ── main ────────────────────────────────────────────────────────────────────
 
-plat="$(detect_platform)" || fatal "unsupported platform $(uname -s)/$(uname -m). Install via: cargo install safe-ai-skill"
+plat="$(detect_platform)" || fatal "unsupported platform $(uname -s)/$(uname -m). Install via: cargo install safe-ai-skill --version ${VERSION} --locked"
 
 ext=""
 case "${plat}" in windows-*) ext=".exe" ;; esac
@@ -111,7 +111,7 @@ trap 'rm -rf "${tmp_dir}"' EXIT INT TERM
 
 err "downloading ${binary_name} from release ${TAG}…"
 download "${RELEASE_BASE}/${binary_name}" "${tmp_dir}/${binary_name}" \
-  || fatal "could not download ${RELEASE_BASE}/${binary_name}. Verify release ${TAG} exists, or use: cargo install safe-ai-skill"
+  || fatal "could not download ${RELEASE_BASE}/${binary_name}. Verify release ${TAG} exists, or use: cargo install safe-ai-skill --version ${VERSION} --locked"
 download "${RELEASE_BASE}/SHA256SUMS" "${tmp_dir}/SHA256SUMS" \
   || fatal "could not download SHA256SUMS for ${TAG}."
 

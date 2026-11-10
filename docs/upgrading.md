@@ -1,11 +1,23 @@
 # Upgrading
 
+- [From 1.3.0 to 1.3.1](#from-130-to-131)
 - [From 1.0.x to 1.3.0](#from-10x-to-130)
 - [Notes carried over from 1.2.0](#upgrading-to-120-read-before-upgrading)
 - [Notes carried over from 1.1.0](#upgrading-to-110-read-before-upgrading)
 - [Moving from `safe-ai-skill@stbr`](#moving-from-safe-ai-skillstbr)
 
 The complete list of changes is in the [CHANGELOG](../CHANGELOG.md).
+
+## From 1.3.0 to 1.3.1
+
+Read these before you upgrade if you script `add` or use `allow`:
+
+1. **`allow --scope authority|destructive` is refused** (exit 1, with the reason): every authority or destructive verdict is a hard guard, so these grants never relaxed anything. Grant scopes are `transfer`, `swap` and `deploy`. A grant of either scope that 1.3.0 stored stays until it expires or you run `safe-ai-skill revoke`, and still relaxes nothing; the session notice lists it as `inert grant …` and `status` marks it `"inert": true`. A pending request for one fails when you confirm it.
+2. **`add` usage errors exit 3**, not 0: a missing or unknown kind, a missing source, an unknown flag, an extra argument, a source starting with `-`, a source with whitespace at either end or a control character, and whitespace inside a package, URL or repository (write a local directory with spaces as `./name`). Flags may now come anywhere (`add --yes skill <source>`). A local path that is not a directory exits 1, for `add mcp` too.
+3. **`add` holds in more cases** until you pass `--yes`: a source that is not GitHub, npm or a local directory (`unrecognised_source`; 1.3.0 passed it with no finding), an osv.dev lookup that fails or comes back incomplete (`osv_unavailable` is MEDIUM; it was LOW and passed), and an npm version short of `major.minor.patch` (`pkg@1`, `pkg@1.2`). A URL that only mentions `github.com` is no longer GitHub. A high-risk catalog entry is now matched under any spelling of its package or repository, offline too.
+4. **`add` prints a pinned command; a moving source still holds.** Only a commit or exact version you name can pass. Online, a branch, tag or missing version is resolved to the commit or exact version it names now and is still held, and with `--yes` the printed command installs exactly that (`npx skills add o/r#<sha>`, `claude mcp add <name> -- npx -y <pkg>@<version>`, `git clone … && git -C … checkout --detach <sha>`). Pin a skill with `owner/repo#<sha>`: as in the skills CLI, `owner/repo@<x>` names the skill `x` and pins nothing. `run` is null, with a `run_note`, where no correct command exists, and the JSON gains `source_kind`, `pin`, `run_note`, `source_note`, `catalog_entry` and `catalog_source`. `add mcp <dir>` now scans the directory, and a bare name that is a directory here is graded as that directory. Details: [cli.md](cli.md#what-add-does).
+5. **`--help` no longer runs the command.** `revoke --help` used to clear every grant and `install --help` checked and pinned `.claude/skills`; `<command> --help` now prints the usage. See [cli.md](cli.md#command-line-reference).
+6. **Every release from 1.3.1 on is published to crates.io:** `cargo install safe-ai-skill --version <version> --locked` (crates.io had only 1.0.0 before). The npm package works as before; it now publishes only its own two scripts and README.
 
 ## From 1.0.x to 1.3.0
 

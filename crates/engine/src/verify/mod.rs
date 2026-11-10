@@ -21,6 +21,64 @@ pub mod rules;
 pub mod state;
 pub mod trust;
 
+/// A loopback HTTP server for the network helpers' unit tests: no test reaches the internet.
+#[cfg(test)]
+pub(crate) mod testnet {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve `route(method, path, body) -> (status, reply)` on `127.0.0.1` from a background
+    /// thread; returns the base URL (`http://127.0.0.1:<port>`).
+    pub fn serve(route: impl Fn(&str, &str, &str) -> (u16, String) + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let (status, reply) = route(&method, &path, &String::from_utf8_lossy(&body));
+                let mut stream = reader.into_inner();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        base
+    }
+
+    /// A loopback base URL nothing listens on (connection refused).
+    pub fn closed() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        base
+    }
+}
+
 use serde::Serialize;
 
 /// Severity of a supply-chain finding.
@@ -144,15 +202,382 @@ pub fn verdict(report: &Report) -> Verdict {
     }
 }
 
-/// Run the full intrinsic pipeline over an npm package source: provenance + osv.dev.
-///
-/// `online` toggles the (isolated) osv.dev lookup — tests pass `false` to stay hermetic.
-pub fn pipeline_npm(source: &str, online: bool) -> Report {
-    let (resolved, mut report) = provenance::resolve_with_identity(source);
-    if online && resolved.kind == "npm" && resolved.immutable {
-        report.merge(osv::query(&resolved.name, &resolved.reference));
+/// What `add` adds; the install command it prints depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddKind {
+    /// `add skill`: installed with the skills CLI (`npx skills add`).
+    Skill,
+    /// `add mcp`: registered with `claude mcp add`.
+    Mcp,
+    /// `add repo`: cloned with `git clone`.
+    Repo,
+}
+
+impl AddKind {
+    /// Parse `skill` / `mcp` / `repo`.
+    pub fn parse(word: &str) -> Option<AddKind> {
+        match word {
+            "skill" => Some(AddKind::Skill),
+            "mcp" => Some(AddKind::Mcp),
+            "repo" => Some(AddKind::Repo),
+            _ => None,
+        }
     }
-    report
+
+    /// Machine-stable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            AddKind::Skill => "skill",
+            AddKind::Mcp => "mcp",
+            AddKind::Repo => "repo",
+        }
+    }
+}
+
+/// The command `add` prints for the user to run, or why it prints none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallCommand {
+    /// The command; `None` when the target tool has no correct one for this kind and source.
+    pub run: Option<String>,
+    /// `run` installs exactly the version / commit graded ([`provenance::Resolved::pin`]).
+    pub pinned: bool,
+    /// Why there is no command, or what an unpinned one installs.
+    pub note: Option<String>,
+}
+
+/// Grade a remote `add` source and build the command that installs what was graded.
+///
+/// Network-free provenance first ([`provenance::resolve_with_identity`]). Online, a moving npm
+/// version (none or a dist-tag) is pinned to the exact version the registry serves now and a
+/// moving GitHub ref to the commit it names now, so `run` installs exactly what was graded; the
+/// unpinned finding stays MEDIUM all the same (only a source the user pinned exactly can pass),
+/// and says what it resolved to. The exact npm version graded is looked up on osv.dev:
+/// unreachable is a MEDIUM `osv_unavailable`; offline (`online == false`, the user's
+/// `--offline`) is a LOW `osv_skipped`. Tests pass `online == false` to stay hermetic.
+pub fn pipeline_add(
+    kind: AddKind,
+    source: &str,
+    online: bool,
+) -> (provenance::Resolved, Report, InstallCommand) {
+    let (mut resolved, mut report) = provenance::resolve_with_identity(source);
+    let looked_up = online
+        && match resolved.kind.as_str() {
+            "npm" => provenance::pin_npm(&mut resolved),
+            "github" => provenance::pin_github(&mut resolved),
+            _ => false,
+        };
+    if resolved.kind == "other" && kind == AddKind::Mcp && provenance::is_http_url(source) {
+        restate(
+            &mut report,
+            "unrecognised_source",
+            Severity::Medium,
+            format!(
+                "`{source}` is a remote MCP server: its code runs on someone else's machine, \
+                 so safe-ai-skill cannot check it"
+            ),
+        );
+    }
+    let install = install_command(kind, &resolved, source);
+    restate_unpinned(&mut report, &resolved, &install, online, looked_up);
+    if resolved.kind == "npm" {
+        if !online {
+            report.findings.push(osv::skipped(&resolved.name));
+        } else if !resolved.pin.is_empty() {
+            report.merge(osv::query(&resolved.name, &resolved.pin));
+        }
+    }
+    (resolved, report, install)
+}
+
+/// Reword the MEDIUM `unpinned_version` / `unpinned_ref` finding of a moving npm / GitHub source
+/// once online: what a lookup resolved it to and whether `run` carries that, or why it stayed
+/// unresolved. It stays MEDIUM either way: the user did not name that version or commit.
+fn restate_unpinned(
+    report: &mut Report,
+    resolved: &provenance::Resolved,
+    install: &InstallCommand,
+    online: bool,
+    looked_up: bool,
+) {
+    if resolved.immutable {
+        return;
+    }
+    let npm = resolved.kind == "npm";
+    let (finding, moving, what, installs, failed) = match resolved.kind.as_str() {
+        "npm" => (
+            "unpinned_version",
+            format!(
+                "npm version `{}` is not an exact pin",
+                provenance::shown_version(&resolved.reference)
+            ),
+            "version",
+            "the version osv.dev was asked about and the one `run` installs",
+            "the registry was unreachable or has no such version, so no CVE lookup ran",
+        ),
+        "github" if !resolved.owner.is_empty() => (
+            "unpinned_ref",
+            format!(
+                "GitHub ref `{}` is moving",
+                provenance::shown_ref(&resolved.reference)
+            ),
+            "commit",
+            "the commit `run` installs",
+            "the GitHub API was unreachable or rate-limited, or there is no such ref",
+        ),
+        _ => return,
+    };
+    let detail = if looked_up && install.pinned {
+        format!(
+            "{moving}; it resolves to {what} {} now, {installs}: pass --yes to take it, or name \
+             that {what} yourself",
+            resolved.pin
+        )
+    } else if looked_up {
+        format!(
+            "{moving}; it resolves to {what} {} now, but there is no install command that pins \
+             it",
+            resolved.pin
+        )
+    } else if !online {
+        return;
+    } else if npm && !provenance::is_dist_tag(&resolved.reference) {
+        format!(
+            "{moving}: safe-ai-skill does not resolve a range, so no CVE lookup ran; use \
+             `name@x.y.z`"
+        )
+    } else {
+        format!(
+            "{moving}, and the lookup of the exact {what} it names failed ({failed}); pin it \
+             yourself"
+        )
+    };
+    restate(report, finding, Severity::Medium, detail);
+}
+
+/// Give the first finding of kind `kind` a new severity and detail.
+fn restate(report: &mut Report, kind: &str, severity: Severity, detail: String) {
+    if let Some(f) = report.findings.iter_mut().find(|f| f.kind == kind) {
+        f.severity = severity;
+        f.detail = detail;
+    }
+}
+
+/// The command `add` prints for `resolved` (from `source`), in the form the target tool accepts:
+/// `npx skills add` for a skill, `claude mcp add` for an MCP server, `git clone` for a repo.
+///
+/// A pinned source prints its pin: `npx skills add owner/repo#<sha>[@<skill>]` (a sub-directory
+/// as `https://github.com/owner/repo/tree/<sha>/<path>`; forms checked against the skills CLI
+/// `skills@1.7.6`, whose `@<x>` after `owner/repo` selects a skill and never pins),
+/// `claude mcp add <name> -- npx -y <pkg>@<version>`,
+/// `git clone <url> <dir> && git -C <dir> checkout --detach <sha>`. An unpinned one prints the
+/// source as given. Pure.
+pub fn install_command(
+    kind: AddKind,
+    resolved: &provenance::Resolved,
+    source: &str,
+) -> InstallCommand {
+    let given = source;
+    let pin = resolved.pin.as_str();
+    let unpinned = |run: String| InstallCommand {
+        run: Some(run),
+        pinned: false,
+        note: Some(format!(
+            "not pinned: this installs whatever `{given}` points to when you run it"
+        )),
+    };
+    let none = |note: &str| InstallCommand {
+        run: None,
+        pinned: false,
+        note: Some(note.to_string()),
+    };
+    match (resolved.kind.as_str(), kind) {
+        ("local", AddKind::Mcp) => none(
+            "a local MCP server directory has no single install command: register it with \
+             `claude mcp add <name> -- <the command that starts it>`",
+        ),
+        ("local", AddKind::Skill) => InstallCommand {
+            run: Some(format!("npx skills add {}", shell_word(&local_arg(given)))),
+            ..Default::default()
+        },
+        ("local", AddKind::Repo) => InstallCommand {
+            run: Some(format!("git clone {}", shell_word(&local_arg(given)))),
+            ..Default::default()
+        },
+        ("npm", AddKind::Mcp) => {
+            let spec = match (pin, resolved.reference.as_str()) {
+                ("", "") => resolved.name.clone(),
+                ("", version) => format!("{}@{version}", resolved.name),
+                (pin, _) => format!("{}@{pin}", resolved.name),
+            };
+            let run = format!(
+                "claude mcp add {} -- npx -y {}",
+                mcp_name(&resolved.name),
+                shell_word(&spec)
+            );
+            if pin.is_empty() {
+                InstallCommand {
+                    run: Some(run),
+                    pinned: false,
+                    note: Some(format!(
+                        "not pinned: `npx -y {spec}` runs whatever version npm serves each time \
+                         the server starts"
+                    )),
+                }
+            } else {
+                InstallCommand {
+                    run: Some(run),
+                    pinned: true,
+                    note: None,
+                }
+            }
+        }
+        ("npm", AddKind::Skill) => none(
+            "`npx skills add` installs from a git repository, a URL or a local directory, not \
+             an npm package",
+        ),
+        ("npm", AddKind::Repo) => none("`git clone` needs a repository URL, not an npm package"),
+        ("github", AddKind::Mcp) if !resolved.owner.is_empty() => none(
+            "an MCP server in a GitHub repository has no single `claude mcp add` command: clone \
+             it, then register it with `claude mcp add <name> -- <the command that starts it>`",
+        ),
+        ("github", AddKind::Skill) if !resolved.owner.is_empty() => {
+            let (owner, name, skill) = (&resolved.owner, &resolved.name, &resolved.skill);
+            let run = match (pin, resolved.subpath.as_str(), skill.as_str()) {
+                ("", _, _) => return unpinned(format!("npx skills add {}", shell_word(given))),
+                (pin, "", "") => format!("npx skills add {owner}/{name}#{pin}"),
+                (pin, "", skill) => format!("npx skills add {owner}/{name}#{pin}@{skill}"),
+                (pin, sub, "") => {
+                    format!("npx skills add https://github.com/{owner}/{name}/tree/{pin}/{sub}")
+                }
+                (pin, sub, skill) => format!(
+                    "npx skills add https://github.com/{owner}/{name}/tree/{pin}/{sub} --skill \
+                     {skill}"
+                ),
+            };
+            InstallCommand {
+                run: Some(run),
+                pinned: true,
+                note: None,
+            }
+        }
+        ("github", AddKind::Repo) if !resolved.owner.is_empty() => {
+            let url = if resolved.ssh {
+                format!("git@github.com:{}/{}.git", resolved.owner, resolved.name)
+            } else {
+                format!(
+                    "https://github.com/{}/{}.git",
+                    resolved.owner, resolved.name
+                )
+            };
+            let dir = &clone_dir(&resolved.name);
+            let reference = resolved.reference.as_str();
+            if !pin.is_empty() {
+                InstallCommand {
+                    run: Some(format!(
+                        "git clone {url} {dir} && git -C {dir} checkout --detach {pin}"
+                    )),
+                    pinned: true,
+                    note: None,
+                }
+            } else if reference.is_empty() {
+                unpinned(format!("git clone {url}"))
+            } else if reference.bytes().all(|b| b.is_ascii_hexdigit()) {
+                unpinned(format!(
+                    "git clone {url} {dir} && git -C {dir} checkout --detach {reference}"
+                ))
+            } else {
+                unpinned(format!("git clone --branch {reference} {url}"))
+            }
+        }
+        ("other", AddKind::Mcp) if provenance::is_http_url(given) => InstallCommand {
+            run: Some(format!(
+                "claude mcp add --transport http {} {}",
+                url_mcp_name(given),
+                shell_word(given)
+            )),
+            pinned: false,
+            note: Some(
+                "not pinned: a remote server can change what it runs at any time".to_string(),
+            ),
+        },
+        (_, AddKind::Mcp) => none(&format!(
+            "safe-ai-skill does not know how to register `{given}` as an MCP server"
+        )),
+        (_, AddKind::Skill) => unpinned(format!("npx skills add {}", shell_word(given))),
+        (_, AddKind::Repo) => unpinned(format!("git clone {}", shell_word(given))),
+    }
+}
+
+/// The directory `git clone` writes `repo` into: the repository name, unless it could be read
+/// as an option or is `.git` (a clone there would be a repository's control dir), then `repo`.
+fn clone_dir(repo: &str) -> String {
+    if repo.starts_with('-') || repo.eq_ignore_ascii_case(".git") {
+        "repo".to_string()
+    } else {
+        repo.to_string()
+    }
+}
+
+/// A local directory as the install tools read one: `~` expanded, and a bare relative path
+/// (`demo/skill`, which the skills CLI would read as GitHub `owner/repo`) prefixed with `./`.
+fn local_arg(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        expand_home(path).display().to_string()
+    } else if provenance::is_local_path(path) {
+        path.to_string()
+    } else {
+        format!("./{path}")
+    }
+}
+
+/// An MCP server name for npm package `name`: the package name without its scope.
+fn mcp_name(name: &str) -> String {
+    sanitize_server_name(name.rsplit('/').next().unwrap_or(name))
+}
+
+/// An MCP server name for a remote server URL: its host, `www.` dropped.
+fn url_mcp_name(url: &str) -> String {
+    let host = provenance::url_host(url).unwrap_or_default();
+    sanitize_server_name(host.strip_prefix("www.").unwrap_or(&host))
+}
+
+/// `[A-Za-z0-9_-]` only (anything else becomes `-`), trimmed of `-`; `mcp` when empty.
+fn sanitize_server_name(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('-');
+    if name.is_empty() {
+        "mcp".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// `s` as one shell word: unchanged when it holds only characters no POSIX shell or zsh treats
+/// specially, else single-quoted.
+fn shell_word(s: &str) -> String {
+    let plain = !s.is_empty()
+        && !s.starts_with('=')
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'_' | b'-'
+                )
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 /// Expand a leading `~` in `path` to the user's home directory (best-effort).
@@ -4365,9 +4790,9 @@ mod orchestration_tests {
     }
 
     #[test]
-    fn pipeline_npm_hermetic_offline() {
+    fn pipeline_add_hermetic_offline() {
         let pkg = format!("left-pad{}1.3.0", '@');
-        let report = pipeline_npm(&pkg, false);
+        let (_, report, _) = pipeline_add(AddKind::Mcp, &pkg, false);
         assert!(report.findings.iter().all(|f| f.kind != "cve"));
     }
 }
@@ -6126,5 +6551,378 @@ mod tests {
         a.merge(b);
         assert_eq!(a.findings.len(), 2);
         assert_eq!(a.max_severity(), Some(Severity::High));
+    }
+}
+
+#[cfg(test)]
+mod add_tests {
+    use super::*;
+
+    /// `name` and `version` joined with `@`, built at runtime (avoids fixture mangling).
+    fn at(name: &str, version: &str) -> String {
+        format!("{name}{}{version}", '@')
+    }
+
+    fn kinds(report: &Report) -> Vec<(String, Severity)> {
+        report
+            .findings
+            .iter()
+            .map(|f| (f.kind.clone(), f.severity))
+            .collect()
+    }
+
+    fn run(kind: AddKind, source: &str) -> Option<String> {
+        let (resolved, _) = provenance::resolve_with_identity(source);
+        install_command(kind, &resolved, source).run
+    }
+
+    #[test]
+    fn add_kinds_parse() {
+        assert_eq!(AddKind::parse("mcp"), Some(AddKind::Mcp));
+        assert_eq!(AddKind::parse("skills"), None);
+        assert_eq!(AddKind::Repo.label(), "repo");
+    }
+
+    #[test]
+    fn offline_npm_exact_is_pass_with_a_low_skip() {
+        let (resolved, report, install) =
+            pipeline_add(AddKind::Mcp, &at("left-pad", "1.3.0"), false);
+        assert_eq!(kinds(&report), vec![("osv_skipped".into(), Severity::Low)]);
+        assert!(report.findings[0].detail.contains("skipped (--offline)"));
+        assert_eq!(verdict(&report), Verdict::Pass);
+        assert_eq!(resolved.pin, "1.3.0");
+        assert!(install.pinned);
+        assert_eq!(
+            install.run.as_deref(),
+            Some(
+                format!(
+                    "claude mcp add left-pad -- npx -y {}",
+                    at("left-pad", "1.3.0")
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn offline_unpinned_sources_hold_and_print_the_source() {
+        let (_, report, install) = pipeline_add(AddKind::Mcp, "left-pad", false);
+        assert_eq!(
+            kinds(&report),
+            vec![
+                ("unpinned_version".into(), Severity::Medium),
+                ("osv_skipped".into(), Severity::Low)
+            ]
+        );
+        assert_eq!(
+            install.run.as_deref(),
+            Some("claude mcp add left-pad -- npx -y left-pad")
+        );
+        assert!(!install.pinned && install.note.is_some());
+        let (_, report, install) =
+            pipeline_add(AddKind::Skill, "https://github.com/o/r/tree/main", false);
+        assert_eq!(
+            kinds(&report),
+            vec![("unpinned_ref".into(), Severity::Medium)]
+        );
+        assert_eq!(
+            install.run.as_deref(),
+            Some("npx skills add https://github.com/o/r/tree/main")
+        );
+    }
+
+    #[test]
+    fn pinned_github_commands() {
+        let sha = "a".repeat(40);
+        let commit = format!("https://github.com/o/r/commit/{sha}");
+        let pinned = format!("npx skills add o/r#{sha}");
+        assert_eq!(run(AddKind::Skill, &commit), Some(pinned.clone()));
+        // The user's own `#<sha>` form is printed as typed.
+        assert_eq!(run(AddKind::Skill, &format!("o/r#{sha}")), Some(pinned));
+        assert_eq!(
+            run(
+                AddKind::Skill,
+                &format!("https://github.com/o/r/tree/{sha}/skills/x")
+            ),
+            Some(format!(
+                "npx skills add https://github.com/o/r/tree/{sha}/skills/x"
+            ))
+        );
+        assert_eq!(
+            run(AddKind::Skill, &format!("o/r#{sha}{}my-skill", '@')),
+            Some(format!("npx skills add o/r#{sha}{}my-skill", '@'))
+        );
+        assert_eq!(
+            run(AddKind::Repo, &commit),
+            Some(format!(
+                "git clone https://github.com/o/r.git r && git -C r checkout --detach {sha}"
+            ))
+        );
+        let scp = format!("git{}github.com:o/r.git#{sha}", '@');
+        assert_eq!(
+            run(AddKind::Repo, &scp),
+            Some(format!(
+                "git clone git{}github.com:o/r.git r && git -C r checkout --detach {sha}",
+                '@'
+            ))
+        );
+        // `owner/repo@<skill>` resolved online keeps the skill selection, in the `#` form.
+        let mut resolved = provenance::resolve_with_identity(&at("o/r", "my-skill")).0;
+        resolved.pin = sha.clone();
+        assert_eq!(
+            install_command(AddKind::Skill, &resolved, "").run,
+            Some(format!("npx skills add o/r#{sha}{}my-skill", '@'))
+        );
+        // A sub-directory and a skill: the tree URL and `--skill`.
+        let mut resolved =
+            provenance::resolve_with_identity(&format!("o/r/skills#main{}my-skill", '@')).0;
+        resolved.pin = sha.clone();
+        assert_eq!(
+            install_command(AddKind::Skill, &resolved, "").run,
+            Some(format!(
+                "npx skills add https://github.com/o/r/tree/{sha}/skills --skill my-skill"
+            ))
+        );
+    }
+
+    /// The GitHub branches of `parseSource` in the skills CLI as published (`skills@1.7.6`,
+    /// `dist/cli.mjs`: `parseFragmentRef`, `githubTreeWithPathMatch`, `githubTreeMatch`,
+    /// `githubRepoMatch`, `atSkillMatch`, `shorthandMatch`), for the shapes `add` prints:
+    /// `(owner, repo, ref, subpath, skill)`.
+    fn skills_cli_1_7_6(input: &str) -> (String, String, String, String, String) {
+        let (input, frag_ref, frag_skill) = match input.split_once('#') {
+            Some((base, frag)) => match frag.split_once('@') {
+                Some((r, k)) => (base, r.to_string(), k.to_string()),
+                None => (base, frag.to_string(), String::new()),
+            },
+            None => (input, String::new(), String::new()),
+        };
+        let none = String::new;
+        if let Some(i) = input.find("github.com/") {
+            let parts: Vec<&str> = input[i + "github.com/".len()..].split('/').collect();
+            let (owner, repo) = (
+                parts[0].to_string(),
+                parts[1].trim_end_matches(".git").to_string(),
+            );
+            return match parts.get(2..) {
+                Some(["tree", r, sub @ ..]) if !sub.is_empty() => {
+                    (owner, repo, r.to_string(), sub.join("/"), none())
+                }
+                Some(["tree", r]) => (owner, repo, r.to_string(), none(), none()),
+                // A `commit/<sha>` path is dropped: only the fragment ref is used.
+                _ => (owner, repo, frag_ref, none(), none()),
+            };
+        }
+        if let Some((path, skill)) = input.split_once('@') {
+            let (owner, repo) = path.split_once('/').unwrap();
+            let skill = if frag_skill.is_empty() {
+                skill.to_string()
+            } else {
+                frag_skill
+            };
+            return (owner.into(), repo.into(), frag_ref, none(), skill);
+        }
+        let mut parts = input.splitn(3, '/');
+        let (owner, repo) = (parts.next().unwrap(), parts.next().unwrap());
+        let sub = parts.next().unwrap_or("").to_string();
+        (owner.into(), repo.into(), frag_ref, sub, frag_skill)
+    }
+
+    /// The source argument and `--skill` of a printed `npx skills add` command.
+    fn skills_args(run: &str) -> (String, Option<String>) {
+        let rest = run.strip_prefix("npx skills add ").unwrap();
+        match rest.split_once(" --skill ") {
+            Some((source, skill)) => (source.to_string(), Some(skill.to_string())),
+            None => (rest.to_string(), None),
+        }
+    }
+
+    #[test]
+    fn printed_skills_commands_pin_under_the_published_cli_grammar() {
+        let sha = "e".repeat(40);
+        let commit = format!("https://github.com/o/r/commit/{sha}");
+        let skill_at = format!("o/r#{sha}{}one", '@');
+        let tree = format!("https://github.com/o/r/tree/{sha}/skills/x");
+        for (source, want_sub, want_skill) in [
+            (commit.as_str(), "", ""),
+            (skill_at.as_str(), "", "one"),
+            (tree.as_str(), "skills/x", ""),
+        ] {
+            let printed = run(AddKind::Skill, source).unwrap();
+            let (arg, skill_flag) = skills_args(&printed);
+            let (owner, repo, reference, sub, skill) = skills_cli_1_7_6(&arg);
+            assert_eq!((owner.as_str(), repo.as_str()), ("o", "r"), "{printed}");
+            assert_eq!(reference, sha, "{printed} does not pin under skills@1.7.6");
+            assert_eq!(sub, want_sub, "{printed}");
+            assert_eq!(skill_flag.unwrap_or(skill), want_skill, "{printed}");
+        }
+        // Why not `owner/repo@<sha>`: that CLI reads it as a skill named <sha>, no ref.
+        let (_, _, reference, _, skill) = skills_cli_1_7_6(&at("o/r", &sha));
+        assert_eq!((reference.as_str(), skill.as_str()), ("", sha.as_str()));
+    }
+
+    #[test]
+    fn a_clone_never_writes_a_dot_git_or_option_like_directory() {
+        assert_eq!(clone_dir("r"), "r");
+        assert_eq!(clone_dir(".github"), ".github");
+        assert_eq!(clone_dir(".git"), "repo");
+        assert_eq!(clone_dir(".GIT"), "repo");
+        assert_eq!(clone_dir("-x"), "repo");
+    }
+
+    #[test]
+    fn unpinned_github_repo_commands() {
+        assert_eq!(
+            run(AddKind::Repo, "o/r"),
+            Some("git clone https://github.com/o/r.git".into())
+        );
+        assert_eq!(
+            run(AddKind::Repo, "https://github.com/o/r/tree/dev"),
+            Some("git clone --branch dev https://github.com/o/r.git".into())
+        );
+        assert_eq!(
+            run(AddKind::Repo, "o/r#abc1234"),
+            Some(
+                "git clone https://github.com/o/r.git r && git -C r checkout --detach abc1234"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn commands_with_no_correct_form_are_none_with_a_note() {
+        for (kind, source) in [
+            (AddKind::Mcp, "o/r"),
+            (AddKind::Skill, "left-pad"),
+            (AddKind::Repo, "left-pad"),
+            (AddKind::Mcp, "gitlab:o/r"),
+        ] {
+            let (resolved, _) = provenance::resolve_with_identity(source);
+            let install = install_command(kind, &resolved, source);
+            assert_eq!(install.run, None, "{kind:?} {source}");
+            assert!(install.note.is_some(), "{kind:?} {source}");
+        }
+        let install = install_command(AddKind::Mcp, &provenance::Resolved::local("./srv"), "./srv");
+        assert_eq!(install.run, None);
+        assert!(install.note.unwrap().contains("local MCP server directory"));
+    }
+
+    #[test]
+    fn remote_mcp_and_other_sources() {
+        let (_, report, install) = pipeline_add(AddKind::Mcp, "https://mcp.example.com/mcp", false);
+        assert_eq!(
+            kinds(&report),
+            vec![("unrecognised_source".into(), Severity::Medium)]
+        );
+        assert!(report.findings[0].detail.contains("remote MCP server"));
+        assert_eq!(
+            install.run.as_deref(),
+            Some("claude mcp add --transport http mcp-example-com https://mcp.example.com/mcp")
+        );
+        let (_, report, install) = pipeline_add(AddKind::Skill, "https://gitlab.com/o/r", false);
+        assert!(report.findings[0].detail.contains("could not check"));
+        assert_eq!(
+            install.run.as_deref(),
+            Some("npx skills add https://gitlab.com/o/r")
+        );
+        assert_eq!(
+            run(AddKind::Repo, "foo bar; id"),
+            Some("git clone 'foo bar; id'".into())
+        );
+    }
+
+    #[test]
+    fn local_commands_name_a_path_the_tools_read_as_local() {
+        let local =
+            |s: &str| install_command(AddKind::Skill, &provenance::Resolved::local(s), s).run;
+        assert_eq!(local("./x"), Some("npx skills add ./x".into()));
+        assert_eq!(local("demo/x"), Some("npx skills add ./demo/x".into()));
+        assert_eq!(local("/a b"), Some("npx skills add '/a b'".into()));
+        assert_eq!(
+            install_command(AddKind::Repo, &provenance::Resolved::local("../r"), "../r").run,
+            Some("git clone ../r".into())
+        );
+    }
+
+    #[test]
+    fn shell_words() {
+        assert_eq!(shell_word("o/r"), "o/r");
+        assert_eq!(shell_word("o/r#main"), "'o/r#main'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$(id)"), "'$(id)'");
+        assert_eq!(shell_word(""), "''");
+    }
+
+    #[test]
+    fn mcp_names() {
+        assert_eq!(
+            mcp_name("@modelcontextprotocol/server-filesystem"),
+            "server-filesystem"
+        );
+        assert_eq!(mcp_name("helius-mcp"), "helius-mcp");
+        assert_eq!(mcp_name("web3.js"), "web3-js");
+        assert_eq!(url_mcp_name("https://www.example.com/mcp"), "example-com");
+    }
+
+    /// A loopback npm registry, osv.dev and GitHub API (no test reaches the internet).
+    fn restate_with(
+        resolved: &mut provenance::Resolved,
+        report: &mut Report,
+        kind: AddKind,
+        pinned_to: &str,
+    ) -> InstallCommand {
+        resolved.pin = pinned_to.to_string();
+        let install = install_command(kind, resolved, "");
+        restate_unpinned(report, resolved, &install, true, !pinned_to.is_empty());
+        install
+    }
+
+    #[test]
+    fn a_lookup_pin_keeps_the_hold_and_prints_the_pin() {
+        let (mut resolved, mut report) = provenance::resolve_with_identity("left-pad");
+        let install = restate_with(&mut resolved, &mut report, AddKind::Mcp, "1.3.0");
+        assert!(install.pinned);
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+        assert!(report.findings[0]
+            .detail
+            .contains("resolves to version 1.3.0 now"));
+        assert!(report.findings[0].detail.contains("--yes"));
+        assert_eq!(
+            install.run,
+            Some(format!(
+                "claude mcp add left-pad -- npx -y {}",
+                at("left-pad", "1.3.0")
+            ))
+        );
+
+        let (mut resolved, mut report) = provenance::resolve_with_identity("left-pad");
+        restate_with(&mut resolved, &mut report, AddKind::Skill, "1.3.0");
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+        assert!(report.findings[0]
+            .detail
+            .contains("no install command that pins it"));
+
+        let sha = "d".repeat(40);
+        let (mut resolved, mut report) = provenance::resolve_with_identity("o/r");
+        let install = restate_with(&mut resolved, &mut report, AddKind::Skill, &sha);
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+        assert!(report.findings[0].detail.contains(&sha));
+        assert_eq!(install.run, Some(format!("npx skills add o/r#{sha}")));
+
+        let (mut resolved, mut report) = provenance::resolve_with_identity("o/r");
+        restate_with(&mut resolved, &mut report, AddKind::Mcp, &sha);
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn a_failed_lookup_keeps_the_hold_and_says_why() {
+        let (mut resolved, mut report) = provenance::resolve_with_identity("left-pad");
+        restate_with(&mut resolved, &mut report, AddKind::Mcp, "");
+        assert_eq!(report.findings[0].severity, Severity::Medium);
+        assert!(report.findings[0].detail.contains("lookup"), "{report:?}");
+        let (mut resolved, mut report) =
+            provenance::resolve_with_identity(&at("left-pad", "^1.0.0"));
+        restate_with(&mut resolved, &mut report, AddKind::Mcp, "");
+        assert!(report.findings[0].detail.contains("range"), "{report:?}");
     }
 }

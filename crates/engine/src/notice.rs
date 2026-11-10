@@ -93,7 +93,10 @@ pub fn loosenings(inputs: &Inputs<'_>) -> Option<String> {
                 .grants
                 .iter()
                 .filter(|g| !g.is_expired(inputs.now))
-                .map(|g| format!("live {}", g.describe(inputs.now)))
+                .map(|g| {
+                    let state = if g.is_inert() { "inert" } else { "live" };
+                    format!("{state} {}", g.describe(inputs.now))
+                })
                 .collect();
             if dir.trusted {
                 lines.extend(live);
@@ -216,6 +219,38 @@ mod tests {
         }
         assert!(!text.contains("grant old"), "{text}");
         assert!(!text.contains("env_read"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir.path);
+    }
+
+    #[test]
+    fn a_stored_authority_or_destructive_grant_is_listed_as_inert() {
+        let dir = tmp_data("notice_inert");
+        let mut authority = transfer_grant("a1", 10_000);
+        authority.scope = crate::gate::Scope::Authority;
+        let mut destructive = transfer_grant("d1", 10_000);
+        destructive.scope = crate::gate::Scope::Destructive;
+        grants::save(
+            &dir,
+            &Grants {
+                grants: vec![authority, destructive, transfer_grant("t1", 10_000)],
+            },
+        )
+        .unwrap();
+        let text = loosenings(&inputs(&dir, &[])).unwrap();
+        let lines: Vec<&str> = text.lines().map(|l| l.trim_start_matches(" - ")).collect();
+        for prefix in [
+            "inert grant a1: authority, relaxes nothing (authority changes are a hard guard; no \
+             grant can relax them), expires in ",
+            "inert grant d1: destructive, relaxes nothing (destructive actions (burns, closes) are \
+             a hard guard; no grant can relax them), expires in ",
+            "live grant t1: transfer, ",
+        ] {
+            assert!(lines.iter().any(|l| l.starts_with(prefix)), "{prefix}: {text}");
+        }
+        assert!(
+            !text.contains("live grant a1") && !text.contains("live grant d1"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir.path);
     }
 

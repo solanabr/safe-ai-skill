@@ -49,7 +49,9 @@
 //! A checkout named like the plugin (`safe-ai-skill-fork`) is not protected state: a component
 //! of the project root (`$CLAUDE_PROJECT_DIR` or the session's working directory) never counts as
 //! a data dir name. Read-only use of the binary (`status`, `verify check`, `--version`,
-//! bare `mode`) is never blocked, even through the plugin's cache path. Matching is deliberately
+//! `--help`, bare `mode`) is never blocked, even through the plugin's cache path when the binary
+//! is a simple command's program (after assignments and wrappers such as `env`, `sudo`, `exec`);
+//! the same path as another program's argument is the installed plugin. Matching is deliberately
 //! loose (case-insensitive, blind to quotes and escapes, `$IFS` read as a space, `~`/`$HOME`
 //! expanded, globs honoured) so that it errs towards a false deny. The Bash path reads no files.
 //!
@@ -210,8 +212,9 @@ const HOOK_SUBCOMMANDS: &[&str] = &[
     "adapt",
 ];
 
-/// Real subcommands: a cache-path word followed by one of these is the binary being run, not a
-/// path being written. Mutating ones are denied before this list is consulted.
+/// Real subcommands: a cache-path word run as a simple command's program with one of these as
+/// its first argument is the binary being run, not a path being written ([`BinaryRuns`]).
+/// Mutating ones are denied before this list is consulted.
 const SUBCOMMANDS: &[&str] = &[
     "gate-bash",
     "gate-bash-secrets",
@@ -238,6 +241,9 @@ const SUBCOMMANDS: &[&str] = &[
     "env",
     "adapt",
     "--version",
+    "help",
+    "--help",
+    "-h",
 ];
 
 /// Entries of a `.safe-ai-skill/` dir that hold state; a literal name also matches by stem
@@ -537,13 +543,71 @@ fn scan_bash(
     let windows = lower
         .contains('\\')
         .then(|| lower.replace(['\'', '"'], "").replace('\\', "/"));
-    if let Some(reason) = check_text(&posix, protected, budget)? {
+    let mut runs = BinaryRuns::new(command);
+    if let Some(reason) = check_text(&posix, protected, &mut runs, budget)? {
         return Ok(Some(reason));
     }
     match windows {
-        Some(w) => check_text(&w, protected, budget),
+        Some(w) => check_text(&w, protected, &mut runs, budget),
         None => Ok(None),
     }
+}
+
+/// Where a command runs the engine binary: the program words of its simple commands (after
+/// assignments and the wrappers [`shell::parse`] strips) whose first argument is one of
+/// [`SUBCOMMANDS`]. A cache-path reference that is one of them is the binary being run; each run
+/// excuses one reference, so the same path as another program's argument is still protected.
+struct BinaryRuns<'a> {
+    command: &'a str,
+    /// Normalised program words, parsed on first use.
+    words: Option<Vec<String>>,
+    /// Indices in `words` already matched in the reading being scanned.
+    used: Vec<usize>,
+}
+
+impl<'a> BinaryRuns<'a> {
+    fn new(command: &'a str) -> Self {
+        BinaryRuns {
+            command,
+            words: None,
+            used: Vec::new(),
+        }
+    }
+
+    /// Whether `word` (normalised) is a run not yet matched in this reading; it is then matched.
+    fn excuse(
+        &mut self,
+        word: &str,
+        protected: &Protected,
+        budget: &mut Budget,
+    ) -> Result<bool, TooComplex> {
+        if self.words.is_none() {
+            budget.spend(self.command.len())?;
+            self.words = Some(binary_runs(self.command, protected));
+        }
+        let words = self.words.as_deref().unwrap_or_default();
+        let found = (0..words.len()).find(|k| !self.used.contains(k) && words[*k] == word);
+        self.used.extend(found);
+        Ok(found.is_some())
+    }
+}
+
+/// The normalised program words of `command`'s simple commands that run the engine binary with
+/// one of [`SUBCOMMANDS`] first. Empty when the command does not parse.
+fn binary_runs(command: &str, protected: &Protected) -> Vec<String> {
+    let parsed = shell::parse(command);
+    if parsed.unparseable {
+        return Vec::new();
+    }
+    parsed
+        .commands
+        .iter()
+        .filter_map(|cmd| {
+            let program = normalize_word(&cmd.words.first()?.text, protected);
+            let sub = cmd.words.get(1)?.text.to_lowercase();
+            (is_binary(&program) && SUBCOMMANDS.contains(&sub.as_str())).then_some(program)
+        })
+        .collect()
 }
 
 /// A nested Claude Code session run through Bash (`claude -p …`, `npx @anthropic-ai/claude-code`)
@@ -997,8 +1061,10 @@ fn ifs_as_space(text: &str) -> String {
 fn check_text(
     text: &str,
     protected: &Protected,
+    runs: &mut BinaryRuns,
     budget: &mut Budget,
 ) -> Result<Option<String>, TooComplex> {
+    runs.used.clear();
     let toks = tokenize(text);
     budget.spend(toks.len())?;
     let cds = scan_cds(&toks, protected, budget)?;
@@ -1066,10 +1132,20 @@ fn check_text(
                 Some(dir) if !is_absolute(&word) => Some(lexical(&format!("{dir}/{word}"))),
                 _ => None,
             };
+            // Whether this word is the plugin's own binary run by its cache path, which is not a
+            // write to it. Decided once per word, on its first plugin match.
+            let mut excused = None;
             for candidate in std::iter::once(&word).chain(joined.as_ref()) {
                 match protected_kind(candidate, protected, names_for(candidate)) {
-                    // Running the plugin's own binary by its cache path is not a write to it.
-                    Some(Kind::Plugin) if run_by_name => {}
+                    Some(Kind::Plugin) if run_by_name => {
+                        let run = match excused {
+                            Some(run) => run,
+                            None => *excused.insert(runs.excuse(&word, protected, budget)?),
+                        };
+                        if !run {
+                            return Ok(Some(path_reason(candidate, Kind::Plugin)));
+                        }
+                    }
                     Some(kind) => return Ok(Some(path_reason(candidate, kind))),
                     None => {}
                 }
@@ -4887,6 +4963,82 @@ mod tests {
         assert_defer("\"${CLAUDE_PLUGIN_ROOT}/bin/safe-ai-skill\" env keys .env");
         assert_deny(&format!("{bin} revoke"));
         assert_deny(&format!("cp {bin} {bin}.bak && echo x > {bin}"));
+    }
+
+    #[test]
+    fn help_is_read_only_but_never_unlocks_a_denied_subcommand() {
+        let bin = "~/.claude/plugins/cache/stbr/safe-ai-skill/1.0.1/bin/safe-ai-skill";
+        for cmd in [
+            "safe-ai-skill --help".to_string(),
+            "safe-ai-skill -h".into(),
+            "safe-ai-skill help".into(),
+            "safe-ai-skill help tier".into(),
+            "safe-ai-skill help add".into(),
+            "safe-ai-skill help revoke".into(),
+            "safe-ai-skill tier --help".into(),
+            "safe-ai-skill verify --help".into(),
+            "npx @stbr/safe-ai-skill --help".into(),
+            format!("{bin} --help"),
+            format!("{bin} -h"),
+            format!("{bin} help"),
+            format!("\"{bin}\" help install"),
+        ] {
+            assert_defer(&cmd);
+        }
+        for cmd in [
+            "safe-ai-skill add --help".to_string(),
+            "safe-ai-skill add -h".into(),
+            "safe-ai-skill install --help".into(),
+            "safe-ai-skill install -h".into(),
+            "safe-ai-skill revoke --help".into(),
+            "safe-ai-skill confirm --help".into(),
+            "safe-ai-skill verify session --help".into(),
+            "safe-ai-skill gate-bash --help".into(),
+            "safe-ai-skill adapt --help".into(),
+            format!("{bin} add --help"),
+            format!("{bin} install -h"),
+        ] {
+            assert_deny(&cmd);
+        }
+    }
+
+    #[test]
+    fn the_plugin_binary_is_run_only_as_a_commands_program() {
+        let dir = "~/.claude/plugins/cache/stbr/safe-ai-skill";
+        let bin = format!("{dir}/1.0.1/bin/safe-ai-skill");
+        for sub in ["status", "--version", "help", "--help", "-h"] {
+            // The cache path as another program's argument is the plugin, whatever follows it.
+            for cmd in [
+                format!("rm -rf {dir} {sub}"),
+                format!("echo x | tee {bin} {sub}"),
+                format!("cp -r evil/. {dir} {sub}"),
+                format!("rsync -a evil/ {dir} {sub}"),
+            ] {
+                assert_deny(&cmd);
+            }
+            for cmd in [format!("{bin} {sub}"), format!("safe-ai-skill {sub}")] {
+                assert_defer(&cmd);
+            }
+        }
+        for cmd in [
+            format!("sudo -E env A=b nohup {bin} status"),
+            format!("ls | {bin} status"),
+            format!("true && {bin} status"),
+            format!("echo $({bin} --version)"),
+            format!("bash -c '{bin} status'"),
+        ] {
+            assert_defer(&cmd);
+        }
+        // A run excuses its own word only: the same path elsewhere in the command, or in an
+        // interpreter's code, still denies.
+        for cmd in [
+            format!("{bin} status && rm -rf {dir} status"),
+            format!("{bin} status | tee {bin} status"),
+            format!("{bin} status > {bin} status"),
+            format!("python3 -c \"import subprocess; subprocess.run(['{bin}', 'status'])\""),
+        ] {
+            assert_deny(&cmd);
+        }
     }
 
     #[test]

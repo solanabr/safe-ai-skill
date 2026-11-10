@@ -1,17 +1,18 @@
 # safe-ai-skill
 
-Security firewall and supply-chain verifier for Solana AI development in Claude
-Code. Its hooks read Solana CLI, SPL Token and Anchor commands and value-moving
-MCP calls before they run: mainnet deploys, authority changes and over-cap
-transfers ask for your approval, and irreversible actions (`--final`,
-`program close` (program or buffer), `spl-token close|burn`, …) are denied on
-mainnet or any cluster not identified as localnet or devnet. Credential stores
-and keypairs are read-denied at every tier; project `.env` reads follow the tier
-(denied at High; `.env.production` is denied from Relaxed). The firewall takes a tier
-(`off < relaxed < medium < high`) as an input. A supply-chain verifier runs at
-every session start: it scans skills and MCPs, flags telemetry preambles and
-plaintext JWTs, pins content hashes, and blocks a pack that drifted (in place,
-never moved) until you approve it.
+A hook-based security firewall and supply-chain verifier for Claude Code skills,
+MCPs and agents. Before a tool call runs, its hooks check the call's text against
+a policy: destructive git commands, secret and credential reads, data leaving for
+known exfiltration hosts, download-and-run, tampering with its own settings, and,
+for Solana work, irreversible or value-moving on-chain actions (irreversible ones
+such as `--final`, `program close` and `spl-token close|burn` are denied on
+mainnet or any cluster not identified as localnet, devnet or testnet). Credential
+stores and keypairs are read-denied at every tier; project `.env` reads follow the
+tier (denied at High; `.env.production` is denied from Relaxed). The firewall
+takes a tier (`off < relaxed < medium < high`) as an input. A supply-chain
+verifier runs at every session start: it grades and pins the project's skill
+packs, and blocks a pack that drifted (in place, never moved) until you approve
+it.
 
 > **Warning: the firewall is hook-level string analysis, and it has known holes.**
 > Every gate reads the text of a tool call; none watches what the call does once
@@ -46,11 +47,16 @@ The package is scoped (`@stbr/safe-ai-skill`); the installed CLI command is `saf
 ## Quick start
 
 ```bash
-# Check a source before you install it: prints the install command, pins and
-# installs nothing (see the project README for what is and isn't checked)
-safe-ai-skill add skill <name|url|dir>
-safe-ai-skill add mcp <id|pkg|url>
-safe-ai-skill add repo <url|dir>
+# Check a source before you install it: installs nothing, and prints an install
+# command pinned to the commit or version it checked where it can (see the
+# project README for what is and isn't checked)
+safe-ai-skill add skill <owner/repo|url|dir>
+safe-ai-skill add mcp <pkg|url|dir>
+safe-ai-skill add repo <owner/repo|url|dir>
+
+# List the commands, or print one command's usage
+safe-ai-skill --help
+safe-ai-skill help add
 
 # Run the session sweep now: grade and pin the installed packs
 safe-ai-skill verify
@@ -98,9 +104,16 @@ Supported platforms: macOS arm64, macOS x64, Linux x64, Linux arm64, Windows x64
 (also used on ARM). The Linux binaries are static (musl), so they run on any
 distribution, Alpine included.
 
-For unsupported platforms or offline installs, build from the matching release tag (crates.io carries only 1.0.0):
+For unsupported platforms, install the same release from crates.io, where every
+release from 1.3.1 on is published (the install error prints this command with
+the package's version filled in):
 ```bash
-git clone --branch v1.3.0 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
+cargo install safe-ai-skill --version <version> --locked
+```
+
+Or build from the matching release tag:
+```bash
+git clone --branch v1.3.1 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
 cargo install --locked --path crates/engine
 ```
 

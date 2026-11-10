@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml"><img src="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-1.3.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-purple" alt="Claude Code plugin">
 </p>
@@ -145,12 +145,18 @@ npm install -g @stbr/safe-ai-skill    # command: safe-ai-skill (or npx @stbr/saf
 
 `postinstall` downloads the binary for the package's release tag and aborts on a checksum mismatch. It installs the binary only, with no shim; use `install.sh` for Codex.
 
-### Building from source
+### CLI via cargo, or building from source
 
-Crates.io carries only 1.0.0, so `cargo install safe-ai-skill` does not give you this release. Build from a checkout of the release tag (CI builds with Rust 1.98.1; the project declares no minimum version):
+From 1.3.1, every release is also published to crates.io (before that it carried only 1.0.0). Name the release, so cargo doesn't pick another one, and build with its lockfile:
 
 ```bash
-git clone --branch v1.3.0 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
+cargo install safe-ai-skill --version <version> --locked
+```
+
+This installs the binary only, with no shim; use `install.sh` for Codex. To build from a checkout of the release tag instead (CI builds with Rust 1.98.1; the project declares no minimum version):
+
+```bash
+git clone --branch v1.3.1 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
 cargo install --locked --path crates/engine
 ```
 
@@ -171,7 +177,7 @@ The full per-gate table is in [docs/tiers.md](docs/tiers.md#behaviour-per-gate),
 
 ### Everyday commands
 
-The CLI has no `--help`; every subcommand and flag is in [docs/cli.md](docs/cli.md).
+`safe-ai-skill --help` lists the commands, and `safe-ai-skill help <command>` (or `<command> --help`) prints one command's usage without running it. Every subcommand and flag is in [docs/cli.md](docs/cli.md).
 
 ```bash
 safe-ai-skill tier                       # show the tier, where it came from, the sandbox state
@@ -184,7 +190,7 @@ safe-ai-skill firewall apply|show|check  # settings manager
 safe-ai-skill env keys|set|unset|init-schema   # work with .env files without printing values
 ```
 
-Grant scopes are `transfer`, `swap`, `deploy`, `authority` and `destructive`. The last two are accepted but relax nothing, since every authority or destructive verdict is a hard guard. A grant covers one action of its scope, and a command line chaining several gated actions is never covered.
+Grant scopes are `transfer`, `swap` and `deploy`. `allow` refuses `authority` and `destructive`, because every authority or destructive verdict is a hard guard that no grant relaxes. A grant covers one action of its scope, and a command line chaining several gated actions is never covered.
 
 **Spend caps.** The default policy asks above 1 SOL per transaction, denies above 10 SOL, and caps the day at 5 SOL; `status` prints them. Only a repo policy can lower them.
 
@@ -203,9 +209,9 @@ Raw reads of the project's `.env` and `.env.*` follow the tier, so at Off, Relax
 ## Verify skills and MCPs before you install them
 
 ```bash
-safe-ai-skill add skill <name|url|dir>   # check a skill; prints the install command
-safe-ai-skill add mcp <id|pkg|url>       # check an MCP's package provenance and known CVEs
-safe-ai-skill add repo <url|dir>         # same for a repository
+safe-ai-skill add skill <owner/repo|url|dir>   # check a skill; prints the install command
+safe-ai-skill add mcp <pkg|url|dir>            # check an MCP server: provenance and known CVEs
+safe-ai-skill add repo <owner/repo|url|dir>    # same for a repository
 safe-ai-skill install [--from <dir|tarball>] [--yes|--force]   # verified install from a local source
 safe-ai-skill verify check <dir>         # grade one directory as the sweep would, every finding listed
 safe-ai-skill verify                     # the session sweep: grade and pin installed packs
@@ -213,7 +219,7 @@ safe-ai-skill verify approve <name>      # re-pin a drifted pack after you revie
 safe-ai-skill registry list|verify       # the opt-in skill-registry.json catalog and its risk classes
 ```
 
-`add` does not fetch or scan remote content, pin anything or install anything. For a local directory, `add skill` and `add repo` run the same rule engine as the SessionStart sweep; `add mcp` does not scan a directory. For a URL or package it reads the source string only: a GitHub URL passes only if it names a full commit SHA, and an npm package only if it names an exact version; another GitHub ref or npm version is a MEDIUM finding that holds the result until you add `--yes`. **A source it doesn't recognise gets no check and passes:** a GitLab URL, the `owner/repo` shorthand, a tarball URL, a remote MCP URL. For an npm source with an exact version it also asks osv.dev about known advisories. **That lookup fails open:** if osv.dev is unreachable, `add` still returns `pass`. If the result is `pass`, it prints the install command (`npx skills add …`, `claude mcp add …` or `git clone …`), built from your original, unpinned source, for you to run. A high-risk catalog entry (wallet signing, key custody, installer script) also needs `--yes`. `install` never downloads and does no CVE lookup: fetch a hub yourself and pass `--from`. Details and flags: [docs/cli.md](docs/cli.md#verify-add-and-install).
+`add` installs nothing and pins nothing: it checks the source and prints the install command (`npx skills add …`, `claude mcp add …` or `git clone …`) for you to run. A local directory, for every kind, is graded by the same rule engine as the SessionStart sweep. Remote content is not fetched or scanned. **Only a source you pinned yourself can pass:** a GitHub source naming a full commit (`owner/repo#<sha>`, or a `tree/<sha>` or `commit/<sha>` URL) or an npm package with an exact `x.y.z` version. **Everything else is held until you pass `--yes`:** a branch, tag or missing version (online, `add` first resolves it to the commit or version it names now, and the printed command installs exactly that), a source that isn't GitHub, npm or a local directory (a GitLab or tarball URL, a remote MCP server), and an osv.dev lookup that fails or comes back incomplete. An npm version, named or resolved, is checked on osv.dev for known advisories; a high-severity one, or a typosquatted npm name, blocks. A high-risk catalog entry (wallet signing, key custody, installer script) also needs `--yes`, however its package or repository is spelled. `install` never downloads and does no CVE lookup: fetch a hub yourself and pass `--from`. The command `add` prints for each kind of source, and its flags: [docs/cli.md](docs/cli.md#verify-add-and-install).
 
 `install` and `verify approve` change what the firewall pins, and `add` is a user-only install step, so the agent can't run them; run them in your own terminal.
 
@@ -283,6 +289,8 @@ If it has no binary for the platform, a wrong executable format or an exec failu
 To report a vulnerability, follow [SECURITY.md](SECURITY.md#vulnerability-reporting).
 
 ## Upgrading from 1.0.x to 1.3.0
+
+Upgrading from 1.3.0? Read [From 1.3.0 to 1.3.1](docs/upgrading.md#from-130-to-131): `add` holds in more cases and its usage errors exit 3, `allow` refuses the `authority` and `destructive` scopes, and more MCP wallet calls ask.
 
 1.3.0 is the first release since 1.0.0; 1.0.1, 1.1.0 and 1.2.0 never shipped on their own. Migrations run at your first 1.3.0 session. What you will notice:
 

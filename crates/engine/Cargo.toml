@@ -1,14 +1,28 @@
 [package]
 name = "safe-ai-skill"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2021"
-description = "safe-ai-skill security engine — runtime firewall + supply-chain verifier for Solana AI dev"
+description = "safe-ai-skill engine: a hook-based security firewall and supply-chain verifier for Claude Code skills, MCPs and agents"
 license = "MIT"
 repository = "https://github.com/solanabr/safe-ai-skill"
 homepage = "https://github.com/solanabr/safe-ai-skill"
-keywords = ["solana", "security", "claude-code", "firewall", "mcp"]
+keywords = ["security", "claude-code", "firewall", "mcp", "supply-chain"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "../../README.md"
+# Ship what the build needs and nothing else: tests/ carries a corpus of malicious command
+# shapes, which would only trip scanners (cargo package prints an "ignoring test" warning per
+# dropped test target; expected). LICENSE is a symlink to the repo root's. README.md (from
+# `readme`) and Cargo.lock (a binary crate, for `cargo install --locked`) are added by cargo.
+include = [
+    "/Cargo.toml",
+    "/LICENSE",
+    "/src/**/*.rs",
+    "/src/bip39_english.txt",
+    "/policy/shared/credentials.list",
+    "/policy/shared/exfil-hosts.list",
+    "/policy/shared/onchain-verbs.list",
+    "/policy/shared/MANIFEST",
+]
 
 [[bin]]
 name = "safe-ai-skill"
