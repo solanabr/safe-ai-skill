@@ -400,9 +400,11 @@ fn decide_parsed_at(
     let tier = policy.tier();
     // A solana-family program named where the parser cannot follow: unparseable text, or an
     // opaque input (a `-c` script, `eval`, interpreter code, a pipe into a shell) that names
-    // one. It could be any command at all: a hard-guard ask, whatever its words.
+    // one. A command nested past the parser's depth limit is treated as unreadable regardless
+    // of what it names, since a hidden family program could sit below the cut the parser made.
+    // It could be any command at all: a hard-guard ask, whatever its words.
     let named = shell::mentions_family(command);
-    if (parsed.unparseable && named) || parsed.opaque_mention {
+    if (parsed.unparseable && named) || parsed.opaque_mention || parsed.too_deep {
         return unreadable_at(ask_unparseable(), tier);
     }
 

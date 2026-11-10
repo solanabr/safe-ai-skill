@@ -1258,6 +1258,60 @@ fn dynamic_eval_and_shell_c_scripts_are_judged_like_the_unwrapped_form() {
     assert_eq!(x4(r#"eval "$CMD --help""#, Setup::at), ["", "", "", ""]);
 }
 
+/// A value-moving family command nested past the parser's depth limit, with the program reached
+/// through an expansion so the literal never shows in the visible text, is unreadable: the gate
+/// asks at Medium and denies at High. Before the depth-limit hard-ask it drew no opinion — the
+/// parser bailed as `unparseable`, but nothing family-shaped was visible, so the gate stayed
+/// silent and the hidden `solana transfer … -um` slipped through.
+#[test]
+fn family_hidden_below_the_parser_depth_limit_is_unreadable() {
+    use safe_ai_skill::context::shell;
+
+    // `c29sYW5h` is base64("solana"): decoded at the deepest level, it never appears as the
+    // literal program name in the command text. The whole thing is a mainnet transfer.
+    let inner = "$(echo c29sYW5h | base64 -d) transfer R 1 -um";
+    // Escape a string for embedding inside a double-quoted `eval` argument one level up.
+    let esc_dq = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`")
+    };
+    // Two routes to the same hole: nested double-quoted `eval` (compact) and nested
+    // single-quoted `sh -c` (what ships in the wild). Twelve levels clears the depth cap of 8.
+    let dq = (0..12).fold(inner.to_string(), |s, _| format!("eval \"{}\"", esc_dq(&s)));
+    let sq = (0..12).fold(inner.to_string(), |s, _| {
+        format!("sh -c '{}'", s.replace('\'', r"'\''"))
+    });
+
+    for cmd in [&dq, &sq] {
+        let parsed = shell::parse(cmd);
+        // The parser gave up on depth, not on anything it could name.
+        assert!(parsed.too_deep, "{cmd}");
+        assert!(parsed.unparseable, "{cmd}");
+        assert!(!parsed.opaque_mention, "{cmd}");
+        assert!(!shell::mentions_family(cmd), "{cmd}");
+        // Hard-guard ask at Off/Relaxed/Medium, denied at High — a grant cannot lift it.
+        assert_eq!(x4(cmd, Setup::at), ["ask", "ask", "ask", "deny"], "{cmd}");
+        assert_eq!(
+            x4(cmd, |t| Setup::at(t).grant()),
+            ["ask", "ask", "ask", "deny"],
+            "{cmd}"
+        );
+    }
+
+    // The blocking entry point (`gate-bash` alone) agrees: ask at Medium, deny at High.
+    let w = World::new("onchain-too-deep");
+    assert_eq!(
+        decision_label(&w.run("gate-bash", &dq, Tier::Medium, &[])),
+        "ask"
+    );
+    assert_eq!(
+        decision_label(&w.run("gate-bash", &dq, Tier::High, &[])),
+        "deny"
+    );
+}
+
 #[test]
 fn find_exec_of_the_found_file_is_an_unresolved_program() {
     for cmd in [
