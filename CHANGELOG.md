@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Tooling & CI
+
+- **The musl builds get through an Ubuntu mirror outage.** CI's and the release's `musl-tools` installs go through `scripts/apt-install.sh`. It installs from the runner's own mirror as before. If that install fails, it tries once more from MIT's mirror (`mirrors.mit.edu`), outside Canonical's domain, which apt still checks against the Ubuntu archive keyring. On 2026-11-11 Canonical's DNS failed for about three hours, and with it every `musl-tools` install on the arm64 runners, which know only `ports.ubuntu.com`; that held up 1.3.4.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed
