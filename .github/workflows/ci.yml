@@ -243,8 +243,23 @@ jobs:
           restore-keys: |
             cargo-musl-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-
 
+      # DRILL, reverted in the next commit: Ubuntu's archive hosts are
+      # unreachable, so the install below has to take the fallback.
+      - name: "Drill: block Ubuntu's archive hosts"
+        run: |
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          grep -rhE '^(URIs:|deb )' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+          hosts='ports.ubuntu.com azure.ports.ubuntu.com archive.ubuntu.com azure.archive.ubuntu.com security.ubuntu.com esm.ubuntu.com'
+          printf '0.0.0.0 %s\n:: %s\n' "$hosts" "$hosts" | sudo tee -a /etc/hosts
+
       - name: Install musl-tools
         run: sudo sh scripts/apt-install.sh musl-tools
+
+      - name: "Drill: the fallback did the install"
+        run: |
+          ls /var/lib/apt/lists/ | grep '^mirrors.mit.edu_'
+          dpkg-query -W musl-tools musl-dev musl
+          command -v musl-gcc
 
       - name: Build (release, --locked)
         env:
@@ -443,8 +458,23 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
           rustup default "$RUST_TOOLCHAIN"
 
+      # DRILL, reverted in the next commit: Ubuntu's archive hosts are
+      # unreachable, so the install below has to take the fallback.
+      - name: "Drill: block Ubuntu's archive hosts"
+        run: |
+          cat /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          grep -rhE '^(URIs:|deb )' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+          hosts='ports.ubuntu.com azure.ports.ubuntu.com archive.ubuntu.com azure.archive.ubuntu.com security.ubuntu.com esm.ubuntu.com'
+          printf '0.0.0.0 %s\n:: %s\n' "$hosts" "$hosts" | sudo tee -a /etc/hosts
+
       - name: Install musl-tools
         run: sudo sh scripts/apt-install.sh musl-tools
+
+      - name: "Drill: the fallback did the install"
+        run: |
+          ls /var/lib/apt/lists/ | grep '^mirrors.mit.edu_'
+          dpkg-query -W musl-tools musl-dev musl
+          command -v musl-gcc
 
       - name: Build (release, musl)
         env:
