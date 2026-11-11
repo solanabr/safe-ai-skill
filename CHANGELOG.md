@@ -4,6 +4,23 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The parser reads more of the ways a shell is handed its script.**
+  - A shell started with `-s` reads its script from standard input, whatever words follow.
+  - A `-c` script is found after other options and `--` by every check that looks for one, as the shell finds it.
+  - `csh`, `tcsh` and `rbash` count as shells, in the parser and in the download-and-run checks.
+  - A subshell or brace group writes what its body writes, and a body's other commands that print nothing (`true`, `cd`) do not hide what the rest prints.
+  - `echo -e` output is read with its escapes decoded.
+  - Output redirected into a process substitution that runs a shell is that shell's script.
+  - `source /dev/stdin` runs its here-string or here-document.
+- **A shell running what a command substitution prints is no longer silent (#50).**
+  - Through a pipe, a here-string or a process substitution, such code asks, and denies at High, like a command nested past the parser's depth limit. `docs/tiers.md` gains the row.
+  - A substitution that only prints a literal (`echo`, `printf`) is read in its place instead, there and in a `-c` script or `eval`.
+  - A substitution that supplies an argument, a `-c` script, an `eval` or a program word keeps no opinion: `eval "$(ssh-agent -s)"`, `$(npm bin)/eslint .`, `sh -c "$(curl …)"` installers.
+
 ## [1.3.3] — 2026-11-10
 
 ### Changed
