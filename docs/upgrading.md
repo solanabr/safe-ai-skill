@@ -1,5 +1,6 @@
 # Upgrading
 
+- [From 1.3.3 to 1.3.4](#from-133-to-134)
 - [From 1.3.2 to 1.3.3](#from-132-to-133)
 - [From 1.3.1 to 1.3.2](#from-131-to-132)
 - [From 1.3.0 to 1.3.1](#from-130-to-131)
@@ -9,6 +10,14 @@
 - [Moving from `safe-ai-skill@stbr`](#moving-from-safe-ai-skillstbr)
 
 The complete list of changes is in the [CHANGELOG](../CHANGELOG.md).
+
+## From 1.3.3 to 1.3.4
+
+A shell running what a command substitution prints now asks, more of the ways a shell is handed its script are read, and rustup's installer one-liner runs. Nothing to migrate.
+
+1. **A shell running what a command substitution prints asks (#50).** A shell or `source` that runs, through a pipe, a here-string or a process substitution, code holding the output of a command substitution the parser cannot resolve asks, and denies at High and headless. A substitution that only prints a literal is read in its place instead. A substitution that supplies an argument, a `-c` script, an `eval` or a program word keeps no opinion, so `eval "$(ssh-agent -s)"`, `$(npm bin)/eslint .` and the Anza installer's `sh -c "$(curl …)"` are unchanged.
+2. **More of the ways a shell is handed its script are read:** `sh -s`, a `-c` after other options or `--`, `csh`, `tcsh` and `rbash`, what a subshell or brace group writes, `echo -e` and zsh `print` escapes, output redirected into a process substitution that runs a shell, and `source /dev/stdin`. Each gets the verdict of its script typed directly, so a few more commands ask or deny.
+3. **Official installer one-liners run.** rustup's `curl … https://sh.rustup.rs | sh`, and any `curl … | sh` or `bash <(curl …)` whose download comes only from the other known installer hosts, no longer ask, and no longer deny under `supply_chain.exec_install_scripts: deny`.
 
 ## From 1.3.2 to 1.3.3
 
