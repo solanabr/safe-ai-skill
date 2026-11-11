@@ -36,7 +36,10 @@
 # Linux builds are static musl: 1.0.0's glibc build needed GLIBC_2.39 and exited
 # 127 on Ubuntu 22.04 / Debian 12, which left the firewall silently off. ring
 # compiles C, so musl-tools provides musl-gcc. ubuntu-24.04-arm is a native arm64
-# runner (free for public repositories).
+# runner (free for public repositories). musl-tools comes from the runner's own
+# Ubuntu mirror; if that install fails, scripts/apt-install.sh tries once more
+# from a mirror outside Canonical's domain, still checked against the Ubuntu
+# archive keyring.
 #
 # Windows (1.1.0 tier: Git Bash only) links the C runtime statically
 # (+crt-static), so the .exe needs no VC++ redistributable, and links with
@@ -205,9 +208,7 @@ jobs:
 
       - name: Install musl-tools (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
+        run: sudo sh scripts/apt-install.sh musl-tools
 
       # RUSTFLAGS replaces any target rustflags, so +crt-static rides along here.
       - name: Build release binary

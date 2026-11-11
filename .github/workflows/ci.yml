@@ -244,9 +244,7 @@ jobs:
             cargo-musl-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Install musl-tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
+        run: sudo sh scripts/apt-install.sh musl-tools
 
       - name: Build (release, --locked)
         env:
@@ -446,9 +444,7 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
 
       - name: Install musl-tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends musl-tools
+        run: sudo sh scripts/apt-install.sh musl-tools
 
       - name: Build (release, musl)
         env:
@@ -514,7 +510,7 @@ jobs:
           [ "$got" = "$want" ] || { echo "::error::npm pack would publish: $got (want: $want)"; exit 1; }
 
       - name: shellcheck (install.sh + scripts)
-        run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh
+        run: shellcheck install.sh scripts/check-versions.sh scripts/check-binary-versions.sh scripts/smoke-static-linux.sh scripts/test-smoke-static-linux.sh scripts/stamp-shim.sh scripts/gate-smoke.sh scripts/apt-install.sh
 
       - name: sh -n (install.sh + scripts)
         run: |
@@ -525,6 +521,7 @@ jobs:
           sh -n scripts/test-smoke-static-linux.sh
           sh -n scripts/stamp-shim.sh
           sh -n scripts/gate-smoke.sh
+          sh -n scripts/apt-install.sh
           python3 -I -m py_compile scripts/latency-budget.py scripts/windows-test-gate.py
 
       - name: smoke-static-linux.sh logic (stubbed readelf + docker)
