@@ -20,6 +20,8 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
   - Through a pipe, a here-string or a process substitution, such code asks, and denies at High, like a command nested past the parser's depth limit. `docs/tiers.md` gains the row.
   - A substitution that only prints a literal (`echo`, `printf`) is read in its place instead, there and in a `-c` script or `eval`.
   - A substitution that supplies an argument, a `-c` script, an `eval` or a program word keeps no opinion: `eval "$(ssh-agent -s)"`, `$(npm bin)/eslint .`, `sh -c "$(curl …)"` installers.
+- **rustup's own installer one-liner no longer asks.** The secrets gate's `curl … | sh` and `bash <(curl …)` checks leave a download from a known installer host (`sh.rustup.rs`, the Anza and Solana release hosts) alone, as the download-and-run gate does, judging each pipe or substitution by the download that feeds the shell. Under `supply_chain.exec_install_scripts: deny` rustup's one-liner was denied, though `docs/tiers.md` lists `sh.rustup.rs` as an installer host.
+  - The download-and-run gate's process-substitution check reads a download's options as written, as its other checks do.
 
 ## [1.3.3] — 2026-11-10
 
