@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml"><img src="https://github.com/solanabr/safe-ai-skill/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-1.3.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-purple" alt="Claude Code plugin">
 </p>
@@ -132,7 +132,7 @@ cargo install safe-ai-skill --version <version> --locked
 This installs the binary only, with no shim; use `install.sh` for Codex. To build from a checkout of the release tag instead (CI builds with Rust 1.98.1; the project declares no minimum version):
 
 ```bash
-git clone --branch v1.3.3 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
+git clone --branch v1.3.4 https://github.com/solanabr/safe-ai-skill && cd safe-ai-skill
 cargo install --locked --path crates/engine
 ```
 
@@ -268,7 +268,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md#vulnerability-report
 
 ## Upgrading from 1.0.x to 1.3.0
 
-Upgrading from 1.3.2? Read [From 1.3.2 to 1.3.3](docs/upgrading.md#from-132-to-133): the Solana dev loop asks less on test clusters, transaction signatures are no longer treated as keys, and shell code a command hands a shell is judged like the code typed directly. From 1.3.1? [From 1.3.1 to 1.3.2](docs/upgrading.md#from-131-to-132): the secrets gate now sees reads and uploads wrapped in a dynamic shell script, and deeply nested commands past the parser's depth limit ask (deny at High). From 1.3.0? [From 1.3.0 to 1.3.1](docs/upgrading.md#from-130-to-131): `add` holds in more cases and its usage errors exit 3, `allow` refuses the `authority` and `destructive` scopes, and more MCP wallet calls ask.
+Upgrading from 1.3.3? Read [From 1.3.3 to 1.3.4](docs/upgrading.md#from-133-to-134): a shell running what a command substitution prints asks (deny at High), more of the ways a shell is handed its script are read, and rustup's installer one-liner runs. From 1.3.2? [From 1.3.2 to 1.3.3](docs/upgrading.md#from-132-to-133): the Solana dev loop asks less on test clusters, transaction signatures are no longer treated as keys, and shell code a command hands a shell is judged like the code typed directly. From 1.3.1? [From 1.3.1 to 1.3.2](docs/upgrading.md#from-131-to-132): the secrets gate now sees reads and uploads wrapped in a dynamic shell script, and deeply nested commands past the parser's depth limit ask (deny at High). From 1.3.0? [From 1.3.0 to 1.3.1](docs/upgrading.md#from-130-to-131): `add` holds in more cases and its usage errors exit 3, `allow` refuses the `authority` and `destructive` scopes, and more MCP wallet calls ask.
 
 1.3.0 is the first release since 1.0.0; 1.0.1, 1.1.0 and 1.2.0 never shipped on their own. Migrations run at your first 1.3.0 session. What you will notice:
 

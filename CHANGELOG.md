@@ -4,7 +4,7 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
-## [Unreleased]
+## [1.3.4] — 2026-11-11
 
 ### Fixed
 
