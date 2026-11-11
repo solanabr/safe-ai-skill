@@ -4966,6 +4966,20 @@ mod tests {
     }
 
     #[test]
+    fn approval_hints_naming_the_plugin_shim_stay_the_users_to_run() {
+        // The verify hints of a plugin install, run by the agent as printed.
+        for bin in [
+            "'/Users/me/.claude/plugins/cache/stbr/safe-ai-skill/1.3.4/bin/safe-ai-skill'",
+            "'/home/o'\\''neil/my plugins/safe-ai-skill/1.3.4/bin/safe-ai-skill'",
+            "'C:/Users/me/.claude/plugins/cache/stbr/safe-ai-skill/1.3.4/bin/safe-ai-skill'",
+        ] {
+            assert_deny(&format!("{bin} verify approve .claude/skills/evil"));
+            assert_deny(&format!("{bin} verify trust .claude/skills/evil"));
+            assert_defer(&format!("{bin} verify check .claude/skills/evil"));
+        }
+    }
+
+    #[test]
     fn help_is_read_only_but_never_unlocks_a_denied_subcommand() {
         let bin = "~/.claude/plugins/cache/stbr/safe-ai-skill/1.0.1/bin/safe-ai-skill";
         for cmd in [

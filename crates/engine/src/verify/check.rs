@@ -235,6 +235,7 @@ struct Action<'a> {
 /// What the tier does with a reported pack, in the sweep's words.
 fn action_line(a: &Action) -> String {
     let shown = super::escape_for_report(a.display);
+    let cli = super::cli();
     let gates = if a.installing {
         "once swept, the gates would deny Skill, /command, Read and Bash access to it"
     } else {
@@ -246,21 +247,21 @@ fn action_line(a: &Action) -> String {
             "{gates}: a combination rule fires, which neither approval nor trust clears; fix or \
              remove the pack"
         ),
-        (PackStatus::Blocked, true) => format!(
-            "{gates} until approved; review it, then run `safe-ai-skill verify approve {shown}`"
-        ),
+        (PackStatus::Blocked, true) => {
+            format!("{gates} until approved; review it, then run `{cli} verify approve {shown}`")
+        }
         (PackStatus::Unreviewed, true) if a.unscanned => {
             format!("{gates} until a sweep scans it in full, which a pack this large never fits")
         }
-        (PackStatus::Unreviewed, true) => format!(
-            "{gates} until trusted; review it, then run `safe-ai-skill verify trust {shown}`"
-        ),
+        (PackStatus::Unreviewed, true) => {
+            format!("{gates} until trusted; review it, then run `{cli} verify trust {shown}`")
+        }
         (_, true) => gates.to_string(),
         (PackStatus::Blocked, false) => {
             "reported only, the tier is off and nothing is denied".to_string()
         }
         (PackStatus::Unreviewed, false) => format!(
-            "reported only (tier high denies it until trusted with `safe-ai-skill verify trust \
+            "reported only (tier high denies it until trusted with `{cli} verify trust \
              {shown}`)"
         ),
         _ => "reported only".to_string(),
@@ -469,6 +470,27 @@ mod tests {
             "{:?}",
             c.report
         );
+    }
+
+    #[test]
+    fn hints_name_the_plugin_shim_when_the_engine_runs_from_a_plugin() {
+        use crate::verify::{cli, plugin_layout, with_exe};
+        let d = pack(&[("SKILL.md", "# x\n"), ("load.sh", KEYPAIR_SCRIPT)]);
+        let plugin = Dir::new();
+        let exe = plugin_layout(&plugin.0);
+        let shim = format!("`{} verify ", with_exe(&exe, cli));
+        let mut stale = ctx(Tier::Relaxed);
+        stale.lock_pins.insert(state::key_of(&d.0), "0".repeat(64));
+        // Trust when denied (High) and when reported only (Relaxed), approval (lock mismatch).
+        for c in [ctx(Tier::High), ctx(Tier::Relaxed), stale] {
+            let report = || check_dir(&d.0, "p", &c).unwrap().report.join("\n");
+            let bare = report();
+            assert_eq!(bare.matches("`safe-ai-skill verify ").count(), 1, "{bare}");
+            assert_eq!(
+                with_exe(&exe, report),
+                bare.replace("`safe-ai-skill verify ", &shim)
+            );
+        }
     }
 
     #[test]

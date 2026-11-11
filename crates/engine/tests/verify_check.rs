@@ -173,6 +173,57 @@ fn a_code_keypair_read_is_denied_at_high_only() {
     }
 }
 
+/// Run from a Claude Code plugin install, whose `bin/` is on the Bash tool's `PATH` only, the
+/// hints name the plugin's shim by its full path, quoted for the user's terminal (on Windows
+/// `/`-separated, for Git Bash). The binary npm, cargo and `install.sh` put on `PATH` keeps the
+/// bare name.
+#[test]
+fn a_plugin_install_names_its_shim_in_the_hints() {
+    let w = World::new("chk-plugin");
+    let rel = "demo/.claude/skills/loader";
+    std::fs::create_dir_all(w.root.join(rel)).unwrap();
+    std::fs::write(w.root.join(rel).join("SKILL.md"), "# loader\n").unwrap();
+    std::fs::write(
+        w.root.join(rel).join("load.sh"),
+        "#!/bin/sh\n\ncat ~/.config/solana/id.json\n",
+    )
+    .unwrap();
+    let plugin = TempDir::new("chk-plugin-install");
+    let bin = plugin.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::write(plugin.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
+    std::fs::write(bin.join("safe-ai-skill"), "#!/bin/sh\n").unwrap();
+    let engine = bin.join(format!(
+        "safe-ai-skill-test{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    std::fs::copy(common::bin(), &engine).unwrap();
+    let shim = std::fs::canonicalize(bin.join("safe-ai-skill")).unwrap();
+    let shim = shim.to_str().unwrap();
+    let shim = if cfg!(windows) {
+        safe_ai_skill::localfs::without_verbatim(shim).replace('\\', "/")
+    } else {
+        shim.to_string()
+    };
+
+    let run = Invocation::new(&["verify", "check", rel])
+        .program(&engine)
+        .plugin_data(w.data.path())
+        .home(w.home.path())
+        .cwd(w.root.path())
+        .stdin("{}")
+        .run();
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    let text = report(&run.json());
+    let hint = format!("`'{shim}' verify trust {rel}`");
+    assert!(text.contains(&hint), "{hint}\n{text}");
+
+    let text = report(&w.check(rel, Tier::Relaxed));
+    let hint = format!("`safe-ai-skill verify trust {rel}`");
+    assert!(text.contains(&hint), "{hint}\n{text}");
+}
+
 #[test]
 fn a_missing_directory_is_an_error_not_a_pass() {
     let w = World::new("chk-missing");

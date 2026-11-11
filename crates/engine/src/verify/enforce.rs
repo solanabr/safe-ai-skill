@@ -64,7 +64,7 @@ struct BlockedPack {
     /// Shown in the denial.
     shown: String,
     /// Why it is blocked.
-    why: &'static str,
+    why: String,
     class: Class,
 }
 
@@ -87,21 +87,25 @@ const HIGH_WHY: &str = "it has a high-severity finding nobody has reviewed";
 /// scan in its budget, and (as [`Class::High`]) packs with an unreviewed HIGH heuristic finding.
 fn blocked_packs(dir: &DataDir, st: &State) -> Vec<BlockedPack> {
     let mut trust: Option<TrustStore> = None;
+    let mut cli: Option<String> = None;
     st.packs
         .iter()
         .filter_map(|(key, e)| {
             let (class, why) = if e.state == PackStatus::Blocked {
-                (Class::Hard, why_label(e.reason))
+                (Class::Hard, why_label(e.reason).to_string())
             } else if e.unscanned() {
+                let cli = cli.get_or_insert_with(super::cli);
                 (
                     Class::Hard,
-                    "it could not be fully scanned within the time budget; `safe-ai-skill verify \
-                     check <dir>` scans it",
+                    format!(
+                        "it could not be fully scanned within the time budget; `{cli} verify \
+                         check <dir>` scans it"
+                    ),
                 )
             } else if e.state >= PackStatus::Warned
                 && high_pending(e, trust.get_or_insert_with(|| trust::load_honoured(dir)))
             {
-                (Class::High, HIGH_WHY)
+                (Class::High, HIGH_WHY.to_string())
             } else {
                 return None;
             };
@@ -146,22 +150,23 @@ fn why_label(reason: Option<state::Reason>) -> &'static str {
 
 /// The verdict for `class`: `Deny` for a hard pack, the `Ask` marker for a high one.
 fn denial(subject: &str, shown: &str, why: &str, class: Class) -> Verdict {
+    let cli = super::cli();
     match class {
         Class::Hard => Verdict::Deny(format!(
             "safe-ai-skill: {subject} the skill pack {shown}, which is blocked ({why}). The user \
-             must review it and run `safe-ai-skill verify approve {shown}` in a terminal, then \
+             must review it and run `{cli} verify approve {shown}` in a terminal, then \
              confirm it."
         )),
         Class::High => Verdict::Ask(format!(
             "safe-ai-skill: {subject} the skill pack {shown}, which tier high denies until it is \
-             trusted ({why}). The user must review it and run `safe-ai-skill verify trust \
+             trusted ({why}). The user must review it and run `{cli} verify trust \
              {shown}` in a terminal, then confirm it."
         )),
     }
 }
 
 fn denial_of(subject: &str, b: &BlockedPack) -> Verdict {
-    denial(subject, &b.shown, b.why, b.class)
+    denial(subject, &b.shown, &b.why, b.class)
 }
 
 /// The directories a hook's packs are looked up under: the hook `cwd`, its repository root,
@@ -483,8 +488,9 @@ fn over_budget_pack(skill: &str, shown: &str) -> Verdict {
     Verdict::Deny(format!(
         "safe-ai-skill: skill `{skill}` may come from the skill pack {shown}, which could not be \
          verified within {} s (too large or too slow to list its skills); review it and run \
-         `safe-ai-skill verify approve {shown}`.",
-        SKILL_BUDGET.as_secs()
+         `{} verify approve {shown}`.",
+        SKILL_BUDGET.as_secs(),
+        super::cli()
     ))
 }
 

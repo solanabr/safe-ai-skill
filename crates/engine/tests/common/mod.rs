@@ -158,6 +158,7 @@ impl Run {
 /// - [`Invocation::kit_security`] writes `<cwd>/.claude/security.json` (requires `cwd`).
 /// - [`Invocation::headless`] sets `SAFE_AI_SKILL_HEADLESS=1`.
 pub struct Invocation<'a> {
+    program: Option<&'a Path>,
     args: Vec<String>,
     stdin: Option<String>,
     plugin_data: Option<&'a Path>,
@@ -175,6 +176,7 @@ impl<'a> Invocation<'a> {
     /// Start an invocation for subcommand `args` (e.g. `["gate-bash"]`).
     pub fn new(args: &[&str]) -> Self {
         Invocation {
+            program: None,
             args: args.iter().map(|s| s.to_string()).collect(),
             stdin: None,
             plugin_data: None,
@@ -316,9 +318,15 @@ impl<'a> Invocation<'a> {
         self
     }
 
+    /// Run `path`, a copy of the built binary placed elsewhere, instead of [`bin`].
+    pub fn program(mut self, path: &'a Path) -> Self {
+        self.program = Some(path);
+        self
+    }
+
     /// Run the binary and capture its output.
     pub fn run(self) -> Run {
-        let mut cmd = Command::new(bin());
+        let mut cmd = Command::new(self.program.unwrap_or(Path::new(bin())));
         cmd.args(&self.args);
         if let Some(dir) = self.cwd {
             cmd.current_dir(dir);

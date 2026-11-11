@@ -1794,7 +1794,7 @@ impl PackReportLine {
             let approve = if self.reason == Some(Reason::Combo) {
                 String::new()
             } else {
-                format!(" or `safe-ai-skill verify approve {}`", sh_quote(&origin))
+                format!(" or `{} verify approve {}`", cli(), sh_quote(&origin))
             };
             return format!(
                 "; MOVED to {to} (origin {origin}); restore with `mv {} {}`{approve}",
@@ -2133,6 +2133,7 @@ fn render_report(
     } = *extras;
     let mut model: Vec<String> = Vec::new();
     let mut user: Vec<String> = Vec::new();
+    let cli = cli();
 
     if !lines.is_empty() || !mcp.is_empty() {
         model.push(if tier == Tier::Off {
@@ -2187,11 +2188,11 @@ fn render_report(
                 .unwrap_or_default();
             let approve = match l.state {
                 PackStatus::Blocked => format!(
-                    "; review it, then run `safe-ai-skill verify approve {}`",
+                    "; review it, then run `{cli} verify approve {}`",
                     escape_for_report(&l.display)
                 ),
                 PackStatus::Unreviewed => format!(
-                    "; review it, then run `safe-ai-skill verify trust {}`",
+                    "; review it, then run `{cli} verify trust {}`",
                     escape_for_report(&l.display)
                 ),
                 _ => String::new(),
@@ -2207,7 +2208,7 @@ fn render_report(
         }
         if for_user.len() > MAX_PACKS_IN_MESSAGE {
             user.push(format!(
-                "… and {} more; `safe-ai-skill verify check <pack dir>` lists every finding",
+                "… and {} more; `{cli} verify check <pack dir>` lists every finding",
                 for_user.len() - MAX_PACKS_IN_MESSAGE
             ));
         }
@@ -2233,8 +2234,8 @@ fn render_report(
         ));
         user.push(format!(
             "safe-ai-skill: tier high denies {} skill pack(s) with an unreviewed high-severity \
-             finding until you trust them: {list}. Review each, then run `safe-ai-skill verify \
-             trust <pack dir>`.",
+             finding until you trust them: {list}. Review each, then run `{cli} verify trust \
+             <pack dir>`.",
             high_denied.len()
         ));
     }
@@ -2266,7 +2267,7 @@ fn render_report(
         let names: Vec<String> = quarantined.iter().map(|n| escape_for_report(n)).collect();
         user.push(format!(
             "safe-ai-skill: {} pack(s) moved by an earlier version are still in {}: {}. \
-             Restore one with `safe-ai-skill verify approve <name>` from the project it came from.",
+             Restore one with `{cli} verify approve <name>` from the project it came from.",
             quarantined.len(),
             escape_for_report(&plugin_data.join("quarantine").display().to_string()),
             names.join(", ")
@@ -3216,6 +3217,76 @@ fn escape_for_report(text: &str) -> String {
 /// `text` as one single-quoted shell word.
 fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The engine binary [`cli`] reads the install from in tests, set by [`with_exe`]; `None`
+    /// stands for the test binary, which no plugin install holds.
+    static EXE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The CLI as a hint names it for the user's own terminal: `safe-ai-skill`, which npm, cargo
+/// and `install.sh` put on `PATH`, or, when this engine runs from a Claude Code plugin install
+/// ([`plugin_cli`]), the plugin's shim by its full path. Claude Code puts a plugin's `bin/` on
+/// the Bash tool's `PATH` only, so in the user's terminal the bare name is not found.
+fn cli() -> String {
+    #[cfg(test)]
+    let exe = EXE.with(|e| e.borrow().clone());
+    #[cfg(not(test))]
+    let exe = std::env::current_exe().ok();
+    exe.and_then(|exe| plugin_cli(&exe))
+        .unwrap_or_else(|| "safe-ai-skill".to_string())
+}
+
+/// `'<root>/bin/safe-ai-skill'` when `exe` (the running engine) sits in the `bin/` of a Claude
+/// Code plugin at `<root>`: beside that shim, with `<root>/.claude-plugin/plugin.json`. Read
+/// from the engine's own location, not `CLAUDE_PLUGIN_ROOT`: a CLI run (`verify check`, `add`,
+/// `install`) gets no such variable, and a project's settings `env` can set one for a hook that
+/// is not the plugin's. The path is resolved, and on Windows shown without `\\?\` and
+/// `/`-separated, so it pastes into Git Bash. `None` for npm, cargo and `install.sh` installs
+/// (no plugin manifest above their `bin/`) and for a path a report line could not show as is.
+fn plugin_cli(exe: &Path) -> Option<String> {
+    let bin = crate::localfs::canonicalize(exe)
+        .ok()?
+        .parent()?
+        .to_path_buf();
+    let shim = bin.join("safe-ai-skill");
+    let manifest = bin.parent()?.join(".claude-plugin").join("plugin.json");
+    let is_file = |p: &Path| crate::localfs::metadata(p).is_ok_and(|m| m.is_file());
+    if bin.file_name()? != "bin" || !is_file(&shim) || !is_file(&manifest) {
+        return None;
+    }
+    let shown = shim.to_str()?;
+    let shown = if cfg!(windows) {
+        crate::localfs::without_verbatim(shown).replace('\\', "/")
+    } else {
+        shown.to_string()
+    };
+    (!shown.chars().any(needs_escape)).then(|| sh_quote(&shown))
+}
+
+/// Run `f` with [`cli`] reading the install from `exe`, a stand-in for the engine binary.
+#[cfg(test)]
+fn with_exe<T>(exe: &Path, f: impl FnOnce() -> T) -> T {
+    EXE.with(|e| *e.borrow_mut() = Some(exe.to_path_buf()));
+    let out = f();
+    EXE.with(|e| *e.borrow_mut() = None);
+    out
+}
+
+/// A Claude Code plugin at `root`: `.claude-plugin/plugin.json`, and in `bin/` the shim beside
+/// a stand-in for the engine binary, whose path this returns.
+#[cfg(test)]
+fn plugin_layout(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    std::fs::write(root.join(".claude-plugin").join("plugin.json"), "{}").unwrap();
+    std::fs::write(bin.join("safe-ai-skill"), "#!/bin/sh\n").unwrap();
+    let exe = bin.join("safe-ai-skill-test");
+    std::fs::write(&exe, "").unwrap();
+    exe
 }
 
 /// [`escape_for_report`] for engine-written text (finding details), whose backticks are its
@@ -5154,6 +5225,50 @@ mod enforce_tests {
     }
 
     #[test]
+    fn gate_denials_name_the_plugin_shim_when_the_engine_runs_from_a_plugin() {
+        let exe = plugin_layout(&tempdir("plugin-cli-install"));
+        let shim = format!("`{} verify ", with_exe(&exe, cli));
+        let read = |d: &DataDir, project: &Path, file: &str| {
+            let input = serde_json::json!({ "file_path": file });
+            enforce::read_verdict(d, "Read", &input, project)
+        };
+        let assert_hints = |gate: &dyn Fn() -> GateVerdict, hints: usize| {
+            let text = |v: GateVerdict| match v {
+                GateVerdict::Deny(r) | GateVerdict::Ask(r) => r,
+                v => panic!("{v:?}"),
+            };
+            let bare = text(gate());
+            assert_eq!(
+                bare.matches("`safe-ai-skill verify ").count(),
+                hints,
+                "{bare}"
+            );
+            assert_eq!(
+                text(with_exe(&exe, gate)),
+                bare.replace("`safe-ai-skill verify ", &shim)
+            );
+        };
+        // ext/evil is blocked by drift: a Read, its skill, and the Skill gate out of budget.
+        let (d, project) = blocked_project("plugin-cli");
+        assert_hints(&|| read(&d, &project, ".claude/skills/ext/evil/s1.sh"), 1);
+        assert_hints(&|| skill(&d, &project, "evil"), 1);
+        assert_hints(&|| skill_budget(&d, &project, "fine", Duration::ZERO), 1);
+        // aaa0 has an unreviewed HIGH finding; zzz is left unscanned by a hash budget with room
+        // for one pack, and its denial adds `verify check` to the approval.
+        let (d, project) = fresh_trusted("plugin-cli-cut");
+        for n in ["aaa0", "zzz"] {
+            md(&skills_of(&project).join(n), n);
+        }
+        state::HASHES_LEFT.with(|h| h.set(Some(1)));
+        sweep_scanned(&d, &project, slow_scan, Duration::from_secs(60));
+        state::HASHES_LEFT.with(|h| h.set(None));
+        let st = state::load(&d).state;
+        assert!(entry_of(&st, &skills_of(&project).join("zzz")).unscanned());
+        assert_hints(&|| read(&d, &project, ".claude/skills/zzz/SKILL.md"), 2);
+        assert_hints(&|| read(&d, &project, ".claude/skills/aaa0/SKILL.md"), 1);
+    }
+
+    #[test]
     fn skill_gate_rehashes_a_pack_edited_mid_session() {
         let (d, project) = blocked_project("skill-toctou");
         let fine = project.join(".claude/skills/fine");
@@ -6567,6 +6682,197 @@ mod tests {
         a.merge(b);
         assert_eq!(a.findings.len(), 2);
         assert_eq!(a.max_severity(), Some(Severity::High));
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::fs;
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "safe-ai-skill-cli-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base.canonicalize().unwrap()
+    }
+
+    /// The path a single-quoted shell word holds.
+    fn unquoted(word: &str) -> String {
+        let inner = word.strip_prefix('\'').and_then(|w| w.strip_suffix('\''));
+        inner
+            .unwrap_or_else(|| panic!("{word}"))
+            .replace("'\\''", "'")
+    }
+
+    #[test]
+    fn a_plugin_install_names_its_shim_by_full_path() {
+        let root = tempdir("plugin").join("1.3.4");
+        let exe = plugin_layout(&root);
+        let shim = root.join("bin").join("safe-ai-skill");
+        let word = plugin_cli(&exe).unwrap();
+        let path = unquoted(&word);
+        assert_eq!(
+            fs::canonicalize(&path).unwrap(),
+            fs::canonicalize(&shim).unwrap(),
+            "{word}"
+        );
+        if cfg!(windows) {
+            // Pastes into Git Bash: a drive path, `/`-separated, without `\\?\`.
+            assert!(
+                path.get(1..3) == Some(":/") && !path.contains('\\'),
+                "{word}"
+            );
+        } else {
+            assert_eq!(path, shim.display().to_string());
+        }
+        assert_eq!(with_exe(&exe, cli), word);
+        assert_eq!(cli(), "safe-ai-skill");
+    }
+
+    #[test]
+    fn a_plugin_path_stays_one_shell_word() {
+        let root = tempdir("quote").join("it's my plugins").join("1.3.4");
+        let exe = plugin_layout(&root);
+        let word = plugin_cli(&exe).unwrap();
+        assert!(word.contains("/it'\\''s my plugins/"), "{word}");
+        assert_eq!(
+            fs::canonicalize(unquoted(&word)).unwrap(),
+            fs::canonicalize(root.join("bin").join("safe-ai-skill")).unwrap()
+        );
+    }
+
+    #[test]
+    fn npm_cargo_and_install_sh_keep_the_bare_name() {
+        let base = tempdir("bare");
+        // cargo: the engine is `bin/safe-ai-skill` itself.
+        let cargo = base.join("cargo").join("bin");
+        fs::create_dir_all(&cargo).unwrap();
+        fs::write(cargo.join("safe-ai-skill"), "").unwrap();
+        assert_eq!(plugin_cli(&cargo.join("safe-ai-skill")), None);
+        // npm and install.sh: the platform binary beside its launcher, `cli.js` or the shim.
+        let local = base.join("local").join("bin");
+        fs::create_dir_all(&local).unwrap();
+        for f in ["cli.js", "safe-ai-skill", "safe-ai-skill-test"] {
+            fs::write(local.join(f), "").unwrap();
+        }
+        assert_eq!(plugin_cli(&local.join("safe-ai-skill-test")), None);
+    }
+
+    #[test]
+    fn an_incomplete_plugin_layout_keeps_the_bare_name() {
+        let base = tempdir("partial");
+        let no_shim = plugin_layout(&base.join("no-shim"));
+        fs::remove_file(no_shim.with_file_name("safe-ai-skill")).unwrap();
+        assert_eq!(plugin_cli(&no_shim), None);
+        let no_manifest = plugin_layout(&base.join("no-manifest"));
+        fs::remove_file(
+            base.join("no-manifest")
+                .join(".claude-plugin")
+                .join("plugin.json"),
+        )
+        .unwrap();
+        assert_eq!(plugin_cli(&no_manifest), None);
+        let dir_shim = plugin_layout(&base.join("dir-shim"));
+        fs::remove_file(dir_shim.with_file_name("safe-ai-skill")).unwrap();
+        fs::create_dir(dir_shim.with_file_name("safe-ai-skill")).unwrap();
+        assert_eq!(plugin_cli(&dir_shim), None);
+        // The engine outside `bin/`, with a shim beside it and the manifest above.
+        let root = base.join("libexec");
+        plugin_layout(&root);
+        let libexec = root.join("libexec");
+        fs::create_dir_all(&libexec).unwrap();
+        for f in ["safe-ai-skill", "safe-ai-skill-test"] {
+            fs::write(libexec.join(f), "").unwrap();
+        }
+        assert_eq!(plugin_cli(&libexec.join("safe-ai-skill-test")), None);
+        let gone = base.join("gone").join("bin").join("safe-ai-skill-test");
+        assert_eq!(plugin_cli(&gone), None);
+    }
+
+    #[test]
+    fn a_path_a_report_line_cannot_show_as_is_keeps_the_bare_name() {
+        let exe = plugin_layout(&tempdir("tick").join("a`b"));
+        assert_eq!(plugin_cli(&exe), None);
+    }
+
+    /// A pack line of the sweep report.
+    fn line(display: &str, state: PackStatus, reason: Option<Reason>) -> PackReportLine {
+        PackReportLine {
+            kind: PackKind::Skill,
+            name: display.rsplit('/').next().unwrap_or(display).to_string(),
+            display: display.to_string(),
+            state,
+            reason,
+            note: None,
+            findings: Vec::new(),
+            more_findings: 0,
+            moved_to: None,
+            origin: format!("/p/{display}"),
+            not_moved: None,
+        }
+    }
+
+    #[test]
+    fn the_sweep_report_names_the_plugin_shim_in_every_hint() {
+        let base = tempdir("report");
+        let exe = plugin_layout(&base.join("plugin"));
+        let shim = format!("`{} verify ", with_exe(&exe, cli));
+        let mut moved = line(
+            ".claude/skills/moved",
+            PackStatus::Blocked,
+            Some(Reason::Drift),
+        );
+        moved.moved_to = Some("/q/moved".to_string());
+        let mut lines = vec![
+            moved,
+            line(
+                ".claude/skills/new",
+                PackStatus::Unreviewed,
+                Some(Reason::Heuristic),
+            ),
+        ];
+        // Past the cap, so the user's message points at `verify check`.
+        lines.extend(
+            (0..MAX_PACKS_IN_MESSAGE)
+                .map(|i| line(&format!(".claude/skills/w{i}"), PackStatus::Warned, None)),
+        );
+        let high = [".claude/skills/new".to_string()];
+        let render = || {
+            let mut r = SessionResult::default();
+            let extras = ReportExtras {
+                tampered: false,
+                tier: Tier::High,
+                high_denied: &high,
+            };
+            let quarantined = ["old-pack".to_string()];
+            render_report(&mut r, &lines, &[], &quarantined, &[], &base, &extras);
+            r
+        };
+        let (bare, plugin) = (render(), with_exe(&exe, render));
+        // The user's: approve and its restore, trust, `verify check` past the cap, tier high's
+        // trust and the leftover quarantine's approve.
+        let user = &bare.system_message;
+        assert_eq!(user.matches("`safe-ai-skill verify ").count(), 6, "{user}");
+        assert_eq!(
+            plugin.system_message,
+            user.replace("`safe-ai-skill verify ", &shim)
+        );
+        // The model's: the moved pack's restore.
+        let model = &bare.additional_context;
+        assert_eq!(
+            model.matches("`safe-ai-skill verify ").count(),
+            1,
+            "{model}"
+        );
+        assert_eq!(
+            plugin.additional_context,
+            model.replace("`safe-ai-skill verify ", &shim)
+        );
     }
 }
 
