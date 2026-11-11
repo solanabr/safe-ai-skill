@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The approve and trust hints work in a plugin-only install.** When the engine runs from a Claude Code plugin install, the SessionStart report, the gates' denials and `verify check`, `add` and `install` name the plugin's shim by its full path, single-quoted (`/`-separated on Windows, for Git Bash); npm, cargo and `install.sh` installs keep `safe-ai-skill`. Claude Code puts a plugin's `bin/` on the Bash tool's `PATH` only, so `safe-ai-skill verify approve <pack>` was `command not found` in the user's terminal.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed
