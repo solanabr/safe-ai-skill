@@ -1,5 +1,6 @@
 # Upgrading
 
+- [From 1.3.2 to 1.3.3](#from-132-to-133)
 - [From 1.3.1 to 1.3.2](#from-131-to-132)
 - [From 1.3.0 to 1.3.1](#from-130-to-131)
 - [From 1.0.x to 1.3.0](#from-10x-to-130)
@@ -8,6 +9,16 @@
 - [Moving from `safe-ai-skill@stbr`](#moving-from-safe-ai-skillstbr)
 
 The complete list of changes is in the [CHANGELOG](../CHANGELOG.md).
+
+## From 1.3.2 to 1.3.3
+
+Fewer prompts in the Solana dev loop, and a stricter read of shell code that a command hands to a shell. Nothing to migrate.
+
+1. **The Solana dev loop asks less.** `anchor run`, `anchor codama`, the local and read-only `anchor idl` commands, and `solana config set` to an identified localnet, devnet or testnet no longer ask, so CI no longer denies them. Mainnet and unidentified clusters still ask, and `anchor idl init|upgrade` are judged like a deploy.
+2. **Transaction signatures are no longer treated as private keys.** A prompt that holds a signature gets through, and command output keeps its signatures. Keypairs, and 64-byte values after a key name, are still blocked and redacted.
+3. **Shell code a command hands a shell is judged like the same code typed directly.** This covers a producer's output that a shell or `source` runs, and a dynamic `-c`, `eval`, here-string, launcher or `su -c` script. A few more commands ask or deny, and a command holding more than 64 such scripts asks as too large to check.
+4. **`gate-permission` answers within the 8-second gate deadline**, instead of running until its 15-second hook timeout.
+5. **A local `source <(…)` followed by an unrelated `curl` no longer asks** as a download-and-run installer.
 
 ## From 1.3.1 to 1.3.2
 

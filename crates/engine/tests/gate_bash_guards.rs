@@ -599,17 +599,49 @@ fn read_only_fast_path_has_no_opinion() {
 fn trimmed_commands_are_off_the_fast_path() {
     for cmd in [
         "spl-token gc",
-        // `anchor test` on an identified devnet has no opinion; off it, it still asks.
+        // `anchor test` and `anchor run` on an identified devnet have no opinion; off it, they
+        // still ask.
         "anchor test --provider.cluster mainnet",
-        "anchor run deploy-script",
-        "anchor idl fetch PROG",
-        "anchor idl init --filepath target/idl/p.json PROG",
+        "anchor run deploy-script --provider.cluster mainnet",
+        "anchor idl init --filepath target/idl/p.json PROG --provider.cluster mainnet",
         "anchor idl erase-authority --program-id PROG",
         "solana config set --url mainnet-beta",
+        "solana config set --url $RPC",
+        "solana config set --url devnet --keypair other.json",
+        "solana config set -k other.json",
     ] {
         let (d, _) = decide(cmd, Network::Devnet);
         assert!(is_ask(&d), "{cmd}: {d:?}");
     }
+}
+
+#[test]
+fn dev_loop_commands_have_no_opinion_on_a_test_cluster() {
+    // The kit's own commands run these: `/test-ts`, `/generate-idl-client`, `/deploy`, `/doctor`.
+    for cmd in [
+        "anchor run lint",
+        "anchor run test --provider.cluster localnet",
+        "anchor codama",
+        "anchor idl build",
+        "anchor idl fetch PROG",
+        "anchor idl fetch PROG --provider.cluster mainnet",
+        "anchor idl authority PROG",
+        "anchor idl init --filepath target/idl/p.json PROG",
+        "anchor idl upgrade --filepath target/idl/p.json PROG --provider.cluster devnet",
+        "solana config set --url devnet",
+        "solana config set --url localhost",
+        "solana config set -ut",
+        "solana config set --commitment confirmed",
+    ] {
+        let (d, _) = decide(cmd, Network::Devnet);
+        assert_eq!(d, Decision::Defer, "{cmd}");
+    }
+    // An IDL write is judged like a deploy: mainnet asks.
+    let (d, _) = decide(
+        "anchor idl upgrade --filepath target/idl/p.json PROG",
+        Network::Mainnet,
+    );
+    assert!(is_ask(&d), "{d:?}");
 }
 
 // ---------------------------------------------------------------------------------------
