@@ -69,7 +69,7 @@ Per Claude Code's hooks documentation, the reason of a `deny` is shown to the mo
 | | [Environment dumps](docs/tiers.md#environment-dumps): `/proc/*/environ`, `echo $SECRET` | Denied; `printenv` runs with secret values blanked |
 | | [Key files git would commit](docs/tiers.md#key-file-hygiene) | Listed at session start; `git add` of one asks (denied from Medium) |
 | | [Exfiltration](docs/tiers.md#exfiltration-tripwire) | Request-bin, tunnel and paste hosts are denied from Relaxed; a key or env file sent by path is denied; an inline `curl` or `wget` POST to another host asks |
-| **Repo and machine** | [Destructive git](docs/tiers.md#git-and-gh-guard): `reset --hard`, `clean`, `push --mirror`, `reflog expire` | Denied at every tier. Force push and `gh pr merge` ask from Medium (denied at High) |
+| **Repo and machine** | [Destructive git](docs/tiers.md#git-and-gh-guard): `reset --hard`, `clean`, `push --mirror`, `reflog expire` | Denied at every tier, as is a `git config` key that names a program (`core.hooksPath`, `core.sshCommand`, `!` aliases). Force push and `gh pr merge` ask from Medium (denied at High) |
 | | [Download-and-run](docs/tiers.md#download-and-run): `curl \| sh`, a one-shot `npx` or `uvx` of an undeclared package | Asks (denied at High) |
 | | [Encoded commands](docs/tiers.md#encoded-commands): `base64 -d \| sh`, hex `printf`, `$'…'` | Decoded and judged like the plain command; one that can't be decoded asks |
 | | [Privileged containers](docs/tiers.md#container-privilege-guard) and host mounts | Asks (denied at High) |

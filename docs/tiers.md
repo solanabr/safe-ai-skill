@@ -209,11 +209,12 @@ Gates that judge command text, tool arguments or file content rather than a path
 | Tamper: write to a file that runs code on the next shell, build or login, to managed settings, or to a project's `.safe-ai-skill/` (not `policy.yaml`) | deny | deny | deny | deny |
 | Tamper: write to the user-scope Claude Code dirs under `~/.claude` (agents, commands, skills, plugins, rules, schedules, shell snapshots) or `~/.claude/.credentials.json` | n/o | n/o | n/o | deny |
 | ConfigChange: a settings change that turns protection off (Claude Code only) | block | block | block | block |
-| Tamper: git hook, risky git config (a `git config` or `-c` form is a deny from Medium, see the git rows), `.mcp.json` server, lifecycle script, kit hook or tier, `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` export, or a write whose content is not shown | ask | ask | ask | ask |
+| Tamper: git hook, risky git config (a `git config` or `-c` form is a deny, see the git rows), `.mcp.json` server, lifecycle script, kit hook or tier, `KIT_FIREWALL_*`/`SAFE_AI_SKILL_*` export, or a write whose content is not shown | ask | ask | ask | ask |
 | Git: `clean`, work-tree `restore`, `checkout` over a path or with `-f`, `switch -f`, `reset --hard`/`--merge`/`--keep`, `reflog expire`, `prune`, `gc --prune`, `push --mirror`; `--config-env`, `GIT_CONFIG_*`/`GIT_EXEC_PATH`; `--upload-pack`/`--receive-pack`/`--exec` | deny | deny | deny | deny |
 | Git: force push, deleting a remote branch or tag, `gh pr merge` | n/o | n/o | ask | deny |
 | Git: rebase, `commit --amend`, `filter-branch`, delete a branch, tag or stash; `GIT_SSH_COMMAND`, `GIT_ASKPASS` and similar | n/o | n/o | n/o | ask |
-| Git: `git config` or `-c` of a key that runs a program | ask | ask | deny | deny |
+| Git: `git config` or `-c` of a key that names a program git runs (`core.hooksPath`, `core.sshCommand`, a `!` alias, …), or `config --edit` | deny | deny | deny | deny |
+| Git: `git config` or `-c` of an alias that names a git command, or a `credential.helper` that names an installed helper | ask | ask | deny | deny |
 | `gh secret set`, `gh variable set`, `gh repo delete`, `gh issue delete`, `gh alias`, `gh api` write to secrets or variables | deny | deny | deny | deny |
 | `gh api` write to workflow dispatches, deployments or environments | ask | ask | deny | deny |
 | `gh api`, any other call | n/o | n/o | deny | deny |
@@ -288,7 +289,7 @@ and in an agent definition, `permissionMode: bypassPermissions` in its front mat
 **Ask** (a deny when headless):
 
 - a git hook (`.git/hooks/<name>`, or a `chmod` of one);
-- a git setting that makes git run a program, written to `.git/config` or set by `git config` or a one-shot `git -c key=value` (the [git guard](#git-and-gh-guard) denies the `git config` and `-c` forms from Medium): `core.hooksPath`, `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.fsmonitor` (a program, not `true`/`false`), `diff.external`, `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`, `uploadpack.packObjectsHook`, `include.path` and `includeIf.*.path`, an `alias.*` starting with `!`, `filter.*`, `diff.*.textconv`/`command` and `merge.*.driver` settings, `pager.*`, and a `credential.helper` that starts with `!` or holds a path. `core.editor`, `core.pager` and `sequence.editor` pass when the value is a known bare editor or pager (`vim`, `vi`, `nvim`, `nano`, `emacs`, `code --wait`, `subl -w`, `less`, `more`, `cat`, `delta`);
+- a git setting that makes git run a program, written to `.git/config` or set by `git config` or a one-shot `git -c key=value` (the [git guard](#git-and-gh-guard) denies the `git config` and `-c` forms at every tier): `core.hooksPath`, `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.fsmonitor` (a program, not `true`/`false`), `diff.external`, `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`, `uploadpack.packObjectsHook`, `include.path` and `includeIf.*.path`, an `alias.*` starting with `!`, `filter.*`, `diff.*.textconv`/`command` and `merge.*.driver` settings, `pager.*`, and a `credential.helper` that starts with `!` or holds a path. `core.editor`, `core.pager` and `sequence.editor` pass when the value is a known bare editor or pager (`vim`, `vi`, `nvim`, `nano`, `emacs`, `code --wait`, `subl -w`, `less`, `more`, `cat`, `delta`);
 - a new or changed server in `.mcp.json`;
 - a new or changed npm lifecycle script in `package.json` (`preinstall`, `install`, `postinstall`, `prepare`, `prepublishOnly`, … also through `npm pkg set scripts.<name>`);
 - a kit hook script, and a lower tier in `.claude/security.json` (or deleting that file);
@@ -344,7 +345,8 @@ The first three bullets follow `supply_chain.exec_install_scripts`: `deny` denie
 | History rewrites: `rebase` (not abort or continue), `commit --amend`, `filter-branch`/`filter-repo`, deleting a branch, tag or stash | no opinion | no opinion | ask |
 | Making git run a program through its transport or environment: `--config-env`, `--exec-path`, `GIT_CONFIG_COUNT` and its siblings, `GIT_EXEC_PATH`, `--upload-pack`, `--receive-pack`, `--exec` | deny | deny | deny |
 | Credential and transport helpers set from the environment (`GIT_SSH_COMMAND`, `GIT_SSH`, `GIT_PROXY_COMMAND`, `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS`) | no opinion | no opinion | ask |
-| `git config` or `git -c` of a key that runs a program (`core.hooksPath`, `alias.*`, `core.pager` set to something other than a known editor or pager, `credential.helper` and the rest of the tamper list above), or `config --edit` | ask | deny | deny |
+| `git config` or `git -c` of a key that names a program git runs (`core.hooksPath`, `core.sshCommand`, an `alias.*` starting with `!`, `core.pager` set to something other than a known editor or pager, a `credential.helper` that starts with `!` or holds a path, the rest of the tamper list above, and the viewer and browser commands `git help` runs), `config --edit`, or a `--rename-section` onto one of their sections | deny | deny | deny |
+| `git config` or `git -c` of an `alias.*` that names a git command (`alias.co checkout`), or a `credential.helper` that names an installed helper (`store`, `osxkeychain`) | ask | deny | deny |
 | `gh secret set`, `gh variable set`, a `gh api` write to secrets or variables, `gh repo delete`, `gh issue delete`, `gh alias` | deny | deny | deny |
 | `gh api` write to workflow dispatches, deployments or environments | ask | deny | deny |
 | `gh api`, any other call | no opinion | deny | deny |

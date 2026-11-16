@@ -15,7 +15,8 @@
 //! | E14 | `gh api` writes to workflow dispatches, deployments, environments | ask | deny | deny |
 //! | E15 | `gh api` (any) | – | deny | deny |
 //! | E15 | `gh repo delete`, `gh issue delete`, `gh alias`, `gh api -X DELETE repos/O/R` | deny | deny | deny |
-//! | E7 | `git config` / `git -c` keys that run a program, `config --edit` ([`decide_git_config_risk`]) | ask | deny | deny |
+//! | E7 | `git config` / `git -c` keys that name a program git runs (`core.hooksPath`, `core.sshCommand`, a `!` alias, …), `config --edit`, a `--rename-section` onto their sections ([`decide_git_config_risk`]) | deny | deny | deny |
+//! | E7 | `git config` / `git -c` of an `alias.*` that names a git command, or a `credential.helper` that names an installed helper | ask | deny | deny |
 //!
 //! Positions are read from [`shell::parse`], so a commit message or an issue body naming any of
 //! these is data. Strings git itself runs as shell code (`git submodule foreach CMD`, `git
@@ -69,13 +70,15 @@ pub fn decide(command: &str, _cwd: &Path, _policy: &Policy, tier: Tier) -> Optio
 }
 
 /// E7 alignment: a `git config` write (or a one-shot `git -c key=value`) of a key that makes git
-/// run a program is denied from Medium up and asked at Relaxed and Off. Keys: the kit's
-/// `GITEXEC` set (`alias.*`, `core.pager`, `core.editor`, `core.hooksPath`, `sequence.editor`,
-/// `credential.helper`, `diff.external`, any value, plus `git config --edit` and a
-/// `--rename-section` onto one of their sections), the viewer and browser commands `git help`
-/// runs (`man.viewer`, `man.<tool>.cmd|path`, `web.browser`, `browser.<tool>.cmd|path`), and the
-/// tamper gate's wider set (fsmonitor, sshCommand, gpg programs, filter and merge drivers,
-/// include paths, …).
+/// run something. A key whose value names a program is denied at every tier: the tamper gate's
+/// set (`core.hooksPath`, `core.sshCommand`, an `alias.*` starting with `!`, fsmonitor, gpg
+/// programs, filter and merge drivers, include paths, …), the program keys of the kit's
+/// `GITEXEC` set (`core.pager`, `core.editor`, `sequence.editor`, `diff.external`), the viewer and
+/// browser commands `git help` runs (`man.viewer`, `man.<tool>.cmd|path`, `web.browser`,
+/// `browser.<tool>.cmd|path`), and `git config --edit` or a `--rename-section` onto a `GITEXEC`
+/// section, whose values the command line does not show. The rest of `GITEXEC`, an `alias.*`
+/// that names a git command and a `credential.helper` that names an installed helper, is denied
+/// from Medium up and asked at Relaxed and Off.
 pub fn decide_git_config_risk(command: &str, tier: Tier) -> Option<Verdict> {
     if command.len() > MAX_PARSE_BYTES || !may_concern(command) {
         return None;
@@ -208,18 +211,20 @@ fn judge(cmd: &SimpleCommand, tier: Tier, depth: usize, mode: Mode, out: &mut Ve
             if mode == Mode::All {
                 git_findings(&walk, tier, out);
             }
-            if let Some(why) = config_risk(&walk) {
-                out.push(if tier >= Tier::Medium {
-                    Finding::Deny(format!(
+            if let Some((runs, why)) = config_risk(&walk) {
+                out.push(match runs {
+                    Runs::Program => {
+                        deny_every_tier(&why, "ask the user to set the key themselves")
+                    }
+                    Runs::Helper if tier >= Tier::Medium => Finding::Deny(format!(
                         "safe-ai-skill git guard: this {why}; the {} tier denies it, so ask the user to \
                          set the key themselves.",
                         tier.label()
-                    ))
-                } else {
-                    Finding::Ask(format!(
-                        "safe-ai-skill git guard: this {why}; confirm the key and the program \
+                    )),
+                    Runs::Helper => Finding::Ask(format!(
+                        "safe-ai-skill git guard: this {why}; confirm the key and what it runs \
                          before approving."
-                    ))
+                    )),
                 });
             }
         }
@@ -780,18 +785,51 @@ fn shell_quote(text: &str) -> String {
 
 // ---- git config keys (E7) ------------------------------------------------------------------
 
-/// Why a git invocation's config write or `-c` makes git run a program, if it does.
-fn config_risk(walk: &GitWalk<'_>) -> Option<String> {
+/// What a git config key makes git run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Runs {
+    /// A program its value names, or may name: `--edit` and a section renamed onto a `GITEXEC`
+    /// one set keys the command line does not show.
+    Program,
+    /// A git command under another name (an alias without `!`) or an installed credential
+    /// helper (`store`, `osxkeychain`): the `GITEXEC` keys whose value names no program.
+    Helper,
+}
+
+impl Runs {
+    /// How a reason describes a key of this kind.
+    fn what(self) -> &'static str {
+        match self {
+            Runs::Program => "a key that names a program git runs",
+            Runs::Helper => "a key whose value git runs as a git command or a credential helper",
+        }
+    }
+}
+
+/// What a git invocation's config write or `-c` makes git run, and why, if anything. A key that
+/// names a program outranks one that does not.
+fn config_risk(walk: &GitWalk<'_>) -> Option<(Runs, String)> {
+    let mut found: Vec<(Runs, String)> = Vec::new();
     for kv in &walk.dash_c {
         if let Some((key, value)) = kv.split_once('=') {
-            if exec_key(key, value) {
-                return Some(format!(
-                    "runs git with -c {}, a key that names a program git runs",
-                    key.to_ascii_lowercase()
+            if let Some(runs) = exec_key(key, value) {
+                found.push((
+                    runs,
+                    format!(
+                        "runs git with -c {}, {}",
+                        key.to_ascii_lowercase(),
+                        runs.what()
+                    ),
                 ));
             }
         }
     }
+    found.extend(config_write(walk));
+    found.into_iter().min_by_key(|(runs, _)| *runs)
+}
+
+/// What a `git config` write makes git run, and why, if anything.
+fn config_write(walk: &GitWalk<'_>) -> Option<(Runs, String)> {
     if walk.sub != Some("config") {
         return None;
     }
@@ -857,12 +895,20 @@ fn config_risk(walk: &GitWalk<'_>) -> Option<String> {
         }
     }
     match mode {
-        M::Edit => Some("runs git config --edit, which opens an editor on the git config".into()),
+        M::Edit => Some((
+            Runs::Program,
+            "runs git config --edit, an editor on the git config".into(),
+        )),
         M::Rename => {
             let to = ops.get(j + 1)?;
             let section = to.split('.').next().unwrap_or("").to_ascii_lowercase();
             EXEC_SECTIONS.contains(&section.as_str()).then(|| {
-                format!("renames a git config section onto {to}, where its keys would run programs")
+                (
+                    Runs::Program,
+                    format!(
+                        "renames a git config section onto {to}, where its keys would run programs"
+                    ),
+                )
             })
         }
         M::Plain | M::Write => {
@@ -873,10 +919,14 @@ fn config_risk(walk: &GitWalk<'_>) -> Option<String> {
                 None if mode == M::Plain => return None,
                 None => "",
             };
-            exec_key(key, value).then(|| {
-                format!(
-                    "writes git config {}, a key that names a program git runs",
-                    key.to_ascii_lowercase()
+            exec_key(key, value).map(|runs| {
+                (
+                    runs,
+                    format!(
+                        "writes git config {}, {}",
+                        key.to_ascii_lowercase(),
+                        runs.what()
+                    ),
                 )
             })
         }
@@ -886,9 +936,11 @@ fn config_risk(walk: &GitWalk<'_>) -> Option<String> {
 /// The sections of the kit's `GITEXEC` keys, for `--rename-section`.
 const EXEC_SECTIONS: &[&str] = &["alias", "core", "sequence", "credential", "diff"];
 
-/// Whether git key `key` set to `value` names a program git runs: the kit's `GITEXEC` set (any
-/// value) or the tamper gate's set.
-fn exec_key(key: &str, value: &str) -> bool {
+/// What git key `key` set to `value` makes git run: [`Runs::Program`] for the tamper gate's set,
+/// the program keys of the kit's `GITEXEC` set and the viewer and browser commands, and
+/// [`Runs::Helper`] for the rest of `GITEXEC` (`alias.*` and `credential.helper`, any value).
+/// `None` for a key that runs nothing, and for a known editor or pager.
+fn exec_key(key: &str, value: &str) -> Option<Runs> {
     let k = key.to_ascii_lowercase();
     let first = k.split('.').next().unwrap_or("");
     let last = k.rsplit('.').next().unwrap_or("");
@@ -897,21 +949,26 @@ fn exec_key(key: &str, value: &str) -> bool {
         ("core", "pager" | "editor") | ("sequence", "editor")
     ) || first == "pager";
     if tool_key && crate::gates::tamper::is_known_editor_or_pager(value) {
-        return false;
+        return None;
     }
-    let kit = k.contains('.')
-        && (first == "alias"
-            || matches!(
-                (first, last),
-                ("core", "pager" | "editor" | "hookspath")
-                    | ("sequence", "editor")
-                    | ("credential", "helper")
-                    | ("diff", "external")
-                    | ("man", "viewer" | "cmd" | "path")
-                    | ("web", "browser")
-                    | ("browser", "cmd" | "path")
-            ));
-    kit || crate::gates::tamper::risky_git_key(&k, value)
+    let dotted = k.contains('.');
+    let program = dotted
+        && matches!(
+            (first, last),
+            ("core", "pager" | "editor" | "hookspath")
+                | ("sequence", "editor")
+                | ("diff", "external")
+                | ("man", "viewer" | "cmd" | "path")
+                | ("web", "browser")
+                | ("browser", "cmd" | "path")
+        );
+    if program || crate::gates::tamper::risky_git_key(&k, value) {
+        Some(Runs::Program)
+    } else if dotted && (first == "alias" || (first, last) == ("credential", "helper")) {
+        Some(Runs::Helper)
+    } else {
+        None
+    }
 }
 
 // ---- gh ----------------------------------------------------------------------------------
@@ -1639,16 +1696,33 @@ mod tests {
     }
 
     #[test]
-    fn config_risk_denies_from_medium() {
+    fn config_keys_naming_a_program_deny_at_every_tier() {
         let v = |c: &str, t: Tier| decide_git_config_risk(c, t).map(|v| v.label());
         for cmd in [
             "git config core.hooksPath .h",
-            "git config --global alias.co checkout",
+            "git config --global core.sshCommand 'ssh -i k'",
+            "git config alias.st '!sh -c id'",
             "git config set core.pager /tmp/p",
+            "git config credential.helper '!gh auth git-credential'",
             "git config --edit",
             "git -c core.fsmonitor=/tmp/x status",
+            "git -c alias.co=checkout -c core.pager=/tmp/p log",
+            "git -c alias.co=checkout config core.hooksPath .h",
             "git config --rename-section foo core",
         ] {
+            for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+                assert_eq!(v(cmd, tier), Some("deny"), "{cmd} at {tier:?}");
+            }
+            assert_eq!(d(cmd, Tier::Relaxed), "D", "{cmd}");
+        }
+        // An alias naming a git command and an installed credential helper ask below Medium.
+        for cmd in [
+            "git config --global alias.co checkout",
+            "git config aLiAs.co checkout",
+            "git config credential.helper store",
+            "git -c alias.co=checkout co main",
+        ] {
+            assert_eq!(v(cmd, Tier::Off), Some("ask"), "{cmd}");
             assert_eq!(v(cmd, Tier::Relaxed), Some("ask"), "{cmd}");
             assert_eq!(v(cmd, Tier::Medium), Some("deny"), "{cmd}");
             assert_eq!(d(cmd, Tier::High), "D", "{cmd}");
