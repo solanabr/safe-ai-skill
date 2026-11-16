@@ -15,7 +15,7 @@ use crate::datadir::DataDir;
 use crate::gate::Verdict;
 use crate::gates::{
     bash, containers, creddump, encoded, envread, envwrite, exfil, fetchexec, gitguard, keyfiles,
-    secrets, tamper, wallet,
+    publish, secrets, tamper, wallet,
 };
 use crate::io::Decision;
 use crate::policy::tier::Tier;
@@ -202,6 +202,7 @@ fn verdicts(
         envwrite::decide_cli(command, cwd, policy, tier),
         exfil::decide_bash(command, cwd, policy, tier),
         fetchexec::decide(command, cwd, policy, tier),
+        publish::decide(command, cwd, policy, tier),
         tamper::decide_bash_writes(command, cwd, policy, tier),
         envread::decide_bash(command),
     ]);

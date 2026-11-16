@@ -19,6 +19,7 @@ pub mod keyfiles;
 pub mod mcp;
 pub mod mcpexec;
 pub mod permreq;
+pub mod publish;
 pub mod read;
 pub mod secretpath;
 pub mod secrets;
