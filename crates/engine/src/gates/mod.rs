@@ -16,6 +16,7 @@ pub mod exfil;
 pub mod fetchexec;
 pub mod gitguard;
 pub mod keyfiles;
+pub mod kill;
 pub mod mcp;
 pub mod mcpexec;
 pub mod permreq;
