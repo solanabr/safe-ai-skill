@@ -271,7 +271,7 @@ pub struct Policy {
     pub runtime: TierContext,               // resolved tier, source, env_read, sandbox, headless
     // private: scan dirs the project added (confined on disk by `load`)
 }
-pub struct NetworkPolicy { pub default: String, pub mainnet: String }
+pub struct NetworkPolicy { pub default: String, pub mainnet: String, pub ask_test_cluster_deploys: bool }
 pub struct SpendPolicy { pub per_tx_sol_max: f64, pub hard_tx_sol_max: f64, pub daily_sol_max: f64 }
 pub struct McpPolicy { pub sensitive_name_pattern: String }   // verbs expanded (see below)
 pub struct SwapPolicy { pub rugcheck: bool, pub rugcheck_max_score: u32, pub rugcheck_timeout_ms: u64, pub trusted_mints: Vec<String> }
@@ -328,7 +328,7 @@ ratchet, so no other field ends up looser than the base. Either way it is noted.
 **Project ratchet.** `.safe-ai-skill/policy.yaml` is repo-controlled, so it may only
 tighten the base, field by field: caps take the lower value (and still bind at any
 tier); `network.mainnet` / `exec_install_scripts` move only toward `deny`;
-`network.default` only to mainnet; deny-lists (`secrets.deny_read_globs`,
+`network.default` only to mainnet; `network.ask_test_cluster_deploys` only on; deny-lists (`secrets.deny_read_globs`,
 `mcp.sensitive_name_pattern` alternatives) add entries; allow-lists
 (`secrets.allow_read_globs`, `swap.trusted_mints`) drop them; toggles can only turn on;
 `verify_skills_dirs` keeps every base dir and may add dirs strictly inside the project

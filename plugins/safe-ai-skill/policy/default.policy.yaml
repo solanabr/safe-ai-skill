@@ -13,6 +13,7 @@ tier: relaxed
 network:
   default: devnet
   mainnet: ask            # any mainnet-touching action → ask (never silent-allow)
+  ask_test_cluster_deploys: false   # true: a deploy or upgrade to an identified devnet, testnet or localnet asks (a project may only turn it on)
 spend:
   per_tx_sol_max: 1.0     # above → ask; above hard_max → deny
   hard_tx_sol_max: 10.0

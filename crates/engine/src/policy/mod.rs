@@ -36,6 +36,7 @@ tier: relaxed
 network:
   default: devnet
   mainnet: ask
+  ask_test_cluster_deploys: false
 spend:
   per_tx_sol_max: 1.0
   hard_tx_sol_max: 10.0
@@ -165,6 +166,9 @@ pub struct NetworkPolicy {
     pub default: String,
     /// Decision applied to any mainnet-touching action (`ask`/`deny`/`allow`).
     pub mainnet: String,
+    /// Ask on a deploy or upgrade to a positively identified devnet, testnet or localnet, which
+    /// otherwise gets no opinion. A project may turn it on, not off.
+    pub ask_test_cluster_deploys: bool,
 }
 
 /// Spend caps in SOL.
@@ -312,6 +316,7 @@ impl Default for NetworkPolicy {
         NetworkPolicy {
             default: "devnet".into(),
             mainnet: "ask".into(),
+            ask_test_cluster_deploys: false,
         }
     }
 }
@@ -595,14 +600,16 @@ impl Policy {
 
     /// A conservative policy used when configuration cannot be trusted.
     ///
-    /// Every soft-gated action resolves to `ask`: caps are tiny, mainnet is `ask`, raw project
-    /// env reads are denied (`env_read: deny`), and all hard guards are present.
+    /// Every soft-gated action resolves to `ask`: caps are tiny, mainnet is `ask`, a deploy to a
+    /// test cluster asks, raw project env reads are denied (`env_read: deny`), and all hard
+    /// guards are present.
     pub fn fail_closed() -> Policy {
         Policy {
             version: 1,
             network: NetworkPolicy {
                 default: "devnet".into(),
                 mainnet: "ask".into(),
+                ask_test_cluster_deploys: true,
             },
             spend: SpendPolicy {
                 per_tx_sol_max: 0.0,
@@ -765,6 +772,10 @@ mod tests {
         assert_eq!(disk.version, embedded.version);
         assert_eq!(disk.network.default, embedded.network.default);
         assert_eq!(disk.network.mainnet, embedded.network.mainnet);
+        assert_eq!(
+            disk.network.ask_test_cluster_deploys,
+            embedded.network.ask_test_cluster_deploys
+        );
         assert_eq!(disk.spend.per_tx_sol_max, embedded.spend.per_tx_sol_max);
         assert_eq!(disk.spend.hard_tx_sol_max, embedded.spend.hard_tx_sol_max);
         assert_eq!(disk.spend.daily_sol_max, embedded.spend.daily_sol_max);
@@ -864,6 +875,7 @@ mod tests {
     fn defaults_match_embedded() {
         let d = Policy::default();
         let p: Policy = serde_yaml::from_str(DEFAULT_POLICY_YAML).unwrap();
+        assert_eq!(d.network, p.network);
         assert_eq!(d.spend.per_tx_sol_max, p.spend.per_tx_sol_max);
         assert_eq!(d.mcp.sensitive_name_pattern, p.mcp.sensitive_name_pattern);
         assert_eq!(
@@ -915,6 +927,7 @@ mod tests {
         let p: Policy = serde_yaml::from_str(legacy).unwrap();
         assert!(p.supply_chain.verify_ext_submodules); // serde default
         assert_eq!(p.supply_chain.exec_install_scripts, "ask");
+        assert!(!p.network.ask_test_cluster_deploys);
         assert_eq!(
             p.catalog.registry_path,
             ".claude/skills/skill-registry.json"
@@ -949,6 +962,7 @@ mod tests {
         let p = Policy::fail_closed();
         assert!(p.is_fail_closed());
         assert_eq!(p.network.mainnet, "ask");
+        assert!(p.network.ask_test_cluster_deploys);
         assert_eq!(p.tier(), Tier::Relaxed);
     }
 

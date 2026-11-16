@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`network.ask_test_cluster_deploys` asks on deploys to test clusters.** A deploy or upgrade (`program deploy`, `write-buffer`, `upgrade`, `extend`, `program-v4 deploy`, `anchor deploy`, `upgrade` and `migrate`) to a positively identified devnet, testnet or localnet has no opinion by default. With this policy key set to `true` it asks at every tier, as a grantable deploy ask, and is denied when headless. Authority changes there already ask. It is off by default; a project's `.safe-ai-skill/policy.yaml` may turn it on but not off, and a policy that fails closed turns it on. solana-ai-kit turns it on to keep its devnet deploy prompt once it drops its own on-chain guard.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed

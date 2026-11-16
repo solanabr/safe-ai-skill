@@ -102,6 +102,12 @@ fn ratchet(policy: &mut Policy, asked: &Policy) -> Vec<String> {
         &asked.network.mainnet,
         n,
     );
+    keep_on(
+        "network.ask_test_cluster_deploys",
+        &mut policy.network.ask_test_cluster_deploys,
+        asked.network.ask_test_cluster_deploys,
+        n,
+    );
 
     let spend = &mut policy.spend;
     for (path, cap, wanted) in [

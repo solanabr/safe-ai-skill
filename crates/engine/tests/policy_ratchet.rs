@@ -246,6 +246,33 @@ fn decisions_move_only_toward_deny() {
 }
 
 #[test]
+fn test_cluster_deploy_asks_turn_on_only() {
+    assert!(!base().network.ask_test_cluster_deploys);
+    let on = with_repo("network:\n  ask_test_cluster_deploys: true\n");
+    assert!(on.network.ask_test_cluster_deploys);
+    assert!(
+        on.ignored_overrides.is_empty(),
+        "{:?}",
+        on.ignored_overrides
+    );
+
+    let base_on = DEFAULT_POLICY_YAML.replace(
+        "ask_test_cluster_deploys: false",
+        "ask_test_cluster_deploys: true",
+    );
+    let off = Policy::from_sources(
+        &base_on,
+        Some("network:\n  ask_test_cluster_deploys: false\n"),
+    );
+    assert!(off.network.ask_test_cluster_deploys);
+    assert!(noted(&off, "network.ask_test_cluster_deploys"));
+
+    // An ill-typed overlay fails closed, which turns it on.
+    let bad = with_repo("network:\n  ask_test_cluster_deploys: maybe\n");
+    assert!(bad.network.ask_test_cluster_deploys);
+}
+
+#[test]
 fn secret_deny_globs_union_and_allow_globs_intersect() {
     let p = with_repo(concat!(
         "secrets:\n  deny_read_globs: [\"**/*.secret\"]\n",
@@ -619,6 +646,29 @@ fn repo_caps_all_1e9_do_not_allow_50_sol() {
 fn repo_lower_cap_still_applies() {
     let proj = project("spend:\n  per_tx_sol_max: 0.1\n");
     assert_eq!(bash(proj.path(), &devnet_transfer("0.5"), &[]), "ask");
+}
+
+#[test]
+fn repo_test_cluster_deploy_knob_asks_and_denies_headless() {
+    let deploy = "solana program deploy ./p.so --url https://api.devnet.solana.com";
+    assert_eq!(bash(project("").path(), deploy, &[]), "");
+    // The kit's own overlay, with the knob turned on.
+    let proj = project(&format!(
+        "{AIKIT_POLICY}network:\n  ask_test_cluster_deploys: true\n"
+    ));
+    assert_eq!(bash(proj.path(), deploy, &[]), "ask");
+    assert_eq!(
+        bash(proj.path(), deploy, &[("SAFE_AI_SKILL_HEADLESS", "1")]),
+        "deny"
+    );
+    assert_eq!(
+        bash(
+            proj.path(),
+            "anchor deploy --provider.cluster localnet",
+            &[]
+        ),
+        "ask"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
