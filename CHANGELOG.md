@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Behaviour changes (read before upgrading)
+
+- **A `git config` key that names a program git runs is denied at every tier.** `core.hooksPath`, `core.sshCommand`, an `alias.*` starting with `!`, `core.pager` or `core.editor` set to a program that is not a known editor or pager, a `credential.helper` that starts with `!` or holds a path, and the rest of the tamper gate's list, set by `git config` or a one-shot `git -c`, used to ask at Off and Relaxed; so did `git config --edit` and a `--rename-section` onto one of their sections. They are now denied from Off up, as solana-ai-kit's guard denies them. An alias that names a git command (`alias.co checkout`) and a `credential.helper` that names an installed helper (`store`, `osxkeychain`) still ask at Off and Relaxed and are denied from Medium.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed
