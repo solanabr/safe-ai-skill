@@ -71,6 +71,7 @@ Per Claude Code's hooks documentation, the reason of a `deny` is shown to the mo
 | | [Exfiltration](docs/tiers.md#exfiltration-tripwire) | Request-bin, tunnel and paste hosts are denied from Relaxed; a key or env file sent by path is denied; an inline `curl` or `wget` POST to another host asks |
 | **Repo and machine** | [Destructive git](docs/tiers.md#git-and-gh-guard): `reset --hard`, `clean`, `push --mirror`, `reflog expire` | Denied at every tier. Force push and `gh pr merge` ask from Medium (denied at High) |
 | | [Download-and-run](docs/tiers.md#download-and-run): `curl \| sh`, a one-shot `npx` or `uvx` of an undeclared package | Asks (denied at High) |
+| | [Package publish](docs/tiers.md#package-publish): `npm publish`, `cargo publish`, `twine upload`, … | Asks (denied from Medium); a dry run passes |
 | | [Encoded commands](docs/tiers.md#encoded-commands): `base64 -d \| sh`, hex `printf`, `$'…'` | Decoded and judged like the plain command; one that can't be decoded asks |
 | | [Privileged containers](docs/tiers.md#container-privilege-guard) and host mounts | Asks (denied at High) |
 | **The firewall itself** | [Tamper](docs/tiers.md#tamper-settings-hooks-and-config-content): settings that turn it off (`disableAllHooks`, `bypassPermissions`, …), shell startup files, managed settings | Denied. Git hooks, `.mcp.json` servers and `package.json` lifecycle scripts ask |

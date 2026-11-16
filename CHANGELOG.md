@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Package publish gate.** A command that uploads a package version to a registry asks at Off and Relaxed and is denied from Medium, and headless turns the ask into a deny, as solana-ai-kit's own publish guard does. It covers `npm`, `pnpm`, `yarn` and `bun publish`, `yarn npm publish`, `cargo publish`, and the other registry uploads listed in `docs/tiers.md` (`twine upload`, `gem push`, `dotnet nuget push`, …), behind wrappers, package runners (`npx lerna publish`) and `yarn workspaces foreach`. A dry run passes where the tool has one. `docs/tiers.md` no longer lists the publish gate as not yet covered.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed
