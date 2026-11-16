@@ -15,7 +15,7 @@ use crate::datadir::DataDir;
 use crate::gate::Verdict;
 use crate::gates::{
     bash, containers, creddump, encoded, envread, envwrite, exfil, fetchexec, gitguard, keyfiles,
-    secrets, tamper, wallet,
+    kill, secrets, tamper, wallet,
 };
 use crate::io::Decision;
 use crate::policy::tier::Tier;
@@ -222,6 +222,7 @@ fn verdicts(
     all.extend([
         containers::decide(command, cwd, policy, tier),
         keyfiles::decide_bash(command, cwd, tier),
+        kill::decide(command, cwd, policy, tier),
     ]);
     strictest(all)
 }

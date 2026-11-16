@@ -62,6 +62,8 @@ shim and accepts its answers.
 
 `gate-bash-secrets` also carries the [container privilege guard](tiers.md#container-privilege-guard) and the git-staging half of [key-file hygiene](tiers.md#key-file-hygiene), so `docker run --privileged` and `git add` of a key file are judged under Codex too (every `ask` a `deny`). The `PermissionRequest` hook (`gate-permission`) and the `session-end` hook have no Codex entry, so there is no permission re-check and no [session report](tiers.md#session-report) or recap. The session start runs the key-file notice.
 
+`gate-bash-secrets` also carries the [process-kill guard](tiers.md#process-kill), so `kill -9 -1` and a `pkill` of a coding agent are denied under Codex too.
+
 ### Self-protection
 
 Under Codex, these targets are also denied, through `apply_patch` and through shell writes.
@@ -390,6 +392,8 @@ call (`packages/opencode/src/plugin/index.ts` `trigger`, `src/session/tools.ts`)
 **Which firewall checks reach opencode.** The `bash` gates are `gate-bash` and `gate-bash-secrets`, so the exfil tripwire, tamper-content write checks, download-and-run, env-dump and encoded-command checks run on `bash` commands, and `gate-mcp` runs the MCP checks, as under Codex (`GATES` in `adapt_opencode.rs`). opencode's `webfetch` tool is **ungated** and there is no `gate-webfetch` entry, so a `WebFetch` URL to an exfil host is not seen (a `curl` through `bash` is). opencode has no output redaction, so a bare `printenv`/`env` dump reaches the model with its values. The [git and `gh` guard](tiers.md#git-and-gh-guard) and the nested-`claude` checks ride on `gate-bash-secrets`, and the MCP tool-name refusals on `gate-mcp`; `gate-config` (Claude Code's `ConfigChange` event) has no opencode counterpart.
 
 The [container privilege guard](tiers.md#container-privilege-guard) and the git-staging half of [key-file hygiene](tiers.md#key-file-hygiene) ride on `gate-bash-secrets`, so they reach `bash` commands. opencode has no `PermissionRequest` or `SessionEnd` counterpart and no SessionStart sweep, so there is no permission re-check, no [session report](tiers.md#session-report) or recap, and no key-file notice.
+
+The [process-kill guard](tiers.md#process-kill) rides on `gate-bash-secrets` too, so `kill -9 -1` and a `pkill` of a coding agent in `bash` commands are denied under opencode.
 
 **`ask` becomes a block.** opencode's `tool.execute.before` either throws or returns; there is
 no ask. So every `ask` reaches opencode as a deny, and the reason says how to go ahead: run it

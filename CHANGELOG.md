@@ -4,6 +4,12 @@ All notable changes are documented in this file. Format follows [Keep a Changelo
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Process-kill guard.** Denied at every tier, as solana-ai-kit's own guard denies them: `kill` of PID -1 (`kill -9 -1`, every process the user owns), `killall5`, a `pkill` or `killall` naming a coding agent (`claude`, `codex`, `opencode`, `orca`), and a `pkill` or `killall` that takes in every process (a match-anything pattern, `pkill -v`, a whole user, group, session or terminal with no pattern). Killing one process, or a worker by its own name (`pkill -f vitest`), stays silent. `docs/tiers.md` no longer lists process kill as not yet covered.
+
 ## [1.3.4] — 2026-11-11
 
 ### Fixed

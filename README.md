@@ -73,6 +73,7 @@ Per Claude Code's hooks documentation, the reason of a `deny` is shown to the mo
 | | [Download-and-run](docs/tiers.md#download-and-run): `curl \| sh`, a one-shot `npx` or `uvx` of an undeclared package | Asks (denied at High) |
 | | [Encoded commands](docs/tiers.md#encoded-commands): `base64 -d \| sh`, hex `printf`, `$'…'` | Decoded and judged like the plain command; one that can't be decoded asks |
 | | [Privileged containers](docs/tiers.md#container-privilege-guard) and host mounts | Asks (denied at High) |
+| | [Process kill](docs/tiers.md#process-kill): `kill -9 -1`, `pkill -f claude`, `killall -u me` | Denied at every tier; killing one process or a worker by name is not gated |
 | **The firewall itself** | [Tamper](docs/tiers.md#tamper-settings-hooks-and-config-content): settings that turn it off (`disableAllHooks`, `bypassPermissions`, …), shell startup files, managed settings | Denied. Git hooks, `.mcp.json` servers and `package.json` lifecycle scripts ask |
 | | [Sandbox settings](docs/tiers.md#settings-manager) a plugin can't ship | `safe-ai-skill firewall apply` writes them |
 | | [Session report](docs/tiers.md#session-report) | A summary at session end and a one-line recap at the next start |
