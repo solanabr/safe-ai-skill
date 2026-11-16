@@ -206,6 +206,8 @@ A repository can tighten the policy with `.safe-ai-skill/policy.yaml`. A setting
 ```yaml
 version: 1
 tier: high                       # may only raise the tier
+network:
+  ask_test_cluster_deploys: true # a deploy to devnet, testnet or localnet asks; may only turn on
 spend:
   per_tx_sol_max: 0.5            # caps take the lower value
 secrets:

@@ -345,6 +345,66 @@ fn mainnet_deny_policy_denies_mainnet_value_moves() {
     assert_eq!(d, Decision::Allow);
 }
 
+#[test]
+fn test_cluster_deploy_policy_asks_on_identified_test_clusters() {
+    use safe_ai_skill::gate::Scope;
+    use safe_ai_skill::policy::tier::Tier;
+
+    let dir = TempDir::new("testclusterdeploy");
+    let deploys = [
+        "solana program deploy ./p.so",
+        "solana program write-buffer ./p.so",
+        "solana program upgrade buf.json prog.json",
+        "solana program extend prog.json 1000",
+        "solana program-v4 deploy ./p.so",
+        "anchor deploy",
+        "anchor upgrade target/deploy/p.so --program-id prog.json",
+        "anchor program deploy",
+    ];
+    let mut on = Policy::default();
+    on.network.ask_test_cluster_deploys = true;
+    for network in [Network::Devnet, Network::Testnet, Network::Localnet] {
+        let ctx = ctx_in(network, network, dir.path());
+        for cmd in deploys {
+            let (d, _) = bash::decide(cmd, &ctx, &Policy::default());
+            assert_eq!(d, Decision::Defer, "off: {cmd} on {network:?}");
+            for tier in [Tier::Off, Tier::Relaxed, Tier::Medium, Tier::High] {
+                on.runtime.tier = tier;
+                let (d, meta) = bash::decide(cmd, &ctx, &on);
+                assert!(is_ask(&d), "on: {cmd} on {network:?} at {tier:?}: {d:?}");
+                assert_eq!(meta.scope, Scope::Deploy, "{cmd}");
+                // Grantable, as a deploy elsewhere is.
+                assert!(!meta.hard_guard, "{cmd}");
+            }
+        }
+        on.runtime.tier = Tier::Relaxed;
+        // The cluster a command names wins over the default.
+        let (d, _) = bash::decide("solana program deploy ./p.so -ud", &ctx, &on);
+        assert!(is_ask(&d), "{d:?}");
+        // Authority changes and irreversible actions keep their own hard-guard asks; transfers
+        // within the caps and read-only commands are untouched.
+        for cmd in [
+            "solana program set-buffer-authority buf.json --new-buffer-authority k.json",
+            "solana program deploy ./p.so --final",
+        ] {
+            let (d, meta) = bash::decide(cmd, &ctx, &on);
+            assert!(is_ask(&d) && meta.hard_guard, "{cmd}: {d:?}");
+        }
+        let (d, _) = bash::decide(&format!("solana transfer {DEST} 0.1"), &ctx, &on);
+        assert_eq!(d, Decision::Allow, "{network:?}");
+        for cmd in ["solana program show prog", "anchor build"] {
+            let (d, _) = bash::decide(cmd, &ctx, &on);
+            assert_eq!(d, Decision::Defer, "{cmd}");
+        }
+    }
+    // Mainnet and an unidentified cluster ask as before.
+    for network in [Network::Mainnet, Network::Unknown] {
+        let ctx = ctx_in(network, network, dir.path());
+        let (d, _) = bash::decide("solana program deploy ./p.so", &ctx, &on);
+        assert!(is_ask(&d), "{network:?}: {d:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Amounts
 // ---------------------------------------------------------------------------------------

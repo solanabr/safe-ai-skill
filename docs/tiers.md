@@ -158,7 +158,7 @@ Transfers (`solana`, `spl-token`), deploy, upgrade, write-buffer, extend, `set-u
 
 - On mainnet or an Unknown cluster: ask at Off, Relaxed and Medium; deny at High. A confirmed grant that covers it (grantable scopes only, a mainnet deploy included) allows below High and never at High. Policy `network.mainnet: deny` forces a deny at every tier.
 - A grant covers one action of its scope. A command line joining two or more gated on-chain actions, or holding any hard-guard ask, is never covered by a grant and asks (deny at High). A grant allows only a direct `solana …`/`spl-token …`/`anchor …` command; the same command behind a wrapper (`env FOO=1 …`) gets no allow from the plugin.
-- On an identified test cluster: deploy and upgrade have no opinion; a transfer within the spend caps is allowed below High (no opinion at High); an authority change asks at every tier.
+- On an identified test cluster: deploy and upgrade have no opinion; a transfer within the spend caps is allowed below High (no opinion at High); an authority change asks at every tier. Policy `network.ask_test_cluster_deploys: true` makes the deploy and upgrade ask at every tier too (a grantable ask, like a mainnet deploy below High; a deny when headless). A project's `policy.yaml` may turn it on, not off; solana-ai-kit turns it on to keep its devnet deploy prompt.
 - The hard guards `set_authority` and `account_close` stay unrelaxable. A program buffer close is Class U (see above), never grantable.
 
 ### Authority verbs, token amounts and cluster parsing
@@ -500,7 +500,7 @@ One rule, shared with the kit.
 2. When headless, **every `ask` becomes a `deny`** (irreversible actions on a devnet, value-moving actions on mainnet, hard-guard asks, opaque commands, MCP asks), with the reason "approve interactively, or run it yourself".
 3. The only thing that passes is a grant you confirmed interactively beforehand, for grantable Class C scopes, below High.
 4. Env escapes (`CONFIRM_MAINNET`, `CONFIRM_*`, anything repo-settable) are ignored. No `defer`, ever. Nothing can be confirmed in a headless session.
-5. A Relaxed localnet deploy passes headless (it has no opinion), and so does an inline JSON-RPC POST to a known Solana RPC host below High. Any other inline `curl`/`wget` POST asks, so such a call is denied under CI.
+5. A Relaxed localnet deploy passes headless (it has no opinion, unless policy `network.ask_test_cluster_deploys` is on), and so does an inline JSON-RPC POST to a known Solana RPC host below High. Any other inline `curl`/`wget` POST asks, so such a call is denied under CI.
 
 ## Known holes
 

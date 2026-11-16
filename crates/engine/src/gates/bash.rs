@@ -27,7 +27,9 @@
 //! A command that names its own cluster (`-um`, `--url …`, `-C file`) is judged on it;
 //! otherwise `solana`/`spl-token` use [`Context::network`] and `anchor`
 //! [`Context::anchor_network`], unless the command changes directory or the CLI config's
-//! environment first. With policy `network.mainnet: deny`, every mainnet ask is a deny.
+//! environment first. With policy `network.mainnet: deny`, every mainnet ask is a deny; with
+//! `network.ask_test_cluster_deploys: true`, a deploy or upgrade on an identified test cluster
+//! asks.
 //!
 //! The gate performs no process or network I/O: `main.rs` resolved the defaults. It reads a
 //! `-C` config file when one is named, and the spend ledger, which is read (not committed)
@@ -575,6 +577,7 @@ fn family_decision(
         decision
     };
     let decision = mainnet_policy(decision, cluster.network, policy);
+    let decision = test_cluster_policy(decision, &meta, cluster.network, policy);
     if is_unreadable_meta(&meta) {
         return unreadable_at((decision, meta), tier);
     }
@@ -1184,6 +1187,37 @@ fn mainnet_policy(decision: Decision, network: Network, policy: &Policy) -> Deci
     }
 }
 
+/// Policy `network.ask_test_cluster_deploys: true` turns the no opinion a deploy or upgrade gets
+/// on a positively identified devnet, testnet or localnet into an ask, grantable as a deploy
+/// elsewhere is (it can only tighten).
+fn test_cluster_policy(
+    decision: Decision,
+    meta: &GateMeta,
+    network: Network,
+    policy: &Policy,
+) -> Decision {
+    let test_cluster = matches!(
+        network,
+        Network::Devnet | Network::Testnet | Network::Localnet
+    );
+    match decision {
+        Decision::Defer
+            if meta.scope == Scope::Deploy
+                && test_cluster
+                && policy.network.ask_test_cluster_deploys =>
+        {
+            Decision::Ask {
+                reason: format!(
+                    "Deploy to {} (policy network.ask_test_cluster_deploys is on) — approve to \
+                     proceed",
+                    cluster_label(network)
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
 /// Classify one solana-family command.
 fn classify(program: &str, argv: &Argv, ctx: &Context, policy: &Policy) -> (Decision, GateMeta) {
     match program {
@@ -1453,7 +1487,7 @@ fn token_transfer_decision(argv: &Argv, ctx: &Context) -> (Decision, GateMeta) {
 ///
 /// `--final` makes the program immutable: irreversible (Class U, normally decided before
 /// this). Otherwise mainnet or an unidentified network → a grantable ask, a positively
-/// identified devnet/testnet/localnet → no opinion.
+/// identified devnet/testnet/localnet → no opinion ([`test_cluster_policy`] may make it an ask).
 fn deploy_decision(program: &str, ctx: &Context, argv: &Argv) -> (Decision, GateMeta) {
     if argv.has_flag("--final") {
         return irreversible_decision(
